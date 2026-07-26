@@ -75,14 +75,30 @@ largest 281 MiB. Copying by default turns a converter into a multi-gigabyte
 archiver that nobody asked for.
 
 So by default a record **references** its origin: absolute path, content hash,
-size, mtime. On use, the store re-hashes and gets one of three answers, all of
-which it reports rather than papering over:
+size, mtime. On use it resolves to one of three answers, all of which it
+reports rather than papering over:
 
-- **hash matches** — use it, full fidelity available.
-- **file grew, prefix matches** — the session log is append-only, so this is
-  the normal case for a live session. Use it; the conversation has advanced.
+- **unchanged** — use it, full fidelity available.
+- **grew, stored prefix still matches** — the session log is append-only, so
+  this is the normal case for a live session. Use it; the conversation has
+  advanced.
 - **gone, or diverged** — origin unavailable. Fall back to the best surviving
   incarnation and *say so*, with the grade that fallback costs.
+
+An earlier draft of this document said the store "re-hashes" on use. Measured,
+that is wrong: SHA-256 over the largest rollout in the corpus (281.6 MiB) costs
+**3.903 s**, and paying it on every lookup would make the store slower than the
+conversion it exists to improve. So size and mtime are a cheap negative check
+first, and bytes are read only when that check passes — **561 ns** and zero
+bytes read on the normal path, a ratio of about 7×10⁶. Truncation is answered
+by the length alone.
+
+That buys speed by weakening the claim, so the weakening is made explicit in
+the type rather than left implicit: `OriginState::Unchanged { rehashed: false }`
+says in the return value that the bytes were not re-read. The residual hazard —
+a rewrite that preserves both length and mtime — is documented on
+`OriginSnapshot::state`. A cheap check that silently calls itself verification
+would be the worse design; one that reports which check it actually ran is not.
 
 `--archive` opts a record into a real byte copy. This is the honest split: a
 reference buys availability, and availability is not backup. Defaulting to a
@@ -109,9 +125,25 @@ id is a fresh UUID minted at first ingest, not derived from content: sessions
 are append-only logs that keep growing, so a content-derived id would change
 under the conversation it names.
 
-Two deliberate omissions, both additive to reverse if they turn out to be
-wanted: only the latest origin snapshot per provider is tracked (no history of
-the origin), and there is no cross-machine sync story.
+A record holds **exactly one** `Origin`. An earlier draft said "one `Origin`"
+in one place and "the latest origin snapshot *per provider*" in another, which
+implies several; the first is what is implemented, and `fsck` reports any
+record whose origin count is not 1. What is genuinely omitted is *history*:
+only the current snapshot of that origin is kept, not its past ones.
+
+`ir.json` caches **the origin's** IR — one file per record, even though a
+record has N incarnations. That follows from the invalidation rule, which says
+to re-derive from *origin bytes*. The consequence is worth knowing before it
+surprises someone: ranking a **derived** candidate always re-parses that
+candidate's file, because there is no cache for it.
+
+Also omitted, and additive to add later: any cross-machine sync story.
+
+`ingest_origin` on a key the store already knows as a `Derived` incarnation
+must **not** promote it to `Origin`. Doing so would overwrite that
+incarnation's recorded `fidelity` and `losses`, and those are a measurement of
+an event that has already happened — nothing can retake them. This was a real
+defect in the first implementation, now pinned by a test.
 
 ## The one interesting function
 
@@ -128,11 +160,34 @@ choice runs through `Capsule::fits()` — the machinery that already decides
 this at the event level — rather than through a new preference order that
 could disagree with it.
 
+`fits()` ranks candidates but does not order the ties — "worth exactly the same
+when the target is Gemini" still has to pick one. The order, declared once as
+the field order of a `Rank` and walked by the explanation so that the reason
+given is the reason that actually decided:
+
+readable → capsules that fit → needs-no-conversion → recorded completeness →
+origin-before-derived → recency.
+
+The third rung is the one this document got wrong. It asserted that a Codex
+origin beats a Claude derivative for a Codex target, which is true, and left
+the symmetric case unstated — where it is **false**. For a Claude target the
+Codex origin does *not* win: converting it costs something and the Claude
+incarnation is already there. Without a needs-no-conversion rung the ranking
+would have been asymmetric in the wrong direction.
+
 Consequences worth naming before they surprise someone:
 
 - The store may read a session the user did not name. That has to be visible
   in the output, not just in the result: "source: codex `01J…` (origin;
-  you named claude-code `a3f…`, which would have cost 30,082 capsules)".
+  you named claude-code `a3f…`, which would have cost 3 capsules (10536 bytes
+  of sealed material))".
+- That line is not reachable from the signature above, which is never told what
+  the user named — an under-specification in this document, not an error in it.
+  The resolution is a deliberate split: `best_source_for` returns **every**
+  ranked candidate with its cost, and rendering takes the named session as an
+  argument. So the **choice** is independent of what the user asked for and
+  only the **explanation** is not, which is the stronger of the two available
+  properties.
 - `--no-store` must exist and must mean *exactly* today's behaviour — read
   what I named, write where I said, record nothing. It is both the escape
   hatch and the regression test: the byte-identical codex→codex round trip has

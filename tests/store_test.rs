@@ -1,0 +1,998 @@
+//! Integration tests for the session store's public contract.
+//!
+//! These test the store the way `pipeline.rs` and `launch.rs` will use it —
+//! through `casr::store` only — so that the wiring has something to lean on.
+//! The three that matter most are the ones that turn a comment into a
+//! guarantee: a stale cached IR is *deleted*, a deleted index is *rebuilt*, and
+//! a store from the future is readable but not writable.
+//!
+//! The corpus under `~/.codex/sessions` and `~/.claude/projects` is read-only
+//! here. Every store these tests create lives in a fresh `tempfile` root.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use casr::ir::{
+    Block, Body, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, IR_VERSION, Loss, LossKind,
+    Role as IrRole, SessionIr, SourceRef, Visibility,
+};
+use casr::providers::Provider;
+use casr::store::{
+    Availability, DerivedWrite, OriginPolicy, OriginSnapshot, OriginState, Role, SessionKey, Store,
+    StoreError,
+};
+
+mod test_env;
+
+static ENV: test_env::EnvLock = test_env::EnvLock;
+
+struct EnvGuard {
+    key: &'static str,
+    original: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &Path) -> Self {
+        let original = std::env::var(key).ok();
+        // SAFETY: guarded by `test_env::EnvLock` for the lifetime of the test.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, original }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn fresh() -> (tempfile::TempDir, Store) {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let store = Store::open_at(tmp.path().join("store")).expect("open store");
+    (tmp, store)
+}
+
+fn write_session(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("write session file");
+    path
+}
+
+fn provider(slug: &str) -> &'static dyn Provider {
+    // The registry owns boxed providers; leak one registry for the test binary
+    // so the borrow can be handed around like the pipeline hands it around.
+    static REGISTRY: std::sync::OnceLock<casr::discovery::ProviderRegistry> =
+        std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(casr::discovery::ProviderRegistry::default_registry)
+        .find_by_slug(slug)
+        .unwrap_or_else(|| panic!("no provider '{slug}'"))
+}
+
+/// A synthetic IR carrying `count` capsules of one vendor's sealed format.
+fn ir_with_capsules(agent: &str, kind: CapsuleKind, count: usize) -> SessionIr {
+    let mut ir = SessionIr::new(agent, "synthetic");
+    for i in 0..count {
+        ir.events.push(Event {
+            id: format!("e{i}"),
+            parent: None,
+            branch: casr::ir::Branch::Main,
+            turn: None,
+            ts: None,
+            visibility: Visibility::Model,
+            body: Body::Message {
+                role: IrRole::Assistant,
+                blocks: vec![Block::Text {
+                    text: "hello".to_string(),
+                }],
+            },
+            capsules: vec![Capsule {
+                kind,
+                bound: CapsuleBinding {
+                    provider: kind.vendor().to_string(),
+                    model: None,
+                },
+                sealed: "SEALEDSEALED".to_string(),
+            }],
+            source: SourceRef {
+                line: (i + 1) as u64,
+                sha256: String::new(),
+            },
+        });
+    }
+    ir
+}
+
+/// Every `(provider, session_id) -> record` row in the index, read straight out
+/// of SQLite so that "the index was rebuilt" is a claim about the index and not
+/// about the store's fallbacks.
+fn index_rows(root: &Path) -> Vec<(String, String, String)> {
+    let conn = rusqlite::Connection::open(root.join("index.sqlite")).expect("open index");
+    let mut stmt = conn
+        .prepare("SELECT provider, provider_session_id, record_id FROM sessions ORDER BY 1, 2")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows")
+}
+
+/// The largest `.jsonl` under `root`, or `None` when the corpus is absent.
+fn largest_under(root: &Path) -> Option<(PathBuf, u64)> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| e.metadata().ok().map(|m| (e.path().to_path_buf(), m.len())))
+        .max_by_key(|(_, size)| *size)
+}
+
+/// The smallest corpus session over `min` bytes whose IR actually carries
+/// capsules its own vendor can replay. Returns the path and the capsule count.
+fn corpus_session_with_capsules(
+    root: &Path,
+    slug: &str,
+    min: u64,
+    max: u64,
+) -> Option<(PathBuf, usize)> {
+    let mut candidates: Vec<(u64, PathBuf)> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter_map(|e| e.metadata().ok().map(|m| (m.len(), e.path().to_path_buf())))
+        .filter(|(size, _)| *size >= min && *size <= max)
+        .collect();
+    candidates.sort();
+
+    let vendor = casr::compare::vendor_of(slug)?;
+    for (_, path) in candidates.into_iter().take(40) {
+        let Ok(Some(ir)) = provider(slug).read_session_ir(&path) else {
+            continue;
+        };
+        let fitting = ir
+            .model_visible()
+            .iter()
+            .flat_map(|event| event.capsules.iter())
+            .filter(|capsule| capsule.fits(vendor) == casr::ir::CapsuleFit::SameVendor)
+            .count();
+        if fitting > 0 {
+            return Some((path, fitting));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Layout and root resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_store_creates_itself_under_agsx_store() {
+    let _lock = ENV.lock().expect("env lock");
+    let home = tempfile::tempdir().expect("temp home");
+    let root = home.path().join("chosen-root");
+    let _guard = EnvGuard::set("AGSX_STORE", &root);
+
+    assert_eq!(
+        casr::store::default_root().expect("root"),
+        root,
+        "$AGSX_STORE wins over every default"
+    );
+    let store = Store::open().expect("open the default store");
+    assert_eq!(store.root(), root.as_path());
+    assert!(root.join("store.json").is_file(), "store.json is written");
+    assert!(root.join("records").is_dir(), "records/ is created");
+}
+
+#[test]
+fn a_record_holds_one_origin_and_a_derived_incarnation_per_conversion() {
+    let (tmp, store) = fresh();
+    let origin_path = write_session(tmp.path(), "rollout.jsonl", "{\"a\":1}\n");
+    let written_path = write_session(tmp.path(), "cc.jsonl", "{\"b\":2}\n");
+    let origin = SessionKey::new("codex", "01JORIGIN");
+    let derived = SessionKey::new("claude-code", "a3fDERIVED");
+
+    let record = store
+        .ingest_origin(&origin, &origin_path, OriginPolicy::Reference)
+        .expect("ingest");
+    assert!(!record.id.is_empty(), "a fresh UUID names the conversation");
+
+    let record = store
+        .record_conversion(
+            &record.id,
+            DerivedWrite {
+                key: derived.clone(),
+                path: written_path,
+                from: origin.clone(),
+                fidelity: Fidelity::ContextNoReasoning,
+                losses: vec![Loss {
+                    kind: LossKind::Reasoning,
+                    events: 41,
+                    capsules: 30_082,
+                    bytes: 1_234_567,
+                    grade: Fidelity::ContextNoReasoning,
+                    note: "openai capsules cannot be replayed by anthropic".to_string(),
+                }],
+            },
+        )
+        .expect("record conversion");
+
+    assert_eq!(record.incarnations.len(), 2);
+    assert_eq!(record.origin().expect("origin").key, origin);
+    assert_eq!(
+        record.for_provider("claude-code").expect("derived").key,
+        derived
+    );
+
+    // Both keys resolve to the one conversation; that is the whole point.
+    for key in [&origin, &derived] {
+        assert_eq!(
+            store
+                .find_by_session(key)
+                .expect("lookup")
+                .expect("indexed")
+                .id,
+            record.id,
+            "{key} should resolve to the conversation"
+        );
+    }
+
+    // The losses survive a round trip through disk verbatim: they describe a
+    // moment that cannot be recomputed.
+    let reloaded = store.get(&record.id).expect("get").expect("record");
+    let Role::Derived {
+        from,
+        fidelity,
+        losses,
+    } = &reloaded
+        .for_provider("claude-code")
+        .expect("derived")
+        .role
+        .clone()
+    else {
+        panic!("expected a derived incarnation");
+    };
+    assert_eq!(from, &origin);
+    assert_eq!(*fidelity, Fidelity::ContextNoReasoning);
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].capsules, 30_082);
+    assert_eq!(losses[0].kind, LossKind::Reasoning);
+}
+
+// ---------------------------------------------------------------------------
+// Cache 1: the IR, keyed by IR_VERSION
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_ir_cache_stamped_with_an_older_version_is_deleted_not_migrated() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let record = store
+        .ingest_origin(
+            &SessionKey::new("codex", "01J"),
+            &path,
+            OriginPolicy::Reference,
+        )
+        .expect("ingest");
+
+    let ir = SessionIr::new("codex", "01J");
+    store.store_ir(&record.id, &ir).expect("cache the IR");
+    let cache = store
+        .root()
+        .join("records")
+        .join(&record.id)
+        .join("ir.json");
+    assert!(cache.is_file());
+    assert_eq!(
+        store.load_ir(&record.id).expect("load"),
+        Some(ir),
+        "a current cache is served"
+    );
+
+    // Plant the version that IR_VERSION superseded. `agsx-ir/1` predates
+    // `Body::Rollback`, `Body::Abort` and `SessionIr::live_head`, so a reader
+    // that "migrated" it would be inventing history.
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache).expect("read")).expect("parse");
+    assert_eq!(raw["ir_version"], serde_json::json!(IR_VERSION));
+    raw["ir_version"] = serde_json::json!("agsx-ir/1");
+    std::fs::write(&cache, serde_json::to_vec(&raw).expect("encode")).expect("plant");
+
+    assert_eq!(
+        store.load_ir(&record.id).expect("load"),
+        None,
+        "a stale stamp means 'no cache', so the caller re-derives from origin bytes"
+    );
+    assert!(
+        !cache.exists(),
+        "and the stale file is gone: there is no migration path, ever"
+    );
+}
+
+#[test]
+fn an_unparseable_ir_cache_is_also_deleted() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let record = store
+        .ingest_origin(
+            &SessionKey::new("codex", "01J"),
+            &path,
+            OriginPolicy::Reference,
+        )
+        .expect("ingest");
+    store
+        .store_ir(&record.id, &SessionIr::new("codex", "01J"))
+        .expect("cache");
+    let cache = store
+        .root()
+        .join("records")
+        .join(&record.id)
+        .join("ir.json");
+    std::fs::write(&cache, b"{ not json at all").expect("corrupt");
+
+    assert_eq!(store.load_ir(&record.id).expect("load"), None);
+    assert!(!cache.exists(), "a cache we cannot read is a cache we drop");
+}
+
+// ---------------------------------------------------------------------------
+// Cache 2: the index
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fsck_rebuilds_a_deleted_index_to_the_same_content() {
+    let (tmp, store) = fresh();
+
+    // Three conversations, one of them with two incarnations: four index rows.
+    let mut expected_records = Vec::new();
+    for i in 0..3 {
+        let path = write_session(tmp.path(), &format!("rollout{i}.jsonl"), "{}\n");
+        let record = store
+            .ingest_origin(
+                &SessionKey::new("codex", format!("origin-{i}")),
+                &path,
+                OriginPolicy::Reference,
+            )
+            .expect("ingest");
+        expected_records.push(record);
+    }
+    let derived_path = write_session(tmp.path(), "cc.jsonl", "{}\n");
+    store
+        .record_conversion(
+            &expected_records[0].id,
+            DerivedWrite {
+                key: SessionKey::new("claude-code", "derived-0"),
+                path: derived_path,
+                from: SessionKey::new("codex", "origin-0"),
+                fidelity: Fidelity::ConversationOnly,
+                losses: Vec::new(),
+            },
+        )
+        .expect("record conversion");
+
+    let before = index_rows(store.root());
+    assert_eq!(before.len(), 4, "3 origins + 1 derived; got {before:?}");
+    println!("index rows before deletion: {}", before.len());
+
+    // Lose the entire index. It is a cache, so nothing authoritative went with
+    // it — the record directories still hold every fact.
+    std::fs::remove_file(store.root().join("index.sqlite")).expect("delete index");
+    assert!(!store.root().join("index.sqlite").exists());
+
+    let report = store.fsck(true).expect("fsck");
+    println!(
+        "fsck: {} records, {} incarnations, {} rows indexed, {} problems",
+        report.records,
+        report.incarnations,
+        report.indexed,
+        report.problems.len()
+    );
+    assert_eq!(report.records, 3);
+    assert_eq!(report.incarnations, 4);
+    assert_eq!(report.indexed, 4, "fsck wrote one row per incarnation");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+
+    let after = index_rows(store.root());
+    assert_eq!(after, before, "rebuilt index is byte-for-byte the same map");
+
+    // And it still answers the question it exists to answer.
+    assert_eq!(
+        store
+            .find_by_session(&SessionKey::new("claude-code", "derived-0"))
+            .expect("lookup")
+            .expect("hit")
+            .id,
+        expected_records[0].id
+    );
+}
+
+#[test]
+fn an_index_speaking_an_unknown_schema_is_rebuilt_rather_than_migrated() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let key = SessionKey::new("codex", "01J");
+    let record = store
+        .ingest_origin(&key, &path, OriginPolicy::Reference)
+        .expect("ingest");
+
+    // A schema this build does not know, with a table it cannot read.
+    let conn = rusqlite::Connection::open(store.root().join("index.sqlite")).expect("open");
+    conn.execute_batch("DROP TABLE sessions; CREATE TABLE sessions (nonsense TEXT);")
+        .expect("mangle");
+    conn.pragma_update(None, "user_version", 9_999_i32)
+        .expect("bump schema version");
+    drop(conn);
+
+    assert_eq!(
+        store
+            .find_by_session(&key)
+            .expect("lookup")
+            .expect("hit")
+            .id,
+        record.id,
+        "the index rebuilt itself from the records and answered anyway"
+    );
+    assert_eq!(index_rows(store.root()).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// store.json: readable from the future, not writable
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_store_from_the_future_stays_readable_and_refuses_writes() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let key = SessionKey::new("codex", "01J");
+    let record = store
+        .ingest_origin(&key, &path, OriginPolicy::Reference)
+        .expect("ingest");
+    drop(store);
+
+    // Someone with a newer build bumped the layout.
+    let manifest_path = tmp.path().join("store").join("store.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read"))
+            .expect("parse");
+    manifest["store_version"] = serde_json::json!(999);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).expect("encode"),
+    )
+    .expect("write manifest");
+
+    let store = Store::open_at(tmp.path().join("store")).expect("a newer store still opens");
+    assert_eq!(store.store_version(), 999);
+
+    // Direction 1: reading works. Listing a record does not require
+    // understanding every field a newer build may have added.
+    let listed = store.list().expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, record.id);
+    assert_eq!(
+        store.get(&record.id).expect("get").expect("record").id,
+        record.id
+    );
+    assert_eq!(
+        store
+            .find_by_session(&key)
+            .expect("lookup")
+            .expect("hit")
+            .id,
+        record.id,
+        "answered by scanning the records, without touching their index"
+    );
+
+    // Direction 2: every write is refused, by name.
+    for (what, err) in [
+        (
+            "ingest_origin",
+            store
+                .ingest_origin(
+                    &SessionKey::new("codex", "other"),
+                    &path,
+                    OriginPolicy::Reference,
+                )
+                .expect_err("ingest must be refused"),
+        ),
+        (
+            "record_conversion",
+            store
+                .record_conversion(
+                    &record.id,
+                    DerivedWrite {
+                        key: SessionKey::new("claude-code", "a3f"),
+                        path: path.clone(),
+                        from: key.clone(),
+                        fidelity: Fidelity::ConversationOnly,
+                        losses: Vec::new(),
+                    },
+                )
+                .expect_err("recording must be refused"),
+        ),
+        (
+            "store_ir",
+            store
+                .store_ir(&record.id, &SessionIr::new("codex", "01J"))
+                .expect_err("caching must be refused"),
+        ),
+        (
+            "fsck --rebuild-index",
+            store.fsck(true).expect_err("rebuilding must be refused"),
+        ),
+    ] {
+        match err.downcast_ref::<StoreError>() {
+            Some(StoreError::NewerStore {
+                found, supported, ..
+            }) => {
+                assert_eq!(*found, 999);
+                assert_eq!(*supported, casr::store::STORE_VERSION);
+            }
+            other => panic!("{what} should refuse with NewerStore, got {other:?}"),
+        }
+    }
+
+    // A read-only fsck still reports.
+    let report = store.fsck(false).expect("read-only fsck");
+    assert_eq!(report.records, 1);
+    assert!(!report.index_rebuilt);
+}
+
+// ---------------------------------------------------------------------------
+// Origin references: the three-way resolution
+// ---------------------------------------------------------------------------
+
+#[test]
+fn origin_resolution_reports_match_growth_and_loss() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "first line\n");
+    let key = SessionKey::new("codex", "01J");
+    let record = store
+        .ingest_origin(&key, &path, OriginPolicy::Reference)
+        .expect("ingest");
+    let Role::Origin { snapshot } = record.origin().expect("origin").role.clone() else {
+        panic!("expected an origin");
+    };
+
+    // 1. Hash matches — usable at full fidelity.
+    let state = snapshot.state(&path);
+    assert!(state.usable());
+    assert_eq!(state, OriginState::Unchanged { rehashed: false });
+    println!("unchanged: {}", state.describe());
+
+    // 2. The file grew and the stored prefix still matches: the normal case for
+    //    a live, append-only session log.
+    std::fs::write(&path, "first line\nsecond line\n").expect("append");
+    let state = snapshot.state(&path);
+    assert!(state.usable(), "an advanced session is still a source");
+    assert_eq!(state, OriginState::Grew { added_bytes: 12 });
+    println!("grew: {}", state.describe());
+
+    // 3a. Diverged: something rewrote it.
+    std::fs::write(&path, "a completely different session\n").expect("rewrite");
+    let state = snapshot.state(&path);
+    assert!(!state.usable());
+    let OriginState::Unavailable { reason } = &state else {
+        panic!("expected unavailable, got {state:?}");
+    };
+    assert!(reason.starts_with("diverged"), "got {reason}");
+    println!("diverged: {}", state.describe());
+
+    // 3b. Gone.
+    std::fs::remove_file(&path).expect("remove");
+    let state = snapshot.state(&path);
+    assert!(!state.usable());
+    let OriginState::Unavailable { reason } = &state else {
+        panic!("expected unavailable, got {state:?}");
+    };
+    assert!(reason.starts_with("missing"), "got {reason}");
+    println!("gone: {}", state.describe());
+
+    // The choice reports the loss instead of papering over it.
+    let choice = store.best_source_for(&record, provider("codex"));
+    assert!(choice.chosen().is_none(), "nothing left to read");
+    let line = choice.explain(Some(&key));
+    assert!(line.starts_with("no usable source for codex"), "got {line}");
+    println!("{line}");
+}
+
+#[test]
+fn a_truncated_origin_is_rejected_without_reading_a_byte() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "0123456789\n");
+    let record = store
+        .ingest_origin(
+            &SessionKey::new("codex", "01J"),
+            &path,
+            OriginPolicy::Reference,
+        )
+        .expect("ingest");
+    let Role::Origin { snapshot } = record.origin().expect("origin").role.clone() else {
+        panic!("expected an origin");
+    };
+
+    std::fs::write(&path, "0123").expect("truncate");
+    let state = snapshot.state(&path);
+    let OriginState::Unavailable { reason } = &state else {
+        panic!("expected unavailable, got {state:?}");
+    };
+    assert!(
+        reason.contains("shrank from 11 to 4 bytes"),
+        "the cheap length check answers this one; got {reason}"
+    );
+}
+
+#[test]
+fn archive_makes_a_record_survive_its_origin() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "irreplaceable\n");
+    let record = store
+        .ingest_origin(
+            &SessionKey::new("codex", "01J"),
+            &path,
+            OriginPolicy::Archive,
+        )
+        .expect("ingest");
+    std::fs::remove_file(&path).expect("delete the original");
+
+    let choice = store.best_source_for(&record, provider("codex"));
+    let chosen = choice.chosen().expect("the archived copy is a source");
+    assert_eq!(chosen.availability, Availability::Archived);
+    assert_eq!(
+        std::fs::read_to_string(&chosen.path).expect("read"),
+        "irreplaceable\n"
+    );
+    assert!(
+        choice.explain(None).contains("from the archived copy"),
+        "the fallback is stated: {}",
+        choice.explain(None)
+    );
+
+    // Without --archive the same deletion is unrecoverable, and says so.
+    let (tmp2, store2) = fresh();
+    let path2 = write_session(tmp2.path(), "rollout.jsonl", "irreplaceable\n");
+    let record2 = store2
+        .ingest_origin(
+            &SessionKey::new("codex", "01J"),
+            &path2,
+            OriginPolicy::Reference,
+        )
+        .expect("ingest");
+    std::fs::remove_file(&path2).expect("delete");
+    assert!(
+        store2
+            .best_source_for(&record2, provider("codex"))
+            .chosen()
+            .is_none(),
+        "a reference buys availability, and availability is not backup"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// best_source_for
+// ---------------------------------------------------------------------------
+
+#[test]
+fn best_source_depends_on_the_target_vendor() {
+    let (tmp, store) = fresh();
+    let codex_path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let cc_path = write_session(tmp.path(), "cc.jsonl", "{}\n");
+    let codex_key = SessionKey::new("codex", "01JCODEX");
+    let cc_key = SessionKey::new("claude-code", "a3fCC");
+
+    let record = store
+        .ingest_origin(&codex_key, &codex_path, OriginPolicy::Reference)
+        .expect("ingest");
+    let record = store
+        .record_conversion(
+            &record.id,
+            DerivedWrite {
+                key: cc_key.clone(),
+                path: cc_path,
+                from: codex_key.clone(),
+                fidelity: Fidelity::ContextNoReasoning,
+                losses: Vec::new(),
+            },
+        )
+        .expect("record conversion");
+
+    // The origin holds sealed OpenAI material. The Claude derivative could not
+    // carry it — that is exactly the loss the record above describes.
+    store
+        .store_ir(
+            &record.id,
+            &ir_with_capsules("codex", CapsuleKind::OpenaiReasoningEncryptedContent, 9),
+        )
+        .expect("cache the origin IR");
+
+    // Same vendor as the sealed material: the origin is strictly better.
+    let to_codex = store.best_source_for(&record, provider("codex"));
+    assert_eq!(to_codex.target_vendor, Some("openai"));
+    assert_eq!(to_codex.chosen().expect("source").key, codex_key);
+    assert_eq!(to_codex.chosen().unwrap().capsules.fitting(), 9);
+    let line = to_codex.explain(Some(&cc_key));
+    println!("{line}");
+    assert!(
+        line.contains("you named claude-code a3fCC, which would have cost 9 capsules"),
+        "the counterfactual must be in the value, not in a log line: {line}"
+    );
+
+    // Foreign vendor: those nine capsules are worth nothing to Anthropic, so
+    // the session that needs no conversion at all wins instead.
+    let to_cc = store.best_source_for(&record, provider("claude-code"));
+    assert_eq!(to_cc.target_vendor, Some("anthropic"));
+    assert_eq!(
+        to_cc.chosen().expect("source").key,
+        cc_key,
+        "a Codex origin does NOT beat a Claude derivative when the target is Claude"
+    );
+    assert_eq!(to_cc.chosen().unwrap().capsules.fitting(), 0);
+    let line = to_cc.explain(Some(&codex_key));
+    println!("{line}");
+    assert!(
+        line.contains("would have needed another conversion"),
+        "{line}"
+    );
+
+    // A target whose vendor this build does not know: neither vendor's capsules
+    // can cross, the two are worth the same, and the store says the vendor is
+    // unknown rather than guessing.
+    let to_gemini = store.best_source_for(&record, provider("gemini"));
+    assert_eq!(to_gemini.target_vendor, None);
+    for candidate in &to_gemini.candidates {
+        assert_eq!(
+            candidate.capsules.fitting(),
+            0,
+            "{} should carry nothing a gemini target can replay",
+            candidate.key
+        );
+    }
+    assert_eq!(
+        to_gemini.chosen().expect("source").key,
+        codex_key,
+        "tied on capsules, the more complete copy of the conversation wins"
+    );
+}
+
+#[test]
+fn re_ingesting_a_derived_session_does_not_overwrite_its_lineage() {
+    let (tmp, store) = fresh();
+    let origin_path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let derived_path = write_session(tmp.path(), "cc.jsonl", "{}\n");
+    let origin = SessionKey::new("codex", "01J");
+    let derived = SessionKey::new("claude-code", "a3f");
+
+    let record = store
+        .ingest_origin(&origin, &origin_path, OriginPolicy::Reference)
+        .expect("ingest");
+    store
+        .record_conversion(
+            &record.id,
+            DerivedWrite {
+                key: derived.clone(),
+                path: derived_path.clone(),
+                from: origin.clone(),
+                fidelity: Fidelity::HistoryIncomplete,
+                losses: vec![Loss {
+                    kind: LossKind::SealedContext,
+                    events: 4,
+                    capsules: 4,
+                    bytes: 87_600_000,
+                    grade: Fidelity::HistoryIncomplete,
+                    note: "a sealed compaction could not cross".to_string(),
+                }],
+            },
+        )
+        .expect("record conversion");
+
+    // Naming the session we wrote must not turn it into an origin: that would
+    // overwrite a measurement nothing can take again.
+    let after = store
+        .ingest_origin(&derived, &derived_path, OriginPolicy::Reference)
+        .expect("re-ingest");
+    assert_eq!(after.incarnations.len(), 2);
+    assert_eq!(after.origin().expect("origin").key, origin);
+    let Role::Derived {
+        losses, fidelity, ..
+    } = &after.for_provider("claude-code").unwrap().role
+    else {
+        panic!("the derived incarnation must stay derived");
+    };
+    assert_eq!(*fidelity, Fidelity::HistoryIncomplete);
+    assert_eq!(
+        losses[0].bytes, 87_600_000,
+        "losses are records, not caches"
+    );
+}
+
+#[test]
+fn a_single_incarnation_costs_no_parse_and_still_reports_its_origin() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let key = SessionKey::new("codex", "01J");
+    let record = store
+        .ingest_origin(&key, &path, OriginPolicy::Reference)
+        .expect("ingest");
+
+    let choice = store.best_source_for(&record, provider("codex"));
+    assert_eq!(choice.candidates.len(), 1);
+    assert_eq!(choice.chosen().expect("source").key, key);
+    assert!(
+        matches!(
+            choice.chosen().unwrap().capsules,
+            casr::store::Inventory::Unknown { .. }
+        ),
+        "with nothing to choose between, counting capsules would be work for nothing"
+    );
+    assert!(choice.chosen().unwrap().origin_state.is_some());
+    assert_eq!(choice.explain(Some(&key)), "source: codex 01J (origin)");
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency
+// ---------------------------------------------------------------------------
+
+#[test]
+fn two_invocations_ingesting_one_session_converge_on_one_record() {
+    let (tmp, store) = fresh();
+    let path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let key = SessionKey::new("codex", "01J");
+
+    let (a, b) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| store.ingest_origin(&key, &path, OriginPolicy::Reference));
+        let second = scope.spawn(|| store.ingest_origin(&key, &path, OriginPolicy::Reference));
+        (
+            first.join().expect("thread a").expect("ingest a"),
+            second.join().expect("thread b").expect("ingest b"),
+        )
+    });
+
+    assert_eq!(a.id, b.id, "one conversation, one record id");
+    assert_eq!(
+        store.list().expect("list").len(),
+        1,
+        "no orphan record dirs"
+    );
+    assert_eq!(index_rows(store.root()).len(), 1);
+    let report = store.fsck(false).expect("fsck");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+}
+
+// ---------------------------------------------------------------------------
+// Measured against the real corpus
+// ---------------------------------------------------------------------------
+
+#[test]
+fn origin_lookup_on_the_largest_corpus_rollout_is_a_stat_not_a_hash() {
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("skipped: no home directory");
+        return;
+    };
+    let sessions = home.join(".codex").join("sessions");
+    let Some((path, size)) = largest_under(&sessions) else {
+        eprintln!("skipped: no Codex corpus under {}", sessions.display());
+        return;
+    };
+
+    let started = Instant::now();
+    let snapshot = OriginSnapshot::of(&path).expect("snapshot");
+    let ingest = started.elapsed();
+    assert_eq!(snapshot.size, size);
+
+    // The lookup a conversion actually performs: unchanged file, one stat.
+    let mut fast = std::time::Duration::MAX;
+    for _ in 0..5 {
+        let started = Instant::now();
+        let state = snapshot.state(&path);
+        fast = fast.min(started.elapsed());
+        assert_eq!(state, OriginState::Unchanged { rehashed: false });
+    }
+
+    // The same lookup with the cheap check defeated — the cost of the growth
+    // case, which hashes the stored prefix rather than the whole file. The
+    // corpus is read-only, so the snapshot's mtime is nudged instead of the
+    // file's.
+    let stale_stat = OriginSnapshot {
+        mtime_ms: snapshot.mtime_ms - 1,
+        ..snapshot.clone()
+    };
+    let started = Instant::now();
+    let state = stale_stat.state(&path);
+    let hashed = started.elapsed();
+    assert_eq!(state, OriginState::Unchanged { rehashed: true });
+
+    println!(
+        "largest corpus rollout: {} ({:.1} MiB)",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        size as f64 / (1024.0 * 1024.0)
+    );
+    println!("  ingest snapshot (full hash): {ingest:?}");
+    println!("  lookup, size+mtime match:    {fast:?}");
+    println!("  lookup, prefix re-hashed:    {hashed:?}");
+
+    assert!(
+        fast < std::time::Duration::from_millis(5),
+        "an unchanged origin must not cost a hash; took {fast:?}"
+    );
+    assert!(
+        hashed > fast * 10,
+        "sanity: hashing {size} bytes should dominate a stat ({hashed:?} vs {fast:?})"
+    );
+}
+
+#[test]
+fn a_real_codex_origin_beats_a_real_claude_session_only_for_a_codex_target() {
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("skipped: no home directory");
+        return;
+    };
+    let (Some((codex_path, codex_capsules)), Some((cc_path, cc_capsules))) = (
+        corpus_session_with_capsules(
+            &home.join(".codex").join("sessions"),
+            "codex",
+            200_000,
+            3_000_000,
+        ),
+        corpus_session_with_capsules(
+            &home.join(".claude").join("projects"),
+            "claude-code",
+            200_000,
+            3_000_000,
+        ),
+    ) else {
+        eprintln!("skipped: corpus has no session pair carrying sealed material");
+        return;
+    };
+
+    println!(
+        "codex origin  {} — {codex_capsules} openai capsules",
+        codex_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+    println!(
+        "claude source {} — {cc_capsules} anthropic capsules",
+        cc_path.file_name().unwrap_or_default().to_string_lossy()
+    );
+
+    let (_tmp, store) = fresh();
+    let codex_key = SessionKey::new("codex", "corpus-codex");
+    let cc_key = SessionKey::new("claude-code", "corpus-cc");
+    let record = store
+        .ingest_origin(&codex_key, &codex_path, OriginPolicy::Reference)
+        .expect("ingest");
+    let record = store
+        .record_conversion(
+            &record.id,
+            DerivedWrite {
+                key: cc_key.clone(),
+                path: cc_path,
+                from: codex_key.clone(),
+                fidelity: Fidelity::ContextNoReasoning,
+                losses: Vec::new(),
+            },
+        )
+        .expect("record conversion");
+
+    let to_codex = store.best_source_for(&record, provider("codex"));
+    println!("→ codex: {}", to_codex.explain(Some(&cc_key)));
+    assert_eq!(to_codex.chosen().expect("source").key, codex_key);
+    assert_eq!(
+        to_codex.chosen().unwrap().capsules.fitting(),
+        codex_capsules,
+        "counted through Capsule::fits, on real bytes"
+    );
+
+    let to_cc = store.best_source_for(&record, provider("claude-code"));
+    println!("→ claude-code: {}", to_cc.explain(Some(&codex_key)));
+    assert_eq!(
+        to_cc.chosen().expect("source").key,
+        cc_key,
+        "the same origin is the wrong source once the target changes vendor"
+    );
+    assert_eq!(to_cc.chosen().unwrap().capsules.fitting(), cc_capsules);
+}

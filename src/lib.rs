@@ -16,3 +16,4 @@ pub mod pipeline;
 pub mod providers;
 pub mod replay;
 pub mod responses;
+pub mod store;
