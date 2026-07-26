@@ -288,10 +288,10 @@ impl Provider for ClawdBot {
         );
 
         Ok(WrittenSession {
-            paths: vec![outcome.target_path],
+            paths: vec![outcome.target_path.clone()],
             session_id: session_id.clone(),
             resume_command: self.resume_command(&session_id),
-            backup_path: outcome.backup_path,
+            backups: outcome.displaced().into_iter().collect(),
             warnings: Vec::new(),
         })
     }

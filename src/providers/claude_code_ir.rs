@@ -351,11 +351,25 @@ impl Sink {
     /// collision is counted, because a provider reusing one identifier for two
     /// different things is worth seeing rather than resolving quietly.
     fn rename(&mut self, mut event: Event) -> Event {
-        // `events.len()` is strictly increasing, so this is unique by
-        // construction and needs no probing. `dup` is non-numeric, so it cannot
-        // be mistaken for — or collide with — a `<uuid>#<slot>` a multi-block
-        // record already minted.
-        let minted = format!("{}#dup{}", event.id, self.ir.events.len());
+        // `events.len()` is strictly increasing, so the counter cannot repeat
+        // itself — but it is not unique against the *transcript*, whose `uuid`
+        // field is an arbitrary input-controlled string. A record literally
+        // named `a#dup2` arriving first makes `a#dup2` exactly what the repair
+        // mints for the second `a`, and `emit` does not re-check after
+        // renaming: `seen` would be overwritten and two events would share an
+        // id, which is the ambiguity this whole sink exists to remove. So the
+        // counter is probed rather than trusted. `dup` is non-numeric, so a
+        // minted id still cannot be mistaken for a `<uuid>#<slot>` a
+        // multi-block record already produced, and `replay::record_of` still
+        // recovers the native record by splitting on `#`.
+        let mut counter = self.ir.events.len();
+        let minted = loop {
+            let candidate = format!("{}#dup{counter}", event.id);
+            if !self.seen.contains_key(&candidate) {
+                break candidate;
+            }
+            counter += 1;
+        };
         let reused = std::mem::replace(&mut event.id, minted);
         self.ir.capture.id_collisions += 1;
         self.ir.capture.note(format!(
@@ -482,12 +496,22 @@ fn push_assistant(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
     // Text blocks coalesce into one message; thinking and tool_use each become
     // their own event because they are different kinds of thing, and because a
     // tool call needs an identity a text block does not have.
+    //
+    // The coalescing is *between* the other blocks, not across them. Block
+    // order is what the model was shown, and a reader that collected every text
+    // block and emitted it last turned `[text, tool_use]` into
+    // `ToolCall, Message` — which the writer faithfully rebuilds as
+    // `[tool_use, text]`, a reordering with no loss recorded and no downgrade.
+    // So pending text is flushed before each block that gets an event of its
+    // own, and again at the end, and the slots come out in the order the blocks
+    // arrived.
     let mut text_blocks: Vec<Block> = Vec::new();
     let mut slot = 0usize;
 
     for item in content {
         match item.get("type").and_then(Value::as_str) {
             Some("thinking") => {
+                flush_text(sink, ctx, &mut text_blocks, &mut slot, Role::Assistant);
                 let capsules = item
                     .get("signature")
                     .and_then(Value::as_str)
@@ -519,6 +543,7 @@ fn push_assistant(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
             // It carries no readable text at all, so the reasoning body is
             // empty and the whole value of the event is its capsule.
             Some("redacted_thinking") => {
+                flush_text(sink, ctx, &mut text_blocks, &mut slot, Role::Assistant);
                 let capsules = item
                     .get("data")
                     .and_then(Value::as_str)
@@ -542,6 +567,7 @@ fn push_assistant(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
                 slot += 1;
             }
             Some("tool_use") => {
+                flush_text(sink, ctx, &mut text_blocks, &mut slot, Role::Assistant);
                 let body = Body::ToolCall {
                     call_id: item
                         .get("id")
@@ -570,13 +596,32 @@ fn push_assistant(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
         }
     }
 
-    if !text_blocks.is_empty() {
-        let body = Body::Message {
-            role: Role::Assistant,
-            blocks: text_blocks,
-        };
-        sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
+    flush_text(sink, ctx, &mut text_blocks, &mut slot, Role::Assistant);
+}
+
+/// Emit the text collected so far as one message, in the slot it occupied.
+///
+/// A no-op when there is nothing pending, so calling it before every block that
+/// gets an event of its own costs nothing on the ordinary
+/// `[thinking, tool_use, text]` record — which is the shape of all but one of
+/// the 32,284 assistant records in the local corpus — and preserves the order
+/// of the one that is not.
+fn flush_text(
+    sink: &mut Sink,
+    ctx: &RecordContext,
+    blocks: &mut Vec<Block>,
+    slot: &mut usize,
+    role: Role,
+) {
+    if blocks.is_empty() {
+        return;
     }
+    let body = Body::Message {
+        role,
+        blocks: std::mem::take(blocks),
+    };
+    sink.emit(ctx.event(*slot, Visibility::Model, body, Vec::new()));
+    *slot += 1;
 }
 
 fn push_user(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
@@ -605,6 +650,7 @@ fn push_user(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
             let mut slot = 0usize;
             for item in items {
                 if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    flush_text(sink, ctx, &mut text_blocks, &mut slot, Role::User);
                     let body = Body::ToolResult {
                         call_id: item
                             .get("tool_use_id")
@@ -627,13 +673,7 @@ fn push_user(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
                     text_blocks.push(block_from_item(item));
                 }
             }
-            if !text_blocks.is_empty() {
-                let body = Body::Message {
-                    role: Role::User,
-                    blocks: text_blocks,
-                };
-                sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
-            }
+            flush_text(sink, ctx, &mut text_blocks, &mut slot, Role::User);
         }
         _ => {}
     }
@@ -656,19 +696,41 @@ fn push_system(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
 
     // Claude names the survivors, so the superseded set is exact rather than
     // "everything before this line".
-    let preserved: HashSet<String> = value
+    //
+    // And "does not name them" is not "names none of them". A compaction is a
+    // state assignment — `crate::replay::resolve` does `live := context` — so
+    // reading a missing or wrong-typed `allUuids` as an empty preserved set
+    // supersedes the entire conversation on the strength of a field that was
+    // not there. All 44 corpus boundaries carry the array; the unmeasured case
+    // keeps the live context and says so, rather than deleting the session
+    // quietly. An `allUuids` that is present and empty is left alone: that is a
+    // boundary saying it preserved nothing, which is a claim, not a gap.
+    let Some(preserved) = value
         .get("compactMetadata")
         .and_then(|meta| meta.get("preservedMessages"))
         .and_then(|preserved| preserved.get("allUuids"))
         .and_then(Value::as_array)
-        .map(|uuids| {
+        .map(|uuids| -> HashSet<String> {
             uuids
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default();
+    else {
+        sink.ir.capture.note(format!(
+            "line {} is a `compact_boundary` with no array \
+             `compactMetadata.preservedMessages.allUuids`; the live context was kept rather \
+             than superseded by nothing",
+            ctx.source.line
+        ));
+        let body = Body::Unknown {
+            native_type: Some("system.compact_boundary".to_string()),
+            raw: value.clone(),
+        };
+        sink.emit(ctx.event(0, Visibility::Unclassified, body, Vec::new()));
+        return;
+    };
 
     // Claude does not inline a replacement history the way Codex does: the
     // summary arrives afterwards as an ordinary message flagged
@@ -846,9 +908,11 @@ mod tests {
         let structured = ir
             .events
             .iter()
-            .find_map(|event| match &event.body {
-                Body::ToolResult { structured, .. } => structured.clone(),
-                _ => None,
+            .find_map(|event| {
+                let Body::ToolResult { structured, .. } = &event.body else {
+                    return None;
+                };
+                structured.clone()
             })
             .expect("tool result carries toolUseResult");
         assert_eq!(structured.get("stdout").and_then(Value::as_str), Some("ok"));
@@ -864,9 +928,11 @@ mod tests {
         let outcome = ir
             .events
             .iter()
-            .find_map(|event| match &event.body {
-                Body::ToolResult { outcome, .. } => Some(*outcome),
-                _ => None,
+            .find_map(|event| {
+                let Body::ToolResult { outcome, .. } = &event.body else {
+                    return None;
+                };
+                Some(*outcome)
             })
             .expect("tool result");
         assert_eq!(outcome, ToolOutcome::Failed);
@@ -901,13 +967,16 @@ mod tests {
         let (context, supersedes) = ir
             .events
             .iter()
-            .find_map(|event| match &event.body {
-                Body::Compaction {
+            .find_map(|event| {
+                let Body::Compaction {
                     context,
                     supersedes,
                     ..
-                } => Some((context.clone(), supersedes.clone())),
-                _ => None,
+                } = &event.body
+                else {
+                    return None;
+                };
+                Some((context.clone(), supersedes.clone()))
             })
             .expect("compaction event");
         assert_eq!(
@@ -1063,13 +1132,16 @@ mod tests {
         let (context, supersedes) = ir
             .events
             .iter()
-            .find_map(|event| match &event.body {
-                Body::Compaction {
+            .find_map(|event| {
+                let Body::Compaction {
                     context,
                     supersedes,
                     ..
-                } => Some((context.clone(), supersedes.clone())),
-                _ => None,
+                } = &event.body
+                else {
+                    return None;
+                };
+                Some((context.clone(), supersedes.clone()))
             })
             .expect("compaction event");
         assert_eq!(context, ["u2"], "the preserved record is shown once, not twice");

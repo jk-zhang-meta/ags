@@ -280,14 +280,35 @@ fn truncate_tool_output(event: &mut Cow<'_, Event>, max: usize, tally: &mut Tall
 /// ended inside a tool loop, which the corpus has — is left exactly as it was
 /// found: repairing a hole the budget did not make would be this function
 /// quietly editing the conversation on its own initiative.
+///
+/// # A pair is one call and one result, not a bag of records sharing a string
+///
+/// Calls and results are collected apart and matched one to one, rather than
+/// dropped into a single bucket per `call_id` and treated as a pair whenever the
+/// bucket holds more than one member. A `call_id` is a string that arrives from
+/// a file; nothing in the IR makes it unique, and an agent that recorded none
+/// leaves it empty. Two *unanswered* calls both carrying `""` formed a bucket of
+/// two, so the cap dropping the older dropped the newer with it — which returned
+/// an empty replay, reported a broken pair that never existed, and deleted the
+/// newest event the cap had explicitly retained. An empty id identifies nothing
+/// and is therefore left alone: a record that cannot say which call it belongs
+/// to must not be used to remove one that can.
 fn repair_pairing(events: &[Cow<'_, Event>], keep: &mut [bool]) {
-    let mut members: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut calls: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut results: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, event) in events.iter().enumerate() {
         match &event.body {
-            Body::ToolCall { call_id, .. } | Body::ToolResult { call_id, .. } => {
-                members.entry(call_id).or_default().push(index);
+            Body::ToolCall { call_id, .. } if !call_id.is_empty() => {
+                calls.entry(call_id).or_default().push(index);
             }
-            Body::Message { .. }
+            Body::ToolResult { call_id, .. } if !call_id.is_empty() => {
+                results.entry(call_id).or_default().push(index);
+            }
+            // The unidentifiable halves, and everything that is not tool
+            // traffic. NO WILDCARD ARM over [`Body`].
+            Body::ToolCall { .. }
+            | Body::ToolResult { .. }
+            | Body::Message { .. }
             | Body::Reasoning { .. }
             | Body::Compaction { .. }
             | Body::SealedContext { .. }
@@ -300,12 +321,17 @@ fn repair_pairing(events: &[Cow<'_, Event>], keep: &mut [bool]) {
             | Body::Unknown { .. } => {}
         }
     }
-    for indices in members.values() {
-        // A group of one is an unanswered call or an orphan result the source
-        // already had; nothing here broke it and nothing here fixes it.
-        if indices.len() > 1 && indices.iter().any(|index| !keep[*index]) {
-            for index in indices {
-                keep[*index] = false;
+    for (call_id, call_indices) in &calls {
+        let Some(result_indices) = results.get(call_id) else {
+            continue;
+        };
+        // In document order, so an id an agent reused across turns pairs each
+        // call with the result that followed it. A leftover call or result on
+        // either end is an imbalance the source already had.
+        for (call, result) in call_indices.iter().zip(result_indices) {
+            if !keep[*call] || !keep[*result] {
+                keep[*call] = false;
+                keep[*result] = false;
             }
         }
     }
@@ -828,6 +854,50 @@ mod tests {
 
         assert_eq!(with_truncation, ["oldest", "r1"]);
         assert_eq!(without, ["r1"]);
+    }
+
+    /// F7. Two calls the source never answered, both recorded with no `call_id`
+    /// — an id is a string and nothing makes it unique. Grouping on it alone
+    /// fuses them into one "pair", so removing the older removes the newer with
+    /// it, and the newest event the cap explicitly retains disappears.
+    #[test]
+    fn an_empty_call_id_does_not_fuse_two_unrelated_calls() {
+        let source = ir(vec![
+            call("old", ""),
+            message("mid", &"x".repeat(400)),
+            call("newest", ""),
+        ]);
+        let out = ContextBudget {
+            max_context_tokens: 40,
+            max_tool_output: 0,
+            keep_reasoning: true,
+        }
+        .apply(source.model_visible());
+
+        assert!(
+            ids(&out).contains(&"newest".to_string()),
+            "the newest event is kept even when it alone exceeds the cap; pairing repair may \
+             not delete it: {:?}",
+            ids(&out)
+        );
+    }
+
+    /// F7, the other side: a real pair still goes together.
+    #[test]
+    fn a_shared_real_call_id_still_pairs_one_to_one() {
+        let source = ir(vec![
+            call("c1", "call-1"),
+            result("r1", "call-1", "output"),
+            message("m", &"z".repeat(400)),
+        ]);
+        let out = ContextBudget {
+            max_context_tokens: 110,
+            max_tool_output: 0,
+            keep_reasoning: true,
+        }
+        .apply(source.model_visible());
+
+        assert_eq!(ids(&out), ["m"]);
     }
 
     #[test]

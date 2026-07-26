@@ -120,6 +120,8 @@ pub fn render(
         reshaped_reasoning: 0,
         untyped_images: 0,
         dropped_documents: 0,
+        foreign_seals: 0,
+        foreign_seal_bytes: 0,
         freeform_calls: HashSet::new(),
     };
 
@@ -147,7 +149,22 @@ pub fn render(
         .rev()
         .find_map(|event| match &event.body {
             Body::Compaction { context, .. } => Some(context),
-            _ => None,
+            // Enumerated rather than wildcarded: a `Body` variant added later
+            // that also names a context would be silently skipped by a `_` arm,
+            // and the failure would be an empty checkpoint — which reads as
+            // "this session never compacted".
+            Body::Message { .. }
+            | Body::Reasoning { .. }
+            | Body::ToolCall { .. }
+            | Body::ToolResult { .. }
+            | Body::SealedContext { .. }
+            | Body::TurnConfig { .. }
+            | Body::EnvSnapshot { .. }
+            | Body::Attachment { .. }
+            | Body::Rollback { .. }
+            | Body::Abort { .. }
+            | Body::Control { .. }
+            | Body::Unknown { .. } => None,
         })
         .map(|context| context.iter().map(String::as_str).collect())
         .unwrap_or_default();
@@ -180,7 +197,7 @@ pub fn render(
     if !head.is_empty() {
         let history: Vec<Value> = head
             .iter()
-            .filter_map(|event| writer.replacement_item(event))
+            .flat_map(|event| writer.replacement_items(event))
             .collect();
         lines.push(
             json!({
@@ -218,7 +235,22 @@ pub fn render(
                     .collect::<Vec<_>>()
                     .join(" "),
             ),
-            _ => None,
+            // Enumerated rather than wildcarded, for the reason the `payloads`
+            // match states at length: a `_` arm over `Body` is how a new variant
+            // stays invisible.
+            Body::Message { .. }
+            | Body::Reasoning { .. }
+            | Body::ToolCall { .. }
+            | Body::ToolResult { .. }
+            | Body::Compaction { .. }
+            | Body::SealedContext { .. }
+            | Body::TurnConfig { .. }
+            | Body::EnvSnapshot { .. }
+            | Body::Attachment { .. }
+            | Body::Rollback { .. }
+            | Body::Abort { .. }
+            | Body::Control { .. }
+            | Body::Unknown { .. } => None,
         })
         .unwrap_or_default();
 
@@ -249,6 +281,8 @@ struct Writer {
     reshaped_reasoning: usize,
     untyped_images: usize,
     dropped_documents: usize,
+    foreign_seals: usize,
+    foreign_seal_bytes: usize,
     freeform_calls: HashSet<String>,
 }
 
@@ -377,6 +411,20 @@ impl Writer {
                 "{} document block(s) have no Codex counterpart and were written as \
                  unrecognised blocks rather than flattened into prose.",
                 self.dropped_documents
+            ),
+        );
+        push(
+            LossKind::Reasoning,
+            self.foreign_seals,
+            self.foreign_seals,
+            self.foreign_seal_bytes,
+            Fidelity::ContextNoReasoning,
+            format!(
+                "{} unrecognised block(s) totalling {} bytes carried a sealed \
+                 `encrypted_content` field from another agent. Written back they would read \
+                 as OpenAI capsules the issuing vendor never minted, so they were dropped \
+                 rather than re-labelled.",
+                self.foreign_seals, self.foreign_seal_bytes
             ),
         );
 
@@ -570,12 +618,18 @@ impl Writer {
         }
     }
 
-    /// One `replacement_history` entry.
+    /// The `replacement_history` entries for one event.
     ///
     /// The corpus has exactly two shapes here — 168,550 messages and 4,325
     /// sealed compactions — so anything else falls through to the ordinary
     /// response-item rendering rather than inventing a third.
-    fn replacement_item(&mut self, event: &Event) -> Option<Value> {
+    ///
+    /// A `Vec` rather than an `Option` because the fallthrough is
+    /// [`Writer::payloads`], which is already allowed to return more than one
+    /// item per event. Taking `.next()` off it made the truncation of any such
+    /// body silent and invisible; returning what it returns makes the
+    /// truncation unrepresentable instead of merely unlikely.
+    fn replacement_items(&mut self, event: &Event) -> Vec<Value> {
         match &event.body {
             Body::SealedContext { native_id, meta } => {
                 let Some(sealed) = event
@@ -587,7 +641,7 @@ impl Writer {
                     if event.capsules.is_empty() {
                         self.dropped_history += 1;
                     }
-                    return Some(sealed_context_marker());
+                    return vec![sealed_context_marker()];
                 };
                 let mut item = Map::new();
                 item.insert("type".into(), json!("compaction"));
@@ -601,14 +655,33 @@ impl Writer {
                         meta.clone(),
                     );
                 }
-                Some(Value::Object(item))
+                vec![Value::Object(item)]
             }
-            Body::Message { role, blocks } => Some(json!({
-                "type": "message",
-                "role": role_string(role),
-                "content": self.content(blocks, matches!(role, Role::Assistant)),
-            })),
-            _ => self.payloads(event).into_iter().next(),
+            // `with_turn`, not a bare object: every one of the 176,027 corpus
+            // entries carries its own `turn_id`, and the reader now reads it
+            // (see `super::codex_ir::Builder::replacement_event`). Writing the
+            // entry without it would put the turn back on the floor one hop
+            // later.
+            Body::Message { role, blocks } => vec![with_turn(
+                event,
+                json!({
+                    "type": "message",
+                    "role": role_string(role),
+                    "content": self.content(blocks, matches!(role, Role::Assistant)),
+                }),
+            )],
+            // Enumerated rather than wildcarded, same rule as `payloads`.
+            Body::Reasoning { .. }
+            | Body::ToolCall { .. }
+            | Body::ToolResult { .. }
+            | Body::Compaction { .. }
+            | Body::TurnConfig { .. }
+            | Body::EnvSnapshot { .. }
+            | Body::Attachment { .. }
+            | Body::Rollback { .. }
+            | Body::Abort { .. }
+            | Body::Control { .. }
+            | Body::Unknown { .. } => self.payloads(event),
         }
     }
 
@@ -635,9 +708,12 @@ impl Writer {
 
     fn content(&mut self, blocks: &[Block], assistant: bool) -> Vec<Value> {
         let text_type = if assistant { "output_text" } else { "input_text" };
-        blocks
-            .iter()
-            .map(|block| match block {
+        let mut content = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if self.is_foreign_seal(block) {
+                continue;
+            }
+            content.push(match block {
                 Block::Text { text } => json!({"type": text_type, "text": text}),
                 Block::Image { url, media_type } => {
                     // Codex records an image as a bare `image_url` and nothing
@@ -661,8 +737,46 @@ impl Writer {
                     },
                 }),
                 Block::Unknown { raw, .. } => raw.clone(),
-            })
-            .collect()
+            });
+        }
+        content
+    }
+
+    /// Would writing this block mint a Codex-native *sealed* item out of bytes
+    /// no vendor gate ever saw?
+    ///
+    /// [`super::codex_ir`] re-labels any content item typed `encrypted_content`
+    /// as [`CapsuleKind::OpenaiReasoningEncryptedContent`] — by the field it
+    /// arrived in, not by the vendor that minted it. So an unrecognised block of
+    /// that shape written back verbatim reads out the other side as an OpenAI
+    /// capsule, and the Responses API is handed bytes only Anthropic can verify.
+    /// [`Event::capsules`] is the one door sealed material is allowed through,
+    /// and [`Writer::keeps`] is the gate on it; a block is not a capsule and
+    /// must not become one.
+    ///
+    /// Same-agent is exempt, and has to be: a Codex rollout's own
+    /// `encrypted_content` really is OpenAI's, and refusing it would delete
+    /// content on the one path that conserves everything. The same exemption
+    /// `tool_output` already makes, for the same reason.
+    ///
+    /// Absent from the local corpus — 0 of 176,027 `replacement_history`
+    /// entries and 0 of 85,674 tool outputs carry one — which is why it went
+    /// unnoticed. This is the same shape as the `redacted_thinking` defect
+    /// already fixed in [`CapsuleKind::AnthropicRedactedThinking`]: sealed
+    /// material filed as an unknown block survives ungated.
+    fn is_foreign_seal(&mut self, block: &Block) -> bool {
+        let Block::Unknown { raw, .. } = block else {
+            return false;
+        };
+        if self.same_agent || raw.get("type").and_then(Value::as_str) != Some("encrypted_content") {
+            return false;
+        }
+        self.foreign_seals += 1;
+        self.foreign_seal_bytes += raw
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .map_or(0, str::len);
+        true
     }
 }
 

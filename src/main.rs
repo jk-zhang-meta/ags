@@ -479,13 +479,30 @@ fn open_store(no_store: bool, dry_run: bool) -> Option<casr::store::Store> {
 ///
 /// Anything that is not a record id is returned untouched, which is every
 /// ordinary invocation.
+///
+/// # Why the substitution is reported
+///
+/// The third element is a sentence, present exactly when this function changed
+/// the session that gets converted. Without it the redirection was invisible:
+/// `print_source_selection` only speaks when the *store* reads something other
+/// than what the pipeline was asked for, and by then the pipeline has been asked
+/// for the redirected session, so it agrees and says nothing. The user typed one
+/// identifier, some other provider's session was converted, and no line of
+/// output connected the two.
+///
+/// That is also the honest answer to record ids and provider session ids sharing
+/// a namespace. A record id is a fresh v4 UUID, so a provider session colliding
+/// with one is not a case worth designing a `record:` prefix around — it would
+/// break the documented `resume <record-id>` form to defend against a 2⁻¹²²
+/// event. What was worth fixing is that when the lookup *does* redirect, for any
+/// reason, it says so.
 fn redirect_record_id(
     store: Option<&casr::store::Store>,
     target: &str,
     session_id: &str,
     source: Option<String>,
-) -> (String, Option<String>) {
-    let untouched = (session_id.to_string(), source);
+) -> (String, Option<String>, Option<String>) {
+    let untouched = (session_id.to_string(), source, None);
     let Some(store) = store else {
         return untouched;
     };
@@ -503,7 +520,15 @@ fn redirect_record_id(
         .map(|provider| provider.slug().to_string())
         .unwrap_or_else(|| target.to_string());
     match casr::launch::session_named_by_record(&record, &target_slug) {
-        Some(key) => (key.provider_session_id.clone(), Some(key.provider.clone())),
+        Some(key) => (
+            key.provider_session_id.clone(),
+            Some(key.provider.clone()),
+            Some(format!(
+                "'{session_id}' is a session-store record id, not a provider session; it names \
+                 the {} session {} in this conversation, and that is what was converted.",
+                key.provider, key.provider_session_id
+            )),
+        ),
         None => untouched,
     }
 }
@@ -529,7 +554,8 @@ fn cmd_resume(
     // than a provider's session id, in which case the positional argument names
     // no session any provider has heard of. Translated before the pipeline runs,
     // so that everything downstream sees an ordinary source session.
-    let (session_id, source) = redirect_record_id(store.as_ref(), target, session_id, source);
+    let (session_id, source, redirection) =
+        redirect_record_id(store.as_ref(), target, session_id, source);
     let pipeline = ConversionPipeline { registry, store };
 
     let opts = ConvertOptions {
@@ -544,6 +570,15 @@ fn cmd_resume(
     };
 
     let result = pipeline.convert(target, &session_id, opts)?;
+
+    // Everything the user should be told, in one list, whoever produced it. The
+    // record-id redirection happens before the pipeline exists, so it has no
+    // other way in.
+    let warnings: Vec<String> = redirection
+        .iter()
+        .cloned()
+        .chain(result.warnings.iter().cloned())
+        .collect();
 
     // Resolved before anything is printed, because the JSON envelope carries
     // the command and the envelope is printed first. The error is held rather
@@ -560,10 +595,21 @@ fn cmd_resume(
             (provider, spec)
         });
 
+    // Decided here rather than inside `run_launch`, because the envelope below
+    // is printed first and used to say `ok: true` on stdout while the very same
+    // invocation put an error envelope on stderr and exited non-zero. A consumer
+    // reading stdout was told the run succeeded by the run that failed. Held
+    // rather than propagated so that the written paths — the part worth having —
+    // stay in the output.
+    let launch_error: Option<String> = prepared.as_ref().and_then(|(provider, spec)| match spec {
+        Err(error) => Some(format!("{error}")),
+        Ok(spec) => launch_blocker(*provider, &result, spec, &launch),
+    });
+
     if json_mode {
         let spec = prepared.as_ref().and_then(|(_, spec)| spec.as_ref().ok());
         let response = ResumeSuccess {
-            ok: true,
+            ok: launch_error.is_none(),
             source_provider: result.source_provider.clone(),
             target_provider: result.target_provider.clone(),
             source_session_id: result.canonical_session.session_id.clone(),
@@ -575,9 +621,12 @@ fn cmd_resume(
             resume_command: result.written.as_ref().map(|w| w.resume_command.clone()),
             dry_run: result.written.is_none(),
             fidelity: result.fidelity,
+            verified_fidelity: result.verified_fidelity,
+            losses: result.losses.clone(),
             launch_command: spec.map(LaunchSpec::display),
             launch_targets_session: spec.map(|s| s.targeting() == SessionTargeting::ById),
-            warnings: result.warnings.clone(),
+            launch_error: launch_error.clone(),
+            warnings: warnings.clone(),
             source_selection: result
                 .source
                 .as_ref()
@@ -606,7 +655,7 @@ fn cmd_resume(
         for path in &written.paths {
             println!("  {} → {}", "Written".dimmed(), path.display());
         }
-        for warning in &result.warnings {
+        for warning in &warnings {
             println!("  {} {warning}", "⚠".yellow());
         }
         println!();
@@ -629,7 +678,7 @@ fn cmd_resume(
             result.canonical_session.messages.len()
         );
         print_source_selection(&result);
-        for warning in &result.warnings {
+        for warning in &warnings {
             println!("  {} {warning}", "⚠".yellow());
         }
     }
@@ -637,7 +686,19 @@ fn cmd_resume(
     let Some((provider, spec)) = prepared else {
         return Ok(ExitCode::SUCCESS);
     };
-    run_launch(provider, &result, spec?, &launch, json_mode)
+    // The envelope already carries this and already says `ok: false`. It is
+    // still raised as an error so that the exit code is non-zero and the reason
+    // reaches stderr, where a human reading a terminal will find it.
+    if let Some(blocker) = launch_error {
+        anyhow::bail!("{blocker}");
+    }
+    run_launch(
+        provider,
+        &result,
+        spec.expect("a spec that failed to resolve is a launch_error"),
+        &launch,
+        json_mode,
+    )
 }
 
 /// Say so when the store read a session other than the one that was named.
@@ -679,32 +740,37 @@ fn prepare_launch(
         .map_err(Into::into)
 }
 
-/// Start the target agent on the session the conversion just wrote.
+/// Why this launch is not going to happen, decided before anything is printed.
 ///
-/// Lost history and the untargetable-provider warning are both decided before
-/// the dry-run exit, so `--launch-dry-run` is a real check rather than a
-/// second, more optimistic code path. Whether the agent is on `PATH` is
-/// deliberately not: checking a converted-but-not-yet-installed target is one
-/// of the things the dry run is for.
-fn run_launch(
+/// `None` means it will. Everything here is a pure function of the conversion
+/// and the resolved spec, which is the point: the JSON envelope is printed
+/// first and has to be able to say `ok: false`, and it can only do that if the
+/// decision is available before the printing rather than made afterwards inside
+/// [`run_launch`]. One invocation, one machine-readable object, and an `ok`
+/// that means what the exit code means.
+///
+/// Whether the agent is on `PATH` is included; whether it *starts* is not,
+/// because that is not knowable without starting it.
+fn launch_blocker(
     provider: &dyn Provider,
     result: &ConversionResult,
-    spec: LaunchSpec,
+    spec: &LaunchSpec,
     launch: &LaunchRequest,
-    json_mode: bool,
-) -> anyhow::Result<ExitCode> {
-    let written = result
-        .written
-        .as_ref()
-        .expect("a launched conversion is never a dry run");
-
+) -> Option<String> {
     // A hole in the conversation blocks rather than warns: the agent would
     // start missing history and neither it nor the user would be told. Every
     // grade above this one is a degraded *rendering* of a whole conversation,
     // which is survivable — and since `Fidelity` is ordered best-first, `>=`
     // is "at least this bad" rather than "at least this good".
-    if result.fidelity >= Fidelity::HistoryIncomplete && !launch.anyway {
-        let mut refusal = format!("refusing to launch — {}.", result.fidelity.describe());
+    //
+    // `effective_fidelity` rather than `fidelity`, and the difference is not
+    // cosmetic: `fidelity` is the writer's own claim, and a writer that
+    // under-reports is exactly the case a refusal exists to survive. When the
+    // read-back verifier independently derived a worse grade, the session it
+    // examined is the session about to be resumed.
+    let grade = result.effective_fidelity();
+    if grade >= Fidelity::HistoryIncomplete && !launch.anyway {
+        let mut refusal = format!("refusing to launch — {}.", grade.describe());
         // The grade names the category; the losses name the capsules, the
         // counts, and the vendor that sealed them, which is what the user can
         // act on. Only the losses that forced this grade are worth printing
@@ -718,9 +784,48 @@ fn run_launch(
             refusal.push(' ');
             refusal.push_str(&loss.note);
         }
+        // The writer's loss list is what those notes come from, so a refusal
+        // driven by the verifier alone would otherwise arrive with no reason
+        // attached — and the disagreement is itself the finding.
+        if let Some(disagreement) = result.fidelity_disagreement() {
+            refusal.push(' ');
+            refusal.push_str(&disagreement);
+        }
         refusal.push_str(" Pass --launch-anyway to start it regardless.");
-        anyhow::bail!("{refusal}");
+        return Some(refusal);
     }
+
+    // A dry run is allowed to describe a launch of an agent that is not
+    // installed yet — checking exactly that is one of the things it is for.
+    if !launch.dry_run && spec.program_path().is_none() {
+        return Some(format!(
+            "{} is not installed: `{}` is not on PATH. The session was converted and \
+             written; install the agent and run: {}",
+            provider.name(),
+            spec.program,
+            spec.display()
+        ));
+    }
+
+    None
+}
+
+/// Start the target agent on the session the conversion just wrote.
+///
+/// Every reason not to start it has already been decided by
+/// [`launch_blocker`], so reaching this function means the launch is happening
+/// (or being described, under `--launch-dry-run`).
+fn run_launch(
+    provider: &dyn Provider,
+    result: &ConversionResult,
+    spec: LaunchSpec,
+    launch: &LaunchRequest,
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let written = result
+        .written
+        .as_ref()
+        .expect("a launched conversion is never a dry run");
 
     if spec.targeting() == SessionTargeting::NotTargeted {
         launch_line(
@@ -740,18 +845,6 @@ fn run_launch(
     if launch.dry_run {
         launch_line(json_mode, &spec.display());
         return Ok(ExitCode::SUCCESS);
-    }
-
-    // Reported as a missing agent rather than as a failed conversion, because
-    // the conversion succeeded — the paths above are already on stdout.
-    if spec.program_path().is_none() {
-        anyhow::bail!(
-            "{} is not installed: `{}` is not on PATH. The session was converted and \
-             written; install the agent and run: {}",
-            provider.name(),
-            spec.program,
-            spec.display()
-        );
     }
 
     launch_agent(&spec)

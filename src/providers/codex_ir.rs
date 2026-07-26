@@ -491,6 +491,24 @@ impl Builder {
     ) {
         let payload = payload(value);
 
+        // A compaction is a *state assignment* — `crate::replay::resolve` does
+        // `live := context` and never diffs — so a record that does not carry
+        // an array `replacement_history` is not an instruction to empty the
+        // context. It is a record this reader does not understand, and applying
+        // it would delete the entire conversation on the strength of a field
+        // that was not there. All 4,866 corpus `compacted` records carry the
+        // array, so this is the unmeasured case, and it fails loudly and
+        // non-destructively rather than quietly and catastrophically.
+        let Some(history) = payload.get("replacement_history").and_then(Value::as_array) else {
+            let line = source.line;
+            self.push_unknown(ir, source, Some("compacted".into()), value.clone());
+            ir.capture.note(format!(
+                "line {line} is a `compacted` record with no array `replacement_history`; \
+                 the live context was kept rather than superseded by nothing"
+            ));
+            return;
+        };
+
         // Codex does not name the events a compaction supersedes: the semantics
         // are "everything model-visible up to here is replaced by
         // replacement_history". So the scope is every live model event, and
@@ -503,13 +521,11 @@ impl Builder {
         // emptied, `emit` refills it with exactly these ids — which is also the
         // post-compaction context the resolver assigns.
         let mut context = Vec::new();
-        if let Some(history) = payload.get("replacement_history").and_then(Value::as_array) {
-            let bound = capsule_binding(ir);
-            for item in history {
-                let event = self.replacement_event(&source, ts, item, &bound);
-                context.push(event.id.clone());
-                self.emit(ir, event);
-            }
+        let bound = capsule_binding(ir);
+        for item in history {
+            let event = self.replacement_event(&source, ts, item, &bound);
+            context.push(event.id.clone());
+            self.emit(ir, event);
         }
 
         let body = Body::Compaction {
@@ -531,6 +547,16 @@ impl Builder {
     /// totals 87.6 MB. Treating the second shape as a message yields an empty
     /// assistant turn where the entire pre-compaction conversation should be —
     /// which is what this reader used to do.
+    ///
+    /// Each entry also carries its **own** turn, and it is not the builder's.
+    /// All 176,027 corpus entries have
+    /// `internal_chat_message_metadata_passthrough.turn_id`, and one `compacted`
+    /// record routinely spans dozens of distinct ones — 763 of them span 17.
+    /// [`Event::turn`] is what [`crate::replay::roll_back`] counts as "the last
+    /// N typed turns", so stamping the builder's current turn on every entry
+    /// collapses the whole compacted history into a single turn and lets one
+    /// rollback undo all of it. The same collapse was already fixed once on the
+    /// Claude side, in [`super::claude_code_ir::is_restatement`].
     fn replacement_event(
         &mut self,
         source: &SourceRef,
@@ -538,6 +564,13 @@ impl Builder {
         item: &Value,
         bound: &CapsuleBinding,
     ) -> Event {
+        let turn = item
+            .get("internal_chat_message_metadata_passthrough")
+            .and_then(|meta| meta.get("turn_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| self.turn.clone());
+
         if item.get("type").and_then(Value::as_str) == Some("compaction") {
             let capsules = item
                 .get("encrypted_content")
@@ -558,7 +591,9 @@ impl Builder {
                     .cloned()
                     .unwrap_or(Value::Null),
             };
-            return self.build(source.clone(), ts, Visibility::Model, body, capsules);
+            let mut event = self.build(source.clone(), ts, Visibility::Model, body, capsules);
+            event.turn = turn;
+            return event;
         }
 
         let role = item
@@ -570,7 +605,9 @@ impl Builder {
             role,
             blocks: blocks_from_content(item.get("content")),
         };
-        self.build(source.clone(), ts, Visibility::Model, body, Vec::new())
+        let mut event = self.build(source.clone(), ts, Visibility::Model, body, Vec::new());
+        event.turn = turn;
+        event
     }
 }
 
@@ -810,9 +847,11 @@ mod tests {
         let protocols: Vec<ToolProtocol> = ir
             .events
             .iter()
-            .filter_map(|event| match &event.body {
-                Body::ToolCall { input, .. } => Some(input.protocol()),
-                _ => None,
+            .filter_map(|event| {
+                let Body::ToolCall { input, .. } = &event.body else {
+                    return None;
+                };
+                Some(input.protocol())
             })
             .collect();
         assert_eq!(
@@ -832,9 +871,11 @@ mod tests {
         let outcome = ir
             .events
             .iter()
-            .find_map(|event| match &event.body {
-                Body::ToolResult { outcome, .. } => Some(*outcome),
-                _ => None,
+            .find_map(|event| {
+                let Body::ToolResult { outcome, .. } = &event.body else {
+                    return None;
+                };
+                Some(*outcome)
             })
             .expect("tool result");
         assert_eq!(
@@ -929,11 +970,11 @@ mod tests {
         let texts: Vec<String> = ir
             .model_visible()
             .iter()
-            .filter_map(|event| match &event.body {
-                Body::Message { blocks, .. } => {
-                    Some(blocks.iter().filter_map(Block::as_text).collect::<String>())
-                }
-                _ => None,
+            .filter_map(|event| {
+                let Body::Message { blocks, .. } = &event.body else {
+                    return None;
+                };
+                Some(blocks.iter().filter_map(Block::as_text).collect::<String>())
             })
             .collect();
         assert_eq!(

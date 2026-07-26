@@ -348,7 +348,7 @@ fn contract_providers_aliases_match_slugs() {
 // ---------------------------------------------------------------------------
 // Contract: `list --json`
 // ---------------------------------------------------------------------------
-// Expected shape: { schema_version: 2, items: [{ schema_version, session_id, provider, ... }] }
+// Expected shape: { schema_version: 3, items: [{ schema_version, session_id, provider, ... }] }
 
 fn assert_list_envelope(parsed: &serde_json::Value) -> &Vec<serde_json::Value> {
     let ctx = "list_envelope";
@@ -356,8 +356,8 @@ fn assert_list_envelope(parsed: &serde_json::Value) -> &Vec<serde_json::Value> {
     assert_uint(&parsed["schema_version"], "schema_version", ctx);
     assert_eq!(
         parsed["schema_version"].as_u64().unwrap(),
-        2,
-        "{ctx}: schema_version should be 2"
+        3,
+        "{ctx}: schema_version should be 3"
     );
     assert_array(&parsed["items"], "items", ctx);
     parsed["items"].as_array().unwrap()
@@ -392,8 +392,8 @@ fn assert_list_item(obj: &serde_json::Value, idx: usize) {
     assert_uint(&obj["schema_version"], "schema_version", &ctx);
     assert_eq!(
         obj["schema_version"].as_u64().unwrap(),
-        2,
-        "{ctx}: per-item schema_version should be 2"
+        3,
+        "{ctx}: per-item schema_version should be 3"
     );
     assert_string(&obj["session_id"], "session_id", &ctx);
     assert_string(&obj["provider"], "provider", &ctx);
@@ -560,8 +560,8 @@ fn assert_info_object(obj: &serde_json::Value) {
     assert_uint(&obj["schema_version"], "schema_version", ctx);
     assert_eq!(
         obj["schema_version"].as_u64().unwrap(),
-        2,
-        "{ctx}: schema_version should be 2"
+        3,
+        "{ctx}: schema_version should be 3"
     );
     assert_string(&obj["session_id"], "session_id", ctx);
     assert_string(&obj["provider"], "provider", ctx);
@@ -665,10 +665,23 @@ fn contract_info_json_source_path_is_absolute() {
 // ---------------------------------------------------------------------------
 // Expected shape: {ok, source_provider, target_provider, source_session_id,
 //                  target_session_id, written_paths, resume_command, dry_run,
-//                  fidelity, launch_command, launch_targets_session, warnings}
+//                  fidelity, verified_fidelity, losses, launch_command,
+//                  launch_targets_session, launch_error, warnings}
 
 /// Every grade `Fidelity` can serialize to, so a renamed variant fails here
 /// rather than silently becoming an unknown string in a caller's parser.
+/// Every `LossKind` a caller can be handed, for the same reason as
+/// `FIDELITY_GRADES`: a renamed variant has to break here rather than turn into
+/// an unrecognised string in somebody's parser.
+const LOSS_KINDS: &[&str] = &[
+    "sealed_context",
+    "conversation",
+    "reasoning",
+    "media",
+    "tool_protocol",
+    "metadata",
+];
+
 const FIDELITY_GRADES: &[&str] = &[
     "byte_identical",
     "native_equivalent",
@@ -693,8 +706,11 @@ fn assert_resume_success_object(obj: &serde_json::Value) {
             "resume_command",
             "dry_run",
             "fidelity",
+            "verified_fidelity",
+            "losses",
             "launch_command",
             "launch_targets_session",
+            "launch_error",
             "warnings",
         ],
         ctx,
@@ -714,6 +730,39 @@ fn assert_resume_success_object(obj: &serde_json::Value) {
         FIDELITY_GRADES.contains(&grade),
         "{ctx}: fidelity {grade:?} is not one of {FIDELITY_GRADES:?}"
     );
+    if !obj["verified_fidelity"].is_null() {
+        let verified = obj["verified_fidelity"].as_str().unwrap_or_else(|| {
+            panic!(
+                "{ctx}: verified_fidelity should be a grade string or null, got {:?}",
+                obj["verified_fidelity"]
+            )
+        });
+        assert!(
+            FIDELITY_GRADES.contains(&verified),
+            "{ctx}: verified_fidelity {verified:?} is not one of {FIDELITY_GRADES:?}"
+        );
+    }
+    assert_array(&obj["losses"], "losses", ctx);
+    for loss in obj["losses"].as_array().unwrap() {
+        assert_exact_keys(
+            loss,
+            &["kind", "events", "capsules", "bytes", "grade", "note"],
+            "resume_success.losses[]",
+        );
+        assert!(
+            LOSS_KINDS.contains(&loss["kind"].as_str().unwrap_or_default()),
+            "{ctx}: loss kind {:?} is not one of {LOSS_KINDS:?}",
+            loss["kind"]
+        );
+        assert!(
+            FIDELITY_GRADES.contains(&loss["grade"].as_str().unwrap_or_default()),
+            "{ctx}: loss grade {:?} is not one of {FIDELITY_GRADES:?}",
+            loss["grade"]
+        );
+        assert!(loss["events"].is_u64() && loss["capsules"].is_u64() && loss["bytes"].is_u64());
+        assert_string(&loss["note"], "note", "resume_success.losses[]");
+    }
+    assert_string_or_null(&obj["launch_error"], "launch_error", ctx);
     assert_string_or_null(&obj["launch_command"], "launch_command", ctx);
     assert!(
         obj["launch_targets_session"].is_boolean() || obj["launch_targets_session"].is_null(),

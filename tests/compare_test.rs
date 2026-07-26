@@ -168,6 +168,13 @@ struct Totals {
     claimed: BTreeMap<String, usize>,
     /// Sessions whose grade the written file does not support, with both grades.
     overclaimed: Vec<(String, Fidelity, Fidelity)>,
+    /// Sessions the writer graded *worse* than the written file supports.
+    ///
+    /// The other half of the same disagreement, and it was missing. A writer
+    /// that reports a loss the comparator cannot see is a comparator that has
+    /// stopped seeing that loss — which is the direction that decays quietly,
+    /// because nothing downstream complains about a pessimistic grade.
+    underclaimed: Vec<(String, Fidelity, Fidelity)>,
     /// Sessions the comparator called damaged.
     damaged: Vec<String>,
 }
@@ -200,6 +207,14 @@ impl Totals {
         *self.claimed.entry(format!("{claimed:?}")).or_insert(0) += 1;
         if observed > claimed {
             self.overclaimed
+                .push((path.display().to_string(), claimed, observed));
+        }
+        // `ByteIdentical` and `NativeEquivalent` are claims about the bytes and
+        // `Comparison::fidelity` folds from `ContextComplete`, so it cannot
+        // corroborate either. That is the one asymmetry allowed, and it is
+        // enumerated rather than left as a margin.
+        if observed < claimed && claimed >= Fidelity::ContextComplete {
+            self.underclaimed
                 .push((path.display().to_string(), claimed, observed));
         }
         if !report.is_clean() {
@@ -276,6 +291,29 @@ impl Totals {
         );
     }
 
+    /// And no writer reported a loss the written file does not show either.
+    ///
+    /// Two independently derived answers to "how much survived" are only worth
+    /// more than one while they are *required to agree*. Checking a single
+    /// direction leaves the comparator free to stop noticing a whole class of
+    /// loss without anything objecting, because the writer's own grade goes on
+    /// being the pessimistic one.
+    fn assert_no_underclaim(&self) {
+        assert!(
+            self.underclaimed.is_empty(),
+            "{} session(s) were graded worse than the written file shows; the writer's loss \
+             list and the comparator disagree, and a comparator that under-reports is the \
+             half nothing else catches:\n{}",
+            self.underclaimed.len(),
+            self.underclaimed
+                .iter()
+                .map(|(path, claimed, observed)| format!(
+                    "{path}: claimed {claimed:?}, file shows only {observed:?}"
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +349,7 @@ fn codex_into_itself_is_clean() {
     assert!(totals.sessions > 0, "no Codex rollouts round-tripped");
     totals.assert_no_damage();
     totals.assert_no_overclaim();
+    totals.assert_no_underclaim();
     assert_eq!(totals.source_events, totals.target_events);
     assert_eq!(
         totals.source_capsules, totals.target_capsules,
@@ -355,6 +394,7 @@ fn claude_into_itself_is_clean() {
     assert!(totals.sessions > 0, "no Claude transcripts round-tripped");
     totals.assert_no_damage();
     totals.assert_no_overclaim();
+    totals.assert_no_underclaim();
     assert_eq!(totals.source_events, totals.target_events);
     assert_eq!(totals.source_capsules, totals.target_capsules);
     assert!(totals.predicted.is_empty(), "{:?}", totals.predicted);
@@ -397,6 +437,7 @@ fn codex_to_claude_loses_only_what_fits_predicted() {
     assert!(totals.sessions > 0);
     totals.assert_no_damage();
     totals.assert_no_overclaim();
+    totals.assert_no_underclaim();
     assert_eq!(
         totals.target_capsules, 0,
         "no OpenAI blob is replayable in a Claude transcript"
@@ -442,6 +483,14 @@ fn claude_to_codex_loses_only_the_thinking_signatures() {
         totals.add(path, &report, claimed);
     }
 
+    // Printed and asserted on the same footing as the other three crossings.
+    // This one used to do neither: it reported no counts at all, never checked
+    // that a single transcript had round-tripped, and — alone among the four —
+    // never called `assert_no_damage`, so unexplained loss on the way out of
+    // Claude Code was the one direction nothing in this file objected to.
+    totals.report("claude -> codex");
+    assert!(totals.sessions > 0, "no Claude transcripts round-tripped");
+    totals.assert_no_damage();
     // Strict. This was briefly weakened to `assert_overclaim_no_worse_than`
     // because `codex_ir_write::Writer::summarise` pushed a `ConversationOnly`
     // loss for every dropped structured companion without calling `degrade`, so
@@ -450,6 +499,7 @@ fn claude_to_codex_loses_only_the_thinking_signatures() {
     // than accumulating it alongside, which removes the class rather than the
     // instance — so the bound goes back to exact.
     totals.assert_no_overclaim();
+    totals.assert_no_underclaim();
     assert_eq!(
         totals.target_capsules, 0,
         "no Anthropic signature is replayable in a Codex rollout"
@@ -555,7 +605,21 @@ fn a_codex_fixture_crossing_to_claude_loses_only_its_reasoning() {
         .expect("the fixture's sealed reasoning must be reported as predicted-not-carried");
     assert_eq!(reasoning.events, sealed);
     assert_eq!(reasoning.grade, Fidelity::ContextNoReasoning);
-    assert_eq!(report.fidelity(), Fidelity::ContextNoReasoning);
+    assert!(
+        report.predicted.len() == 1 && report.unexplained.is_empty(),
+        "the reasoning is the only thing the vendor boundary takes: {report:?}"
+    );
+    // Not `== ContextNoReasoning`. The fixture's 28 `function_call`s carry their
+    // arguments as a JSON *string*, and `tool_use.input` is an object on all
+    // 15,607 corpus blocks — so the exact argument text cannot cross and the
+    // tool channel degrades. That used to be invisible here because the writer
+    // wrote the string through verbatim, producing a transcript the Anthropic
+    // API rejects; the shape change is the honest report of a real one.
+    assert!(
+        report.fidelity() >= Fidelity::ContextNoReasoning,
+        "{:?}",
+        report.fidelity()
+    );
     assert!(
         claimed >= report.fidelity(),
         "the writer graded {claimed:?}, better than the file supports"
@@ -586,4 +650,3 @@ fn the_comparator_only_knows_the_two_structured_agents() {
          correct conversion into a verification failure"
     );
 }
-

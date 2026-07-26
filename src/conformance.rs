@@ -612,9 +612,24 @@ fn cross(
             comparison.damage_detail()
         ));
     }
-    if derived > claimed {
+    // Both directions, because a disagreement is a disagreement. `derived >
+    // claimed` alone — the writer claiming better than its own output supports —
+    // let the opposite through untouched, and the opposite is not benign: it is
+    // the comparator grading a loss more kindly than the writer that performed
+    // it, which is the comparator losing the ability to see that loss at all.
+    // Readable reasoning reshaped into assistant text was exactly that, graded
+    // `ConversationOnly` by the writer and `ContextNoReasoning` here.
+    //
+    // One asymmetry is intentional and it is enumerated rather than tolerated:
+    // `ByteIdentical` and `NativeEquivalent` are claims about the *bytes*, and
+    // this comparator only ever compares structure — `Comparison::fidelity`
+    // folds from `ContextComplete` and cannot reach either. A writer making one
+    // of those two claims is making a claim this check has no evidence about.
+    if claimed >= Fidelity::ContextComplete && derived != claimed {
         report.pending.push(format!(
-            "{} -> {} {}: graded {claimed:?}, but the written file only supports {derived:?}",
+            "{} -> {} {}: graded {claimed:?}, but the written file independently supports \
+             {derived:?} — the writer's loss list and the comparator disagree about what the \
+             crossing cost, and one of the two has stopped seeing something",
             source.slug(),
             target.slug(),
             path.display()
@@ -813,6 +828,30 @@ pub struct Report {
     suppressed: usize,
 }
 
+/// Whether any loss this crossing reported could be about `kind`.
+///
+/// Keyed on [`Body::kind`]'s slug rather than on [`Body`] itself, because
+/// that is what the tallies are keyed on. The mapping is the one
+/// `compare::loss_kind` draws, and a slug this function has never been
+/// taught maps to nothing: an unrecognised body kind that reaches none of
+/// the written sessions is reported rather than excused, which is the same
+/// default the crate's no-wildcard rule exists to force.
+fn explains(kind: &str, tally: &CrossTally) -> bool {
+    let accepted: &[&str] = match kind {
+        "message" => &["Conversation", "Media", "Metadata"],
+        "reasoning" => &["Reasoning"],
+        "tool_call" | "tool_result" => &["ToolProtocol"],
+        "sealed_context" => &["SealedContext"],
+        "compaction" | "turn_config" | "env_snapshot" | "attachment" | "rollback" | "abort"
+        | "control" | "unknown" => &["Metadata"],
+        _ => &[],
+    };
+    [&tally.predicted, &tally.degraded, &tally.unexplained]
+        .into_iter()
+        .flat_map(|bucket| bucket.keys())
+        .any(|reported| accepted.contains(&reported.as_str()))
+}
+
 impl Report {
     fn new(tier: &str, files: usize, providers: &[&dyn Provider]) -> Self {
         Self {
@@ -952,21 +991,36 @@ impl Report {
                          writer does not reproduce is a hole in every conversion"
                     ));
                 }
-                if !same_agent && after == 0 && tally.predicted.is_empty() && tally.degraded.is_empty()
-                {
+                // Cross-agent, the same closure with the allowance the boundary
+                // really buys. The guard used to be `predicted.is_empty() &&
+                // degraded.is_empty()`, and both are tier-wide totals over the
+                // whole crossing — so one predicted reasoning capsule anywhere
+                // in the corpus switched the check off for *every* body kind,
+                // and a variant a writer drops whole could never be reported.
+                // A loss only explains the variant it could actually be about.
+                if !same_agent && *before > 0 && after == 0 && !explains(kind, tally) {
                     self.finding(&format!(
                         "{from} -> {to}: `Body::{kind}` appears {before} time(s) in the replays \
-                         read and never in the written sessions, and no loss was reported for it"
+                         read and never in the written sessions, and no loss of a kind that \
+                         could describe it was reported"
                     ));
                 }
             }
 
-            if !same_agent && tally.loss_events == 0 && !tally.predicted.is_empty() {
-                self.finding(&format!(
-                    "{from} -> {to}: the comparator found losses the writer's own loss list does \
-                     not mention, so nothing downstream can say what the grade is made of"
-                ));
-            }
+            // "The comparator found losses the writer's own loss list does not
+            // mention" used to be checked here as
+            // `loss_events == 0 && !predicted.is_empty()`. Both operands are
+            // tier-wide totals over every session in the crossing, and any real
+            // corpus makes `loss_events` five figures — codex -> claude-code
+            // reports 49,701 — so the condition was false on every run this
+            // suite has ever had. It is gone rather than commented, because a
+            // check nobody can trigger reads as coverage.
+            //
+            // What replaces it is stronger and per-session: `cross` requires the
+            // writer's claimed grade and the comparator's derived grade to be
+            // *equal*, in both directions. A writer whose loss list is empty
+            // claims `ContextComplete`, so a comparator that found anything at
+            // all now disagrees with it, on the session, by name.
         }
     }
 
@@ -1581,18 +1635,34 @@ fn chain(
 /// Whether a refused hop is this crate's bug rather than a fact about the input.
 ///
 /// A hop can fail for two unrelated reasons and they deserve opposite
-/// treatment. `ValidationError` means the session itself is unusable — the
-/// corpus holds one-sided transcripts, and refusing them is correct behaviour
-/// worth counting but not worth failing. `VerifyFailed` means the pipeline
-/// wrote a file and then could not read its own output back as the session it
-/// had just converted, which is a writer defect every time.
+/// treatment. A session that is genuinely unusable — the corpus holds one-sided
+/// transcripts, and `validate_session` is right to refuse them — is worth
+/// counting but not worth failing. Everything else happens *after* a structured
+/// reader has already claimed the file and the pipeline has committed to
+/// converting it, and at that point a failure is this crate's.
+///
+/// # The whitelist is the passing side, and that is the whole point
+///
+/// This used to whitelist the *failing* side: `VerifyFailed` was a defect and
+/// every other error was a printed note. That has the default backwards. A
+/// `SessionWriteError` — the pipeline failing to write the file it had just
+/// converted — is not a fact about the corpus by any reading, and it was being
+/// filed as a note nobody asserts on. So was a `SessionReadError` on the
+/// intermediate this suite wrote itself, and so was any error type added later.
+/// Naming what may pass and failing the rest means a new failure mode arrives
+/// loud.
 ///
 /// Matched on the typed variant rather than on the message, so renaming the
 /// error text cannot silently turn a failure back into a note.
 fn is_write_defect(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<crate::error::CasrError>()
-        .is_some_and(|error| matches!(error, crate::error::CasrError::VerifyFailed { .. }))
+    match error.downcast_ref::<crate::error::CasrError>() {
+        // The one refusal proven to describe the input rather than the crate:
+        // `validate_session` found the session itself unusable and stopped
+        // before writing anything.
+        Some(crate::error::CasrError::ValidationError { .. }) => false,
+        // Every other `CasrError`, and every error that is not one at all.
+        Some(_) | None => true,
+    }
 }
 
 /// Which of the two arms a measurement belongs to.
@@ -2169,6 +2239,41 @@ mod tests {
             "{:?}",
             report.findings()
         );
+    }
+
+    /// F6. The default has to be "this is our bug". A write that failed after a
+    /// source was successfully claimed is not a fact about the input, and filing
+    /// it as a printed note is how a real defect stays invisible.
+    #[test]
+    fn only_an_unusable_input_may_be_filed_as_a_note() {
+        let unusable = anyhow::Error::from(crate::error::CasrError::ValidationError {
+            errors: vec!["one-sided transcript".into()],
+            warnings: Vec::new(),
+            info: Vec::new(),
+        });
+        assert!(
+            !is_write_defect(&unusable),
+            "a session `validate_session` correctly refuses is a fact about the corpus"
+        );
+
+        for defect in [
+            crate::error::CasrError::SessionWriteError {
+                path: PathBuf::from("/sandbox/out.jsonl"),
+                provider: "codex".into(),
+                detail: "no space left on device".into(),
+            },
+            crate::error::CasrError::SessionReadError {
+                path: PathBuf::from("/sandbox/out.jsonl"),
+                provider: "codex".into(),
+                detail: "unexpected end of input".into(),
+            },
+        ] {
+            let error = anyhow::Error::from(defect);
+            assert!(
+                is_write_defect(&error),
+                "a hop that got as far as writing and then failed is this crate's bug: {error}"
+            );
+        }
     }
 
     /// The registry is the list. If this ever finds fewer than two, the

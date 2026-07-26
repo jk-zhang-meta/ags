@@ -34,7 +34,7 @@ use casr::{
     providers::claude_code::ClaudeCode,
     providers::codex::Codex,
     providers::gemini::Gemini,
-    providers::{Provider, StructuredWrite, WriteOptions, WrittenSession},
+    providers::{Displaced, Provider, StructuredWrite, WriteOptions, WrittenSession},
 };
 
 #[derive(Clone)]
@@ -61,6 +61,14 @@ struct MockState {
     /// What `read_session_ir` returns. `None` models a provider with no
     /// structured reader, which is the default and the majority.
     ir_read: Option<SessionIr>,
+    /// A provider that claims a structured reader whose reader then fails —
+    /// a corrupt or truncated rollout, not an absent capability.
+    ir_read_error: Option<String>,
+    /// `read_session` hands back whatever `write_session` was last given, which
+    /// is what a faithful writer/reader pair does. The alternative — a fixed
+    /// session registered per path — cannot model a conversion that legitimately
+    /// changed the session before writing it.
+    read_echo: bool,
     /// Grade `write_session_ir` reports. `None` models a provider with no
     /// structured writer, so the pipeline must fall back to the flat path.
     structured_grade: Option<Fidelity>,
@@ -133,6 +141,14 @@ impl MockProvider {
         self.state.lock().expect("mock state lock").ir_read = Some(ir);
     }
 
+    fn set_structured_read_error(&self, message: &str) {
+        self.state.lock().expect("mock state lock").ir_read_error = Some(message.to_string());
+    }
+
+    fn set_read_echo(&self) {
+        self.state.lock().expect("mock state lock").read_echo = true;
+    }
+
     fn set_structured_write(&self, grade: Fidelity) {
         self.state.lock().expect("mock state lock").structured_grade = Some(grade);
     }
@@ -194,6 +210,12 @@ impl Provider for MockProvider {
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         let state = self.state.lock().expect("mock state lock");
+        if state.read_echo {
+            return state
+                .last_written
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("mock echo reader: nothing has been written"));
+        }
         if let Some(outcome) = state.read_by_path.get(path).cloned() {
             return match outcome {
                 ReadOutcome::Session(session) => Ok(*session),
@@ -231,7 +253,7 @@ impl Provider for MockProvider {
                 ))],
                 session_id: format!("{}-target-session", self.alias),
                 resume_command: self.resume_command(&format!("{}-target-session", self.alias)),
-                backup_path: None,
+                backups: Vec::new(),
                 warnings: Vec::new(),
             }),
         }
@@ -242,7 +264,11 @@ impl Provider for MockProvider {
     }
 
     fn read_session_ir(&self, _path: &Path) -> anyhow::Result<Option<SessionIr>> {
-        Ok(self.state.lock().expect("mock state lock").ir_read.clone())
+        let state = self.state.lock().expect("mock state lock");
+        if let Some(message) = state.ir_read_error.clone() {
+            return Err(anyhow::anyhow!(message));
+        }
+        Ok(state.ir_read.clone())
     }
 
     /// Mirrors what `read_session_ir` above actually does, for the same reason
@@ -250,11 +276,8 @@ impl Provider for MockProvider {
     /// calling the reader, so a mock whose probe disagrees with its reader models
     /// a provider that cannot exist.
     fn supports_structured_read(&self) -> bool {
-        self.state
-            .lock()
-            .expect("mock state lock")
-            .ir_read
-            .is_some()
+        let state = self.state.lock().expect("mock state lock");
+        state.ir_read.is_some() || state.ir_read_error.is_some()
     }
 
     /// Mirrors what `write_session_ir` below will actually do, so the capability
@@ -285,7 +308,7 @@ impl Provider for MockProvider {
                 paths: vec![PathBuf::from(format!("/tmp/{}/structured.json", self.slug))],
                 resume_command: self.resume_command(&session_id),
                 session_id,
-                backup_path: None,
+                backups: Vec::new(),
                 warnings: vec!["structured writer note".to_string()],
             },
             losses: Vec::new(),
@@ -440,7 +463,7 @@ fn pipeline_convert_happy_path_writes_and_verifies() {
         paths: vec![written_path.clone()],
         session_id: "target-sid-a".to_string(),
         resume_command: "tgt --resume target-sid-a".to_string(),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
     dst.set_read_session(written_path, session.clone());
@@ -594,7 +617,7 @@ fn pair_with_target_slug(
         paths: vec![written_path.clone()],
         session_id: format!("target-{session_id}"),
         resume_command: format!("tgt --resume target-{session_id}"),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
     dst.set_read_session(written_path, session);
@@ -893,7 +916,7 @@ fn pipeline_warns_when_target_cli_missing_but_write_succeeds() {
         paths: vec![written_path.clone()],
         session_id: "sid-target-cli-missing-out".to_string(),
         resume_command: "tgt --resume sid-target-cli-missing-out".to_string(),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
     dst.set_read_session(
@@ -1014,7 +1037,7 @@ fn pipeline_source_hint_alias_narrows_resolution() {
         paths: vec![written_path.clone()],
         session_id: "target-id".to_string(),
         resume_command: "tgt --resume target-id".to_string(),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
     dst.set_read_session(written_path, valid_session_with_id("from-a"));
@@ -1059,7 +1082,7 @@ fn pipeline_source_hint_path_bypasses_discovery() {
         paths: vec![written_path.clone()],
         session_id: "target-direct".to_string(),
         resume_command: "tgt --resume target-direct".to_string(),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
     dst.set_read_session(written_path, valid_session_with_id("direct-session"));
@@ -1130,7 +1153,7 @@ fn pipeline_readback_mismatch_fails_and_removes_unverified_output() {
         paths: vec![written_path.clone()],
         session_id: "target-mismatch".to_string(),
         resume_command: "tgt --resume target-mismatch".to_string(),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
 
@@ -1185,7 +1208,7 @@ fn pipeline_readback_content_mismatch_fails_and_removes_unverified_output() {
         paths: vec![written_path.clone()],
         session_id: "target-content-mismatch".to_string(),
         resume_command: "tgt --resume target-content-mismatch".to_string(),
-        backup_path: None,
+        backups: Vec::new(),
         warnings: Vec::new(),
     });
 
@@ -1238,7 +1261,10 @@ fn pipeline_readback_error_restores_backup_and_returns_verify_failed() {
         paths: vec![written_path.clone()],
         session_id: "target-readback-error".to_string(),
         resume_command: "tgt --resume target-readback-error".to_string(),
-        backup_path: Some(backup_path.clone()),
+        backups: vec![Displaced {
+            target: written_path.clone(),
+            backup: backup_path.clone(),
+        }],
         warnings: Vec::new(),
     });
     dst.set_read_error(written_path.clone(), "cannot parse written file");
@@ -1917,6 +1943,478 @@ fn a_provider_that_denies_a_structured_reader_has_none() {
              reader; if that reader can return anything but Ok(None) the skip \
              changes the conversion",
             provider.slug()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The grade a decision acts on
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_grade_the_comparator_disproved_is_not_what_a_refusal_acts_on() {
+    // The writer says the conversion is fine. The comparator, reading the file
+    // back independently, finds a sealed compaction that could not cross into an
+    // Anthropic target and is therefore gone. Reporting the writer's number is
+    // deliberate — substituting would hide the disagreement — but the launch
+    // refusal reads `effective_fidelity`, which is the worse of the two.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-underclaimed", "claude-code");
+    src.set_structured_read(sealed_compaction_ir());
+    dst.set_structured_write(Fidelity::ConversationOnly);
+    dst.set_structured_read(intact_ir());
+
+    let result = pipeline
+        .convert("tgt", "sid-underclaimed", options(false, None))
+        .expect("the bytes are as predicted, so nothing is rolled back");
+
+    assert_eq!(
+        result.fidelity,
+        Fidelity::ConversationOnly,
+        "the reported grade is still the writer's, so the disagreement stays visible"
+    );
+    assert_eq!(
+        result.verified_fidelity,
+        Some(Fidelity::HistoryIncomplete),
+        "the comparator derived its own grade and it must survive to the caller"
+    );
+    assert_eq!(
+        result.effective_fidelity(),
+        Fidelity::HistoryIncomplete,
+        "a launch keys on this, and a writer that under-reports must not be able to \
+         talk it into starting on a session with a hole in it"
+    );
+    assert!(
+        result
+            .fidelity_disagreement()
+            .is_some_and(|note| note.contains("ConversationOnly")
+                && note.contains("HistoryIncomplete")),
+        "the disagreement has to be sayable in one sentence: {:?}",
+        result.fidelity_disagreement()
+    );
+}
+
+#[test]
+fn agreement_and_no_check_at_all_are_different_answers() {
+    // `verified_fidelity` is `Some` when a check ran and agreed, and `None` when
+    // none ran. Collapsing those would make "verified" unreadable.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-agreed", "codex");
+    src.set_structured_read(intact_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+    dst.set_structured_read(intact_ir());
+    let verified = pipeline
+        .convert("tgt", "sid-agreed", options(false, None))
+        .expect("convert");
+    assert_eq!(verified.verified_fidelity, Some(Fidelity::ContextComplete));
+    assert_eq!(verified.effective_fidelity(), Fidelity::ContextComplete);
+    assert!(verified.fidelity_disagreement().is_none());
+
+    let (_src, _dst, pipeline) = flat_pair("sid-unchecked");
+    let flat = pipeline
+        .convert("tgt", "sid-unchecked", options(false, None))
+        .expect("convert");
+    assert_eq!(
+        flat.verified_fidelity, None,
+        "the flat read-back checks text and roles, not fidelity; it has no grade to offer"
+    );
+    assert_eq!(flat.effective_fidelity(), flat.fidelity);
+}
+
+// ---------------------------------------------------------------------------
+// The flat context budget
+// ---------------------------------------------------------------------------
+
+/// A session long enough that a small `--max-context-tokens` has to delete
+/// turns out of the middle of it.
+fn long_session(session_id: &str) -> CanonicalSession {
+    let mut session = valid_session_with_id(session_id);
+    session.messages = (0..12)
+        .map(|i| {
+            msg(
+                i,
+                if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                &"x".repeat(400),
+                Some(1_700_000_000_000 + i as i64),
+            )
+        })
+        .collect();
+    session
+}
+
+#[test]
+fn the_flat_budget_grades_the_turns_it_deleted() {
+    // The flat twin of the structured track's budget accounting. Dropping the
+    // middle of a conversation used to produce a warning and nothing else, so
+    // the conversion still reported `ConversationOnly` — "every piece of the
+    // conversation is still present" — and `--launch` believed it.
+    let (src, dst, pipeline) = flat_pair("sid-budget");
+    let source_path = PathBuf::from("/tmp/src-root/sid-budget.json");
+    src.set_read_session(source_path, long_session("sid-budget"));
+    dst.set_read_echo();
+
+    let result = pipeline
+        .convert(
+            "tgt",
+            "sid-budget",
+            ConvertOptions {
+                max_context_tokens: 300,
+                ..ConvertOptions::default()
+            },
+        )
+        .expect("convert");
+
+    assert!(
+        result.canonical_session.messages.len() < 12,
+        "the budget has to have actually dropped something for this to test anything"
+    );
+    let loss = result
+        .losses
+        .iter()
+        .find(|loss| loss.kind == LossKind::Conversation)
+        .expect("deleted turns are a loss of conversation");
+    assert!(loss.events > 0, "the count has to be a count: {loss:?}");
+    assert_eq!(loss.grade, Fidelity::HistoryIncomplete);
+    assert_eq!(
+        result.fidelity,
+        Fidelity::HistoryIncomplete,
+        "a hole the budget made is still a hole"
+    );
+}
+
+#[test]
+fn an_unbudgeted_conversion_is_graded_exactly_as_before() {
+    // The other half of the same guarantee: folding budget losses into the grade
+    // must not move a conversion that had no budget applied to it.
+    let (_src, _dst, pipeline) = flat_pair("sid-unbudgeted");
+    let result = pipeline
+        .convert("tgt", "sid-unbudgeted", options(false, None))
+        .expect("convert");
+    assert_eq!(result.fidelity, Fidelity::ConversationOnly);
+    assert!(result.losses.is_empty());
+}
+
+#[test]
+fn pairing_repair_leaves_a_call_that_arrived_unanswered() {
+    // A session that ended while a tool call was outstanding is a normal
+    // session. Repairing by pairing alone deleted that call, then deleted the
+    // message it lived in when nothing was left, on every conversion — including
+    // ones where the budget removed nothing at all.
+    let (src, dst, pipeline) = flat_pair("sid-orphan");
+    let mut trailing = msg(1, MessageRole::Assistant, "", Some(1_700_000_005_000));
+    trailing.tool_calls.push(casr::model::ToolCall {
+        id: Some("call-1".to_string()),
+        name: "bash".to_string(),
+        arguments: serde_json::json!({"cmd": "ls"}),
+    });
+    let mut session = valid_session_with_id("sid-orphan");
+    session.messages = vec![
+        msg(0, MessageRole::User, "run ls", Some(1_700_000_000_000)),
+        trailing,
+    ];
+    src.set_read_session(PathBuf::from("/tmp/src-root/sid-orphan.json"), session);
+    dst.set_read_echo();
+
+    let result = pipeline
+        .convert("tgt", "sid-orphan", options(false, None))
+        .expect("convert");
+
+    let written = dst.last_written().expect("the flat writer ran");
+    assert_eq!(
+        written.messages.len(),
+        2,
+        "the trailing turn must survive: {:?}",
+        written.messages
+    );
+    assert_eq!(
+        written.messages[1].tool_calls.len(),
+        1,
+        "an unanswered call is the source's own shape, not damage to repair"
+    );
+    assert!(
+        result
+            .losses
+            .iter()
+            .all(|loss| loss.kind != LossKind::ToolProtocol),
+        "nothing was severed, so nothing should be reported as severed: {:?}",
+        result.losses
+    );
+}
+
+#[test]
+fn pairing_repair_reports_the_pairs_the_budget_broke() {
+    // The converse: when the budget genuinely severs a call from its result, the
+    // removal is real and has to be graded, not just warned about.
+    let (src, dst, pipeline) = flat_pair("sid-severed");
+    let mut session = valid_session_with_id("sid-severed");
+    // The call is the expensive turn, so the budget drops it and keeps the cheap
+    // result that answered it — the one shape where the repair is removing
+    // something that was whole a moment ago.
+    let mut caller = msg(1, MessageRole::Assistant, &"a".repeat(4000), Some(1));
+    caller.tool_calls.push(casr::model::ToolCall {
+        id: Some("call-1".to_string()),
+        name: "bash".to_string(),
+        arguments: serde_json::json!({}),
+    });
+    let mut answerer = msg(2, MessageRole::Tool, "ok", Some(2));
+    answerer.tool_results.push(casr::model::ToolResult {
+        call_id: Some("call-1".to_string()),
+        content: "ok".to_string(),
+        is_error: false,
+    });
+    session.messages = vec![
+        msg(0, MessageRole::User, "pinned task", Some(0)),
+        caller,
+        answerer,
+        msg(3, MessageRole::User, "and now this", Some(3)),
+    ];
+    src.set_read_session(PathBuf::from("/tmp/src-root/sid-severed.json"), session);
+    dst.set_read_echo();
+
+    let result = pipeline
+        .convert(
+            "tgt",
+            "sid-severed",
+            ConvertOptions {
+                max_context_tokens: 300,
+                ..ConvertOptions::default()
+            },
+        )
+        .expect("convert");
+
+    assert!(
+        result
+            .losses
+            .iter()
+            .any(|loss| loss.kind == LossKind::ToolProtocol
+                && loss.grade == Fidelity::HistoryIncomplete),
+        "a severed pair removes something the model was shown: {:?}",
+        result.losses
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A source this build cannot parse
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_failed_structured_read_is_not_the_same_as_no_structured_reader() {
+    // Both used to arrive at `flat_fidelity` as `None`, and `None` means "this
+    // provider has a plain format and the projection carries all of it". Applied
+    // to a rollout the reader choked on, that is a claim nobody checked.
+    let (src, _dst, pipeline) = flat_pair("sid-unparseable");
+    src.set_structured_read_error("truncated rollout: unexpected end of file at line 4102");
+
+    let result = pipeline
+        .convert("tgt", "sid-unparseable", options(false, None))
+        .expect("an unparseable structure is not a failed conversion");
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not parse")),
+        "a reader that ran and failed must be reported: {:?}",
+        result.warnings
+    );
+    assert_eq!(
+        result.fidelity,
+        Fidelity::HistoryIncomplete,
+        "graded at the worst it could be, because nothing here can rule it out"
+    );
+    let loss = result
+        .losses
+        .iter()
+        .find(|loss| loss.grade == Fidelity::HistoryIncomplete)
+        .expect("a grade this bad has to be explained");
+    assert_eq!(
+        (loss.events, loss.capsules, loss.bytes),
+        (0, 0, 0),
+        "nothing was measured, so the counts must not pretend otherwise"
+    );
+    assert!(
+        loss.note.contains("could not be determined"),
+        "the note has to separate a floor from a finding: {}",
+        loss.note
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --enrich
+// ---------------------------------------------------------------------------
+
+#[test]
+fn enrichment_reaches_the_file_the_output_claims_it_reached() {
+    // The structured writer is handed the source IR, which enrichment never
+    // touches, so an enriched structured conversion reported "Added 2 synthetic
+    // context message(s)" over a file containing none of them — and the read-back
+    // verifier, comparing that same untouched IR, agreed the file was perfect.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-enriched", "claude-code");
+    src.set_structured_read(intact_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+    dst.set_structured_read(intact_ir());
+    dst.set_read_echo();
+
+    let result = pipeline
+        .convert(
+            "tgt",
+            "sid-enriched",
+            ConvertOptions {
+                enrich: true,
+                ..ConvertOptions::default()
+            },
+        )
+        .expect("convert");
+
+    assert_eq!(
+        dst.structured_write_calls(),
+        0,
+        "the track that cannot carry enrichment must not be the one that runs"
+    );
+    let written = dst.last_written().expect("the flat writer ran");
+    assert!(
+        written
+            .messages
+            .iter()
+            .any(|m| m.content.contains("[casr synthetic context]")),
+        "the file must hold what the run said was added to it"
+    );
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("--enrich adds messages")),
+        "the track change is a fidelity consequence and has to be stated: {:?}",
+        result.warnings
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rolling a write back
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rollback_restores_each_backup_onto_the_file_it_came_from() {
+    // Cline's shape, which is the one the old rollback got wrong: three session
+    // files, plus a backup of a shared index that is not one of them. Pairing the
+    // backup with `paths[0]` moved the task index on top of the API history.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let api = tmp.path().join("api_conversation_history.json");
+    let ui = tmp.path().join("ui_messages.json");
+    let index = tmp.path().join("taskHistory.json");
+    let index_backup = tmp.path().join("taskHistory.json.bak");
+    fs::write(&api, "NEW API HISTORY").expect("seed api");
+    fs::write(&ui, "NEW UI MESSAGES").expect("seed ui");
+    fs::write(&index, "MODIFIED INDEX").expect("seed index");
+    fs::write(&index_backup, "ORIGINAL INDEX").expect("seed index backup");
+
+    let (src, dst, pipeline) = flat_pair("sid-rollback");
+    let _ = src;
+    dst.set_write_success(WrittenSession {
+        paths: vec![api.clone(), ui.clone()],
+        session_id: "task-1".to_string(),
+        resume_command: "code .".to_string(),
+        backups: vec![Displaced {
+            target: index.clone(),
+            backup: index_backup.clone(),
+        }],
+        warnings: Vec::new(),
+    });
+    dst.set_read_error(api.clone(), "cannot parse written file");
+
+    pipeline
+        .convert("tgt", "sid-rollback", options(false, None))
+        .expect_err("an unreadable write must fail verification");
+
+    assert_eq!(
+        fs::read_to_string(&index).expect("the index must still exist"),
+        "ORIGINAL INDEX",
+        "the index's own backup goes back to the index"
+    );
+    assert!(!api.exists(), "an unverified output is removed");
+    assert!(!ui.exists(), "every unverified output is removed");
+    assert!(!index_backup.exists(), "the backup is consumed by the restore");
+}
+
+// ---------------------------------------------------------------------------
+// Atomic writes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_forced_write_never_leaves_the_session_path_empty() {
+    // The session file is what the agent reads. A forced conversion that renames
+    // the target away before writing its replacement has an interval in which the
+    // session does not exist, and a crash in that interval loses it outright.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let target = tmp.path().join("session.jsonl");
+    fs::write(&target, "ORIGINAL").expect("seed target");
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let vanished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let (target, stop, vanished) = (
+            target.clone(),
+            std::sync::Arc::clone(&stop),
+            std::sync::Arc::clone(&vanished),
+        );
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if !target.exists() {
+                    vanished.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        })
+    };
+
+    // Large enough that the write takes long enough to be observed.
+    let content = vec![b'x'; 32 * 1024 * 1024];
+    casr::pipeline::atomic_write(&target, &content, true, "test").expect("forced write");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    watcher.join().expect("watcher");
+
+    assert!(
+        !vanished.load(std::sync::atomic::Ordering::Relaxed),
+        "the session path was empty part way through a forced write"
+    );
+    assert_eq!(content.len(), fs::metadata(&target).expect("target").len() as usize);
+}
+
+#[test]
+fn concurrent_forced_writes_cannot_overwrite_each_others_backups() {
+    // Backup names used to be chosen by an existence check and used a moment
+    // later, so two forced conversions aimed at one target could both pick
+    // `session.jsonl.bak` and the second would rename the first's *output* over
+    // the original. The reservation is now the same operation as the check.
+    for round in 0..25 {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let target = tmp.path().join("session.jsonl");
+        fs::write(&target, "ORIGINAL").expect("seed target");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let target = target.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let payload = vec![b'0' + i as u8; 256 * 1024];
+                    let _ = casr::pipeline::atomic_write(&target, &payload, true, "test");
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let survived = fs::read_dir(tmp.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .any(|entry| fs::read_to_string(entry.path()).is_ok_and(|c| c == "ORIGINAL"));
+        assert!(
+            survived,
+            "round {round}: the original session exists nowhere any more"
         );
     }
 }

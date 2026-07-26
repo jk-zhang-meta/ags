@@ -2176,3 +2176,589 @@ fn writer_piagent_tool_role_normalized() {
         "PiAgent should normalize Tool role to 'toolResult'"
     );
 }
+
+// ===========================================================================
+// Structured IR readers and writers
+//
+// Everything above is the flat track. The block below pins the four structured
+// modules — `codex_ir`, `codex_ir_write`, `claude_code_ir`,
+// `claude_code_ir_write` — against silent loss: material that crosses without a
+// `Loss`, a state assignment built out of a field that was not there, and a
+// sealed field re-labelled by the field it arrived in rather than by the vendor
+// that minted it. None of these tests touch the process environment, so none of
+// them take the env lock.
+// ===========================================================================
+
+mod structured_ir {
+    use std::io::Write;
+
+    use casr::budget::ContextBudget;
+    use casr::ir::{
+        Block, Body, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, SessionIr, ToolInput,
+        Visibility,
+    };
+    use casr::providers::{claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write};
+    use serde_json::{Value, json};
+
+    fn write_lines(lines: &[String]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        for line in lines {
+            writeln!(file, "{line}").expect("write");
+        }
+        file.flush().expect("flush");
+        file
+    }
+
+    fn reparse<T>(lines: &[String], read: fn(&std::path::Path) -> anyhow::Result<T>) -> T {
+        let file = write_lines(lines);
+        read(file.path()).expect("the writer produced a session its own reader rejects")
+    }
+
+    const CODEX_META: &str = r#"{"timestamp":"2026-07-25T10:00:00.000Z","type":"session_meta","payload":{"id":"s-1","cli_version":"0.145.0","model_provider":"openai","cwd":"/work","timestamp":"2026-07-25T10:00:00.000Z"}}"#;
+
+    fn claude_user(uuid: &str, parent: &str, text: &str) -> String {
+        let parent = if parent.is_empty() {
+            "null".to_string()
+        } else {
+            format!("\"{parent}\"")
+        };
+        format!(
+            r#"{{"type":"user","uuid":"{uuid}","parentUuid":{parent},"isSidechain":false,"sessionId":"s1","cwd":"/work","version":"2.1.220","timestamp":"2026-07-25T10:00:00.000Z","message":{{"role":"user","content":"{text}"}}}}"#
+        )
+    }
+
+    fn codex_rollout(lines: &[String]) -> SessionIr {
+        let mut all = vec![CODEX_META.to_string()];
+        all.extend_from_slice(lines);
+        let file = write_lines(&all);
+        codex_ir::read(file.path()).expect("rollout parses")
+    }
+
+    fn claude_transcript(lines: &[String]) -> SessionIr {
+        let file = write_lines(lines);
+        claude_code_ir::read(file.path()).expect("transcript parses")
+    }
+
+    fn event(id: &str, line: u64, body: Body) -> Event {
+        Event {
+            id: id.to_string(),
+            parent: None,
+            branch: casr::ir::Branch::Main,
+            turn: Some("t1".to_string()),
+            ts: None,
+            visibility: Visibility::Model,
+            body,
+            capsules: Vec::new(),
+            source: casr::ir::SourceRef {
+                line,
+                sha256: String::new(),
+            },
+        }
+    }
+
+    fn text_message(id: &str, line: u64, role: casr::ir::Role, text: &str) -> Event {
+        event(
+            id,
+            line,
+            Body::Message {
+                role,
+                blocks: vec![Block::Text { text: text.into() }],
+            },
+        )
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 — a target-native sealed field must not be minted out of an
+    // unrecognised block
+    // -----------------------------------------------------------------------
+
+    /// `codex_ir` re-labels an `encrypted_content` item as an OpenAI capsule by
+    /// the field it arrived in. A block that reaches the Codex writer as
+    /// [`Block::Unknown`] never passed a vendor gate, so writing its bytes back
+    /// verbatim mints an OpenAI capsule out of material no gate ever saw.
+    #[test]
+    fn a_sealed_envelope_inside_an_unknown_block_is_not_written_as_a_codex_capsule() {
+        let anthropic_blob = "ANTHROPIC_SEALED_BLOB_AAAA";
+        let source = claude_transcript(&[
+            claude_user("u1", "", "hi"),
+            format!(
+                r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"sessionId":"s1","timestamp":"2026-07-25T10:00:01.000Z","message":{{"role":"assistant","model":"claude-opus-4-8","content":[{{"type":"encrypted_content","encrypted_content":"{anthropic_blob}"}},{{"type":"text","text":"done"}}]}}}}"#
+            ),
+        ]);
+        assert_eq!(
+            source
+                .model_visible()
+                .iter()
+                .map(|event| event.capsules.len())
+                .sum::<usize>(),
+            0,
+            "the reader files this under Block::Unknown, so no capsule gate ever sees it"
+        );
+
+        let rendered = codex_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
+
+        assert!(
+            !rendered.lines.iter().any(|line| line.contains(anthropic_blob)),
+            "an Anthropic blob written into a Codex rollout is bytes OpenAI must reject"
+        );
+
+        let back = reparse(&rendered.lines, codex_ir::read);
+        let relabelled: Vec<CapsuleKind> = back
+            .model_visible()
+            .iter()
+            .flat_map(|event| event.capsules.iter())
+            .map(|capsule| capsule.kind)
+            .collect();
+        assert!(
+            relabelled.is_empty(),
+            "the blob came back as {relabelled:?}: a sealed field was re-labelled by the \
+             field it arrived in rather than by the vendor that minted it"
+        );
+        assert!(
+            !rendered.losses.is_empty(),
+            "dropping sealed material silently is the failure this gate exists to stop"
+        );
+    }
+
+    /// The mirror image: an unrecognised block carrying an Anthropic sealed
+    /// field must not be written into a Claude transcript, where the reader
+    /// would read it back as a real `thinking` capsule.
+    #[test]
+    fn a_sealed_envelope_inside_an_unknown_block_is_not_written_as_a_claude_capsule() {
+        let mut source = SessionIr::new("codex", "s1");
+        source.origin.provider = Some("openai".into());
+        source.events = vec![
+            text_message("u1", 1, casr::ir::Role::User, "hi"),
+            event(
+                "a1",
+                2,
+                Body::Message {
+                    role: casr::ir::Role::Assistant,
+                    blocks: vec![
+                        Block::Unknown {
+                            native_type: Some("redacted_thinking".into()),
+                            raw: json!({"type": "redacted_thinking", "data": "OPENAI_SEALED_XYZ"}),
+                        },
+                        Block::Text {
+                            text: "done".into(),
+                        },
+                    ],
+                },
+            ),
+        ];
+
+        let rendered = claude_code_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
+        let back = reparse(&rendered.lines, claude_code_ir::read);
+        let minted: Vec<CapsuleKind> = back
+            .model_visible()
+            .iter()
+            .flat_map(|event| event.capsules.iter())
+            .map(|capsule| capsule.kind)
+            .collect();
+        assert!(
+            minted.is_empty(),
+            "an unrecognised block became {minted:?}: Anthropic will reject a signature \
+             it never issued"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F2 — a missing context list is not an empty one
+    // -----------------------------------------------------------------------
+
+    /// A `compacted` record with no array `replacement_history` supersedes the
+    /// whole conversation with nothing. Compaction is a state assignment, so an
+    /// empty one deletes everything that came before it.
+    #[test]
+    fn a_codex_compaction_with_no_replacement_history_keeps_the_live_context() {
+        let ir = codex_rollout(&[
+            r#"{"timestamp":"2026-07-25T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first"}]}}"#.to_string(),
+            r#"{"timestamp":"2026-07-25T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"second"}]}}"#.to_string(),
+            // Syntactically valid, and `replacement_history` is simply absent.
+            r#"{"timestamp":"2026-07-25T10:00:03.000Z","type":"compacted","payload":{"window_id":"w2","previous_window_id":"w1"}}"#.to_string(),
+        ]);
+
+        let visible = ir.model_visible();
+        let texts: Vec<String> = visible
+            .iter()
+            .filter_map(|event| {
+                let Body::Message { blocks, .. } = &event.body else {
+                    return None;
+                };
+                Some(blocks.iter().filter_map(Block::as_text).collect::<String>())
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["first", "second"],
+            "a compaction that names no replacement history must not delete the conversation"
+        );
+        assert!(
+            ir.capture.unknown > 0 || !ir.capture.notes.is_empty(),
+            "and the malformed record has to be loud: {:?}",
+            ir.capture
+        );
+    }
+
+    /// Same shape on the Claude side: a `compact_boundary` whose
+    /// `preservedMessages.allUuids` is missing or not an array.
+    #[test]
+    fn a_claude_boundary_with_no_preserved_list_keeps_the_live_context() {
+        let ir = claude_transcript(&[
+            claude_user("u1", "", "first"),
+            claude_user("u2", "u1", "second"),
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"cb1","logicalParentUuid":"u2","sessionId":"s1","compactMetadata":{"trigger":"auto","preservedMessages":{"anchorUuid":"u2"}}}"#.to_string(),
+        ]);
+
+        let visible: Vec<&str> = ir.model_visible().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            visible,
+            ["u1", "u2"],
+            "a boundary that names no preserved set must not supersede the whole session"
+        );
+        assert!(
+            ir.capture.unknown > 0 || !ir.capture.notes.is_empty(),
+            "and it has to be loud: {:?}",
+            ir.capture
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F3 — the collision repair must not collide
+    // -----------------------------------------------------------------------
+
+    /// `#dup<n>` is minted from `events.len()`, which an input-controlled uuid
+    /// can name in advance. `Sink::emit` does not re-check after renaming, so
+    /// the minted id lands on top of the existing one.
+    #[test]
+    fn the_duplicate_id_repair_never_mints_an_id_the_transcript_already_used() {
+        let ir = claude_transcript(&[
+            // events.len() == 1 after this one, so `a#dup2` is what the repair
+            // will mint for the third record.
+            claude_user("a#dup2", "", "planted"),
+            claude_user("a", "", "first"),
+            claude_user("a", "", "edited"),
+        ]);
+
+        let mut ids: Vec<&str> = ir.events.iter().map(|e| e.id.as_str()).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            total,
+            "two events share an id, which is the ambiguity the sink exists to remove: {:?}",
+            ir.events.iter().map(|e| e.id.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(ir.events.len(), 3, "nothing may be dropped");
+    }
+
+    // -----------------------------------------------------------------------
+    // F4 — capsules on a message are capsules
+    // -----------------------------------------------------------------------
+
+    /// A Codex `agent_message` carries readable text *and* sealed material —
+    /// 4,638 of them in the local corpus. The Claude writer writes the text and
+    /// never looks at the capsules, so the seal is dropped with no counter and
+    /// no `Loss`, and the conversion grades itself complete.
+    #[test]
+    fn a_foreign_capsule_on_a_message_is_counted_when_it_is_dropped() {
+        let mut assistant = text_message("a1", 2, casr::ir::Role::Assistant, "done");
+        assistant.capsules.push(Capsule {
+            kind: CapsuleKind::OpenaiReasoningEncryptedContent,
+            bound: CapsuleBinding {
+                provider: "openai".into(),
+                model: None,
+            },
+            sealed: "OPENAI_SEALED_ON_A_MESSAGE".into(),
+        });
+        let mut source = SessionIr::new("codex", "s1");
+        source.origin.provider = Some("openai".into());
+        source.events = vec![text_message("u1", 1, casr::ir::Role::User, "hi"), assistant];
+
+        let rendered = claude_code_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
+        let back = reparse(&rendered.lines, claude_code_ir::read);
+        let report = casr::compare::compare(&source, &back, "anthropic");
+
+        assert!(
+            !rendered.losses.is_empty(),
+            "the capsule was dropped and nothing was recorded"
+        );
+        assert!(
+            rendered.fidelity >= Fidelity::ContextNoReasoning,
+            "a conversion that dropped sealed material may not grade itself {:?}",
+            rendered.fidelity
+        );
+        assert!(
+            report.fidelity() <= rendered.fidelity,
+            "the writer claimed {:?}; the file only supports {:?}",
+            rendered.fidelity,
+            report.fidelity()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F5 — an Anthropic capsule has a subtype
+    // -----------------------------------------------------------------------
+
+    /// `redacted_thinking.data` and `thinking.signature` are both Anthropic
+    /// capsules and both pass the vendor gate, but they are not the same field.
+    /// Writing the first into the second hands Anthropic a signature it never
+    /// issued, and the round trip changes the capsule kind while the loss list
+    /// stays empty.
+    #[test]
+    fn a_redacted_thinking_capsule_goes_back_as_redacted_thinking() {
+        let source = claude_transcript(&[
+            claude_user("u1", "", "hi"),
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"sessionId":"s1","timestamp":"2026-07-25T10:00:01.000Z","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"redacted_thinking","data":"REDACTED_SEALED_BLOB"},{"type":"text","text":"done"}]}}"#.to_string(),
+        ]);
+        let kinds: Vec<CapsuleKind> = source
+            .model_visible()
+            .iter()
+            .flat_map(|event| event.capsules.iter())
+            .map(|capsule| capsule.kind)
+            .collect();
+        assert_eq!(kinds, [CapsuleKind::AnthropicRedactedThinking]);
+
+        let rendered = claude_code_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
+        let back = reparse(&rendered.lines, claude_code_ir::read);
+        let round_tripped: Vec<CapsuleKind> = back
+            .model_visible()
+            .iter()
+            .flat_map(|event| event.capsules.iter())
+            .map(|capsule| capsule.kind)
+            .collect();
+        assert_eq!(
+            round_tripped,
+            [CapsuleKind::AnthropicRedactedThinking],
+            "the capsule changed kind crossing a same-vendor write, and no loss says so"
+        );
+        assert!(rendered.losses.is_empty(), "{:?}", rendered.losses);
+    }
+
+    // -----------------------------------------------------------------------
+    // F6 — block order is model-visible
+    // -----------------------------------------------------------------------
+
+    /// Text that came before a tool call must not be replayed after it.
+    #[test]
+    fn text_before_a_tool_use_stays_before_it() {
+        let source = claude_transcript(&[
+            claude_user("u1", "", "hi"),
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","isSidechain":false,"sessionId":"s1","timestamp":"2026-07-25T10:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"before"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#.to_string(),
+        ]);
+
+        let kinds: Vec<&str> = source
+            .model_visible()
+            .iter()
+            .map(|event| event.body.kind())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["message", "message", "tool_call"],
+            "the reader moved the text after the tool call: {kinds:?}"
+        );
+
+        let rendered = claude_code_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
+        let record: Value =
+            serde_json::from_str(rendered.lines.last().expect("assistant record")).expect("json");
+        let types: Vec<&str> = record["message"]["content"]
+            .as_array()
+            .expect("content array")
+            .iter()
+            .map(|block| block["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            types,
+            ["text", "tool_use"],
+            "the model was shown the text first and must be shown it first again"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F8 — `tool_use.input` is an object
+    // -----------------------------------------------------------------------
+
+    /// Codex writes `function_call.arguments` as a JSON string. Handing that
+    /// string to Claude as `tool_use.input` produces a transcript the Anthropic
+    /// API rejects: all 15,607 corpus `tool_use` blocks carry an object.
+    #[test]
+    fn a_json_tool_call_reaches_claude_as_an_object() {
+        let mut source = SessionIr::new("codex", "s1");
+        source.origin.provider = Some("openai".into());
+        source.events = vec![event(
+            "c1",
+            1,
+            Body::ToolCall {
+                call_id: "call_1".into(),
+                name: "read".into(),
+                namespace: None,
+                input: ToolInput::Json {
+                    value: json!({"path": "a.txt"}),
+                    original: Some("{\"path\":\"a.txt\"}".into()),
+                },
+            },
+        )];
+
+        let rendered = claude_code_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
+        let record: Value = serde_json::from_str(&rendered.lines[0]).expect("json");
+        let input = &record["message"]["content"][0]["input"];
+        assert!(
+            input.is_object(),
+            "`tool_use.input` must be an object, not {input}"
+        );
+        assert_eq!(input["path"], json!("a.txt"));
+    }
+
+    // -----------------------------------------------------------------------
+    // F9 — a replacement message keeps its own turn
+    // -----------------------------------------------------------------------
+
+    /// Every one of the 176,027 `replacement_history` items in the local corpus
+    /// carries its own `turn_id`, and a single `compacted` record routinely
+    /// spans dozens of distinct ones. Stamping the builder's current turn on all
+    /// of them collapses them into one, and `replay::roll_back` counts distinct
+    /// turns — so one rollback then removes the entire compacted history.
+    #[test]
+    fn compacted_replacement_messages_keep_their_own_turn() {
+        let ir = codex_rollout(&[
+            r#"{"timestamp":"2026-07-25T10:00:01.000Z","type":"turn_context","payload":{"turn_id":"t9","model":"gpt-5"}}"#.to_string(),
+            r#"{"timestamp":"2026-07-25T10:00:02.000Z","type":"compacted","payload":{"window_id":"w2","replacement_history":[
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"one"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1"}},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t2"}}
+            ]}}"#.replace('\n', "").replace("                ", ""),
+        ]);
+
+        let turns: Vec<Option<&str>> = ir
+            .model_visible()
+            .iter()
+            .filter(|event| matches!(event.body, Body::Message { .. }))
+            .map(|event| event.turn.as_deref())
+            .collect();
+        assert_eq!(
+            turns,
+            [Some("t1"), Some("t2")],
+            "the replacement items were re-stamped with the builder's turn"
+        );
+
+        // And the writer has to put it back, or the round trip loses it.
+        let rendered =
+            codex_ir_write::render(&ir, "sid", chrono::Utc::now(), &ContextBudget::UNLIMITED)
+                .expect("renders");
+        let back = reparse(&rendered.lines, codex_ir::read);
+        let back_turns: Vec<Option<&str>> = back
+            .model_visible()
+            .iter()
+            .filter(|event| matches!(event.body, Body::Message { .. }))
+            .map(|event| event.turn.as_deref())
+            .collect();
+        assert_eq!(back_turns, [Some("t1"), Some("t2")]);
+    }
+
+    // -----------------------------------------------------------------------
+    // F7 — `replacement_history` may not truncate an event's payloads
+    // -----------------------------------------------------------------------
+
+    /// A compaction whose preserved context holds a tool pair must write both
+    /// halves back. The old fallback took `payloads(event).into_iter().next()`,
+    /// which is a silent truncation waiting for the first body that renders as
+    /// more than one native item.
+    #[test]
+    fn every_payload_of_a_preserved_event_reaches_replacement_history() {
+        let mut sealed = event(
+            "cmp",
+            1,
+            Body::SealedContext {
+                native_id: Some("cmp_1".into()),
+                meta: Value::Null,
+            },
+        );
+        sealed.capsules.push(Capsule {
+            kind: CapsuleKind::OpenaiCompactedContext,
+            bound: CapsuleBinding {
+                provider: "openai".into(),
+                model: None,
+            },
+            sealed: "CCCC".into(),
+        });
+        let mut source = SessionIr::new("codex", "s1");
+        source.origin.provider = Some("openai".into());
+        source.events = vec![
+            sealed,
+            event(
+                "call",
+                2,
+                Body::ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    namespace: None,
+                    input: ToolInput::Freeform {
+                        text: "ls".into(),
+                    },
+                },
+            ),
+            event(
+                "cm",
+                3,
+                Body::Compaction {
+                    context: vec!["cmp".into(), "call".into()],
+                    supersedes: Vec::new(),
+                    note: None,
+                    window_from: None,
+                    window_to: None,
+                },
+            ),
+        ];
+
+        let rendered =
+            codex_ir_write::render(&source, "sid", chrono::Utc::now(), &ContextBudget::UNLIMITED)
+                .expect("renders");
+        let compacted: Value = rendered
+            .lines
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|value| value["type"] == json!("compacted"))
+            .expect("a compacted envelope");
+        let history = compacted["payload"]["replacement_history"]
+            .as_array()
+            .expect("replacement history");
+        assert_eq!(history.len(), 2, "both preserved events must be written");
+        assert_eq!(history[1]["type"], json!("custom_tool_call"));
+    }
+}

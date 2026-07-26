@@ -37,6 +37,17 @@
 //! replacement history is a *new* list of events that shares no id with what
 //! came before. Both readers normalize onto [`Body::Compaction::context`], so
 //! nothing here branches on [`crate::ir::Origin::agent`].
+//!
+//! The assignment carries the *complete, ordered* post-operation context, and
+//! everything after it in this file defers to that. The replay follows the
+//! compaction's order rather than the file's; the fork prune may narrow what
+//! came before a boundary but never what the newest compaction placed after
+//! one. Both used to be quietly overruled — by a final sort back into file
+//! order, and by a fork walk that kept the checkpoint only if it happened to
+//! reach it — and neither showed up on the corpus, because both readers record
+//! their context in file order and their leaves reach their boundaries. A rule
+//! that is only correct on the sessions that exist is not the rule the type is
+//! claiming.
 
 use std::collections::{HashMap, HashSet};
 
@@ -46,7 +57,17 @@ use crate::ir::{Body, SessionIr, Visibility};
 /// checkpoints were.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayPlan {
-    /// Ids, in order, the target model should be shown.
+    /// Ids, in order, the target model should be shown. Each appears once.
+    ///
+    /// Not yet guaranteed to *resolve*: a [`Body::Compaction`] naming context
+    /// this session does not contain still puts that id here, and
+    /// [`SessionIr::model_visible`] drops it — turning a lookup miss into a
+    /// shorter replay, which nothing downstream can tell from a shorter
+    /// conversation. Both current readers build `context` out of ids they have
+    /// already emitted (4,831 corpus compactions, 0 dangling), so this is
+    /// latent, and closing it needs a paired change in
+    /// `conformance::invariants`, which is the only thing that reports it and
+    /// reads it out of this field.
     pub events: Vec<String>,
     /// What the fold removed and why. Ordered, for the fidelity report.
     pub excluded: Vec<Excluded>,
@@ -79,50 +100,51 @@ pub enum ExclusionReason {
 
 /// Fold the capture into the context the target should be handed.
 pub fn resolve(ir: &SessionIr) -> ReplayPlan {
-    let position: HashMap<&str, usize> = ir
-        .events
-        .iter()
-        .enumerate()
-        .map(|(index, event)| (event.id.as_str(), index))
-        .collect();
-    // `Event::id` is documented unique within the session, and this is the map
-    // that silently assumes it: a repeated id collapses here, one copy wins, and
-    // which one is arbitrary. Checked at this line rather than in each reader
-    // because every consumer of every provider's IR passes through `resolve` —
-    // `model_visible` is a view over it, so is the pipeline, so is the
-    // conformance battery — which makes it the one place a future reader cannot
-    // route around and nobody has to remember to opt into. Free in release, so
-    // the corpus tier is covered by `conformance::invariants`, which counts the
-    // same thing and reports it instead of panicking.
-    debug_assert_eq!(
-        position.len(),
-        ir.events.len(),
-        "{} of {} event ids in this {} session are duplicates. `Event::id` must be \
-         unique within the session: this map, `SessionIr::model_visible`'s `by_id` and \
-         `prune_forks`' record index all key on it, so a repeat means an arbitrary copy \
-         wins and the fidelity report double-counts the other. The reader has to \
-         recognise the re-emission or mint a distinct id for it — see \
-         `claude_code_ir::Sink::emit`",
-        ir.events.len() - position.len(),
-        ir.events.len(),
-        ir.origin.agent,
-    );
+    // `Event::id` is documented unique within the session and every map here
+    // keys on it, so a repeat means one copy is unreachable by id and which one
+    // is arbitrary. First-wins, stated rather than left to whatever
+    // `Iterator::collect` does with a duplicate key, and the replay below is
+    // deduplicated so the target is never shown the same event twice.
+    //
+    // This used to be a `debug_assert_eq!` — free in release, which is where
+    // every real conversion runs, and where the fold was pushing both copies of
+    // a repeated id straight into the replay. A panic is the wrong repair: no
+    // parse failure may fail a conversion, and the resolver can still answer
+    // correctly for every *other* event in the session. Detection is not lost
+    // by dropping the assert, because it never lived here — `conformance::
+    // invariants` counts duplicates from the event list itself and reports
+    // them, and `CaptureReport::id_collisions` records the ones a reader
+    // resolved. See `claude_code_ir::Sink::emit`, which makes them
+    // unrepresentable on the one provider that emits them.
+    let mut position: HashMap<&str, usize> = HashMap::with_capacity(ir.events.len());
+    for (index, event) in ir.events.iter().enumerate() {
+        position.entry(event.id.as_str()).or_insert(index);
+    }
 
     let mut live: Vec<String> = Vec::new();
     let mut excluded: Vec<Excluded> = Vec::new();
     let mut checkpoints: Vec<String> = Vec::new();
+    // The newest checkpoint's surviving context, carried out of the fold rather
+    // than looked up again afterwards. `prune_forks` needs it, and recovering
+    // it from `checkpoints.last()` meant an id lookup that could miss and a
+    // `match` on the body it found — two ways to silently decide the newest
+    // compaction preserved nothing.
+    let mut checkpoint_context: Vec<String> = Vec::new();
 
     for event in &ir.events {
         // The visibility gate, with the history directives exempted. Codex
-        // writes both as `event_msg`, which the reader correctly files as `Ui`
-        // because it is rendering rather than context — but they are directives
-        // to this fold rather than content, so they are read *before* the gate.
-        // Behind it the rollback rule fires on zero of 714 real rollbacks.
+        // writes rollback and abort as `event_msg`, which the reader correctly
+        // files as `Ui` because it is rendering rather than context — but they
+        // are directives to this fold rather than content, so they are read
+        // *before* the gate. Behind it the rollback rule fires on zero of 714
+        // real rollbacks. A compaction marker is the third of them, for the same
+        // reason: it is an instruction about model content, not model content.
         //
         // The exemption goes through `Body::is_history_directive`, which is an
-        // exhaustive `match` rather than a `matches!` here, so that a third
+        // exhaustive `match` rather than a `matches!` here, so that a fourth
         // directive variant cannot be omitted from it without a compile error.
-        // Inline, this was the one hole left in the retype.
+        // Inline, this was the one hole left in the retype — and the list itself
+        // still had one, because it left the compaction marker out.
         if event.visibility != Visibility::Model && !event.body.is_history_directive() {
             if event.visibility == Visibility::Unclassified {
                 excluded.push(Excluded {
@@ -163,6 +185,7 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
                 }
                 // The marker itself never joins `live`: it is a boundary, not
                 // replayable content.
+                checkpoint_context = context.clone();
                 live = context.clone();
                 checkpoints.push(event.id.clone());
             }
@@ -183,11 +206,39 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
         }
     }
 
-    let mut events = prune_forks(ir, &position, &checkpoints, live, &mut excluded);
-    // The capture order is the conversation order. The DAG walk in
-    // `prune_forks` is only a membership test, so the final sequence comes
-    // from the file.
-    events.sort_by_key(|id| position.get(id.as_str()).copied().unwrap_or(usize::MAX));
+    let live = prune_forks(
+        ir,
+        &checkpoint_context,
+        checkpoints.last().map(String::as_str),
+        live,
+        &mut excluded,
+    );
+
+    // `live` is already in conversation order and nothing here re-derives it:
+    // content joins it in file order, a compaction replaces it wholesale with
+    // its own ordered context, and rollback and the fork prune only ever
+    // remove. So the one place the order departs from the file is the one place
+    // it is meant to — `Body::Compaction::context` is the COMPLETE *ordered*
+    // post-operation context, and that is the whole claim the state assignment
+    // makes.
+    //
+    // Sorting by file position here undid exactly that claim, and nothing
+    // caught it: both current readers record their context in file order (4,831
+    // corpus compactions, 0 that do not), so the sort was a no-op on every real
+    // session while making the fold's authority fictional for the next reader.
+    //
+    // The `filter` is the id-uniqueness guarantee. A repeated `Event::id` puts
+    // both copies in `live`, and one of the two events is unreachable by id
+    // anyway — every map here and in `model_visible` keys on it. Nothing can
+    // recover the shadowed event at this point, but the target must at least
+    // not be shown the survivor twice.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(live.len());
+    let events: Vec<String> = live
+        .iter()
+        .filter(|id| seen.insert(id.as_str()))
+        .cloned()
+        .collect();
+
     ReplayPlan {
         events,
         excluded,
@@ -255,12 +306,16 @@ fn roll_back(
 /// all keeps 3, because compaction re-roots the graph and the head sits at
 /// chain depth 3 behind it.
 ///
+/// `checkpoint_context` is the newest compaction's surviving context and is
+/// passed in rather than looked back up from the marker id, so that the one
+/// thing this walk must not lose cannot go missing in a lookup.
+///
 /// Codex names no [`SessionIr::live_head`], so this returns `live` untouched —
 /// the no-op is structural rather than an agent check.
 fn prune_forks(
     ir: &SessionIr,
-    position: &HashMap<&str, usize>,
-    checkpoints: &[String],
+    checkpoint_context: &[String],
+    checkpoint_marker: Option<&str>,
     live: Vec<String>,
     excluded: &mut Vec<Excluded>,
 ) -> Vec<String> {
@@ -287,28 +342,25 @@ fn prune_forks(
         return live;
     }
 
-    // The newest checkpoint's context is the model's history at that point,
-    // and compaction re-roots the DAG: the preserved events do not share a
-    // parent chain with what follows the boundary, so walking past it finds
-    // nothing that belongs in the replay anyway.
-    let checkpoint: &[String] = checkpoints
-        .last()
-        .and_then(|id| position.get(id.as_str()))
-        .map(|index| match &ir.events[*index].body {
-            Body::Compaction { context, .. } => context.as_slice(),
-            _ => &[],
-        })
-        .unwrap_or(&[]);
-    let checkpoint_ids: HashSet<&str> = checkpoint.iter().map(String::as_str).collect();
+    let checkpoint_ids: HashSet<&str> = checkpoint_context.iter().map(String::as_str).collect();
     // The marker is the boundary as much as its context is, and sometimes it
     // is the only part of the boundary the walk can reach. Corpus transcript
     // `55f695db` compacts 20 lines from the end and gives that
     // `compact_boundary` a `logicalParentUuid` naming a record that is not in
     // the file, so a walk that recognised only context ids died on the marker
-    // and dropped the preserved segment: 9 events instead of 11.
-    let checkpoint_marker = checkpoints.last().map(|id| record_of(id));
+    // and stopped one record short of the preserved segment.
+    let checkpoint_marker = checkpoint_marker.map(record_of);
 
-    let mut keep: HashSet<&str> = HashSet::new();
+    // The newest compaction already decided this: after the boundary the
+    // model's context *is* `context`, assigned rather than diffed. This prune
+    // is a membership test over a DAG that compaction re-roots, so whether the
+    // leaf's parent chain happens to reach the boundary is a fact about the
+    // transcript graph and not a verdict on the preserved history. Seeded
+    // unconditionally, because the alternative is that an unreachable
+    // checkpoint deletes every event the compaction preserved and reports the
+    // lot as `AbandonedFork` — the whole post-compaction session, with the
+    // fidelity report calling it a pruned branch.
+    let mut keep: HashSet<&str> = checkpoint_ids.iter().copied().collect();
     let mut walked: HashSet<&str> = HashSet::new();
     let mut cursor = Some(leaf);
     while let Some(record) = cursor {
@@ -320,8 +372,10 @@ fn prune_forks(
         let reached_checkpoint = checkpoint_marker == Some(record)
             || ids.iter().any(|id| checkpoint_ids.contains(id));
         keep.extend(ids.iter().copied());
+        // Stop *at* the boundary. Everything the compaction kept is already in
+        // `keep`; everything above it was superseded and must not be walked
+        // back into the replay.
         if reached_checkpoint {
-            keep.extend(checkpoint_ids.iter().copied());
             break;
         }
         cursor = parent_of.get(record).copied();
@@ -730,6 +784,128 @@ mod tests {
             ["kept1", "kept2", "after"],
             "the walk reached the marker and must take the whole checkpoint \
              context with it, not stop one record short of the preserved segment"
+        );
+    }
+
+    /// The compaction's own order is the replay's order.
+    ///
+    /// `Body::Compaction::context` is the COMPLETE ordered post-operation
+    /// context, so an order that differs from the file's is the compaction's to
+    /// choose. Both current readers happen to emit it in file order, which is
+    /// why re-sorting by file position looked harmless — it made the state
+    /// assignment's authority fictional without any corpus symptom to say so.
+    #[test]
+    fn compaction_context_order_is_the_replay_order() {
+        let plan = resolve(&ir(vec![
+            message("a"),
+            message("b"),
+            compaction("c", &["b", "a"], &[]),
+            message("after"),
+        ]));
+
+        assert_eq!(plan.events, ["b", "a", "after"]);
+        assert!(plan.excluded.is_empty());
+    }
+
+    /// A repeated id is replayed once, in release as well as in debug.
+    ///
+    /// `Event::id` is documented unique and every map here keys on it, but this
+    /// used to be a `debug_assert` — free in release, which is where every real
+    /// conversion runs. A hand-built, deserialized or future-provider IR that
+    /// repeats an id would then have the fold push both copies and hand the
+    /// target the same message twice.
+    #[test]
+    fn a_repeated_id_is_replayed_once() {
+        let plan = resolve(&ir(vec![message("a"), message("a"), message("b")]));
+
+        assert_eq!(plan.events, ["a", "b"]);
+    }
+
+    /// The fork prune may not contradict the newest compaction.
+    ///
+    /// The compaction assigned the model's context; `prune_forks` is a
+    /// membership test over a DAG that compaction re-roots, so a leaf whose
+    /// parent chain never reaches the boundary must not be read as "none of the
+    /// preserved history is live". Reachability is a property of the transcript
+    /// graph, not a licence to delete the post-compaction session.
+    #[test]
+    fn the_checkpoint_context_survives_a_leaf_that_cannot_reach_it() {
+        let a = message("a");
+        let mut kept = message("kept");
+        kept.parent = Some("a".into());
+        // The user retried from `a`, so the live leaf sits on a sibling branch
+        // that neither descends from nor leads to the preserved segment.
+        let mut other = message("other");
+        other.parent = Some("a".into());
+        let mut boundary = compaction("cb", &["kept"], &["a", "other"]);
+        boundary.parent = Some("kept".into());
+
+        let plan = resolve(&forked(vec![a, kept, other, boundary], "other"));
+
+        assert_eq!(
+            plan.events,
+            ["kept"],
+            "the fold placed `kept` in the model's context; the fork prune \
+             cannot take it back out"
+        );
+    }
+
+    /// A compaction marker is read before the visibility gate, like every other
+    /// history directive.
+    ///
+    /// Both current readers file the marker `Model`, so this is latent — but a
+    /// marker is not model content, it is an instruction about model content,
+    /// and a provider that records it as chrome (Codex records its other two
+    /// directives exactly that way) would have the whole rewrite skipped.
+    #[test]
+    fn a_ui_compaction_still_fires() {
+        let mut boundary = compaction("cb", &["summary"], &["old"]);
+        boundary.visibility = Visibility::Ui;
+        let plan = resolve(&ir(vec![message("old"), message("summary"), boundary]));
+
+        assert_eq!(plan.events, ["summary"]);
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                id: "old".into(),
+                reason: ExclusionReason::Superseded { by: "cb".into() }
+            }]
+        );
+    }
+
+    /// KNOWN GAP, pinned deliberately: a context id naming nothing is replayed
+    /// as an absence.
+    ///
+    /// This asserts what the fold does *today*, not what it should do, so that
+    /// closing the gap breaks this test and lands on this comment.
+    ///
+    /// The defect is the shape this codebase keeps getting bitten by — a lookup
+    /// miss becoming an absence. `SessionIr::model_visible` resolves plan ids
+    /// against the event list, so an id naming no event vanishes there: a
+    /// compaction whose whole `context` is absent supersedes the real history
+    /// and replays as an *empty* model context, which compares clean against an
+    /// empty file and grades `Fidelity::ContextComplete`.
+    ///
+    /// Latent — both readers build `context` from ids they have already
+    /// emitted, 0 dangling across 4,831 corpus compactions — and it cannot be
+    /// fixed here alone. The repair is for the fold to keep unresolvable ids out
+    /// of `ReplayPlan::events` and report them separately, but
+    /// `conformance::invariants` is the only thing that reports this today and
+    /// it detects it by scanning `plan.events` for ids absent from the capture.
+    /// A resolver that stops emitting them silences that detector and fails
+    /// `conformance::tests::a_replay_naming_an_absent_event_is_a_finding`. Both
+    /// files have to move together.
+    #[test]
+    fn a_context_id_naming_nothing_currently_replays_as_an_absence() {
+        let session = ir(vec![message("a"), compaction("c", &["missing", "a"], &[])]);
+        let plan = resolve(&session);
+
+        assert_eq!(plan.events, ["missing", "a"]);
+        assert_eq!(
+            session.model_visible().len(),
+            1,
+            "KNOWN GAP: the plan names two ids and only one resolves, so the \
+             replay is silently one event short"
         );
     }
 

@@ -323,7 +323,7 @@ impl Cline {
         task_id: &str,
         session: &CanonicalSession,
         provider_slug: &str,
-    ) -> anyhow::Result<Option<PathBuf>> {
+    ) -> anyhow::Result<Option<crate::providers::Displaced>> {
         let history_path = Self::task_history_path(storage_root);
 
         let mut items: Vec<serde_json::Value> = match Self::read_json(&history_path) {
@@ -387,10 +387,16 @@ impl Cline {
         // `taskHistory.json` is a shared state file; we must overwrite it even when
         // `--force` is not used for the session itself. We still do an atomic write
         // with a `.bak` backup for safety.
+        //
+        // The backup is returned paired with the file it restores, because the
+        // file it restores is *not* one of the session's own outputs — it is the
+        // workspace-wide task index. Handed back bare it was restored onto
+        // `api_conversation_history.json` instead, which destroyed the index and
+        // corrupted the API history in one move.
         let outcome = crate::pipeline::atomic_write(&history_path, &bytes, true, provider_slug)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        Ok(outcome.backup_path)
+        Ok(outcome.displaced())
     }
 }
 
@@ -664,19 +670,25 @@ impl Provider for Cline {
         std::fs::create_dir_all(&task_dir)
             .with_context(|| format!("failed to create {}", task_dir.display()))?;
 
+        let mut backups = Vec::new();
+
         // 1) api_conversation_history.json
         let api_history = Self::build_api_history(session);
         let api_bytes =
             serde_json::to_vec(&api_history).context("failed to serialize api history")?;
         let api_path = task_dir.join(FILE_API_HISTORY);
-        let _ = crate::pipeline::atomic_write(&api_path, &api_bytes, opts.force, self.slug())?;
+        let api_outcome =
+            crate::pipeline::atomic_write(&api_path, &api_bytes, opts.force, self.slug())?;
+        backups.extend(api_outcome.displaced());
 
         // 2) ui_messages.json
         let ui_messages = Self::build_ui_messages(session);
         let ui_bytes =
             serde_json::to_vec(&ui_messages).context("failed to serialize ui messages")?;
         let ui_path = task_dir.join(FILE_UI_MESSAGES);
-        let _ = crate::pipeline::atomic_write(&ui_path, &ui_bytes, opts.force, self.slug())?;
+        let ui_outcome =
+            crate::pipeline::atomic_write(&ui_path, &ui_bytes, opts.force, self.slug())?;
+        backups.extend(ui_outcome.displaced());
 
         // 3) task_metadata.json (minimal)
         let metadata_path = task_dir.join(FILE_TASK_METADATA);
@@ -686,16 +698,21 @@ impl Provider for Cline {
             "environment_history": [],
         }))
         .context("failed to serialize task metadata")?;
-        let _ = crate::pipeline::atomic_write(
+        let metadata_outcome = crate::pipeline::atomic_write(
             &metadata_path,
             &metadata_bytes,
             opts.force,
             self.slug(),
         )?;
+        backups.extend(metadata_outcome.displaced());
 
         // 4) state/taskHistory.json (best-effort, but needed for Cline to list tasks)
-        let backup_path =
-            Self::update_task_history(&storage_root, &target_task_id, session, self.slug())?;
+        backups.extend(Self::update_task_history(
+            &storage_root,
+            &target_task_id,
+            session,
+            self.slug(),
+        )?);
 
         debug!(
             task_id = target_task_id,
@@ -707,7 +724,7 @@ impl Provider for Cline {
             paths: vec![api_path, ui_path, metadata_path],
             session_id: target_task_id.clone(),
             resume_command: self.resume_command(&target_task_id),
-            backup_path,
+            backups,
             warnings: Vec::new(),
         })
     }

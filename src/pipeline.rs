@@ -157,12 +157,59 @@ pub struct ConversionResult {
     /// launch refusal cares only about [`LossKind::SealedContext`] — instead of
     /// matching on sentences. Empty means the grade is its track's baseline.
     pub losses: Vec<Loss>,
+    /// The grade an independent read-back of the written file supports.
+    ///
+    /// `None` when no comparison could run: every flat conversion, every dry
+    /// run, and the structured writes whose target has no structured reader or
+    /// no vendor this build knows. It is *not* `None` for agreement — a
+    /// verifier that ran and agreed is a different fact from one that never ran,
+    /// and only the first justifies confidence in
+    /// [`ConversionResult::fidelity`].
+    ///
+    /// Kept beside the writer's claim rather than replacing it. See
+    /// [`verify_structured_write`] for why both are reported, and
+    /// [`ConversionResult::effective_fidelity`] for which one a decision uses.
+    pub verified_fidelity: Option<Fidelity>,
     /// Which incarnation the store chose to read, when a store was in use.
     ///
     /// `None` under `--no-store`, and also when the store was asked and had
     /// nothing to say — a conversation it has never seen and could not ingest.
     /// Either way the conversion read the session that was named.
     pub source: Option<SourceSelection>,
+}
+
+impl ConversionResult {
+    /// The worst grade any party to this conversion could establish.
+    ///
+    /// What a refusal keys on, and the reason it exists as its own method: the
+    /// number *reported* is the writer's, because hiding a disagreement by
+    /// substitution is no better than ignoring it, but the number *acted on*
+    /// cannot be one an under-reporting writer chose. When the two agree — the
+    /// overwhelmingly common case — this is `fidelity` and nothing changes.
+    pub fn effective_fidelity(&self) -> Fidelity {
+        match self.verified_fidelity {
+            Some(verified) => self.fidelity.worse_of(verified),
+            None => self.fidelity,
+        }
+    }
+
+    /// One sentence when the writer and the read-back disagree, `None` when
+    /// they agree or nothing checked.
+    ///
+    /// Rendered here rather than at each call site so the CLI, the JSON
+    /// envelope and the launch refusal cannot describe the same disagreement
+    /// three different ways.
+    pub fn fidelity_disagreement(&self) -> Option<String> {
+        let verified = self.verified_fidelity?;
+        (verified > self.fidelity).then(|| {
+            format!(
+                "The writer graded this conversion {:?}, but reading the written file back \
+                 independently only supports {verified:?}; the stricter grade is the one being \
+                 acted on.",
+                self.fidelity
+            )
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -524,8 +571,12 @@ but resume may fail until the CLI is installed.",
             // What a dry run can honestly report is what the flat projection
             // would earn, which is also the only track available until a
             // structured writer exists for the target.
+            let source_ir = read_source_ir(resolved.provider, &resolved.path);
+            if let Err(detail) = &source_ir {
+                all_warnings.push(detail.clone());
+            }
             let (fidelity, losses) = flat_fidelity(
-                read_source_ir(resolved.provider, &resolved.path).as_ref(),
+                source_ir.as_ref().map(Option::as_ref).map_err(String::as_str),
                 target_provider.slug(),
             );
             return Ok(ConversionResult {
@@ -536,6 +587,7 @@ but resume may fail until the CLI is installed.",
                 warnings: all_warnings,
                 fidelity,
                 losses,
+                verified_fidelity: None,
                 source: selection,
             });
         }
@@ -554,7 +606,7 @@ but resume may fail until the CLI is installed.",
                     paths: Vec::new(),
                     session_id: canonical.session_id.clone(),
                     resume_command: target_provider.resume_command(&canonical.session_id),
-                    backup_path: None,
+                    backups: Vec::new(),
                     warnings: Vec::new(),
                 }),
                 warnings: all_warnings,
@@ -562,6 +614,7 @@ but resume may fail until the CLI is installed.",
                 // command points the agent back at its own bytes.
                 fidelity: Fidelity::ByteIdentical,
                 losses: Vec::new(),
+                verified_fidelity: None,
                 // Nothing was written, so there is no new incarnation to
                 // record; the source the store chose is already in the record.
                 source: selection,
@@ -598,11 +651,33 @@ but resume may fail until the CLI is installed.",
         // the context budget on this track is the writer's job, over the IR's
         // own `model_visible` view — hence `budget`, which is the same three
         // flags step 7a2 gives the flat projection.
+        //
+        // `--enrich` is the one thing that takes the structured track away from
+        // a pair that both support it, and it has to. Enrichment prepends
+        // synthetic messages to `canonical`; the structured writer is handed the
+        // untouched source IR and writes it, so the conversion reported "Added
+        // N synthetic context messages" over a file that contained none of them,
+        // and the read-back verifier — comparing that same untouched IR against
+        // what was written — agreed the file was perfect. The flat track is
+        // where `canonical` is the thing being written, so it is the track that
+        // can keep the promise. A lower grade for an enriched conversion is a
+        // true statement; the alternative was a higher one that was false.
         let write_opts = WriteOptions { force: opts.force };
         let budget = opts.budget();
         let source_ir = read_source_ir(resolved.provider, &resolved.path);
-        if target_provider.supports_structured_write()
-            && let Some(ir) = source_ir.as_ref()
+        if let Err(detail) = &source_ir {
+            all_warnings.push(detail.clone());
+        }
+        if opts.enrich && target_provider.supports_structured_write() {
+            all_warnings.push(
+                "--enrich adds messages the structured writers do not carry, so this conversion \
+                 ran on the flat track and is graded accordingly."
+                    .to_string(),
+            );
+        }
+        if !opts.enrich
+            && target_provider.supports_structured_write()
+            && let Ok(Some(ir)) = source_ir.as_ref()
             && let Some(StructuredWrite {
                 written,
                 fidelity,
@@ -626,8 +701,12 @@ but resume may fail until the CLI is installed.",
             // through `read_session_ir` and compared IR to IR by
             // [`crate::compare`], whose whole point is that it can tell a
             // predicted vendor-boundary drop from a hole.
+            let verified_fidelity;
             match verify_structured_write(target_provider, ir, &budget, &written, fidelity) {
-                Ok(notes) => all_warnings.extend(notes),
+                Ok((notes, observed)) => {
+                    all_warnings.extend(notes);
+                    verified_fidelity = observed;
+                }
                 Err(detail) => {
                     warn!(detail, "structured read-back verification failed");
                     let rollback_detail =
@@ -666,6 +745,7 @@ but resume may fail until the CLI is installed.",
                 warnings: all_warnings,
                 fidelity,
                 losses,
+                verified_fidelity,
                 source: selection,
             });
         }
@@ -678,7 +758,7 @@ but resume may fail until the CLI is installed.",
         // truncate oversized tool observations, then drop the oldest turns if
         // still over the token cap — preserving the original task message and
         // the most recent history, and never severing tool_use/tool_result pairs.
-        let budget_warnings = apply_context_budget(
+        let (budget_warnings, budget_losses) = apply_context_budget(
             &mut canonical,
             opts.max_context_tokens,
             opts.max_tool_output,
@@ -796,7 +876,18 @@ but resume may fail until the CLI is installed.",
             }
         }
 
-        let (fidelity, losses) = flat_fidelity(source_ir.as_ref(), target_provider.slug());
+        // The projection's own grade, then everything the budget removed on top
+        // of it. Folded rather than accumulated separately: a `Fidelity` is the
+        // worst of its losses, and a budget that deleted turns has to be able to
+        // make the grade worse than the projection alone would.
+        let (mut fidelity, mut losses) = flat_fidelity(
+            source_ir.as_ref().map(Option::as_ref).map_err(String::as_str),
+            target_provider.slug(),
+        );
+        for loss in budget_losses {
+            fidelity = fidelity.worse_of(loss.grade);
+            losses.push(loss);
+        }
 
         self.record_write(
             selection.as_ref(),
@@ -815,6 +906,9 @@ but resume may fail until the CLI is installed.",
             warnings: all_warnings,
             fidelity,
             losses,
+            // The flat read-back checks message text and roles, not fidelity: it
+            // has no independent grade to offer, so there is none to report.
+            verified_fidelity: None,
             source: selection,
         })
     }
@@ -999,6 +1093,17 @@ but resume may fail until the CLI is installed.",
 /// convert a session that the flat path handles fine would be a regression
 /// introduced by the better track — exactly backwards.
 ///
+/// It is *not* treated as an absent reader for grading, and the difference is
+/// the whole reason this returns a `Result`. `Err` and `Ok(None)` used to be
+/// the same `None`, and [`flat_fidelity`] reads `None` as "this provider never
+/// had a structured reader, so nothing here is entitled to claim it lost
+/// anything" — the benign [`Fidelity::ConversationOnly`] baseline. Applied to a
+/// Codex rollout the reader choked on, that baseline is a claim nobody checked:
+/// a sealed compaction the flat projection is about to delete would be graded
+/// as an intact conversation. A provider that *has* a structured reader and
+/// whose structured reader failed knows less about the file than one that never
+/// had one, and the grade has to say so.
+///
 /// # Why the only skip here is the source's own capability
 ///
 /// [`Provider::supports_structured_read`] is asked first so that the nineteen
@@ -1015,16 +1120,16 @@ but resume may fail until the CLI is installed.",
 /// session reports [`Fidelity::ConversationOnly`] instead: one saved parse
 /// bought with a grade that no longer describes the file. A faster wrong answer
 /// is not an optimization.
-fn read_source_ir(provider: &dyn Provider, path: &Path) -> Option<SessionIr> {
+fn read_source_ir(provider: &dyn Provider, path: &Path) -> Result<Option<SessionIr>, String> {
     if !provider.supports_structured_read() {
         debug!(
             provider = provider.slug(),
             "no structured reader; grading and writing on the flat track"
         );
-        return None;
+        return Ok(None);
     }
     match provider.read_session_ir(path) {
-        Ok(ir) => ir,
+        Ok(ir) => Ok(ir),
         Err(error) => {
             warn!(
                 provider = provider.slug(),
@@ -1032,7 +1137,12 @@ fn read_source_ir(provider: &dyn Provider, path: &Path) -> Option<SessionIr> {
                 %error,
                 "structured read failed; grading and writing on the flat track"
             );
-            None
+            Err(format!(
+                "The {} structured reader could not parse {}, so this conversion ran on the \
+                 flat projection without ever seeing the session's structure: {error}",
+                provider.slug(),
+                path.display(),
+            ))
         }
     }
 }
@@ -1061,9 +1171,17 @@ fn read_source_ir(provider: &dyn Provider, path: &Path) -> Option<SessionIr> {
 /// - **A grade the file does not support** — the comparator's independently
 ///   derived [`Fidelity`] is worse than the writer's claim. The bytes are fine,
 ///   so nothing is rolled back; the disagreement is surfaced as a warning
-///   naming both grades. The writer's grade is still the one reported, because
+///   naming both grades. The writer's grade is still the one *reported*, because
 ///   silently substituting the comparator's would hide the disagreement just as
-///   effectively as ignoring it.
+///   effectively as ignoring it — but the comparator's grade is returned
+///   alongside it, and [`ConversionResult::effective_fidelity`] is what any
+///   decision has to key on. Reporting the writer's number and then *acting* on
+///   it are different things: the launch refusal used to read the claim, so a
+///   writer that under-reported was launched over a hole the comparator had
+///   already proved was there. Since the structured writers derive their grade
+///   by folding their own loss list, a comparator grade worse than the claim is
+///   a writer whose loss list is incomplete; that is a defect to surface, not to
+///   resolve by picking a side.
 /// - **Unverifiable** — the target has a structured writer but no structured
 ///   reader, or the vendor of its sealed formats is unknown to this version. No
 ///   check was possible, so the conversion is not failed and the skip is stated
@@ -1086,22 +1204,28 @@ fn verify_structured_write(
     budget: &crate::budget::ContextBudget,
     written: &WrittenSession,
     claimed: Fidelity,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<Fidelity>), String> {
     let Some(path) = written.paths.first() else {
-        return Ok(vec![format!(
-            "Structured write to '{}' reported no output path, so it could not be verified.",
-            target.slug()
-        )]);
+        return Ok((
+            vec![format!(
+                "Structured write to '{}' reported no output path, so it could not be verified.",
+                target.slug()
+            )],
+            None,
+        ));
     };
 
     let target_ir = match target.read_session_ir(path) {
         Ok(Some(ir)) => ir,
         Ok(None) => {
-            return Ok(vec![format!(
-                "Wrote '{}' on the structured track but it has no structured reader, so the \
-                 result could not be verified.",
-                target.slug()
-            )]);
+            return Ok((
+                vec![format!(
+                    "Wrote '{}' on the structured track but it has no structured reader, so the \
+                     result could not be verified.",
+                    target.slug()
+                )],
+                None,
+            ));
         }
         Err(error) => {
             return Err(format!(
@@ -1115,11 +1239,14 @@ fn verify_structured_write(
     // and 109 of the 591 rollouts in the corpus were served by a gateway under
     // its own name.
     let Some(vendor) = crate::compare::vendor_of(target.slug()) else {
-        return Ok(vec![format!(
-            "Wrote '{}' on the structured track but this version does not know which vendor's \
-             sealed formats it can replay, so the result could not be verified.",
-            target.slug()
-        )]);
+        return Ok((
+            vec![format!(
+                "Wrote '{}' on the structured track but this version does not know which vendor's \
+                 sealed formats it can replay, so the result could not be verified.",
+                target.slug()
+            )],
+            None,
+        ));
     };
 
     let budgeted = budget.apply(source_ir.model_visible());
@@ -1166,7 +1293,7 @@ fn verify_structured_write(
             report.added_events
         ));
     }
-    Ok(warnings)
+    Ok((warnings, Some(observed)))
 }
 
 /// Grade a conversion that went through the flat [`CanonicalSession`]
@@ -1199,19 +1326,65 @@ fn verify_structured_write(
 /// drops to [`Fidelity::HistoryIncomplete`].
 ///
 /// Only a source with a structured reader can be checked this way. For the rest
-/// `ir` is `None` and the baseline stands — not because they lost nothing, but
-/// because nothing here is entitled to claim they did.
-fn flat_fidelity(ir: Option<&SessionIr>, target_slug: &str) -> (Fidelity, Vec<Loss>) {
+/// `ir` is `Ok(None)` and the baseline stands — not because they lost nothing,
+/// but because nothing here is entitled to claim they did.
+///
+/// `Err` is the third case, and it is not the second. The provider has a
+/// structured reader, it ran, and it failed: the baseline's claim that "every
+/// piece of the conversation is still present" is then not a modest reading of
+/// a plain format but an unchecked assertion about a file this build could not
+/// parse. Graded at the worst it could be, with the counts left at zero and the
+/// note saying plainly that nothing was measured — the grade is a floor on how
+/// bad this might be, not a finding.
+fn flat_fidelity(
+    ir: Result<Option<&SessionIr>, &str>,
+    target_slug: &str,
+) -> (Fidelity, Vec<Loss>) {
     let baseline = Fidelity::ConversationOnly;
 
-    let Some(ir) = ir else {
-        return (baseline, Vec::new());
+    let ir = match ir {
+        Ok(Some(ir)) => ir,
+        Ok(None) => return (baseline, Vec::new()),
+        Err(detail) => {
+            return (
+                baseline.worse_of(Fidelity::HistoryIncomplete),
+                vec![Loss {
+                    kind: LossKind::Conversation,
+                    events: 0,
+                    capsules: 0,
+                    bytes: 0,
+                    grade: Fidelity::HistoryIncomplete,
+                    note: format!(
+                        "{detail} Whether it held a sealed compaction the flat projection \
+                         deletes could not be determined, so this is graded as though it did.",
+                    ),
+                }],
+            );
+        }
     };
 
     let sealed: Vec<_> = ir
         .model_visible()
         .into_iter()
-        .filter(|event| matches!(event.body, Body::SealedContext { .. }))
+        .filter(|event| match &event.body {
+            // Enumerated rather than wildcarded: a new body that also carries
+            // conversation the flat projection cannot hold would otherwise be
+            // graded `ConversationOnly` by default, which is the exact silent
+            // degradation this function exists to catch.
+            Body::SealedContext { .. } => true,
+            Body::Message { .. }
+            | Body::Reasoning { .. }
+            | Body::ToolCall { .. }
+            | Body::ToolResult { .. }
+            | Body::Compaction { .. }
+            | Body::TurnConfig { .. }
+            | Body::EnvSnapshot { .. }
+            | Body::Attachment { .. }
+            | Body::Rollback { .. }
+            | Body::Abort {}
+            | Body::Control { .. }
+            | Body::Unknown { .. } => false,
+        })
         .flat_map(|event| event.capsules.iter())
         .collect();
     let Some(first) = sealed.first() else {
@@ -1276,38 +1449,95 @@ pub(crate) fn elide_middle(s: &str, max: usize) -> Option<String> {
     Some(format!("{head}\n…[casr: {omitted} chars elided]…\n{tail}"))
 }
 
+/// The tool ids that are already unpaired in `session`.
+///
+/// Taken before the budget runs, so that [`repair_tool_pairing`] can tell a pair
+/// *it* broke from one that arrived broken.
+fn unpaired_tool_ids(session: &CanonicalSession) -> HashSet<String> {
+    let result_ids: HashSet<&str> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_results.iter())
+        .filter_map(|tr| tr.call_id.as_deref())
+        .collect();
+    let call_ids: HashSet<&str> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .filter_map(|tc| tc.id.as_deref())
+        .collect();
+
+    let orphan_calls = call_ids.difference(&result_ids);
+    let orphan_results = result_ids.difference(&call_ids);
+    orphan_calls
+        .chain(orphan_results)
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
 /// Remove `tool_use` blocks that lack a matching `tool_result` (and vice
 /// versa), then drop messages left with no content and no tool payloads.
 ///
 /// The Anthropic API requires paired tool calls/results. After older turns are
 /// dropped by the token budget, previously-paired tool_use/tool_result entries
 /// can become orphaned; this function restores validity.
-fn repair_tool_pairing(session: &mut CanonicalSession) {
-    let result_ids: std::collections::HashSet<String> = session
+///
+/// # Why `already_unpaired` is a parameter and not a recomputation
+///
+/// Real sessions end mid-tool-call: the user quits while the agent is waiting
+/// for a command to return, and the last turn holds a call whose result never
+/// arrived. Repairing by pairing alone deleted that call — and then, because
+/// the message it lived in often has no text of its own, deleted the message —
+/// on every cross-provider conversion, including ones where the budget removed
+/// nothing at all. Nothing said so, and no [`Loss`] recorded it.
+///
+/// The ids that arrived unpaired are therefore left alone. They are already
+/// what the source says; carrying them across is a faithful conversion, and
+/// whether the target's API accepts a trailing unanswered call is the target
+/// writer's problem to state rather than this function's to solve by deletion.
+///
+/// Returns the number of calls and results that were genuinely severed by the
+/// budget, so the caller can report them.
+fn repair_tool_pairing(
+    session: &mut CanonicalSession,
+    already_unpaired: &HashSet<String>,
+) -> usize {
+    let result_ids: HashSet<String> = session
         .messages
         .iter()
         .flat_map(|m| m.tool_results.iter())
         .filter_map(|tr| tr.call_id.clone())
         .collect();
-    let call_ids: std::collections::HashSet<String> = session
+    let call_ids: HashSet<String> = session
         .messages
         .iter()
         .flat_map(|m| m.tool_calls.iter())
         .filter_map(|tc| tc.id.clone())
         .collect();
+
+    let mut severed = 0usize;
     for m in &mut session.messages {
         m.tool_calls.retain(|tc| match tc.id.as_deref() {
-            Some(id) => result_ids.contains(id),
+            Some(id) => {
+                let keep = result_ids.contains(id) || already_unpaired.contains(id);
+                severed += usize::from(!keep);
+                keep
+            }
             None => true,
         });
         m.tool_results.retain(|tr| match tr.call_id.as_deref() {
-            Some(id) => call_ids.contains(id),
+            Some(id) => {
+                let keep = call_ids.contains(id) || already_unpaired.contains(id);
+                severed += usize::from(!keep);
+                keep
+            }
             None => true,
         });
     }
     session.messages.retain(|m| {
         !(m.content.trim().is_empty() && m.tool_calls.is_empty() && m.tool_results.is_empty())
     });
+    severed
 }
 
 /// Fit a (cross-provider) session into a target-friendly context budget while
@@ -1317,44 +1547,91 @@ fn repair_tool_pairing(session: &mut CanonicalSession) {
 /// 3. Drop the oldest turns (excluding the first task message) if still over budget.
 /// 4. Repair orphaned tool_use/tool_result pairs that result from the dropping.
 ///
-/// Returns human-readable notes about what was elided — never silent.
+/// Returns human-readable notes about what was elided — never silent — and the
+/// [`Loss`] values behind them.
+///
+/// # Why the losses exist as well as the notes
+///
+/// Step 3 deletes turns. It said so in a warning and stopped there, so
+/// [`flat_fidelity`] never heard about it and a `--max-context-tokens`
+/// conversion that removed the middle of a conversation still reported
+/// [`Fidelity::ConversationOnly`] — a grade whose definition is "every piece of
+/// the conversation is still present". `--launch` read that grade and started
+/// the agent on a session with a hole in it. A warning is something a human may
+/// read; a grade is what the refusal acts on, and the two have to agree.
+///
+/// The vocabulary is the same one [`crate::budget`] files on the structured
+/// track, deliberately: eliding the middle of an observation leaves the event,
+/// its link and its outcome, so it grades [`Fidelity::ConversationOnly`];
+/// dropping a turn or severing a call from its result removes something the
+/// model was shown, so it grades [`Fidelity::HistoryIncomplete`].
 fn apply_context_budget(
     canonical: &mut CanonicalSession,
     max_tokens: usize,
     max_tool_output: usize,
     keep_reasoning: bool,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<Loss>) {
     let mut warnings = Vec::new();
+    let mut losses = Vec::new();
+
+    // Taken before anything is removed: an id that is already unpaired here is
+    // the source's own shape, not damage this function did.
+    let already_unpaired = unpaired_tool_ids(canonical);
 
     // 1. Drop source-agent reasoning traces (unusable by another agent).
     if !keep_reasoning {
         let before = canonical.messages.len();
-        canonical
-            .messages
-            .retain(|m| m.author.as_deref() != Some("reasoning"));
+        let mut bytes = 0usize;
+        canonical.messages.retain(|m| {
+            let is_reasoning = m.author.as_deref() == Some("reasoning");
+            if is_reasoning {
+                bytes += m.content.len();
+            }
+            !is_reasoning
+        });
         let dropped = before - canonical.messages.len();
         if dropped > 0 {
-            warnings.push(format!(
+            let note = format!(
                 "Dropped {dropped} source reasoning trace(s); pass --keep-reasoning to retain."
-            ));
+            );
+            warnings.push(note.clone());
+            losses.push(Loss {
+                kind: LossKind::Reasoning,
+                events: dropped,
+                capsules: 0,
+                bytes,
+                grade: Fidelity::ContextNoReasoning,
+                note,
+            });
         }
     }
 
     // 2. Truncate oversized tool observations (the dominant byte source).
     if max_tool_output > 0 {
         let mut truncated = 0usize;
+        let mut bytes = 0usize;
         for m in &mut canonical.messages {
             for tr in &mut m.tool_results {
                 if let Some(short) = elide_middle(&tr.content, max_tool_output) {
+                    bytes += tr.content.len().saturating_sub(short.len());
                     tr.content = short;
                     truncated += 1;
                 }
             }
         }
         if truncated > 0 {
-            warnings.push(format!(
+            let note = format!(
                 "Truncated {truncated} oversized tool result(s) to ~{max_tool_output} chars each."
-            ));
+            );
+            warnings.push(note.clone());
+            losses.push(Loss {
+                kind: LossKind::ToolProtocol,
+                events: truncated,
+                capsules: 0,
+                bytes,
+                grade: Fidelity::ConversationOnly,
+                note,
+            });
         }
     }
 
@@ -1376,22 +1653,50 @@ fn apply_context_budget(
             }
             if keep_from > 1 {
                 let dropped = keep_from - 1;
+                let bytes: usize = canonical.messages[1..keep_from]
+                    .iter()
+                    .map(|m| m.content.len())
+                    .sum();
                 let tail = canonical.messages.split_off(keep_from);
                 canonical.messages.truncate(1);
                 canonical.messages.extend(tail);
-                warnings.push(format!(
+                let note = format!(
                     "Context budget (~{max_tokens} tokens) exceeded; dropped {dropped} older \
 turn(s) between the task and the most recent history."
-                ));
+                );
+                warnings.push(note.clone());
+                losses.push(Loss {
+                    kind: LossKind::Conversation,
+                    events: dropped,
+                    capsules: 0,
+                    bytes,
+                    grade: Fidelity::HistoryIncomplete,
+                    note,
+                });
             }
         }
     }
 
     // 4. Re-pair tool calls/results and drop now-empty messages.
-    repair_tool_pairing(canonical);
+    let severed = repair_tool_pairing(canonical, &already_unpaired);
+    if severed > 0 {
+        let note = format!(
+            "Dropped {severed} tool call(s)/result(s) whose other half was removed by the \
+             context budget."
+        );
+        warnings.push(note.clone());
+        losses.push(Loss {
+            kind: LossKind::ToolProtocol,
+            events: severed,
+            capsules: 0,
+            bytes: 0,
+            grade: Fidelity::HistoryIncomplete,
+            note,
+        });
+    }
     reindex_messages(&mut canonical.messages);
 
-    warnings
+    (warnings, losses)
 }
 
 /// Coarse role bucket used for read-back verification.
@@ -1451,65 +1756,68 @@ fn readback_mismatch_detail(
     None
 }
 
+/// Remove a file that may already be gone.
+fn remove_if_present(path: &Path, provider_slug: &str, what: &str) -> Result<(), CasrError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CasrError::SessionWriteError {
+            path: path.to_path_buf(),
+            provider: provider_slug.to_string(),
+            detail: format!("{what}: {error}"),
+        }),
+    }
+}
+
+/// Undo a write that failed verification: take back every file it produced and
+/// put back every file it displaced.
+///
+/// # Why the pairing is carried rather than assumed
+///
+/// This used to restore [`WrittenSession::backups`]' single predecessor —
+/// a bare `backup_path` — onto `paths[0]`, which assumed the one backup a write
+/// took was a backup *of its first output*. Cline breaks that assumption
+/// completely: its only backup is of `state/taskHistory.json`, the shared task
+/// index, while `paths[0]` is `api_conversation_history.json`. The rollback
+/// therefore deleted the new API history, moved the old global index into its
+/// place, left the modified index installed, and reported that it had succeeded
+/// — three files wrong, no error. Kiro broke it more quietly: it writes two or
+/// three files under `--force` and could only ever hand back the first one's
+/// backup, so a rollback left the others' predecessors sitting in `.bak` files
+/// nothing would ever restore.
+///
+/// Each [`Displaced`] now names the file it restores, so neither provider has to
+/// be special-cased and a future multi-file writer cannot reintroduce either
+/// shape.
 fn rollback_written_session(
     provider_slug: &str,
     written: &WrittenSession,
 ) -> Result<(), CasrError> {
-    let target_path = written.paths.first().cloned();
-    if let Some(path) = &target_path
-        && let Some(backup_path) = &written.backup_path
-    {
+    // Outputs first. A displaced file may also be one of them (the ordinary
+    // `--force` case, where the write replaced the very file it backed up), and
+    // removing after restoring would delete what was just put back.
+    for path in &written.paths {
+        remove_if_present(path, provider_slug, "failed to remove unverified output")?;
+    }
+
+    for displaced in &written.backups {
         warn!(
-            backup = %backup_path.display(),
-            target = %path.display(),
+            backup = %displaced.backup.display(),
+            target = %displaced.target.display(),
             "restoring backup after verification failure"
         );
-
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CasrError::SessionWriteError {
-                    path: path.clone(),
-                    provider: provider_slug.to_string(),
-                    detail: format!("failed to remove unverified output before restore: {error}"),
-                });
+        remove_if_present(
+            &displaced.target,
+            provider_slug,
+            "failed to remove unverified output before restore",
+        )?;
+        std::fs::rename(&displaced.backup, &displaced.target).map_err(|error| {
+            CasrError::SessionWriteError {
+                path: displaced.target.clone(),
+                provider: provider_slug.to_string(),
+                detail: format!("failed to restore backup: {error}"),
             }
-        }
-
-        std::fs::rename(backup_path, path).map_err(|error| CasrError::SessionWriteError {
-            path: path.clone(),
-            provider: provider_slug.to_string(),
-            detail: format!("failed to restore backup: {error}"),
         })?;
-    }
-
-    for (index, path) in written.paths.iter().enumerate() {
-        if index == 0 && written.backup_path.is_some() {
-            continue;
-        }
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(CasrError::SessionWriteError {
-                    path: path.clone(),
-                    provider: provider_slug.to_string(),
-                    detail: format!("failed to remove unverified output: {error}"),
-                });
-            }
-        }
-    }
-
-    if target_path.is_none() && written.backup_path.is_some() {
-        return Err(CasrError::SessionWriteError {
-            path: written
-                .backup_path
-                .clone()
-                .expect("checked backup_path is_some"),
-            provider: provider_slug.to_string(),
-            detail: "backup path present but no written target path was recorded".to_string(),
-        });
     }
 
     Ok(())
@@ -1528,6 +1836,22 @@ pub struct AtomicWriteOutcome {
     pub temp_path: PathBuf,
     /// Path to the `.bak` backup of a pre-existing file (if `--force` was used).
     pub backup_path: Option<PathBuf>,
+}
+
+impl AtomicWriteOutcome {
+    /// What this write displaced, if it displaced anything.
+    ///
+    /// The pair every caller needs and none of them should have to assemble:
+    /// a writer that produces several files has several of these, and only the
+    /// call that made each one knows which target its backup belongs to.
+    pub fn displaced(&self) -> Option<crate::providers::Displaced> {
+        self.backup_path
+            .as_ref()
+            .map(|backup| crate::providers::Displaced {
+                target: self.target_path.clone(),
+                backup: backup.clone(),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -1572,6 +1896,30 @@ fn maybe_inject_atomic_write_failure(stage: AtomicWriteFailStage) -> std::io::Re
 /// Returns `AtomicWriteOutcome` on success, or:
 /// - [`CasrError::SessionConflict`] if target exists and `force` is false.
 /// - [`CasrError::SessionWriteError`] on I/O failures.
+///
+/// # Why the original is never unlinked
+///
+/// A forced write used to begin by renaming the target out of the way, onto a
+/// name chosen by testing each candidate for existence. Two things fell out of
+/// that, and both destroy the file this program exists to protect:
+///
+/// - **The name was chosen, then used.** Two forced conversions aimed at one
+///   target both saw no `session.jsonl.bak` and both picked it. The first
+///   installed its output; the second renamed *that* over the backup. The
+///   original was gone, and the only copy of it had been overwritten by a file
+///   that was still on disk anyway.
+/// - **The target stopped existing.** Between the two renames there is no file
+///   at the path the agent reads. A crash, a full disk, or a signal in that
+///   window leaves the session missing rather than merely stale.
+///
+/// So the order is inverted: the new content is written and fsynced *first*,
+/// then the original is preserved by [`preserve_original`] without being
+/// unlinked — a hard link, whose failure with `AlreadyExists` is itself the
+/// name reservation, so two writers cannot agree on one backup name. Only then
+/// does one `rename` replace the target, which is atomic: readers see the old
+/// file or the new one and never neither. The directory is fsynced afterwards
+/// so the replacement survives the crash the temp file's own `sync_all` was
+/// already guarding against.
 pub fn atomic_write(
     target_path: &Path,
     content: &[u8],
@@ -1589,38 +1937,15 @@ pub fn atomic_write(
         })?;
     }
 
-    // 2. Check for existing target.
-    let backup_path = if target_path.exists() {
-        if !force {
-            return Err(CasrError::SessionConflict {
-                session_id: String::new(),
-                existing_path: target_path.to_path_buf(),
-            });
-        }
-        // Create backup with deterministic de-dupe.
-        let bak = find_backup_path(target_path);
-        debug!(
-            target = %target_path.display(),
-            backup = %bak.display(),
-            "backing up existing file"
-        );
-        #[cfg(test)]
-        maybe_inject_atomic_write_failure(AtomicWriteFailStage::BackupRename).map_err(|e| {
-            CasrError::SessionWriteError {
-                path: target_path.to_path_buf(),
-                provider: provider_slug.to_string(),
-                detail: format!("failed to create backup: {e}"),
-            }
-        })?;
-        std::fs::rename(target_path, &bak).map_err(|e| CasrError::SessionWriteError {
-            path: target_path.to_path_buf(),
-            provider: provider_slug.to_string(),
-            detail: format!("failed to create backup: {e}"),
-        })?;
-        Some(bak)
-    } else {
-        None
-    };
+    // 2. Refuse an existing target unless forced. Nothing is moved here: the
+    //    check is a check, and the file stays where the agent can read it.
+    let displaces_existing = target_path.exists();
+    if displaces_existing && !force {
+        return Err(CasrError::SessionConflict {
+            session_id: String::new(),
+            existing_path: target_path.to_path_buf(),
+        });
+    }
 
     // 3. Write to temp file in the same directory.
     let temp_name = format!(".casr-tmp-{}", uuid::Uuid::new_v4().as_hyphenated());
@@ -1646,17 +1971,9 @@ pub fn atomic_write(
     })();
 
     if let Err(e) = write_result {
-        // Cleanup temp file on write failure.
+        // The target was never touched, so cleaning up the temp file is the
+        // whole of the recovery.
         let _ = std::fs::remove_file(&temp_path);
-        // Restore backup if we made one.
-        if let Some(ref bak) = backup_path {
-            warn!(
-                backup = %bak.display(),
-                target = %target_path.display(),
-                "restoring backup after write failure"
-            );
-            let _ = std::fs::rename(bak, target_path);
-        }
         return Err(CasrError::SessionWriteError {
             path: target_path.to_path_buf(),
             provider: provider_slug.to_string(),
@@ -1664,17 +1981,52 @@ pub fn atomic_write(
         });
     }
 
-    // 4. Atomic rename temp -> target.
-    #[cfg(test)]
-    if let Err(e) = maybe_inject_atomic_write_failure(AtomicWriteFailStage::FinalRename) {
+    // 4. Preserve the original alongside itself, without unlinking it.
+    let backup_path = if displaces_existing {
+        let reserved = (|| -> std::io::Result<Option<PathBuf>> {
+            #[cfg(test)]
+            maybe_inject_atomic_write_failure(AtomicWriteFailStage::BackupRename)?;
+            preserve_original(target_path)
+        })();
+        match reserved {
+            Ok(bak) => {
+                if let Some(bak) = &bak {
+                    debug!(
+                        target = %target_path.display(),
+                        backup = %bak.display(),
+                        "preserved existing file"
+                    );
+                }
+                bak
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(CasrError::SessionWriteError {
+                    path: target_path.to_path_buf(),
+                    provider: provider_slug.to_string(),
+                    detail: format!("failed to create backup: {e}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // 5. One rename installs the new content. The target held the old file
+    //    until this instant and holds the new one after it.
+    let rename_result = (|| -> std::io::Result<()> {
+        #[cfg(test)]
+        maybe_inject_atomic_write_failure(AtomicWriteFailStage::FinalRename)?;
+        std::fs::rename(&temp_path, target_path)
+    })();
+
+    if let Err(e) = rename_result {
         let _ = std::fs::remove_file(&temp_path);
+        // The backup is a second name for the file still at `target_path`, so
+        // dropping that name is the undo — and leaving it behind would strand a
+        // `.bak` for a write that never happened.
         if let Some(ref bak) = backup_path {
-            warn!(
-                backup = %bak.display(),
-                target = %target_path.display(),
-                "restoring backup after rename failure"
-            );
-            let _ = std::fs::rename(bak, target_path);
+            let _ = std::fs::remove_file(bak);
         }
         return Err(CasrError::SessionWriteError {
             path: target_path.to_path_buf(),
@@ -1683,21 +2035,11 @@ pub fn atomic_write(
         });
     }
 
-    if let Err(e) = std::fs::rename(&temp_path, target_path) {
-        let _ = std::fs::remove_file(&temp_path);
-        if let Some(ref bak) = backup_path {
-            warn!(
-                backup = %bak.display(),
-                target = %target_path.display(),
-                "restoring backup after rename failure"
-            );
-            let _ = std::fs::rename(bak, target_path);
-        }
-        return Err(CasrError::SessionWriteError {
-            path: target_path.to_path_buf(),
-            provider: provider_slug.to_string(),
-            detail: format!("failed to rename temp file to target: {e}"),
-        });
+    // 6. Make the replacement itself durable. `sync_all` on the temp file
+    //    persisted the bytes; the rename that gave them the target's name lives
+    //    in the directory.
+    if let Some(parent) = target_path.parent() {
+        let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
     }
 
     info!(target = %target_path.display(), "atomic write complete");
@@ -1732,26 +2074,82 @@ pub fn restore_backup(outcome: &AtomicWriteOutcome, provider_slug: &str) -> Resu
     Ok(())
 }
 
-/// Find an available backup path, deduplicating with `.bak`, `.bak.1`, `.bak.2`, etc.
-fn find_backup_path(target: &Path) -> PathBuf {
-    let mut filename = target.file_name().unwrap_or_default().to_os_string();
-    filename.push(".bak");
-    let bak = target.with_file_name(&filename);
-    if !bak.exists() {
-        return bak;
-    }
-    for i in 1..100 {
-        let mut numbered = filename.clone();
-        numbered.push(format!(".{i}"));
-        let numbered_path = target.with_file_name(numbered);
-        if !numbered_path.exists() {
-            return numbered_path;
+/// The backup names for `target`, in the order they are tried: `.bak`, then
+/// `.bak.1` … `.bak.99`, then one with a random suffix that cannot collide.
+fn backup_candidates(target: &Path) -> impl Iterator<Item = PathBuf> + use<'_> {
+    let mut base = target.file_name().unwrap_or_default().to_os_string();
+    base.push(".bak");
+    (0..=100).map(move |i| {
+        let mut name = base.clone();
+        match i {
+            0 => {}
+            100 => name.push(format!(".{}", uuid::Uuid::new_v4().as_hyphenated())),
+            n => name.push(format!(".{n}")),
+        }
+        target.with_file_name(name)
+    })
+}
+
+/// Give `target`'s current contents a second name, without taking away the one
+/// they already have.
+///
+/// Returns the name that was taken, or `None` if `target` disappeared before it
+/// could be preserved — which is not a failure to write, only a race with
+/// something else deleting a file we were about to replace anyway.
+///
+/// # Why a link rather than a rename or a copy
+///
+/// The reservation has to be atomic or it is not a reservation: "does this name
+/// exist yet" answered before the name is used is a question two concurrent
+/// forced conversions both answer `no`. `link(2)` fails with `EEXIST` instead,
+/// so *taking* the name and *checking* it are one operation and the loser simply
+/// moves to the next candidate. It is also O(1) — the largest rollout in the
+/// corpus is 281 MiB — and it leaves the original in place, so there is no
+/// window in which the session has no file.
+///
+/// A copy is the fallback for filesystems with no hard links, where the name is
+/// reserved by an exclusive create instead. It is slower and it can be
+/// interrupted, but an interrupted copy loses only the backup: the original is
+/// still at `target`, because nothing has moved it.
+fn preserve_original(target: &Path) -> std::io::Result<Option<PathBuf>> {
+    use std::io::ErrorKind;
+
+    let mut links_unsupported = false;
+    for candidate in backup_candidates(target) {
+        if !links_unsupported {
+            match std::fs::hard_link(target, &candidate) {
+                Ok(()) => return Ok(Some(candidate)),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+                // EPERM/EMLINK/EXDEV and friends: this filesystem will not link.
+                Err(_) => links_unsupported = true,
+            }
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        match std::fs::copy(target, &candidate) {
+            Ok(_) => return Ok(Some(candidate)),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&candidate);
+                return Ok(None);
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&candidate);
+                return Err(error);
+            }
         }
     }
-    // Fallback: use random suffix.
-    let mut random = filename;
-    random.push(format!(".{}", uuid::Uuid::new_v4().as_hyphenated()));
-    target.with_file_name(random)
+    Err(std::io::Error::other(format!(
+        "no free backup name for {}",
+        target.display()
+    )))
 }
 
 #[cfg(test)]
@@ -2101,7 +2499,7 @@ mod tests {
         let task = budget_msg(MessageRole::User, "task");
         let mut s = budget_session(vec![task, call, tool, reasoning]);
 
-        let warns = apply_context_budget(&mut s, 0, 4000, false);
+        let (warns, _) = apply_context_budget(&mut s, 0, 4000, false);
 
         // Reasoning was dropped.
         assert!(
@@ -2150,7 +2548,7 @@ mod tests {
         let before = msgs.len();
         let mut s = budget_session(msgs);
 
-        let warns = apply_context_budget(&mut s, 2000, 0, true);
+        let (warns, _) = apply_context_budget(&mut s, 2000, 0, true);
 
         assert!(s.messages.len() < before, "older turns should be dropped");
         assert_eq!(
@@ -2179,20 +2577,65 @@ mod tests {
             name: "X".into(),
             arguments: serde_json::Value::Null,
         });
-        // No matching tool_result — the tool call is already orphaned.
+        // No matching tool_result — the tool call arrived orphaned, which is
+        // what a session that ended mid-command looks like. It is the source's
+        // own shape and nothing here removed anything, so nothing here may
+        // delete it: the previous behaviour dropped the call and then the whole
+        // turn, on every conversion, with no warning and no `Loss`.
         let mut s = budget_session(vec![budget_msg(MessageRole::User, "hi"), call]);
 
-        apply_context_budget(&mut s, 0, 0, true);
+        let (warnings, losses) = apply_context_budget(&mut s, 0, 0, true);
 
-        // Orphaned tool_use removed; now-empty assistant turn also dropped.
-        assert!(
-            s.messages.iter().all(|m| m.tool_calls.is_empty()),
-            "orphaned tool_use should be stripped"
-        );
         assert_eq!(
             s.messages.len(),
+            2,
+            "a turn the budget did not touch must survive it"
+        );
+        assert_eq!(
+            s.messages[1].tool_calls.len(),
             1,
-            "empty assistant turn should be dropped"
+            "a call that was never answered is not damage to repair"
+        );
+        assert!(warnings.is_empty(), "nothing happened: {warnings:?}");
+        assert!(losses.is_empty(), "nothing happened: {losses:?}");
+    }
+
+    #[test]
+    fn budget_reports_the_pairs_it_severs() {
+        use crate::model::{ToolCall, ToolResult};
+
+        let mut call = budget_msg(MessageRole::Assistant, &"word ".repeat(2000));
+        call.tool_calls.push(ToolCall {
+            id: Some("paired".into()),
+            name: "X".into(),
+            arguments: serde_json::Value::Null,
+        });
+        let mut answer = budget_msg(MessageRole::Tool, "ok");
+        answer.tool_results.push(ToolResult {
+            call_id: Some("paired".into()),
+            content: "ok".into(),
+            is_error: false,
+        });
+        let mut s = budget_session(vec![
+            budget_msg(MessageRole::User, "the original task"),
+            call,
+            answer,
+            budget_msg(MessageRole::User, "and now this"),
+        ]);
+
+        // Small enough to drop the expensive call, large enough to keep the
+        // cheap result that answered it.
+        let (_warnings, losses) = apply_context_budget(&mut s, 300, 0, true);
+
+        assert!(
+            losses.iter().any(|loss| loss.kind == LossKind::Conversation
+                && loss.grade == Fidelity::HistoryIncomplete),
+            "a dropped turn is a hole in the conversation: {losses:?}"
+        );
+        assert!(
+            losses.iter().any(|loss| loss.kind == LossKind::ToolProtocol
+                && loss.grade == Fidelity::HistoryIncomplete),
+            "and severing its result from it is a second one: {losses:?}"
         );
     }
 }

@@ -119,12 +119,28 @@ impl LaunchSpec {
     /// for the launch to reach that session, and for several providers it does
     /// not. Substring rather than equality because providers embed the id in
     /// a path (`pi --session ~/.pi/sessions/<id>.jsonl`) or a URL.
+    ///
+    /// # What this can and cannot establish
+    ///
+    /// It reads `self.args`, so it is only as true as the argv it is given. A
+    /// spec built by a provider from its own values is structural and this is a
+    /// faithful reading of it. A spec recovered by [`Self::from_command_line`]
+    /// is not: the string it split may already have lost a word boundary, and
+    /// no rule over the resulting words can recover one — `pi --session /tmp/Pi
+    /// Home/sessions/<id>.jsonl` re-renders to itself, so the corruption is
+    /// invisible from here. That is why Pi-Agent, the one provider whose resume
+    /// form interpolates a path, builds its argv directly instead. A provider
+    /// that interpolates any value that could contain whitespace must do the
+    /// same; `launch_spec_test` pins that a value needing quotes never yields a
+    /// *false* targeting claim, which is the failure that matters.
+    ///
+    /// An empty `session_id` never targets. Every argument contains the empty
+    /// string, so the plain reading would have reported every provider in the
+    /// registry as pointed at a session that does not exist.
     pub fn targeting_session(mut self, session_id: &str) -> Self {
-        self.targets = self
-            .args
-            .iter()
-            .any(|arg| arg.contains(session_id))
-            .then(|| session_id.to_string());
+        self.targets = (!session_id.is_empty()
+            && self.args.iter().any(|arg| arg.contains(session_id)))
+        .then(|| session_id.to_string());
         self
     }
 

@@ -567,7 +567,7 @@ impl Provider for Aider {
             paths: vec![virtual_path],
             session_id: target_session_id.clone(),
             resume_command: self.resume_command(&target_session_id),
-            backup_path: outcome.backup_path,
+            backups: outcome.displaced().into_iter().collect(),
             warnings: Vec::new(),
         })
     }

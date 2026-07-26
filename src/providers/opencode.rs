@@ -674,7 +674,7 @@ impl Provider for OpenCode {
             paths: vec![virtual_path],
             session_id: target_session_id.clone(),
             resume_command: self.resume_command(&target_session_id),
-            backup_path: None,
+            backups: Vec::new(),
             warnings: Vec::new(),
         })
     }

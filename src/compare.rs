@@ -63,13 +63,31 @@
 //! writer is deliberately louder than its source — the `[converted by casr]`
 //! marker that stands where a dropped sealed compaction used to be — and a hole
 //! that announces itself is the behaviour the corpus tests demand.
+//!
+//! # Order and attachment are part of what is conserved
+//!
+//! Conservation is not a bag count. Two things a multiset cannot see are things
+//! a replay depends on, so both are matched positionally instead:
+//!
+//! - **Order.** `[tool_call A, tool_result A]` written back as
+//!   `[tool_result A, tool_call A]` has every shape, every text and every
+//!   capsule the source had, and is a session Anthropic rejects outright. Source
+//!   events are matched to target events in order, so an inversion leaves an
+//!   event with no counterpart and is reported.
+//! - **Attachment.** A sealed blob is bound to the event it was minted for: an
+//!   Anthropic signature belongs to *its* thinking block. So a same-vendor
+//!   capsule is looked for on the target event its own event matched, not
+//!   anywhere in the file. A *foreign* capsule is the opposite question — it may
+//!   not be anywhere in the file at all — so that one stays global.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{Block, Body, CapsuleFit, CapsuleKind, Event, Fidelity, Loss, LossKind, SessionIr};
+use crate::ir::{
+    Block, Body, CapsuleFit, CapsuleKind, Event, Fidelity, Loss, LossKind, SessionIr, ToolInput,
+};
 
 // ---------------------------------------------------------------------------
 // Vendors
@@ -228,27 +246,50 @@ pub fn compare_replays(src: &[&Event], tgt: &[&Event], target_vendor: &str) -> C
         ..Comparison::default()
     };
 
-    // Three multisets of what the target holds, drawn down as the source is
-    // walked. What is left over at the end is what the target added.
-    let mut shapes = counted(tgt.iter().map(|event| shape(event)));
+    // What the target holds, drawn down as the source is walked. What is left
+    // over at the end is what the target added.
+    //
+    // Shapes are a *queue of positions* per shape rather than a plain count,
+    // because order is part of what a conversion has to conserve and a multiset
+    // cannot see it. `[tool_call A, tool_result A]` written as
+    // `[tool_result A, tool_call A]` holds the same shapes, the same texts, the
+    // same capsule count and invents nothing — and is a session Anthropic
+    // rejects and Codex pairs against a call it has not reached yet. Matching in
+    // order costs one `VecDeque` and makes the inversion a finding.
+    let mut shapes = queued(tgt.iter().map(|event| shape(event)));
     let mut texts = counted(tgt.iter().flat_map(|event| substance(event)));
+    // Every sealed blob anywhere in the target: what a *foreign* capsule must
+    // not be found in, wherever the writer put it.
     let mut sealed = counted(
         tgt.iter()
             .flat_map(|event| event.capsules.iter())
             .map(|capsule| digest(&capsule.sealed)),
     );
+    // And the same blobs indexed by the event carrying them: what a
+    // *same-vendor* capsule has to be found on. A thinking signature under a
+    // different thinking block, or an `encrypted_content` under a different
+    // reasoning item, is not the session that went in — the vendor binds the
+    // blob to the event, and the aggregate count cannot tell the two apart.
+    let mut sealed_per_event: Vec<HashMap<u64, usize>> = tgt
+        .iter()
+        .map(|event| counted(event.capsules.iter().map(|capsule| digest(&capsule.sealed))))
+        .collect();
 
-    // Pass one: which source events have no counterpart at all. Events that do
-    // have one spend their text, so a later missing event cannot be explained
+    // Pass one: which source events have a counterpart, and where. Events that
+    // do have one spend their text, so a later missing event cannot be explained
     // by content that is already accounted for.
-    let mut missing = vec![false; src.len()];
+    //
+    // `next` only ever moves forward, so a counterpart that sits before an
+    // already-matched one is no counterpart: the target reordered it.
+    let mut matched: Vec<Option<usize>> = vec![None; src.len()];
+    let mut next = 0usize;
     for (index, event) in src.iter().enumerate() {
-        if take(&mut shapes, shape(event)) {
+        if let Some(position) = take_after(&mut shapes, shape(event), next) {
+            matched[index] = Some(position);
+            next = position + 1;
             for text in substance(event) {
                 take(&mut texts, text);
             }
-        } else {
-            missing[index] = true;
         }
     }
 
@@ -261,12 +302,30 @@ pub fn compare_replays(src: &[&Event], tgt: &[&Event], target_vendor: &str) -> C
         let mut seen: Vec<(Bucket, LossKind)> = Vec::new();
 
         for capsule in &event.capsules {
-            let crossed = take(&mut sealed, digest(&capsule.sealed));
+            let key = digest(&capsule.sealed);
             let bytes = capsule.sealed.len();
-            match (capsule.fits(target_vendor), crossed) {
+            let fit = capsule.fits(target_vendor);
+            // A same-vendor blob is looked for on the event it belongs to, and a
+            // foreign one anywhere at all. Each direction asks the strictest
+            // question it can answer: the first is "did the target keep this
+            // where the vendor requires it", the second is "did any of this
+            // reach a provider that must reject it".
+            let crossed = match fit {
+                CapsuleFit::SameVendor => match matched[index] {
+                    Some(position) => take(&mut sealed_per_event[position], key),
+                    // No counterpart to be attached to; fall back to the file as
+                    // a whole rather than call a reshaped event's surviving blob
+                    // a loss.
+                    None => take(&mut sealed, key),
+                },
+                CapsuleFit::ForeignVendor => take(&mut sealed, key),
+            };
+            match (fit, crossed) {
                 // The ordinary same-agent case: the bytes are where they were.
                 (CapsuleFit::SameVendor, true) => {}
-                // The target speaks this format and the blob is gone anyway.
+                // The target speaks this format and the blob is not on the event
+                // it was sealed for — missing outright, or moved somewhere it
+                // cannot be replayed from.
                 (CapsuleFit::SameVendor, false) => hit(
                     &mut tallies,
                     &mut seen,
@@ -296,41 +355,50 @@ pub fn compare_replays(src: &[&Event], tgt: &[&Event], target_vendor: &str) -> C
             }
         }
 
-        if !missing[index] {
+        if matched[index].is_some() {
             continue;
         }
         let content = substance(event);
 
         // The event existed to carry material bound to a vendor this target is
         // not, and it went with it. Its capsules are already counted above;
-        // counting the disappearance again would report one loss as two.
+        // counting the disappearance again would report one loss as two. The
+        // writers drop the whole event rather than leave an empty husk that
+        // costs context window while telling the model its own thinking was
+        // truncated.
         //
-        // Reasoning and sealed context qualify whatever they hold: both are
-        // documented as droppable across a vendor boundary, and the writers drop
-        // the whole event rather than leave an empty husk that costs context
-        // window while telling the model its own thinking was truncated. Any
-        // other body qualifies only if it had no readable content of its own to
-        // lose — a message whose text vanished alongside a foreign capsule has
-        // lost the text too, and that is not predicted by anything.
+        // Readable substance is never covered by this. `Capsule::fits` predicts
+        // what happens to *sealed bytes*; it predicts nothing about a sentence.
+        // A Claude `thinking` block holding plaintext and an Anthropic signature,
+        // dropped whole by the Codex writer, lost a sentence the model read and
+        // that Codex could have carried in its `summary` — so it falls through
+        // and is classified like any other missing content, `degraded` if the
+        // words turn up elsewhere and `unexplained` if they do not. This clause
+        // used to name [`Body::Reasoning`] alongside `SealedContext` and skip it
+        // whatever it held, which is how that sentence went missing with
+        // `is_clean()` still true.
+        //
+        // [`Body::SealedContext`] stays, and is the one body that can: its
+        // content *is* the capsule by construction, and the fields left around
+        // it are the provider's own identifier and metadata rather than
+        // anything the model read. `substance` cannot tell that — it has no
+        // model of which part of an arbitrary body is content, so it serialises
+        // the whole thing — and reporting those fields as deleted conversation
+        // would file one predicted capsule loss twice.
         if !event.capsules.is_empty()
             && event
                 .capsules
                 .iter()
                 .all(|capsule| capsule.fits(target_vendor) == CapsuleFit::ForeignVendor)
-            && (content.is_empty()
-                || matches!(
-                    &event.body,
-                    Body::Reasoning { .. } | Body::SealedContext { .. }
-                ))
+            && (content.is_empty() || matches!(&event.body, Body::SealedContext { .. }))
         {
             continue;
         }
 
-        // The event holds nothing. A tool that printed no output leaves a result
-        // whose only block is the empty string; a reasoning step that has lost
-        // both its text and its blob is a husk. Neither can have deleted
-        // anything the model reads, because neither contained anything. The
-        // writers drop them, and there is no loss here to report.
+        // Nothing sealed, nothing readable: a tool that printed no output
+        // leaves a result whose only block is the empty string, and a reasoning
+        // step with neither text nor blob is a husk. Neither can have deleted
+        // anything the model reads, because neither contained anything.
         if content.is_empty() && event.capsules.is_empty() {
             continue;
         }
@@ -473,12 +541,37 @@ fn entry_kind(tallies: &mut Vec<(CapsuleKind, Tally)>, kind: CapsuleKind) -> &mu
 /// [`Fidelity::HistoryIncomplete`]: a `developer` message that arrived as a
 /// `user` message still says what it said, and a message that did not arrive is
 /// a hole the resumed session will not know about.
+///
+/// NO WILDCARD ARM over [`LossKind`], and every variant is spelled out against
+/// both values of `content_survived`. The arms this replaced were
+/// `_ if content_survived => ConversationOnly, _ => HistoryIncomplete`, which is
+/// the shape that hid the [`LossKind::Reasoning`] case below: a variant added to
+/// the vocabulary would have been graded by whichever default it fell into,
+/// silently, in the one function whose whole job is to say how bad a loss is.
 fn grade_of(kind: LossKind, content_survived: bool) -> Fidelity {
-    match kind {
-        LossKind::SealedContext | LossKind::Conversation => Fidelity::HistoryIncomplete,
-        LossKind::Reasoning => Fidelity::ContextNoReasoning,
-        _ if content_survived => Fidelity::ConversationOnly,
-        _ => Fidelity::HistoryIncomplete,
+    match (kind, content_survived) {
+        // Conversation that is not there. There is no reshaped version of an
+        // absent message, so the flag cannot make this better.
+        (LossKind::SealedContext | LossKind::Conversation, _) => Fidelity::HistoryIncomplete,
+        // Readable reasoning that arrived in another shape — Claude's `thinking`
+        // string folded into Codex's `summary`, or the reverse written as
+        // assistant text — has not lost reasoning. It has lost the *thinking
+        // block*, which is a structural downgrade like any other. Both writers
+        // already grade their own reshape `ConversationOnly`; grading it
+        // `ContextNoReasoning` here made the comparator disagree with them in
+        // the one direction `cross` was not checking.
+        (LossKind::Reasoning, true) => Fidelity::ConversationOnly,
+        (LossKind::Reasoning, false) => Fidelity::ContextNoReasoning,
+        // A role folded, a tool protocol downgraded, an image that lost its
+        // declared type: the shape changed and the content did not.
+        (LossKind::Media | LossKind::ToolProtocol | LossKind::Metadata, true) => {
+            Fidelity::ConversationOnly
+        }
+        // The same three with the content gone. A hole the resumed session will
+        // not know about.
+        (LossKind::Media | LossKind::ToolProtocol | LossKind::Metadata, false) => {
+            Fidelity::HistoryIncomplete
+        }
     }
 }
 
@@ -503,8 +596,9 @@ fn render(bucket: Bucket, kind: LossKind, tally: Tally, target_vendor: &str) -> 
         ),
         Bucket::Unexplained => format!(
             "{events} event(s) and {capsules} capsule(s) totalling {bytes} bytes are in the \
-             source and not in the written {target_vendor} session, and nothing predicted the \
-             loss. That is a bug in the writer, not a property of the crossing."
+             source and not where the written {target_vendor} session put them — missing \
+             outright, or attached to some other event — and nothing predicted the loss. That \
+             is a bug in the writer, not a property of the crossing."
         ),
     };
     Loss {
@@ -536,19 +630,40 @@ fn shape(event: &Event) -> u64 {
 
 /// The part of an event a downgrade may reshape but must never delete.
 ///
-/// Text, wherever the body keeps it, and tool calls by name. A `developer`
-/// message folded to `user`, a freeform call rewritten as JSON arguments, a
-/// thinking string that arrives in Codex's `summary` because Codex reasoning
-/// has no `text` field — all three are legitimate crossings and all three
-/// change the shape. What none of them is allowed to do is drop what the model
-/// reads.
+/// Text wherever the body keeps it, and a tool call by name *and by what it was
+/// invoked with*. A `developer` message folded to `user`, a freeform call
+/// rewritten as JSON arguments, a thinking string that arrives in Codex's
+/// `summary` because Codex reasoning has no `text` field — all three are
+/// legitimate crossings and all three change the shape. What none of them is
+/// allowed to do is drop what the model reads, and a call's arguments are as
+/// much a part of that as its name.
 fn substance(event: &Event) -> Vec<u64> {
     let blocks = match &event.body {
         Body::Message { blocks, .. } => blocks,
         Body::ToolResult { output, .. } => output,
-        // Arguments are the part that gets rewritten; the identity of the call
-        // is the part that cannot go missing without orphaning its result.
-        Body::ToolCall { name, .. } => return vec![digest(&format!("call:{name}"))],
+        // The identity of the call plus what it was actually invoked with.
+        //
+        // The name alone was not enough. `shell {"command": "rm -rf /"}` written
+        // as `shell {}` reduced to `call:shell` on both sides, so total deletion
+        // of a call's arguments read as a benign protocol reshape and graded
+        // `ConversationOnly`. The name still has to be here — it is what cannot
+        // go missing without orphaning the result — but the arguments are the
+        // part the model chose and a target that drops them has deleted content.
+        //
+        // Only the *representation* change is normalised away, and only the one
+        // the writers really perform: see [`tool_arguments`].
+        Body::ToolCall { name, input, .. } => {
+            let mut keys = vec![digest(&format!("call:{name}"))];
+            let mut values = Vec::new();
+            json_leaves(&tool_arguments(input), &mut values);
+            keys.extend(
+                values
+                    .iter()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| digest(value)),
+            );
+            return keys;
+        }
         // The two vendors disagree on which field readable reasoning lives in,
         // so both are one pool.
         Body::Reasoning { text, summary } => {
@@ -565,9 +680,19 @@ fn substance(event: &Event) -> Vec<u64> {
         // purpose — "I cannot tell what would have been lost" must never be
         // filed as "there was nothing to lose". `Body::Unknown` is the case that
         // makes this necessary and a variant added tomorrow is the case that
-        // makes it matter.
-        other => {
-            return vec![digest(&serde_json::to_string(other).unwrap_or_default())];
+        // makes it matter — which is why they are named here rather than caught
+        // by a `_`, so that adding one does not silently join this list.
+        Body::Compaction { .. }
+        | Body::SealedContext { .. }
+        | Body::TurnConfig { .. }
+        | Body::EnvSnapshot { .. }
+        | Body::Attachment { .. }
+        | Body::Rollback { .. }
+        | Body::Abort { .. }
+        | Body::Control { .. }
+        | Body::Unknown { .. } => {
+            let json = serde_json::to_string(&event.body).unwrap_or_default();
+            return vec![digest(&json)];
         }
     };
     blocks
@@ -576,6 +701,61 @@ fn substance(event: &Event) -> Vec<u64> {
         .filter(|payload| !payload.trim().is_empty())
         .map(|payload| digest(&payload))
         .collect()
+}
+
+/// A tool call's arguments, with the representation change the writers really
+/// perform normalised away and nothing else.
+///
+/// Exactly one reshape is supported and it is the one both writers do. Claude
+/// Code has a single calling convention, so `super::claude_code::coerce_tool_input`
+/// writes a freeform `ls -la` as `{"value": "ls -la"}` — or, when the freeform
+/// text is itself a JSON object, as that object. Codex has both conventions and
+/// writes each back as itself. Parsing the freeform text when it parses, and
+/// comparing *values* rather than keys, makes those crossings equal while
+/// leaving a deleted argument unequal.
+///
+/// [`ToolInput::Json`] with a `Null` value and an `original` is what
+/// [`crate::ir::ToolInput::from_json_field`] produces for arguments the provider
+/// wrote as a string that is not JSON. The string is the arguments in that case,
+/// so it is what gets compared.
+fn tool_arguments(input: &ToolInput) -> serde_json::Value {
+    let text_or_json = |text: &str| {
+        serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+    };
+    match input {
+        ToolInput::Freeform { text } => text_or_json(text),
+        ToolInput::Json {
+            value: serde_json::Value::Null,
+            original: Some(text),
+        } => text_or_json(text),
+        ToolInput::Json { value, .. } => value.clone(),
+    }
+}
+
+/// Every scalar in a JSON value, keys excluded.
+///
+/// Keys are the part a supported reshape is allowed to rename — `{"value": …}`
+/// is what a freeform call becomes crossing into Claude Code — and the values
+/// are the part that is the call. Enumerated rather than defaulted, though
+/// [`serde_json::Value`] is not one of the four enums the crate forbids a
+/// wildcard over.
+fn json_leaves(value: &serde_json::Value, into: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Null => {}
+        serde_json::Value::Bool(flag) => into.push(flag.to_string()),
+        serde_json::Value::Number(number) => into.push(number.to_string()),
+        serde_json::Value::String(text) => into.push(text.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                json_leaves(item, into);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values() {
+                json_leaves(item, into);
+            }
+        }
+    }
 }
 
 /// A block's content, without the wrapper that says what kind of block it is.
@@ -630,8 +810,22 @@ fn loss_kind(event: &Event, content_survived: bool) -> LossKind {
         // hiding behind `Metadata` with the severity carried only by the grade
         // — a consumer filtering on `kind` would walk straight past it.
         Body::Message { .. } if !content_survived => LossKind::Conversation,
-        // Chrome, per-turn scaffolding, and messages that only changed shape.
-        _ => LossKind::Metadata,
+        // A message that only changed shape: the role folded and the words
+        // arrived. Named here rather than left to a `_`, so the arm below can be
+        // what it says it is.
+        Body::Message { .. } => LossKind::Metadata,
+        // Chrome and per-turn scaffolding. NO WILDCARD ARM over [`Body`]: a
+        // variant added later has to be classified by whoever adds it, not
+        // filed under the vocabulary's blandest label by a default. The same
+        // list, for the same reason, as `budget::Dropped::record`.
+        Body::Compaction { .. }
+        | Body::TurnConfig { .. }
+        | Body::EnvSnapshot { .. }
+        | Body::Attachment { .. }
+        | Body::Rollback { .. }
+        | Body::Abort { .. }
+        | Body::Control { .. }
+        | Body::Unknown { .. } => LossKind::Metadata,
     }
 }
 
@@ -660,6 +854,30 @@ fn counted(values: impl Iterator<Item = u64>) -> HashMap<u64, usize> {
         *counts.entry(value).or_insert(0) += 1;
     }
     counts
+}
+
+/// The positions each key occupies in the target, oldest first.
+fn queued(values: impl Iterator<Item = u64>) -> HashMap<u64, VecDeque<usize>> {
+    let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
+    for (position, value) in values.enumerate() {
+        queues.entry(value).or_default().push_back(position);
+    }
+    queues
+}
+
+/// Spend the earliest occurrence of `key` at or after `from`. `None` when the
+/// target has none left there.
+///
+/// Positions before `from` are discarded rather than skipped: `from` only ever
+/// moves forward, so an occurrence a later source event could not use is one no
+/// source event can use. That is what makes a target which holds every shape in
+/// the wrong order report a missing event instead of a clean conversion.
+fn take_after(queues: &mut HashMap<u64, VecDeque<usize>>, key: u64, from: usize) -> Option<usize> {
+    let queue = queues.get_mut(&key)?;
+    while queue.front().is_some_and(|position| *position < from) {
+        queue.pop_front();
+    }
+    queue.pop_front()
 }
 
 /// Spend one occurrence of `key`. `false` when there was none left.
@@ -1003,6 +1221,224 @@ mod tests {
 
         assert_eq!(report.source_events, 1, "the marker is not content");
         assert!(report.is_clean());
+    }
+
+    // -----------------------------------------------------------------------
+    // Repro tests for the review findings. Each fails on the pre-fix tree.
+    // -----------------------------------------------------------------------
+
+    fn call(id: &str, call_id: &str, name: &str, input: ToolInput) -> Event {
+        event(
+            id,
+            Body::ToolCall {
+                call_id: call_id.into(),
+                name: name.into(),
+                namespace: None,
+                input,
+            },
+        )
+    }
+
+    fn tool_result(id: &str, call_id: &str, text: &str) -> Event {
+        event(
+            id,
+            Body::ToolResult {
+                call_id: call_id.into(),
+                outcome: crate::ir::ToolOutcome::Unknown,
+                output: vec![Block::Text { text: text.into() }],
+                structured: None,
+            },
+        )
+    }
+
+    /// F1. Same-agent, same events, opposite order.
+    #[test]
+    fn f1_reordering_a_replay_is_not_a_clean_conversion() {
+        let source = ir(
+            "codex",
+            vec![
+                call(
+                    "c",
+                    "call-1",
+                    "shell",
+                    ToolInput::Freeform { text: "ls".into() },
+                ),
+                tool_result("r", "call-1", "output"),
+            ],
+        );
+        let target = ir(
+            "codex",
+            vec![
+                tool_result("r", "call-1", "output"),
+                call(
+                    "c",
+                    "call-1",
+                    "shell",
+                    ToolInput::Freeform { text: "ls".into() },
+                ),
+            ],
+        );
+
+        let report = compare(&source, &target, "openai");
+
+        assert!(
+            !report.is_clean() || !report.degraded.is_empty(),
+            "a result written before the call it answers is not replayable, and a comparator \
+             that reports it clean cannot be the oracle same-agent conservation rests on"
+        );
+    }
+
+    /// F1. Same-agent, same capsule bytes, attached to the wrong event.
+    #[test]
+    fn f1_a_capsule_reattached_to_another_event_is_not_conserved() {
+        let mut first = event(
+            "r1",
+            Body::Reasoning {
+                text: None,
+                summary: vec!["one".into()],
+            },
+        );
+        first.capsules.push(Capsule {
+            kind: CapsuleKind::OpenaiReasoningEncryptedContent,
+            bound: CapsuleBinding {
+                provider: "openai".into(),
+                model: None,
+            },
+            sealed: "SEALED".into(),
+        });
+        let second = event(
+            "r2",
+            Body::Reasoning {
+                text: None,
+                summary: vec!["two".into()],
+            },
+        );
+        let source = ir("codex", vec![first.clone(), second.clone()]);
+
+        // The writer moved the blob onto the *other* reasoning event. Every
+        // aggregate survives: two events, one capsule, same bytes.
+        let mut moved_first = first.clone();
+        moved_first.capsules.clear();
+        let mut moved_second = second.clone();
+        moved_second.capsules = first.capsules.clone();
+        let target = ir("codex", vec![moved_first, moved_second]);
+
+        let report = compare(&source, &target, "openai");
+
+        assert!(
+            !report.is_clean(),
+            "an OpenAI reasoning blob replayed under a different reasoning item is not the \
+             session that went in"
+        );
+    }
+
+    /// F2. A reasoning event with readable words and a foreign capsule, dropped
+    /// whole. `fits()` predicted the capsule. It predicted nothing about the
+    /// words.
+    #[test]
+    fn f2_dropping_readable_reasoning_is_not_explained_by_its_capsule() {
+        let mut thinking = event(
+            "t",
+            Body::Reasoning {
+                text: Some("I should read the file first".into()),
+                summary: Vec::new(),
+            },
+        );
+        thinking.capsules.push(Capsule {
+            kind: CapsuleKind::AnthropicThinkingSignature,
+            bound: CapsuleBinding {
+                provider: "anthropic".into(),
+                model: None,
+            },
+            sealed: "SIG".into(),
+        });
+        let source = ir(
+            "claude-code",
+            vec![message("a", Role::User, "hi"), thinking],
+        );
+        // The Codex writer dropped the whole event, words and all.
+        let target = ir("codex", vec![message("a", Role::User, "hi")]);
+
+        let report = compare(&source, &target, "openai");
+
+        assert!(
+            !report.is_clean(),
+            "the signature could not cross; the sentence the model read could have, and \
+             nothing predicted its removal: {report:?}"
+        );
+    }
+
+    /// F4. Same tool, same protocol reshape, no arguments left.
+    #[test]
+    fn f4_deleting_a_tool_calls_arguments_is_not_a_protocol_downgrade() {
+        let source = ir(
+            "codex",
+            vec![call(
+                "c",
+                "call-1",
+                "shell",
+                ToolInput::Freeform {
+                    text: "rm -rf /important".into(),
+                },
+            )],
+        );
+        let target = ir(
+            "claude-code",
+            vec![call(
+                "c",
+                "call-1",
+                "shell",
+                ToolInput::Json {
+                    value: serde_json::json!({}),
+                    original: None,
+                },
+            )],
+        );
+
+        let report = compare(&source, &target, "anthropic");
+
+        assert!(
+            !report.is_clean(),
+            "the call arrived with nothing to call it with; that is deleted content, not a \
+             reshaped one: {report:?}"
+        );
+    }
+
+    /// F4, the other side: the reshape the writers really perform must stay
+    /// clean, or the check above would just be noise.
+    #[test]
+    fn f4_the_supported_freeform_to_json_reshape_stays_degraded() {
+        let source = ir(
+            "codex",
+            vec![call(
+                "c",
+                "call-1",
+                "shell",
+                ToolInput::Freeform {
+                    text: "ls -la".into(),
+                },
+            )],
+        );
+        // Exactly what `claude_code::coerce_tool_input` produces for text that
+        // is not itself a JSON object.
+        let target = ir(
+            "claude-code",
+            vec![call(
+                "c",
+                "call-1",
+                "shell",
+                ToolInput::Json {
+                    value: serde_json::json!({"value": "ls -la"}),
+                    original: None,
+                },
+            )],
+        );
+
+        let report = compare(&source, &target, "anthropic");
+
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(report.degraded.len(), 1);
+        assert_eq!(report.degraded[0].kind, LossKind::ToolProtocol);
     }
 
     #[test]

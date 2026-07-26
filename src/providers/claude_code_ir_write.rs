@@ -118,6 +118,9 @@ pub fn render(
         dropped_history: 0,
         history_bytes: 0,
         downgraded_calls: 0,
+        rewritten_arguments: 0,
+        foreign_seals: 0,
+        foreign_seal_bytes: 0,
         recast_roles: 0,
         dropped_empty: 0,
         reshaped_reasoning: 0,
@@ -416,6 +419,9 @@ struct Writer {
     dropped_history: usize,
     history_bytes: usize,
     downgraded_calls: usize,
+    rewritten_arguments: usize,
+    foreign_seals: usize,
+    foreign_seal_bytes: usize,
     recast_roles: usize,
     dropped_empty: usize,
     reshaped_reasoning: usize,
@@ -498,6 +504,33 @@ impl Writer {
             ),
         );
         push(
+            LossKind::Reasoning,
+            self.foreign_seals,
+            self.foreign_seals,
+            self.foreign_seal_bytes,
+            Fidelity::ContextNoReasoning,
+            format!(
+                "{} unrecognised block(s) totalling {} bytes carried a sealed Anthropic \
+                 field from another agent. Written back they would read as signatures \
+                 Anthropic never issued and must reject, so they were dropped rather than \
+                 re-labelled.",
+                self.foreign_seals, self.foreign_seal_bytes
+            ),
+        );
+        push(
+            LossKind::ToolProtocol,
+            self.rewritten_arguments,
+            0,
+            0,
+            Fidelity::ConversationOnly,
+            format!(
+                "{} tool call(s) arrived with the exact argument text their provider wrote; \
+                 Claude Code records `tool_use.input` as an object, so the parsed arguments \
+                 were written and the original text was not.",
+                self.rewritten_arguments
+            ),
+        );
+        push(
             LossKind::Metadata,
             self.recast_roles,
             0,
@@ -547,12 +580,32 @@ impl Writer {
                     // Claude Code has two record types. Everything else — 4,870
                     // Codex `developer` messages among them — becomes a user
                     // record, which is a genuine loss of the operator/harness
-                    // distinction rather than a rename.
-                    _ => {
+                    // distinction rather than a rename. Enumerated rather than
+                    // wildcarded so a role added to the IR has to be decided
+                    // here rather than silently folded.
+                    Role::System | Role::Developer | Role::Tool | Role::Other(_) => {
                         self.recast_roles += 1;
                         Side::User
                     }
                 };
+                // Claude Code has no field for sealed material on a message,
+                // and a message can carry some: 4,638 Codex `agent_message`s in
+                // the local corpus hold an `encrypted_content` block beside
+                // their text, and `codex_ir` files those on
+                // `Event::capsules`. This arm used to write the text and never
+                // look at the capsules, so the seal went with no counter and no
+                // `Loss` and the conversion still graded itself complete.
+                //
+                // `keeps` grades the ones the vendor boundary already forbids.
+                // A capsule it *would* allow has nowhere to go here either, so
+                // it is counted too rather than dropped in silence — the point
+                // is that every capsule is accounted for exactly once.
+                for capsule in &event.capsules {
+                    if self.keeps(capsule, false) {
+                        self.dropped_reasoning += 1;
+                        self.reasoning_bytes += capsule.sealed.len();
+                    }
+                }
                 let blocks = self.content(blocks);
                 if blocks.is_empty() {
                     // A Codex `agent_message` can be nothing but sealed
@@ -581,9 +634,9 @@ impl Writer {
                     .capsules
                     .iter()
                     .find(|capsule| self.keeps(capsule, false))
-                    .map(|capsule| capsule.sealed.clone());
+                    .map(|capsule| (capsule.kind, capsule.sealed.clone()));
 
-                let Some(sealed) = sealed else {
+                let Some((kind, sealed)) = sealed else {
                     return self.reshape_reasoning(text.as_deref(), summary);
                 };
 
@@ -594,10 +647,48 @@ impl Writer {
                     }
                     thinking.push_str(&summary.join("\n\n"));
                 }
+                // Same vendor is not the same *field*. `thinking.signature` and
+                // `redacted_thinking.data` are both Anthropic-sealed and both
+                // pass `keeps`, and writing the second into the first hands
+                // Anthropic a signature it never issued — while the round trip
+                // reads the capsule back as the other kind with the loss list
+                // empty and the grade still `ContextComplete`. Absent from the
+                // local corpus (0 of 32,284 assistant records), which is why
+                // nothing caught it; the gate is the invariant, not a corpus
+                // finding.
+                let (blocks, is_text) = match kind {
+                    // A redacted block has no `thinking` field to put words in.
+                    // The reader that mints this kind leaves both `text` and
+                    // `summary` empty, so there are none — but if a future one
+                    // does not, they go beside the block as assistant text
+                    // rather than on the floor.
+                    CapsuleKind::AnthropicRedactedThinking => {
+                        let mut blocks = vec![json!({"type": "redacted_thinking", "data": sealed})];
+                        let readable = !thinking.trim().is_empty();
+                        if readable {
+                            self.reshaped_reasoning += 1;
+                            blocks.push(json!({"type": "text", "text": thinking}));
+                        }
+                        (blocks, readable)
+                    }
+                    CapsuleKind::AnthropicThinkingSignature => (
+                        vec![json!({"type": "thinking", "thinking": thinking, "signature": sealed})],
+                        false,
+                    ),
+                    // `keeps` returns true only for `CapsuleFit::SameVendor`, so
+                    // an OpenAI capsule never reaches here. Enumerated anyway:
+                    // the alternative is a `_` arm that would quietly write the
+                    // next Anthropic kind into whichever field happened to be
+                    // listed first.
+                    CapsuleKind::OpenaiReasoningEncryptedContent
+                    | CapsuleKind::OpenaiCompactedContext => {
+                        return self.reshape_reasoning(text.as_deref(), summary);
+                    }
+                };
                 Some(Part {
                     side: Side::Assistant,
-                    blocks: vec![json!({"type": "thinking", "thinking": thinking, "signature": sealed})],
-                    is_text: false,
+                    blocks,
+                    is_text,
                     provides: Vec::new(),
                     answers: None,
                 })
@@ -740,16 +831,33 @@ impl Writer {
 
     /// `tool_use.input`, which the Anthropic API requires to be an object.
     ///
+    /// All 15,607 `tool_use` blocks in the local Claude corpus carry an object,
+    /// and Codex writes `function_call.arguments` as a JSON *string*. Writing
+    /// [`ToolInput::Json::original`] back therefore produced a transcript
+    /// Claude's own API rejects — a schema failure at replay with nothing in the
+    /// loss list to predict it. The parsed arguments go in instead; the exact
+    /// text the source provider wrote has nowhere to live in an object field and
+    /// is counted rather than dropped in silence.
+    ///
     /// A freeform call's input is not required to be JSON at all, so it is
     /// wrapped rather than parsed. The text survives verbatim; the fact that it
     /// was freeform does not, because Claude Code has nowhere to record a second
     /// calling convention.
     fn tool_input(&mut self, input: &ToolInput) -> Value {
         match input {
-            ToolInput::Json { value, original } => match original {
-                Some(text) => json!(text),
-                None => value.clone(),
-            },
+            ToolInput::Json { value, original } => {
+                if original.is_some() {
+                    self.rewritten_arguments += 1;
+                }
+                match (value.is_object(), original) {
+                    (true, _) => value.clone(),
+                    // The arguments did not parse into an object. The text is
+                    // the only thing the model actually saw, so it is wrapped
+                    // the way the flat writer wraps a freeform call.
+                    (false, Some(text)) => super::claude_code::coerce_tool_input(&json!(text)),
+                    (false, None) => super::claude_code::coerce_tool_input(value),
+                }
+            }
             ToolInput::Freeform { text } => {
                 self.downgraded_calls += 1;
                 super::claude_code::coerce_tool_input(&json!(text))
@@ -758,9 +866,12 @@ impl Writer {
     }
 
     fn content(&mut self, blocks: &[Block]) -> Vec<Value> {
-        blocks
-            .iter()
-            .map(|block| match block {
+        let mut content = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            if self.is_foreign_seal(block) {
+                continue;
+            }
+            content.push(match block {
                 Block::Text { text } => json!({"type": "text", "text": text}),
                 Block::Image { url, media_type } => image_block(url, media_type.as_deref()),
                 Block::Document { data } => data.clone(),
@@ -772,8 +883,48 @@ impl Writer {
                     },
                 }),
                 Block::Unknown { raw, .. } => raw.clone(),
-            })
-            .collect()
+            });
+        }
+        content
+    }
+
+    /// Would writing this block mint an Anthropic-native *sealed* block out of
+    /// bytes no vendor gate ever saw?
+    ///
+    /// [`super::claude_code_ir`] turns a `thinking` block's `signature` and a
+    /// `redacted_thinking` block's `data` into capsules by the field they
+    /// arrived in, not by the vendor that minted them. So an unrecognised block
+    /// of either shape, written back verbatim, reads out the other side as an
+    /// Anthropic capsule — and Anthropic verifies signatures, so the resumed
+    /// session replays bytes its own provider must reject.
+    /// [`Event::capsules`] is the one door sealed material goes through and
+    /// [`Writer::keeps`] is the gate on it; a block is not a capsule.
+    ///
+    /// Same-agent is exempt: a Claude transcript's own thinking block really is
+    /// Anthropic's, and refusing it would delete content on the one path that
+    /// conserves everything.
+    ///
+    /// This is the `redacted_thinking` defect already fixed once in
+    /// [`crate::ir::CapsuleKind::AnthropicRedactedThinking`], stated as the
+    /// invariant rather than as the instance.
+    fn is_foreign_seal(&mut self, block: &Block) -> bool {
+        let Block::Unknown { raw, .. } = block else {
+            return false;
+        };
+        if self.same_agent {
+            return false;
+        }
+        let sealed = match raw.get("type").and_then(Value::as_str) {
+            Some("thinking") => raw.get("signature"),
+            Some("redacted_thinking") => raw.get("data"),
+            _ => None,
+        };
+        let Some(sealed) = sealed.and_then(Value::as_str) else {
+            return false;
+        };
+        self.foreign_seals += 1;
+        self.foreign_seal_bytes += sealed.len();
+        true
     }
 }
 

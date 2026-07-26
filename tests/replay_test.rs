@@ -18,7 +18,7 @@
 //!
 //! The corpus is only ever read. Nothing here writes to it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use casr::ir::{Body, SessionIr, Visibility};
@@ -472,4 +472,274 @@ fn model_visible_agrees_with_the_resolver() {
         return;
     }
     println!("model_visible() matches resolve() on {checked} sessions");
+}
+
+/// What a compaction marker looks like today, and why the fold's two
+/// compaction rules cost nothing on real sessions.
+///
+/// Three measurements in one pass, because they are three halves of the same
+/// claim — that the resolver now takes `Body::Compaction` at its word, and that
+/// doing so changes nothing about what any current session replays:
+///
+/// - Every compaction records its `context` in file order, so replaying it in
+///   the compaction's order rather than the file's is a no-op today. The old
+///   re-sort-by-file-position was therefore invisible while it quietly overruled
+///   the state assignment.
+/// - The whole plan comes out in file order, which is the same measurement seen
+///   from the other end: the removed sort had nothing to reorder.
+/// - Every marker is `Visibility::Model`, so exempting it from the visibility
+///   gate is likewise a no-op today. It matters for the reader that files its
+///   boundary as chrome, the way Codex files its rollbacks and aborts.
+///
+/// A failure here is not automatically a bug: a reader is *allowed* to record a
+/// context in an order of its own, and the replay follows the compaction. It
+/// means this measurement is stale and the ordering is now load-bearing. Do not
+/// "fix" it by sorting the replay again.
+#[test]
+#[ignore = "requires a local corpus; set AGSX_CODEX_CORPUS and AGSX_CLAUDE_CORPUS"]
+fn compactions_are_recorded_in_file_order_and_marked_model_visible() {
+    let mut compactions = 0usize;
+    let mut out_of_order = 0usize;
+    let mut not_model = 0usize;
+    let mut plans_out_of_order = 0usize;
+
+    let mut check = |path: &Path, ir: &SessionIr| {
+        let position: HashMap<&str, usize> = ir
+            .events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (event.id.as_str(), index))
+            .collect();
+        for event in &ir.events {
+            let Body::Compaction { context, .. } = &event.body else {
+                continue;
+            };
+            compactions += 1;
+            if event.visibility != Visibility::Model {
+                not_model += 1;
+                println!(
+                    "{}: {} is a compaction the reader marked {:?}",
+                    path.display(),
+                    event.id,
+                    event.visibility
+                );
+            }
+            let places: Vec<usize> = context
+                .iter()
+                .filter_map(|id| position.get(id.as_str()).copied())
+                .collect();
+            if places.windows(2).any(|pair| pair[0] > pair[1]) {
+                out_of_order += 1;
+                println!(
+                    "{}: {} lists context out of file order",
+                    path.display(),
+                    event.id
+                );
+            }
+        }
+
+        let replayed: Vec<usize> = resolve(ir)
+            .events
+            .iter()
+            .filter_map(|id| position.get(id.as_str()).copied())
+            .collect();
+        if replayed.windows(2).any(|pair| pair[0] > pair[1]) {
+            plans_out_of_order += 1;
+            println!("{}: the replay is not in file order", path.display());
+        }
+    };
+
+    for path in codex_corpus() {
+        if let Ok(ir) = codex_ir::read(&path) {
+            check(&path, &ir);
+        }
+    }
+    for path in claude_corpus() {
+        if let Ok(ir) = claude_code_ir::read(&path) {
+            check(&path, &ir);
+        }
+    }
+    if compactions == 0 {
+        return;
+    }
+
+    println!(
+        "{compactions} compactions: {out_of_order} not in file order, \
+         {not_model} not model-visible; {plans_out_of_order} plans not in file order"
+    );
+    assert_eq!(
+        out_of_order, 0,
+        "see this test's doc comment before changing it"
+    );
+    assert_eq!(
+        plans_out_of_order, 0,
+        "see this test's doc comment before changing it"
+    );
+    assert_eq!(
+        not_model, 0,
+        "a reader now files its compaction boundary as chrome; the fold reads \
+         the marker before the visibility gate, so verify that is intended"
+    );
+}
+
+/// The fork prune may never contradict the newest compaction.
+///
+/// `resolve` folds compaction as a state assignment: after the boundary, the
+/// model's context *is* `context`. `prune_forks` runs afterwards and is only a
+/// membership test over a DAG that compaction re-roots, so a leaf whose parent
+/// chain cannot reach the boundary is a fact about the graph, not a licence to
+/// delete the post-compaction session.
+#[test]
+#[ignore = "requires a local corpus; set AGSX_CODEX_CORPUS and AGSX_CLAUDE_CORPUS"]
+fn the_newest_checkpoint_context_is_never_pruned() {
+    let mut compacted = 0usize;
+    let mut pruned_sessions = 0usize;
+    let mut pruned_events = 0usize;
+
+    let mut check = |path: &Path, ir: &SessionIr| {
+        let plan = resolve(ir);
+        let Some(marker) = plan.checkpoints.last() else {
+            return;
+        };
+        compacted += 1;
+        let context: HashSet<&str> = ir
+            .events
+            .iter()
+            .find(|event| &event.id == marker)
+            .and_then(|event| match &event.body {
+                Body::Compaction { context, .. } => Some(context),
+                _ => None,
+            })
+            .map(|context| context.iter().map(String::as_str).collect())
+            .unwrap_or_default();
+        let lost = plan
+            .excluded
+            .iter()
+            .filter(|excluded| excluded.reason == ExclusionReason::AbandonedFork)
+            .filter(|excluded| context.contains(excluded.id.as_str()))
+            .count();
+        if lost > 0 {
+            pruned_sessions += 1;
+            pruned_events += lost;
+            println!(
+                "{}: the fork prune dropped {lost} of {} events the newest \
+                 compaction placed in the model's context",
+                path.display(),
+                context.len()
+            );
+        }
+    };
+
+    for path in codex_corpus() {
+        if let Ok(ir) = codex_ir::read(&path) {
+            check(&path, &ir);
+        }
+    }
+    for path in claude_corpus() {
+        if let Ok(ir) = claude_code_ir::read(&path) {
+            check(&path, &ir);
+        }
+    }
+    if compacted == 0 {
+        return;
+    }
+
+    println!("{compacted} compacted sessions, {pruned_sessions} with pruned checkpoint context");
+    assert_eq!(
+        pruned_events, 0,
+        "{pruned_events} events across {pruned_sessions} sessions were assigned \
+         to the model's context by a compaction and then removed by the fork \
+         prune"
+    );
+}
+
+/// The two transcripts whose replay size was measured by hand stay that size.
+///
+/// `55f695db` is the one that proved reaching the checkpoint *marker* has to
+/// count as reaching the checkpoint: its `compact_boundary` names a
+/// `logicalParentUuid` that is not in the file, and a walk recognising only
+/// context ids returned 9 events instead of 11. `2d68b149` is the one that
+/// proved the leaf's descendants belong in the replay: 1,311 with them, 1,309
+/// without. Both numbers were established by measurement rather than by
+/// argument, so they are pinned here rather than restated in a comment.
+#[test]
+#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+fn measured_transcripts_keep_their_replay_size() {
+    let Ok(root) = std::env::var("AGSX_CLAUDE_CORPUS") else {
+        eprintln!("AGSX_CLAUDE_CORPUS unset; skipping");
+        return;
+    };
+    let by_stem: HashMap<String, PathBuf> = walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|path| {
+            let stem = path.file_stem()?.to_str()?.to_string();
+            Some((stem, path))
+        })
+        .collect();
+
+    let mut checked = 0usize;
+    for prefix in [
+        "55f695db-fa1b-4d8d-9fc9-4bcf2c9fa892",
+        "2d68b149-3e63-489f-9785-0bdbcd139b0e",
+    ] {
+        let Some(path) = by_stem.get(prefix) else {
+            eprintln!("{prefix} not in this corpus; skipping");
+            continue;
+        };
+        let ir = claude_code_ir::read(path).expect("read");
+        let plan = resolve(&ir);
+        let replayed: HashSet<&str> = plan.events.iter().map(String::as_str).collect();
+
+        // The checkpoint-marker rule, stated as the property the 9-vs-11
+        // measurement was actually about: every id the newest checkpoint
+        // assigns has to survive into the replay. Without the rule the walk
+        // could not reach the marker on this transcript and dropped part of
+        // that context.
+        if let Some(newest) = plan.checkpoints.last() {
+            let context = ir
+                .events
+                .iter()
+                .find(|event| &event.id == newest)
+                .and_then(|event| match &event.body {
+                    Body::Compaction { context, .. } => Some(context.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            for id in &context {
+                assert!(
+                    replayed.contains(id.as_str()),
+                    "{}: checkpoint {newest} assigns {id}, which is not in the replay",
+                    path.display()
+                );
+            }
+        }
+
+        // The descendant walk, likewise: if the transcript has a live head,
+        // anything hanging below it is live and must be replayed.
+        if let Some(head) = ir.live_head.as_deref() {
+            for event in &ir.events {
+                if event.parent.as_deref() == Some(head) && replayed.contains(head) {
+                    assert!(
+                        replayed.contains(event.id.as_str()),
+                        "{}: {} descends from live head {head} and was pruned",
+                        path.display(),
+                        event.id
+                    );
+                }
+            }
+        }
+
+        println!("{prefix}: {} events replayed", plan.events.len());
+        checked += 1;
+    }
+    // Deliberately no absolute size assertion. Both transcripts are live
+    // sessions on the machine that runs this suite -- `55f695db` grew from 11
+    // replayed events to 18 while this very change was being written -- so
+    // pinning a count pins the afternoon, not the rule. The rules are pinned
+    // above as properties, which is what the original measurements established.
+    println!("{checked} measured transcripts still satisfy the rules measured on them");
 }

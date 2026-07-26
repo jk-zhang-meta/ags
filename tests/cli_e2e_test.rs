@@ -305,7 +305,7 @@ fn cli_list_json_is_valid_array() {
         parsed.is_object(),
         "list --json should be an envelope object"
     );
-    assert_eq!(parsed["schema_version"], 2);
+    assert_eq!(parsed["schema_version"], 3);
     let items = parsed["items"].as_array().expect("items should be array");
     assert!(!items.is_empty());
     let first = &items[0];
@@ -1803,12 +1803,29 @@ fn cli_launch_refusal_keeps_the_json_envelope_parseable() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("stdout must stay parseable JSON: {e}\nOutput: {stdout}"));
-    assert_eq!(parsed["ok"], true);
+    // `ok` follows the exit code. It used to be `true` on a run that exited
+    // non-zero, so a script reading only stdout was told a refused launch had
+    // succeeded; the reason for the refusal is in the envelope too, so nothing
+    // has to be recovered by parsing stderr.
+    assert_eq!(parsed["ok"], false);
+    assert!(
+        parsed["launch_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("refusing to launch")),
+        "the envelope has to carry why: {parsed}"
+    );
     assert_eq!(
         parsed["fidelity"], "history_incomplete",
         "the grade a script would gate on must be in the envelope"
     );
     assert!(parsed["written_paths"].as_array().is_some_and(|p| !p.is_empty()));
+    assert!(
+        parsed["losses"]
+            .as_array()
+            .is_some_and(|losses| losses.iter().any(|loss| loss["kind"] == "sealed_context"
+                && loss["capsules"].as_u64().is_some_and(|n| n > 0))),
+        "the counts behind the grade have to reach a machine consumer: {parsed}"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let error: serde_json::Value = serde_json::from_str(stderr.trim())
@@ -2076,4 +2093,137 @@ fn cli_resume_structured_track_without_flags_carries_everything() {
         .filter(|line| line.contains("response_item"))
         .count();
     assert!(lines > 1, "the whole replay crossed, {lines} events");
+}
+
+// ---------------------------------------------------------------------------
+// One invocation, one machine-readable answer
+// ---------------------------------------------------------------------------
+
+/// A launch that cannot even be prepared must not be reported as a success.
+///
+/// The envelope is printed before the launch is attempted, so the failure has to
+/// be decided before the printing. It was not: stdout said `{"ok": true}` and
+/// stderr said `{"ok": false}` for the same run.
+#[test]
+fn cli_json_launch_preparation_failure_is_one_coherent_object() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
+
+    let output = casr_cmd(&tmp)
+        .env("PATH", empty_path(&tmp))
+        .args([
+            "--json",
+            "resume",
+            "cc",
+            &session_id,
+            "--launch",
+            "--",
+            "--resume",
+            "a-different-session",
+        ])
+        .output()
+        .expect("launch should run");
+
+    assert!(!output.status.success(), "the run failed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be parseable JSON: {e}\nOutput: {stdout}"));
+    assert_eq!(
+        parsed["ok"], false,
+        "ok must follow the exit code, not the conversion alone: {parsed}"
+    );
+    assert!(
+        parsed["launch_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("already set by the resume command")),
+        "the reason belongs in the object that reports the failure: {parsed}"
+    );
+    // The conversion did happen, and its output is the part worth keeping.
+    assert!(
+        parsed["written_paths"]
+            .as_array()
+            .is_some_and(|paths| !paths.is_empty()),
+        "a launch that could not be prepared does not un-write the session: {parsed}"
+    );
+}
+
+/// A `--json` run that launches cleanly still says `ok: true`.
+#[test]
+fn cli_json_launch_dry_run_still_reports_success() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "resume", "cc", &session_id, "--launch-dry-run"])
+        .output()
+        .expect("launch dry run should run");
+
+    assert!(output.status.success(), "nothing blocked this launch");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is JSON");
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["launch_error"].is_null());
+    assert!(parsed["launch_command"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// Resuming a store record id
+// ---------------------------------------------------------------------------
+
+/// `resume <record-id>` says which session it actually converted.
+///
+/// A record id is ours; no provider has heard of it, so it is translated into a
+/// provider session before the pipeline runs. Nothing reported that: the store's
+/// own "I read something else" line only fires when the store disagrees with the
+/// pipeline, and by then the pipeline has already been handed the substituted
+/// session, so it agrees. The user named one identifier and a different one was
+/// converted, in silence.
+#[test]
+fn cli_resume_by_record_id_says_which_session_it_converted() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
+
+    // First conversion, with the store on, files this conversation as a record.
+    let first = casr_cmd(&tmp)
+        .args(["--json", "resume", "cc", &session_id])
+        .output()
+        .expect("first conversion");
+    assert!(
+        first.status.success(),
+        "seeding conversion failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let records_dir = tmp.path().join("xdg-data/agsx/records");
+    let record_id = fs::read_dir(&records_dir)
+        .unwrap_or_else(|e| panic!("store records at {}: {e}", records_dir.display()))
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().join("record.json").is_file())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .expect("the first conversion filed a record");
+    assert_ne!(
+        record_id, session_id,
+        "the record id is ours and is not any provider's session id"
+    );
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "resume", "cod", &record_id])
+        .output()
+        .expect("resume by record id");
+    assert!(
+        output.status.success(),
+        "resume by record id failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("stdout is JSON");
+    let warnings = parsed["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|w| {
+            let w = w.as_str().unwrap_or_default();
+            w.contains("session-store record id") && w.contains(&session_id)
+        }),
+        "the substitution has to be reported, naming what was converted: {parsed}"
+    );
 }

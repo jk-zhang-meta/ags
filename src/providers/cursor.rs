@@ -628,7 +628,7 @@ impl Provider for Cursor {
             paths: vec![virtual_path],
             session_id: target_composer_id.clone(),
             resume_command: self.resume_command(&target_composer_id),
-            backup_path: None,
+            backups: Vec::new(),
             warnings: Vec::new(),
         })
     }

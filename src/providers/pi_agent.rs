@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, normalize_role, parse_timestamp,
     reindex_messages, truncate_title,
@@ -53,6 +54,15 @@ impl PiAgent {
             .unwrap_or_default()
             .join(".pi")
             .join("agent")
+    }
+
+    /// Where a session with this id lives — the path the writer produces and
+    /// the path `pi --session` is pointed at, resolved once so the two cannot
+    /// disagree.
+    fn session_path(session_id: &str) -> PathBuf {
+        Self::home_dir()
+            .join("sessions")
+            .join(format!("{session_id}.jsonl"))
     }
 
     /// Sessions directory under the home dir.
@@ -570,19 +580,45 @@ impl Provider for PiAgent {
         );
 
         Ok(WrittenSession {
-            paths: vec![outcome.target_path],
+            paths: vec![outcome.target_path.clone()],
             session_id: session_id.clone(),
             resume_command: self.resume_command(&session_id),
-            backup_path: outcome.backup_path,
+            backups: outcome.displaced().into_iter().collect(),
             warnings: Vec::new(),
         })
     }
 
     fn resume_command(&self, session_id: &str) -> String {
-        let home = Self::home_dir();
-        let sessions_dir = home.join("sessions");
-        let session_path = sessions_dir.join(format!("{session_id}.jsonl"));
-        format!("pi --session {}", session_path.display())
+        // Display form only. Quoted, because it is the one resume form in the
+        // registry that interpolates a filesystem path, and an unquoted path is
+        // wrong the moment `PI_AGENT_HOME` contains a space — which is the
+        // default on macOS for anyone whose home directory has one.
+        let path = Self::session_path(session_id).display().to_string();
+        shlex::try_join(["pi", "--session", &path])
+            .unwrap_or_else(|_| format!("pi --session {path}"))
+    }
+
+    /// Built directly rather than recovered from [`Self::resume_command`].
+    ///
+    /// The trait default splits the rendered string back into words, which for
+    /// every other provider is exact and for this one was not: with
+    /// `PI_AGENT_HOME=/tmp/Pi Home` the rendering `pi --session /tmp/Pi
+    /// Home/sessions/<id>.jsonl` split into three arguments, so `pi` was handed
+    /// `/tmp/Pi` and opened nothing — while `targeting_session` found the id
+    /// inside the stray third word and reported the session as targeted. The
+    /// argv is the truth here, so it is what gets constructed; nothing is
+    /// rendered and re-parsed on the way.
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        Some(
+            LaunchSpec::new(
+                "pi",
+                [
+                    "--session".to_string(),
+                    Self::session_path(session_id).display().to_string(),
+                ],
+            )
+            .targeting_session(session_id),
+        )
     }
 }
 

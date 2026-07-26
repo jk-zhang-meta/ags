@@ -15,7 +15,11 @@ use crate::store::{Availability, OriginState};
 /// Current schema version for all JSON envelopes and per-record outputs.
 ///
 /// Bump this when adding/removing/renaming fields in any response struct.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// 3 added `losses`, `verified_fidelity` and `launch_error` to
+/// [`ResumeSuccess`], and made its `ok` false when a launch could not be
+/// prepared.
+pub const SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // `list --json`
@@ -136,6 +140,23 @@ pub struct ResumeSuccess {
     /// The one field a script needs to decide whether the converted session is
     /// safe to resume unattended.
     pub fidelity: Fidelity,
+    /// The grade an independent read-back of the written file supports.
+    ///
+    /// Present only when a structural verification actually ran, which is why
+    /// it is `null` rather than absent on the flat track: "the check agreed"
+    /// and "there was no check" are different answers and a script that has to
+    /// tell them apart cannot do it from a missing key. When this is worse than
+    /// `fidelity`, `fidelity` is the writer's claim and this is what the CLI
+    /// itself acted on.
+    pub verified_fidelity: Option<Fidelity>,
+    /// What the grade is made of: kind, counts, bytes and the sentence.
+    ///
+    /// A grade names a category and nothing else, so a machine consumer used to
+    /// get `"history_incomplete"` and no way to find out whether that was one
+    /// 40-byte capsule or four hundred deleted turns — the counts existed, they
+    /// were simply dropped on the way out. Empty when the conversion's grade is
+    /// its track's baseline.
+    pub losses: Vec<crate::ir::Loss>,
     /// The command `--launch` / `--launch-dry-run` resolved to, shell-quoted.
     ///
     /// `null` when no launch was asked for. Present under `--json` so the
@@ -148,6 +169,13 @@ pub struct ResumeSuccess {
     /// was written correctly, the agent simply will not be pointed at it.
     /// `null` when no launch was asked for, which is not the same as `false`.
     pub launch_targets_session: Option<bool>,
+    /// Why the launch could not be prepared, when one was asked for and failed.
+    ///
+    /// Its presence is exactly the condition under which `ok` is false. The
+    /// conversion itself still happened — `written_paths` is populated and
+    /// correct — which is why this is a field on the success envelope rather
+    /// than an error envelope that would have had to throw those paths away.
+    pub launch_error: Option<String>,
     pub warnings: Vec<String>,
     /// The session store read a session other than the one that was named.
     ///
@@ -325,8 +353,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn schema_version_is_2() {
-        assert_eq!(SCHEMA_VERSION, 2);
+    fn schema_version_is_3() {
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 
     // -----------------------------------------------------------------------
@@ -337,7 +365,7 @@ mod tests {
     fn list_envelope_empty_items_serializes() {
         let envelope = ListEnvelope::new(vec![]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert!(json["items"].as_array().unwrap().is_empty());
     }
 
@@ -366,10 +394,10 @@ mod tests {
         };
         let envelope = ListEnvelope::new(vec![item]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
         let first = &json["items"][0];
-        assert_eq!(first["schema_version"], 2);
+        assert_eq!(first["schema_version"], 3);
         assert_eq!(first["session_id"], "sid-1");
         assert_eq!(first["provider"], "claude-code");
         assert_eq!(first["native_name"], "Renamed Session");
@@ -403,7 +431,7 @@ mod tests {
             transcript_tail: None,
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["session_id"], "sid-info");
         assert_eq!(json["provider"], "codex");
         assert!(json["title"].is_null());
@@ -458,8 +486,11 @@ mod tests {
             resume_command: None,
             dry_run: true,
             fidelity: Fidelity::ConversationOnly,
+            verified_fidelity: None,
+            losses: vec![],
             launch_command: None,
             launch_targets_session: None,
+            launch_error: None,
             warnings: vec![],
             source_selection: None,
         };
@@ -487,8 +518,18 @@ mod tests {
             resume_command: Some("claude --resume sid-tgt".to_string()),
             dry_run: false,
             fidelity: Fidelity::HistoryIncomplete,
+            verified_fidelity: Some(Fidelity::HistoryIncomplete),
+            losses: vec![crate::ir::Loss {
+                kind: crate::ir::LossKind::SealedContext,
+                events: 1,
+                capsules: 1,
+                bytes: 87_000,
+                grade: Fidelity::HistoryIncomplete,
+                note: "one sealed capsule could not cross".to_string(),
+            }],
             launch_command: Some("claude --resume sid-tgt".to_string()),
             launch_targets_session: Some(true),
+            launch_error: None,
             warnings: vec!["missing workspace".to_string()],
             source_selection: None,
         };
@@ -500,6 +541,15 @@ mod tests {
         assert_eq!(json["resume_command"], "claude --resume sid-tgt");
         assert_eq!(json["warnings"][0], "missing workspace");
         assert_eq!(json["fidelity"], "history_incomplete");
+        assert_eq!(json["verified_fidelity"], "history_incomplete");
+        // The counts a machine consumer could not previously reach: a grade on
+        // its own cannot distinguish one 87 kB capsule from four hundred
+        // deleted turns.
+        assert_eq!(json["losses"][0]["kind"], "sealed_context");
+        assert_eq!(json["losses"][0]["capsules"], 1);
+        assert_eq!(json["losses"][0]["bytes"], 87_000);
+        assert_eq!(json["losses"][0]["grade"], "history_incomplete");
+        assert!(json["launch_error"].is_null());
         assert_eq!(json["launch_command"], "claude --resume sid-tgt");
         assert_eq!(json["launch_targets_session"], true);
     }

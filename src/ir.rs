@@ -131,6 +131,23 @@ impl SessionIr {
     /// The compaction marker itself is not replayable content, so it is
     /// omitted. It stays in `events` because later compactions supersede it in
     /// turn, and because the fidelity report needs its window ids.
+    ///
+    /// # The `filter_map` below is a known hole
+    ///
+    /// It silently drops any plan id that names no event, which is how a
+    /// lookup miss becomes an absence: a [`Body::Compaction`] whose `context`
+    /// names something this session does not contain supersedes the real
+    /// events, replays as an *empty* model context, and compares clean against
+    /// an empty file — [`Fidelity::ContextComplete`] for a conversion that
+    /// carried nothing.
+    ///
+    /// Latent: both readers build `context` out of ids they have already
+    /// emitted, 0 dangling across 4,831 corpus compactions. The repair belongs
+    /// in [`crate::replay::resolve`], which is the only place holding both
+    /// lists — but it cannot land alone, because `conformance::invariants`
+    /// detects exactly this by scanning the plan for ids absent from the
+    /// capture, and a resolver that stops emitting them silences the detector.
+    /// See `replay::tests::a_context_id_naming_nothing_is_reported_not_replayed`.
     pub fn model_visible(&self) -> Vec<&Event> {
         let by_id: std::collections::HashMap<&str, &Event> = self
             .events
@@ -458,14 +475,23 @@ impl Body {
     /// is silently skipped on every provider that files control records as
     /// chrome, which is exactly the 0-of-714 failure the typed variants exist to
     /// kill. Here, omitting it does not compile.
+    ///
+    /// [`Body::Compaction`] is one of these, and was the third directive the
+    /// list was missing. A marker is not model content — it is an instruction
+    /// *about* model content, and the fold reads it to replace the history
+    /// rather than to replay it. Both current readers file the marker
+    /// [`Visibility::Model`], so exempting it changed nothing on the corpus and
+    /// nothing said it was wrong; a provider that records its boundary the way
+    /// Codex records its other two directives — as chrome — would have had the
+    /// entire rewrite skipped by the gate and replayed the pre-compaction
+    /// history.
     pub fn is_history_directive(&self) -> bool {
         match self {
-            Body::Rollback { .. } | Body::Abort { .. } => true,
+            Body::Rollback { .. } | Body::Abort { .. } | Body::Compaction { .. } => true,
             Body::Message { .. }
             | Body::Reasoning { .. }
             | Body::ToolCall { .. }
             | Body::ToolResult { .. }
-            | Body::Compaction { .. }
             | Body::SealedContext { .. }
             | Body::TurnConfig { .. }
             | Body::EnvSnapshot { .. }
@@ -644,10 +670,21 @@ pub enum Block {
 
 impl Block {
     /// Plain-text projection, for the flat model and for search.
+    ///
+    /// Every variant is named. [`Block`] is not one of the four enums the
+    /// no-wildcard rule lists, but it is the level at which the rule was
+    /// learned: both readers used to `filter_map` unrecognised blocks away and
+    /// discarded 4,562 sealed blobs doing it, which is why [`Block::Unknown`]
+    /// exists at all. A wildcard here would let the next variant that *does*
+    /// carry text — and there will be one — drop out of the flat model and out
+    /// of search without a compile error to say so.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Block::Text { text } => Some(text),
-            _ => None,
+            Block::Image { .. }
+            | Block::Document { .. }
+            | Block::Redacted { .. }
+            | Block::Unknown { .. } => None,
         }
     }
 }
@@ -1131,6 +1168,50 @@ mod tests {
             visible,
             ["sum2"],
             "a superseded replacement must not survive its own compaction"
+        );
+    }
+
+    /// A compaction marker is a directive, so the visibility gate does not get
+    /// to skip it.
+    ///
+    /// Both readers file it [`Visibility::Model`] today, which is why this is a
+    /// unit test and not a corpus one: the marker is an instruction about model
+    /// content rather than model content, and a provider that recorded it as
+    /// chrome — the way Codex records its rollbacks and aborts — would have had
+    /// the whole rewrite skipped and the pre-compaction history replayed.
+    #[test]
+    fn a_compaction_marker_is_a_history_directive() {
+        assert!(
+            Body::Compaction {
+                context: Vec::new(),
+                supersedes: Vec::new(),
+                note: None,
+                window_from: None,
+                window_to: None,
+            }
+            .is_history_directive()
+        );
+
+        let mut ir = SessionIr::new("claude-code", "s1");
+        ir.events.push(message("old", "before"));
+        ir.events.push(message("summary", "condensed"));
+        ir.events.push(event(
+            "boundary",
+            Visibility::Ui,
+            Body::Compaction {
+                context: vec!["summary".into()],
+                supersedes: vec!["old".into()],
+                note: None,
+                window_from: None,
+                window_to: None,
+            },
+        ));
+
+        let visible: Vec<&str> = ir.model_visible().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            visible,
+            ["summary"],
+            "a marker the reader filed as chrome still rewrites the history"
         );
     }
 

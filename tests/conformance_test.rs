@@ -305,6 +305,20 @@ fn finish_hops(tier: &str, report: &HopReport) {
          the degenerate one where the intermediate is a lossy projection of the origin and \
          returning the origin is trivially correct"
     );
+    // The floor has to be a floor of something. `store_kept_work ==
+    // control_kept_work` is satisfied by `0 == 0`, which is the state where
+    // *neither* arm delivered the work that was appended — the exact failure
+    // this suite exists to detect, passing as agreement. So the control arm is
+    // required to have found the marker at least once before the two are
+    // compared. It found it in 13 of 13 fixture chains and 778 of 778 corpus
+    // chains, so this asserts a property that holds rather than one that might.
+    assert!(
+        appended.control_kept_work > 0,
+        "the {tier} tier's `--no-store` arm delivered the appended work in none of its {} \
+         chain(s), so the floor the store is held to is the empty one and the comparison below \
+         would pass on two zeroes",
+        appended.sessions
+    );
     assert_eq!(
         appended.store_kept_work, appended.control_kept_work,
         "the {tier} tier delivered the work appended to the intermediate in {} chain(s) without \

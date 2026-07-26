@@ -419,15 +419,21 @@ impl Provider for Kiro {
         }
 
         // --- Write all files atomically -----------------------------------
+        //
+        // Three files, so three backups: reporting only the first one's meant a
+        // rolled-back `--force` write left the journal's and the history's
+        // predecessors in `.bak` files that nothing would ever put back.
         let mut written_paths = Vec::new();
+        let mut backups = Vec::new();
 
         let json_outcome =
             crate::pipeline::atomic_write(&json_path, &json_bytes, opts.force, self.slug())?;
-        let backup_path = json_outcome.backup_path.clone();
+        backups.extend(json_outcome.displaced());
         written_paths.push(json_outcome.target_path);
 
         let jsonl_outcome =
             crate::pipeline::atomic_write(&jsonl_path, jsonl.as_bytes(), opts.force, self.slug())?;
+        backups.extend(jsonl_outcome.displaced());
         written_paths.push(jsonl_outcome.target_path);
 
         // `.history` is optional; only emit when we carried one through.
@@ -438,6 +444,7 @@ impl Provider for Kiro {
                 opts.force,
                 self.slug(),
             )?;
+            backups.extend(hist_outcome.displaced());
             written_paths.push(hist_outcome.target_path);
         }
 
@@ -452,7 +459,7 @@ impl Provider for Kiro {
             paths: written_paths,
             session_id: target_session_id.clone(),
             resume_command: self.resume_command(&target_session_id),
-            backup_path,
+            backups,
             warnings: Vec::new(),
         })
     }

@@ -499,10 +499,10 @@ impl Provider for ClaudeCode {
         );
 
         Ok(WrittenSession {
-            paths: vec![outcome.target_path],
+            paths: vec![outcome.target_path.clone()],
             session_id: target_session_id.clone(),
             resume_command: self.resume_command(&target_session_id),
-            backup_path: outcome.backup_path,
+            backups: outcome.displaced().into_iter().collect(),
             warnings: Vec::new(),
         })
     }
@@ -581,10 +581,10 @@ impl Provider for ClaudeCode {
 
         Ok(Some(StructuredWrite {
             written: WrittenSession {
-                paths: vec![outcome.target_path],
+                paths: vec![outcome.target_path.clone()],
                 session_id: target_session_id.clone(),
                 resume_command: self.resume_command(&target_session_id),
-                backup_path: outcome.backup_path,
+                backups: outcome.displaced().into_iter().collect(),
                 warnings: rendered.warnings,
             },
             fidelity: rendered.fidelity,

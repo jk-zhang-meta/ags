@@ -42,6 +42,23 @@ pub struct WriteOptions {
     pub force: bool,
 }
 
+/// A file this write displaced, and where its previous contents were put.
+///
+/// The pair is the point. It replaced a bare `backup_path: Option<PathBuf>`
+/// that the rollback in [`crate::pipeline`] paired with `paths[0]` by
+/// assumption — true for the eleven providers that write one file, and false
+/// for the two that do not. Cline's only backup is of `state/taskHistory.json`,
+/// a *shared* index that is not in `paths` at all, so a rollback moved the
+/// global task index on top of `api_conversation_history.json` and reported
+/// success. A backup that does not say what it restores is not a backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Displaced {
+    /// The file that was overwritten, and where the backup goes back to.
+    pub target: PathBuf,
+    /// Where its previous contents live until the write is accepted.
+    pub backup: PathBuf,
+}
+
 /// Describes the files produced by a successful write operation.
 #[derive(Debug, Clone)]
 pub struct WrittenSession {
@@ -51,8 +68,11 @@ pub struct WrittenSession {
     pub session_id: String,
     /// Ready-to-paste command to resume the session.
     pub resume_command: String,
-    /// Path to the `.bak` backup, if an existing file was overwritten.
-    pub backup_path: Option<PathBuf>,
+    /// Every file this write overwrote, each with the backup that restores it.
+    ///
+    /// Empty when nothing was displaced, which is the ordinary case: a session
+    /// is written to a fresh path unless `--force` aimed it at an existing one.
+    pub backups: Vec<Displaced>,
     /// Non-fatal warnings produced while writing (e.g. the target session was
     /// written but could not be registered in the provider's resume index).
     /// Surfaced to the user and merged into the conversion's warning list.
