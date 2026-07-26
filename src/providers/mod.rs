@@ -29,6 +29,7 @@ pub mod vibe;
 
 use std::path::{Path, PathBuf};
 
+use crate::budget::ContextBudget;
 use crate::discovery::DetectionResult;
 use crate::launch::LaunchSpec;
 use crate::ir::{Fidelity, Loss, SessionIr};
@@ -169,6 +170,32 @@ pub trait Provider: Send + Sync {
         Ok(None)
     }
 
+    /// Whether [`Provider::read_session_ir`] can do anything.
+    ///
+    /// The read-side companion of [`Provider::supports_structured_write`], and
+    /// it exists for the same reason: a capability is a property of the
+    /// provider, so asking about it should not cost a session parse. Nineteen
+    /// of the twenty-one providers answer `false`.
+    ///
+    /// It buys less than the write-side probe does, and the gap is worth
+    /// stating because it bounds where the probe may be used. Skipping
+    /// `write_session_ir` skips building an IR the writer would refuse;
+    /// skipping `read_session_ir` on a provider that has no reader skips a call
+    /// that was already going to return `Ok(None)` without touching the file.
+    /// The 281 MiB parse it looks like it should save belongs to the two
+    /// providers that answer `true`, and for those the parse cannot be skipped:
+    /// `pipeline::flat_fidelity` needs the same IR to see a sealed compaction
+    /// the flat projection is about to delete, whatever the target is. Gating
+    /// the read on the *target's* capability would buy one parse and sell that
+    /// grade — see the note at the pipeline's track selection.
+    ///
+    /// `true` is a claim about the reader's existence, not about any particular
+    /// file: a provider that supports the track still returns `Err` for a
+    /// session it cannot parse.
+    fn supports_structured_read(&self) -> bool {
+        false
+    }
+
     /// Whether [`Provider::write_session_ir`] can do anything.
     ///
     /// A capability probe, separate from the method itself, because
@@ -184,7 +211,8 @@ pub trait Provider: Send + Sync {
         false
     }
 
-    /// Write a structured IR into this provider's native format.
+    /// Write a structured IR into this provider's native format, inside
+    /// `budget`.
     ///
     /// `Ok(None)` means "this provider has no structured writer"; the caller
     /// falls back to [`Provider::write_session`] with the flat projection.
@@ -192,10 +220,28 @@ pub trait Provider: Send + Sync {
     /// Implementors must honour [`SessionIr::model_visible`] rather than
     /// emitting `events` verbatim: replaying compacted-away history is how a
     /// converted session ends up larger than the original conversation.
+    ///
+    /// # Why the budget is a parameter here and not in [`WriteOptions`]
+    ///
+    /// The flat track never sees one. Its budget is applied to the
+    /// [`CanonicalSession`] in the pipeline, before any writer is called, so a
+    /// `budget` field on `WriteOptions` would hand all twenty-one flat writers a
+    /// value that exactly one of the two tracks is expected to act on — an
+    /// option that is silently ignored by most of its implementors is a bug
+    /// waiting for its first reader. The structured writers cannot be served the
+    /// same way: what they write is the IR, and trimming an IR before the writer
+    /// means rebuilding one, which is the [`crate::replay`] fold's answer to
+    /// override rather than reuse.
+    ///
+    /// Implementors must apply it with [`crate::budget::ContextBudget::apply`]
+    /// over `model_visible`, and must fold what it removes into the losses
+    /// [`StructuredWrite::fidelity`] is derived from. `UNLIMITED` must produce
+    /// byte-identical output to a writer that had no budget at all.
     fn write_session_ir(
         &self,
         _ir: &SessionIr,
         _opts: &WriteOptions,
+        _budget: &ContextBudget,
     ) -> anyhow::Result<Option<StructuredWrite>> {
         Ok(None)
     }

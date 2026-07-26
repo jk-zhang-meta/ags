@@ -373,6 +373,10 @@ impl Provider for Codex {
         super::codex_ir::read(path).map(Some)
     }
 
+    fn supports_structured_read(&self) -> bool {
+        true
+    }
+
     fn supports_structured_write(&self) -> bool {
         true
     }
@@ -388,10 +392,12 @@ impl Provider for Codex {
         &self,
         ir: &SessionIr,
         opts: &WriteOptions,
+        budget: &crate::budget::ContextBudget,
     ) -> anyhow::Result<Option<StructuredWrite>> {
         let target_session_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
-        let Some(rendered) = super::codex_ir_write::render(ir, &target_session_id, now) else {
+        let Some(rendered) = super::codex_ir_write::render(ir, &target_session_id, now, budget)
+        else {
             debug!("structured Codex write skipped: the replay is empty");
             return Ok(None);
         };

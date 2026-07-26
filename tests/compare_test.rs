@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use casr::budget::ContextBudget;
 use casr::compare::{Comparison, compare, vendor_of};
 use casr::ir::{Fidelity, LossKind, SessionIr};
 use casr::providers::{claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write};
@@ -122,10 +123,10 @@ fn crossing(source: &SessionIr, target: Agent) -> Option<(Comparison, Fidelity)>
     let session = "compare-session";
     let now = chrono::Utc::now();
     let (lines, claimed) = if target == CODEX {
-        let rendered = codex_ir_write::render(source, session, now)?;
+        let rendered = codex_ir_write::render(source, session, now, &ContextBudget::UNLIMITED)?;
         (rendered.lines, rendered.fidelity)
     } else {
-        let rendered = claude_code_ir_write::render(source, session, now)?;
+        let rendered = claude_code_ir_write::render(source, session, now, &ContextBudget::UNLIMITED)?;
         (rendered.lines, rendered.fidelity)
     };
 

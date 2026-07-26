@@ -134,6 +134,16 @@ The trait already makes this opt-in: `read_session_ir` and `write_session_ir`
 default to `Ok(None)`, so a provider joins the high-fidelity track by
 overriding them and no provider is ever rewritten to accommodate another.
 
+Override **four** methods, not two. `supports_structured_read` and
+`supports_structured_write` are capability probes the pipeline asks *instead of*
+calling the method — a capability should not cost a session parse to discover —
+so a provider that implements a reader and leaves the probe at `false` is a
+provider the pipeline never asks. It will convert, silently, on the flat track.
+A writer must also honour the `ContextBudget` it is handed, apply it over
+`model_visible` with `ContextBudget::apply`, and fold what it removes into the
+losses its grade is derived from; `ContextBudget::UNLIMITED` must produce
+byte-identical output.
+
 **The conformance suite comes with that override, and there is no list to add
 yourself to.** `src/conformance.rs` takes
 `ProviderRegistry::default_registry()`, keeps the providers whose

@@ -975,14 +975,33 @@ pub enum LossKind {
     /// consumer filtering on `kind` (as the launch refusal does, on
     /// [`LossKind::SealedContext`]) would have walked straight past a deleted
     /// message. Distinct from `SealedContext`, which is history the vendor
-    /// boundary made impossible to carry; this is history that went missing
-    /// with no such excuse, and it is a writer bug.
+    /// boundary made impossible to carry; this is history that went missing for
+    /// some other reason.
+    ///
+    /// Two producers, and which one it is matters to whoever reads it. From
+    /// [`crate::compare`] it is a writer bug: content the model was shown that
+    /// the written file does not hold, with nothing predicting the loss. From
+    /// [`crate::budget`] it is the requested outcome of a context cap — the
+    /// removal was deliberate and the user asked for it, which the `note` says.
+    /// Neither is a degraded *rendering*, which is why both grade
+    /// [`Fidelity::HistoryIncomplete`]: the resumed session is missing
+    /// conversation either way and will not know it.
     Conversation,
     /// Reasoning capsules minted by a vendor the target cannot replay.
     Reasoning,
     /// Media the target's content model has no type for.
     Media,
-    /// A calling convention the target does not distinguish.
+    /// The tool channel degraded: a calling convention the target does not
+    /// distinguish, or an observation that did not arrive whole.
+    ///
+    /// Named for the channel rather than for one cause, because both producers
+    /// are about tool traffic and neither is a loss of anything that was *said*.
+    /// [`crate::budget`] files two kinds here and they grade differently, which
+    /// is the distinction to preserve: eliding the middle of an observation
+    /// leaves the event, its `call_id` and its outcome intact and grades
+    /// [`Fidelity::ConversationOnly`], while dropping a call/result pair outright
+    /// removes something the model was shown and grades
+    /// [`Fidelity::HistoryIncomplete`].
     ToolProtocol,
     /// Agent-side metadata with nowhere to live in the target.
     Metadata,

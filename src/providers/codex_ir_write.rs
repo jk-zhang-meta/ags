@@ -38,6 +38,7 @@ use std::collections::HashSet;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 
+use crate::budget::ContextBudget;
 use crate::ir::{
     Block, Body, Capsule, CapsuleFit, CapsuleKind, Event, Fidelity, Loss, LossKind, Role,
     SessionIr, ToolInput, ToolOutcome,
@@ -78,13 +79,27 @@ pub struct Rendered {
     pub first_user_text: String,
 }
 
-/// Render `ir` as a Codex rollout under `session_id`.
+/// Render `ir` as a Codex rollout under `session_id`, inside `budget`.
 ///
 /// `None` when the replay is empty: there is no structured session to write,
 /// and the caller is better served by the flat path than by a header with no
 /// conversation under it.
-pub fn render(ir: &SessionIr, session_id: &str, now: DateTime<Utc>) -> Option<Rendered> {
-    let visible = ir.model_visible();
+///
+/// `budget` is applied to [`SessionIr::model_visible`] and to nothing else — the
+/// resolved live context, not the captured event list, because trimming the
+/// capture would "save" history the agent had already compacted away. Pass
+/// [`ContextBudget::UNLIMITED`] for the pre-budget behaviour, which is
+/// byte-identical rather than merely equivalent. Whatever the budget removes
+/// arrives here as a [`Loss`] and is folded into the grade with the writer's
+/// own; see [`crate::budget`].
+pub fn render(
+    ir: &SessionIr,
+    session_id: &str,
+    now: DateTime<Utc>,
+    budget: &ContextBudget,
+) -> Option<Rendered> {
+    let budgeted = budget.apply(ir.model_visible());
+    let visible = budgeted.as_events();
     if visible.is_empty() {
         return None;
     }
@@ -93,7 +108,10 @@ pub fn render(ir: &SessionIr, session_id: &str, now: DateTime<Utc>) -> Option<Re
         same_agent: ir.origin.agent == SAME_AGENT,
         grade: Fidelity::ContextComplete,
         warnings: Vec::new(),
-        losses: Vec::new(),
+        // The budget's losses go into the same list the writer's own go into, so
+        // the fold in `summarise` grades both. Nothing accumulates a grade
+        // separately — that is the bug the fold replaced.
+        losses: budgeted.losses.clone(),
         dropped_reasoning: 0,
         reasoning_bytes: 0,
         dropped_history: 0,
@@ -809,7 +827,7 @@ mod tests {
     }
 
     fn rendered(ir: &SessionIr) -> Rendered {
-        render(ir, "sid", Utc::now()).expect("non-empty replay")
+        render(ir, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay")
     }
 
     fn payload_types(out: &Rendered) -> Vec<String> {
@@ -825,9 +843,162 @@ mod tests {
             .collect()
     }
 
+    /// The IR the budget tests below render, deliberately small and with one
+    /// oversized tool observation.
+    fn budget_source() -> SessionIr {
+        ir(vec![
+            event(
+                "u",
+                Body::Message {
+                    role: Role::User,
+                    blocks: vec![Block::Text {
+                        text: "fix the build".into(),
+                    }],
+                },
+            ),
+            event(
+                "c",
+                Body::ToolCall {
+                    call_id: "c1".into(),
+                    name: "shell".into(),
+                    namespace: None,
+                    input: ToolInput::Freeform {
+                        text: "cargo build".into(),
+                    },
+                },
+            ),
+            event(
+                "o",
+                Body::ToolResult {
+                    call_id: "c1".into(),
+                    outcome: ToolOutcome::Unknown,
+                    output: vec![Block::Text {
+                        text: "E".repeat(50),
+                    }],
+                    structured: None,
+                },
+            ),
+            event(
+                "a",
+                Body::Message {
+                    role: Role::Assistant,
+                    blocks: vec![Block::Text { text: "fixed".into() }],
+                },
+            ),
+        ])
+    }
+
+    /// A fixed clock, so the rendering is a pure function of the IR.
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid epoch millis")
+    }
+
+    /// Flags absent must mean *these bytes*, not merely equivalent ones.
+    ///
+    /// The codex→codex round trip is verified event-for-event, so a budget that
+    /// reshaped the output even when switched off would break a guarantee this
+    /// crate sells. Spelled out as bytes rather than as properties because a
+    /// property test cannot fail on a field that quietly moved.
+    #[test]
+    fn an_absent_budget_writes_the_bytes_it_wrote_before_there_was_a_budget() {
+        let out = render(&budget_source(), "sid", fixed_now(), &ContextBudget::UNLIMITED)
+            .expect("non-empty replay");
+
+        let version = env!("CARGO_PKG_VERSION");
+        let expected = [
+            format!(
+                r#"{{"payload":{{"base_instructions":null,"cli_version":"{version}","context_window":null,"cwd":"/tmp","history_mode":"legacy","id":"sid","model_provider":"openai","originator":"casr","session_id":"sid","source":"cli","thread_source":"user","timestamp":"2023-11-14T22:13:20.000Z"}},"timestamp":"2023-11-14T22:13:20.000Z","type":"session_meta"}}"#
+            ),
+            r#"{"payload":{"content":[{"text":"fix the build","type":"input_text"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1"},"role":"user","type":"message"},"timestamp":"2023-11-14T22:13:20.000Z","type":"response_item"}"#.to_string(),
+            r#"{"payload":{"call_id":"c1","input":"cargo build","internal_chat_message_metadata_passthrough":{"turn_id":"t1"},"name":"shell","status":"completed","type":"custom_tool_call"},"timestamp":"2023-11-14T22:13:20.000Z","type":"response_item"}"#.to_string(),
+            format!(
+                r#"{{"payload":{{"call_id":"c1","internal_chat_message_metadata_passthrough":{{"turn_id":"t1"}},"output":"{}","type":"custom_tool_call_output"}},"timestamp":"2023-11-14T22:13:20.000Z","type":"response_item"}}"#,
+                "E".repeat(50)
+            ),
+            r#"{"payload":{"content":[{"text":"fixed","type":"output_text"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1"},"role":"assistant","type":"message"},"timestamp":"2023-11-14T22:13:20.000Z","type":"response_item"}"#.to_string(),
+        ];
+        assert_eq!(out.lines, expected);
+        assert!(out.losses.is_empty(), "{:?}", out.losses);
+        assert_eq!(out.fidelity, Fidelity::ContextComplete);
+    }
+
+    /// The same IR, a cap that binds: the tail survives, the head is reported.
+    #[test]
+    fn a_cap_keeps_the_tail_and_reports_what_it_dropped() {
+        let out = render(
+            &budget_source(),
+            "sid",
+            fixed_now(),
+            &ContextBudget {
+                // Each of these four events costs 30-60 tokens; 60 buys the last.
+                max_context_tokens: 60,
+                max_tool_output: 0,
+                keep_reasoning: true,
+            },
+        )
+        .expect("non-empty replay");
+
+        let texts: Vec<String> = out
+            .lines
+            .iter()
+            .skip(1)
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(texts.len(), 1, "only the newest turn fits: {texts:?}");
+        assert!(texts[0].contains("fixed"), "the tail is what a resume needs");
+        assert!(
+            !out.lines.iter().any(|line| line.contains("custom_tool_call")),
+            "the call and its output went together; an orphan is rejected at replay"
+        );
+
+        let kinds: Vec<LossKind> = out.losses.iter().map(|loss| loss.kind).collect();
+        assert!(kinds.contains(&LossKind::Conversation), "{kinds:?}");
+        assert!(kinds.contains(&LossKind::ToolProtocol), "{kinds:?}");
+        assert_eq!(
+            out.fidelity,
+            Fidelity::HistoryIncomplete,
+            "the grade is folded from the losses, budget losses included"
+        );
+        assert!(
+            out.warnings.iter().any(|note| note.contains("context budget")),
+            "a trim the user cannot see is the flat track's silence again: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn an_oversized_observation_is_elided_in_place_not_dropped() {
+        let out = render(
+            &budget_source(),
+            "sid",
+            fixed_now(),
+            &ContextBudget {
+                max_context_tokens: 0,
+                max_tool_output: 20,
+                keep_reasoning: true,
+            },
+        )
+        .expect("non-empty replay");
+
+        let output = out
+            .lines
+            .iter()
+            .find(|line| line.contains("custom_tool_call_output"))
+            .expect("the tool result kept its event, its call_id and its outcome");
+        assert!(output.contains("elided"), "{output}");
+        assert_eq!(out.losses.len(), 1);
+        assert_eq!(out.losses[0].kind, LossKind::ToolProtocol);
+        assert_eq!(
+            out.fidelity,
+            Fidelity::ConversationOnly,
+            "an elision that announces itself is a degraded observation, not a \
+             hole in the conversation"
+        );
+    }
+
     #[test]
     fn empty_replay_writes_nothing() {
-        assert!(render(&ir(Vec::new()), "sid", Utc::now()).is_none());
+        assert!(render(&ir(Vec::new()), "sid", Utc::now(), &ContextBudget::UNLIMITED).is_none());
     }
 
     #[test]

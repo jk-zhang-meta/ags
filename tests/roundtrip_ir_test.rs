@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use casr::budget::ContextBudget;
 use casr::ir::{Block, Body, Fidelity, Role, SessionIr, ToolInput, ToolOutcome};
 use casr::providers::{
     Provider, WriteOptions, claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write,
@@ -99,13 +100,13 @@ fn claude_corpus() -> Vec<PathBuf> {
 
 /// Render `ir` as Codex and parse the result. `None` when the replay is empty.
 fn through_codex(ir: &SessionIr) -> Option<(SessionIr, Fidelity)> {
-    let rendered = codex_ir_write::render(ir, "roundtrip-session", chrono::Utc::now())?;
+    let rendered = codex_ir_write::render(ir, "roundtrip-session", chrono::Utc::now(), &ContextBudget::UNLIMITED)?;
     Some((reparse(&rendered.lines, codex_ir::read), rendered.fidelity))
 }
 
 /// Render `ir` as Claude Code and parse the result.
 fn through_claude(ir: &SessionIr) -> Option<(SessionIr, Fidelity)> {
-    let rendered = claude_code_ir_write::render(ir, "roundtrip-session", chrono::Utc::now())?;
+    let rendered = claude_code_ir_write::render(ir, "roundtrip-session", chrono::Utc::now(), &ContextBudget::UNLIMITED)?;
     Some((reparse(&rendered.lines, claude_code_ir::read), rendered.fidelity))
 }
 
@@ -852,7 +853,7 @@ fn codex_write_session_ir_lands_where_codex_looks_for_it() {
 
     let source = synthetic(CODEX_ROLLOUT);
     let written = casr::providers::codex::Codex
-        .write_session_ir(&source, &WriteOptions { force: false })
+        .write_session_ir(&source, &WriteOptions { force: false }, &ContextBudget::UNLIMITED)
         .expect("write")
         .expect("Codex is on the structured track");
 
@@ -898,7 +899,7 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
     let source =
         claude_code_ir::read(&fixture("cc_real_world_sanitized.jsonl")).expect("fixture parses");
     let written = casr::providers::claude_code::ClaudeCode
-        .write_session_ir(&source, &WriteOptions { force: false })
+        .write_session_ir(&source, &WriteOptions { force: false }, &ContextBudget::UNLIMITED)
         .expect("write")
         .expect("Claude Code is on the structured track");
 

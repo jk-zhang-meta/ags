@@ -87,19 +87,23 @@ enum Command {
         enrich: bool,
 
         /// Cap the transferred history at roughly this many tokens (0 = unlimited).
-        /// Applies to cross-provider conversions; the oldest turns are dropped
-        /// first, pinning the original task and the most recent history.
+        /// Applies to cross-provider conversions on both tracks; the oldest
+        /// turns are dropped first and the most recent history is kept. The
+        /// flat track also pins the original task message; the structured track
+        /// keeps a plain suffix and reports everything it dropped as a loss.
         #[arg(long, default_value = "200000")]
         max_context_tokens: usize,
 
         /// Truncate each tool result/observation to this many characters
-        /// (0 = unlimited). Tool output is usually the bulk of a long session.
+        /// (0 = unlimited). Tool output is usually the bulk of a long session,
+        /// so this often removes the need to drop any turn at all.
         #[arg(long, default_value = "4000")]
         max_tool_output: usize,
 
         /// Keep the source agent's reasoning traces (dropped by default for
         /// cross-agent handoffs, since the target can't use another agent's
-        /// hidden reasoning).
+        /// hidden reasoning). Not an exemption from --max-context-tokens:
+        /// reasoning that belongs to a turn the cap removes goes with the turn.
         #[arg(long)]
         keep_reasoning: bool,
 

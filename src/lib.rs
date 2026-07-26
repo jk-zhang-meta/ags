@@ -5,6 +5,7 @@
 //! Library entry point exposing the public API for session conversion.
 //! The binary (`main.rs`) is a thin CLI wrapper around this library.
 
+pub mod budget;
 pub mod compare;
 pub mod conformance;
 pub mod discovery;

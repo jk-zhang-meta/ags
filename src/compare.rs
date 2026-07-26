@@ -203,9 +203,23 @@ impl Comparison {
 /// by a gateway under its own name — gating on that string is the mistake
 /// [`crate::ir::Capsule::fits`] documents at length.
 pub fn compare(source: &SessionIr, target: &SessionIr, target_vendor: &str) -> Comparison {
-    let src = source.model_visible();
-    let tgt = target.model_visible();
+    compare_replays(
+        &source.model_visible(),
+        &target.model_visible(),
+        target_vendor,
+    )
+}
 
+/// [`compare`], for a caller that already has the two replays.
+///
+/// The two exist because one caller does not have a source `SessionIr` whose
+/// `model_visible` is the thing it wrote: a conversion under a context budget
+/// writes the *budgeted* replay, so the pipeline's verifier trims the source's
+/// replay with [`crate::budget::ContextBudget::apply`] and compares that. Asking
+/// it to build a trimmed `SessionIr` instead would mean re-deriving what
+/// [`crate::replay::resolve`] already decided, which is the second answer to
+/// "what does the model see" that this crate keeps refusing to have.
+pub fn compare_replays(src: &[&Event], tgt: &[&Event], target_vendor: &str) -> Comparison {
     let mut report = Comparison {
         source_events: src.len(),
         target_events: tgt.len(),
@@ -348,7 +362,7 @@ pub fn compare(source: &SessionIr, target: &SessionIr, target_vendor: &str) -> C
     // up. Counting leftover *shapes* instead would have counted every reshaped
     // event, which is 19,400 of them crossing the corpus and tells nobody
     // anything.
-    for event in &tgt {
+    for event in tgt {
         let content = substance(event);
         if content.is_empty() {
             continue;

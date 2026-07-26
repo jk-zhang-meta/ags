@@ -1968,3 +1968,112 @@ fn cli_trace_emits_trace_logs() {
         .success()
         .stderr(predicate::str::contains("TRACE").and(predicate::str::contains("searching")));
 }
+
+// ---------------------------------------------------------------------------
+// Context budget on the structured track
+// ---------------------------------------------------------------------------
+
+/// The whole chain under a binding budget: writer trims, grade follows the loss
+/// list, and the structural read-back verifier does not mistake the trim for
+/// damage.
+///
+/// That last part is the reason this is an end-to-end test and not a writer
+/// test. `verify_structured_write` compares the source's replay against the file
+/// it wrote; if it compared the *unbudgeted* replay, every dropped turn would
+/// land in the comparator's `unexplained` bucket, and the conversion would roll
+/// itself back and fail as a writer bug. A budget that cannot be used is not a
+/// budget.
+#[test]
+fn cli_resume_structured_track_honours_the_context_budget() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_complex");
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "resume",
+            "cod",
+            &session_id,
+            // Small enough that only the newest turn survives.
+            "--max-context-tokens",
+            "30",
+        ])
+        .output()
+        .expect("resume should run");
+
+    assert!(
+        output.status.success(),
+        "a trimmed structured write must not fail verification: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .expect("resume --json should emit valid JSON");
+    let warnings = parsed["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|warning| warning.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        warnings.contains("context budget"),
+        "the trim has to be visible: {warnings}"
+    );
+    assert_eq!(
+        parsed["fidelity"], "history_incomplete",
+        "dropping conversation to fit a cap is a hole, and the grade says so"
+    );
+
+    // And the file that landed is the trimmed one, not the whole session.
+    let written = parsed["written_paths"][0].as_str().expect("a written path");
+    let lines = fs::read_to_string(written)
+        .expect("the rollout is on disk")
+        .lines()
+        .filter(|line| line.contains("response_item"))
+        .count();
+    assert_eq!(lines, 1, "only the newest turn was in budget");
+}
+
+/// The same conversion with the budget switched off, as the contrast.
+#[test]
+fn cli_resume_structured_track_without_flags_carries_everything() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_complex");
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "resume",
+            "cod",
+            &session_id,
+            "--max-context-tokens",
+            "0",
+            "--max-tool-output",
+            "0",
+            "--keep-reasoning",
+        ])
+        .output()
+        .expect("resume should run");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .expect("resume --json should emit valid JSON");
+    let warnings = parsed["warnings"]
+        .as_array()
+        .expect("warnings array")
+        .iter()
+        .filter_map(|warning| warning.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !warnings.contains("context budget"),
+        "an absent budget removes nothing and therefore reports nothing: {warnings}"
+    );
+    let written = parsed["written_paths"][0].as_str().expect("a written path");
+    let lines = fs::read_to_string(written)
+        .expect("the rollout is on disk")
+        .lines()
+        .filter(|line| line.contains("response_item"))
+        .count();
+    assert!(lines > 1, "the whole replay crossed, {lines} events");
+}

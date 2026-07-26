@@ -15,6 +15,7 @@ use std::{
 };
 
 use casr::{
+    budget::ContextBudget,
     discovery::{DetectionResult, ProviderRegistry},
     error::CasrError,
     ir::{
@@ -237,6 +238,18 @@ impl Provider for MockProvider {
         Ok(self.state.lock().expect("mock state lock").ir_read.clone())
     }
 
+    /// Mirrors what `read_session_ir` above actually does, for the same reason
+    /// `supports_structured_write` does: the pipeline asks the probe *instead of*
+    /// calling the reader, so a mock whose probe disagrees with its reader models
+    /// a provider that cannot exist.
+    fn supports_structured_read(&self) -> bool {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .ir_read
+            .is_some()
+    }
+
     /// Mirrors what `write_session_ir` below will actually do, so the capability
     /// flag cannot drift out of step with the capability in a mock the way it
     /// could in a real provider.
@@ -252,6 +265,7 @@ impl Provider for MockProvider {
         &self,
         _ir: &SessionIr,
         _opts: &WriteOptions,
+        _budget: &ContextBudget,
     ) -> anyhow::Result<Option<StructuredWrite>> {
         let mut state = self.state.lock().expect("mock state lock");
         let Some(fidelity) = state.structured_grade else {
@@ -1832,4 +1846,48 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
         "the structured track must run the structural comparator: without it \
          the high-fidelity conversions are the unverified ones; got {events:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Structured-read capability
+// ---------------------------------------------------------------------------
+
+/// The pipeline asks [`Provider::supports_structured_read`] *instead of* calling
+/// `read_session_ir`, so the two have to agree: a provider whose probe says
+/// `false` must be a provider whose reader would have returned `Ok(None)`. That
+/// equivalence is the whole justification for the skip, and it is mechanical
+/// enough to check rather than assert in a comment.
+#[test]
+fn a_provider_that_denies_a_structured_reader_has_none() {
+    let registry = ProviderRegistry::default_registry();
+
+    let structured: Vec<&str> = registry
+        .all_providers()
+        .iter()
+        .filter(|provider| provider.supports_structured_read())
+        .map(|provider| provider.slug())
+        .collect();
+    assert_eq!(
+        structured,
+        ["claude-code", "codex"],
+        "the structured track is these two; a provider joining it overrides the \
+         probe as well as the reader"
+    );
+
+    for provider in registry.all_providers() {
+        if provider.supports_structured_read() {
+            continue;
+        }
+        // The path is deliberately one that does not exist. A provider with no
+        // structured reader cannot look at it — that is what makes skipping the
+        // call free of consequences — so `Ok(None)` is the only answer available.
+        let answer = provider.read_session_ir(Path::new("/nonexistent/session.jsonl"));
+        assert!(
+            matches!(answer, Ok(None)),
+            "{} answers `false` to the probe, so the pipeline never calls its \
+             reader; if that reader can return anything but Ok(None) the skip \
+             changes the conversion",
+            provider.slug()
+        );
+    }
 }

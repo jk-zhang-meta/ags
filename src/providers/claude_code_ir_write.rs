@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
 
+use crate::budget::ContextBudget;
 use crate::ir::{
     Block, Body, Branch, Capsule, CapsuleFit, CapsuleKind, Event, Fidelity, Loss, LossKind, Role,
     SessionIr, ToolInput, ToolOutcome,
@@ -86,12 +87,26 @@ pub struct Rendered {
     pub losses: Vec<Loss>,
 }
 
-/// Render `ir` as a Claude Code transcript under `session_id`.
+/// Render `ir` as a Claude Code transcript under `session_id`, inside `budget`.
 ///
 /// `None` when the replay is empty; the caller falls back to the flat path
 /// rather than writing a transcript with no conversation in it.
-pub fn render(ir: &SessionIr, session_id: &str, now: DateTime<Utc>) -> Option<Rendered> {
-    let visible = ir.model_visible();
+///
+/// `budget` is applied to [`SessionIr::model_visible`] and to nothing else — the
+/// resolved live context, not the captured event list, because trimming the
+/// capture would "save" history the agent had already compacted away. Pass
+/// [`ContextBudget::UNLIMITED`] for the pre-budget behaviour, which is
+/// byte-identical rather than merely equivalent. Whatever the budget removes
+/// arrives here as a [`Loss`] and is folded into the grade with the writer's
+/// own; see [`crate::budget`].
+pub fn render(
+    ir: &SessionIr,
+    session_id: &str,
+    now: DateTime<Utc>,
+    budget: &ContextBudget,
+) -> Option<Rendered> {
+    let budgeted = budget.apply(ir.model_visible());
+    let visible = budgeted.as_events();
     if visible.is_empty() {
         return None;
     }
@@ -178,7 +193,9 @@ pub fn render(ir: &SessionIr, session_id: &str, now: DateTime<Utc>) -> Option<Re
     // Derived from the losses, not accumulated beside them — see
     // `codex_ir_write::Writer::summarise` for the bug that motivated it. Two
     // sources of truth for one fact meant each covered for the other's gaps.
-    let losses = writer.losses();
+    // The budget's losses join the same list, so the fold grades them too.
+    let mut losses = budgeted.losses.clone();
+    losses.extend(writer.losses());
     let fidelity = losses
         .iter()
         .fold(Fidelity::ContextComplete, |worst, loss| {
@@ -763,6 +780,7 @@ mod tests {
             )]),
             "sid",
             Utc::now(),
+            &ContextBudget::UNLIMITED,
         )
         .expect("non-empty replay");
 
@@ -837,6 +855,7 @@ mod tests {
             ]),
             "sid",
             Utc::now(),
+            &ContextBudget::UNLIMITED,
         )
         .expect("non-empty replay");
 
@@ -882,6 +901,7 @@ mod tests {
             ]),
             "sid",
             Utc::now(),
+            &ContextBudget::UNLIMITED,
         )
         .expect("non-empty replay");
 
@@ -928,7 +948,7 @@ mod tests {
         ]);
         source.origin.agent = "codex".into();
 
-        let out = render(&source, "sid", Utc::now()).expect("non-empty replay");
+        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay");
         assert_eq!(records(&out).len(), 1);
         assert_eq!(out.fidelity, Fidelity::ContextNoReasoning);
     }
@@ -949,10 +969,121 @@ mod tests {
         )]);
         source.origin.agent = "codex".into();
 
-        let out = render(&source, "sid", Utc::now()).expect("non-empty replay");
+        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay");
         let block = &records(&out)[0]["message"]["content"][0];
         assert_eq!(block["name"], json!("shell"), "the tool name is history");
         assert_eq!(block["input"], json!({"value": "ls -la"}));
+        assert_eq!(out.fidelity, Fidelity::ConversationOnly);
+    }
+
+    /// The budget's other half: the same trim, on the writer that coalesces
+    /// events into records. Records, not events, is the unit here — so a trim
+    /// that cut inside a record would show up as a record that lost a block.
+    #[test]
+    fn a_cap_keeps_the_tail_and_reports_what_it_dropped() {
+        let source = ir(vec![
+            event(
+                "u1",
+                1,
+                Body::Message {
+                    role: Role::User,
+                    blocks: vec![Block::Text {
+                        text: "x".repeat(400),
+                    }],
+                },
+            ),
+            event(
+                "u2",
+                2,
+                Body::Message {
+                    role: Role::User,
+                    blocks: vec![Block::Text {
+                        text: "the newest turn".into(),
+                    }],
+                },
+            ),
+        ]);
+
+        let whole = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED)
+            .expect("non-empty replay");
+        assert_eq!(records(&whole).len(), 2);
+        assert!(whole.losses.is_empty());
+        assert_eq!(whole.fidelity, Fidelity::ContextComplete);
+
+        let trimmed = render(
+            &source,
+            "sid",
+            Utc::now(),
+            &ContextBudget {
+                max_context_tokens: 20,
+                max_tool_output: 0,
+                keep_reasoning: true,
+            },
+        )
+        .expect("non-empty replay");
+        let records = records(&trimmed);
+        assert_eq!(records.len(), 1, "the oldest record went, the tail stayed");
+        assert_eq!(records[0]["message"]["content"], json!("the newest turn"));
+        assert_eq!(
+            records[0]["parentUuid"],
+            Value::Null,
+            "the kept tail is a chain of its own, not a chain with a dangling head"
+        );
+        assert_eq!(trimmed.losses.len(), 1);
+        assert_eq!(trimmed.losses[0].kind, LossKind::Conversation);
+        assert_eq!(trimmed.fidelity, Fidelity::HistoryIncomplete);
+    }
+
+    #[test]
+    fn an_oversized_observation_is_elided_in_place_not_dropped() {
+        let source = ir(vec![
+            event(
+                "a1",
+                1,
+                Body::ToolCall {
+                    call_id: "t1".into(),
+                    name: "Bash".into(),
+                    namespace: None,
+                    input: ToolInput::Json {
+                        value: json!({}),
+                        original: None,
+                    },
+                },
+            ),
+            event(
+                "u2",
+                2,
+                Body::ToolResult {
+                    call_id: "t1".into(),
+                    outcome: ToolOutcome::Succeeded,
+                    output: vec![Block::Text {
+                        text: "E".repeat(5_000),
+                    }],
+                    structured: None,
+                },
+            ),
+        ]);
+        let out = render(
+            &source,
+            "sid",
+            Utc::now(),
+            &ContextBudget {
+                max_context_tokens: 0,
+                max_tool_output: 100,
+                keep_reasoning: true,
+            },
+        )
+        .expect("non-empty replay");
+
+        let records = records(&out);
+        assert_eq!(records.len(), 2, "the pair is intact");
+        let block = &records[1]["message"]["content"][0];
+        assert_eq!(block["tool_use_id"], json!("t1"));
+        let text = block["content"][0]["text"].as_str().expect("text block");
+        assert!(text.contains("elided"), "{text}");
+        assert!(text.len() < 400);
+        assert_eq!(out.losses.len(), 1);
+        assert_eq!(out.losses[0].kind, LossKind::ToolProtocol);
         assert_eq!(out.fidelity, Fidelity::ConversationOnly);
     }
 
@@ -977,7 +1108,7 @@ mod tests {
         let mut source = ir(vec![sealed]);
         source.origin.agent = "codex".into();
 
-        let out = render(&source, "sid", Utc::now()).expect("non-empty replay");
+        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay");
         assert_eq!(
             out.fidelity,
             Fidelity::HistoryIncomplete,

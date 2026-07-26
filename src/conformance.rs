@@ -87,6 +87,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::budget::ContextBudget;
 use crate::compare::{Comparison, compare, vendor_of};
 use crate::discovery::ProviderRegistry;
 use crate::ir::{Body, Event, Fidelity, Loss, SessionIr, Visibility};
@@ -508,7 +509,13 @@ fn cross(
         return;
     };
 
-    let written = match target.write_session_ir(ir, &WriteOptions { force: false }) {
+    // `UNLIMITED`, and not the CLI's defaults, because this battery verifies the
+    // *conversion* and not the budget policy. Same-agent conservation is only
+    // meaningful when nothing is allowed to be trimmed: under the CLI defaults a
+    // long session would legitimately lose its oldest turns, and the check could
+    // no longer tell that from a writer dropping them by mistake. The budget has
+    // its own tests, including that `UNLIMITED` writes byte-identical output.
+    let written = match target.write_session_ir(ir, &WriteOptions { force: false }, &ContextBudget::UNLIMITED) {
         Ok(Some(written)) => written,
         Ok(None) => {
             report.finding(&format!(

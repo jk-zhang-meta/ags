@@ -41,6 +41,23 @@ pub struct ConvertOptions {
     pub keep_reasoning: bool,
 }
 
+impl ConvertOptions {
+    /// The three context-budget flags, as the structured track takes them.
+    ///
+    /// The flat track reads the fields directly (see [`apply_context_budget`]);
+    /// the structured track needs them as one value because they travel through
+    /// [`Provider::write_session_ir`] into the writers. One conversion in one
+    /// place, so the two tracks cannot drift into disagreeing about what
+    /// "`--max-tool-output 0`" means.
+    pub fn budget(&self) -> crate::budget::ContextBudget {
+        crate::budget::ContextBudget {
+            max_context_tokens: self.max_context_tokens,
+            max_tool_output: self.max_tool_output,
+            keep_reasoning: self.keep_reasoning,
+        }
+    }
+}
+
 impl Default for ConvertOptions {
     fn default() -> Self {
         // No-op budgeting by default; the CLI layer supplies the smart caps.
@@ -467,22 +484,25 @@ but resume may fail until the CLI is installed.",
         // source — 281 MiB for the largest rollout in the corpus — to be told
         // `Ok(None)`. [`Provider::supports_structured_write`] answers for free.
         //
-        // The *read* below is still unconditional, and deliberately so. It has
-        // a second consumer: [`flat_fidelity`] needs the same IR to see a
+        // The *read* below is gated only on the source's own
+        // [`Provider::supports_structured_read`], which skips the nineteen
+        // providers whose reader would have answered `Ok(None)` anyway. It is
+        // deliberately *not* gated on the target's capability, because the IR
+        // has a second consumer: [`flat_fidelity`] needs the same IR to see a
         // sealed compaction that the flat projection is about to delete, and
         // grading such a conversion `ConversationOnly` when it is
         // `HistoryIncomplete` is the silent degradation this crate exists to
-        // prevent. Gating the read on the target's capability would buy one
-        // parse and sell that grade; the trade is real, and it is not this
-        // change's to make.
+        // prevent. That gate would buy one parse and sell the grade.
         //
         // Selected here, above the budgeting and tool-normalization steps,
         // because both of those edit `canonical` to suit a flat writer. The
         // structured writer never sees `canonical`, so applying them would be
         // work whose only effect is to misreport the message count; honouring
         // the context budget on this track is the writer's job, over the IR's
-        // own `model_visible` view.
+        // own `model_visible` view — hence `budget`, which is the same three
+        // flags step 7a2 gives the flat projection.
         let write_opts = WriteOptions { force: opts.force };
+        let budget = opts.budget();
         let source_ir = read_source_ir(resolved.provider, &resolved.path);
         if target_provider.supports_structured_write()
             && let Some(ir) = source_ir.as_ref()
@@ -491,7 +511,7 @@ but resume may fail until the CLI is installed.",
                 fidelity,
                 losses,
             }) =
-                target_provider.write_session_ir(ir, &write_opts)?
+                target_provider.write_session_ir(ir, &write_opts, &budget)?
         {
             info!(
                 target_session_id = written.session_id,
@@ -509,7 +529,7 @@ but resume may fail until the CLI is installed.",
             // through `read_session_ir` and compared IR to IR by
             // [`crate::compare`], whose whole point is that it can tell a
             // predicted vendor-boundary drop from a hole.
-            match verify_structured_write(target_provider, ir, &written, fidelity) {
+            match verify_structured_write(target_provider, ir, &budget, &written, fidelity) {
                 Ok(notes) => all_warnings.extend(notes),
                 Err(detail) => {
                     warn!(detail, "structured read-back verification failed");
@@ -689,7 +709,31 @@ but resume may fail until the CLI is installed.",
 /// as a failed conversion. The flat path does not need the IR, so refusing to
 /// convert a session that the flat path handles fine would be a regression
 /// introduced by the better track — exactly backwards.
+///
+/// # Why the only skip here is the source's own capability
+///
+/// [`Provider::supports_structured_read`] is asked first so that the nineteen
+/// providers with no structured reader are not called at all. That is the whole
+/// of the legitimate skip, and it is exactly equivalent to calling them: the
+/// trait default returns `Ok(None)` without opening the file, so the two paths
+/// produce the same `None` for the same providers.
+///
+/// The larger-looking skip — "the target has no structured writer, so do not
+/// parse" — is not available, and the reason is the second consumer. This IR
+/// feeds [`flat_fidelity`] as well as [`Provider::write_session_ir`], and a
+/// source whose structured read reveals a sealed compaction earns
+/// [`Fidelity::HistoryIncomplete`] on the flat path. Skip the parse and that
+/// session reports [`Fidelity::ConversationOnly`] instead: one saved parse
+/// bought with a grade that no longer describes the file. A faster wrong answer
+/// is not an optimization.
 fn read_source_ir(provider: &dyn Provider, path: &Path) -> Option<SessionIr> {
+    if !provider.supports_structured_read() {
+        debug!(
+            provider = provider.slug(),
+            "no structured reader; grading and writing on the flat track"
+        );
+        return None;
+    }
     match provider.read_session_ir(path) {
         Ok(ir) => ir,
         Err(error) => {
@@ -735,9 +779,22 @@ fn read_source_ir(provider: &dyn Provider, path: &Path) -> Option<SessionIr> {
 ///   reader, or the vendor of its sealed formats is unknown to this version. No
 ///   check was possible, so the conversion is not failed and the skip is stated
 ///   in a warning rather than passing silently for a check that never ran.
+///
+/// # Why the budget is compared against, not ignored
+///
+/// The oracle is "does the file hold the session that was asked for", and a
+/// `--max-context-tokens` conversion asks for the budgeted session. So `budget`
+/// is applied to the source's replay here too, through the same
+/// [`crate::budget::ContextBudget::apply`] the writer used, and the comparison
+/// runs against that. Comparing the *un*budgeted replay instead would report
+/// every trimmed turn as content that went missing with nothing predicting it —
+/// which is the `Unexplained` bucket, so the first over-budget conversion would
+/// roll itself back and fail as a writer bug. A verifier that fails the feature
+/// it was extended for gets switched off, which is the same as not having one.
 fn verify_structured_write(
     target: &dyn Provider,
     source_ir: &SessionIr,
+    budget: &crate::budget::ContextBudget,
     written: &WrittenSession,
     claimed: Fidelity,
 ) -> Result<Vec<String>, String> {
@@ -776,7 +833,9 @@ fn verify_structured_write(
         )]);
     };
 
-    let report = crate::compare::compare(source_ir, &target_ir, vendor);
+    let budgeted = budget.apply(source_ir.model_visible());
+    let report =
+        crate::compare::compare_replays(&budgeted.as_events(), &target_ir.model_visible(), vendor);
     debug!(
         source_events = report.source_events,
         target_events = report.target_events,
@@ -908,7 +967,11 @@ fn estimate_message_tokens(m: &CanonicalMessage) -> usize {
 
 /// Trim a string to ~`max` chars, keeping head and tail with an elision marker.
 /// Returns `None` if no truncation was needed.
-fn elide_middle(s: &str, max: usize) -> Option<String> {
+///
+/// Shared with [`crate::budget`], which truncates tool observations on the
+/// structured track. One elision routine rather than two, so that the marker a
+/// model reads is the same sentence whichever track produced the session.
+pub(crate) fn elide_middle(s: &str, max: usize) -> Option<String> {
     if max == 0 {
         return None;
     }
