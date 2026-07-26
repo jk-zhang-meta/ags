@@ -176,12 +176,42 @@ fn assert_roundtrip_lossless(
     roundtrip: &CanonicalSession,
     label: &str,
 ) {
+    assert_roundtrip_lossless_except(original, roundtrip, label, &[]);
+}
+
+/// The round trip lost nothing beyond `expected`, and lost every one of them.
+///
+/// Two-sided on purpose. A flat round trip through a provider with no tool role
+/// genuinely cannot keep `MessageRole::Tool`, and pretending otherwise would
+/// mean either a failing test or a weakened one. But an allowance that stops
+/// being exercised is worse than no allowance: it silently widens to cover a
+/// real regression. So an expected loss that does not occur fails too.
+fn assert_roundtrip_lossless_except(
+    original: &CanonicalSession,
+    roundtrip: &CanonicalSession,
+    label: &str,
+    expected: &[&str],
+) {
     let losses = collect_lossiness(original, roundtrip);
+    let (allowed, unexpected): (Vec<&String>, Vec<&String>) = losses
+        .iter()
+        .partition(|loss| expected.iter().any(|pat| loss.contains(pat)));
     assert!(
-        losses.is_empty(),
+        unexpected.is_empty(),
         "[{label}] lossy round-trip detected:\n{}",
-        losses.join("\n")
+        unexpected
+            .iter()
+            .map(|loss| loss.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
+    for pat in expected {
+        assert!(
+            allowed.iter().any(|loss| loss.contains(pat)),
+            "[{label}] expected loss {pat:?} did not occur — the allowance is now \
+             covering nothing and must be removed"
+        );
+    }
 }
 
 #[test]
@@ -248,7 +278,23 @@ fn roundtrip_codex_to_cc_to_gemini_to_codex_is_lossless() {
     let gmi = write_then_read(&Gemini, &cc);
     let back_to_codex = write_then_read(&Codex, &gmi);
 
-    assert_roundtrip_lossless(&original, &back_to_codex, "cod->cc->gmi->cod");
+    // `Tool -> User` is the one real loss on this path and it is structural,
+    // not a bug: Claude Code represents a tool result as a user record holding
+    // a `tool_result` block, and Gemini has no tool role at all, so by the time
+    // the session returns to Codex the role is gone. That is exactly what
+    // `Fidelity::ConversationOnly` describes, and it is why the structured
+    // track exists.
+    //
+    // The old fixture never surfaced this: all 33 of its records were
+    // `role: assistant` carrying Claude-shaped `tool_use` blocks inline, a
+    // shape Codex has never written, and it contained no tool results at all.
+    // The round trip was lossless because the input was degenerate.
+    assert_roundtrip_lossless_except(
+        &original,
+        &back_to_codex,
+        "cod->cc->gmi->cod",
+        &["role: Tool -> User"],
+    );
 }
 
 #[test]

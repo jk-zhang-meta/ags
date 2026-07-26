@@ -21,11 +21,12 @@ use anyhow::Context;
 use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
+use crate::ir::SessionIr;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
 
 /// Claude Code provider implementation.
 pub struct ClaudeCode;
@@ -509,6 +510,81 @@ impl Provider for ClaudeCode {
     fn resume_command(&self, session_id: &str) -> String {
         format!("claude --resume {session_id}")
     }
+
+    /// Claude Code is on the high-fidelity track; see [`super::claude_code_ir`].
+    fn read_session_ir(&self, path: &Path) -> anyhow::Result<Option<SessionIr>> {
+        super::claude_code_ir::read(path).map(Some)
+    }
+
+    fn supports_structured_write(&self) -> bool {
+        true
+    }
+
+    /// Write the structured IR as a native transcript; see
+    /// [`super::claude_code_ir_write`].
+    ///
+    /// Placement, naming and the atomic write are the flat writer's, unchanged
+    /// — the only thing this path does differently is what goes *in* the file.
+    /// `Ok(None)` when the replay is empty, so the caller falls back to the flat
+    /// projection rather than writing a transcript with no conversation in it.
+    fn write_session_ir(
+        &self,
+        ir: &SessionIr,
+        opts: &WriteOptions,
+    ) -> anyhow::Result<Option<StructuredWrite>> {
+        let target_session_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let Some(rendered) = super::claude_code_ir_write::render(ir, &target_session_id, now)
+        else {
+            debug!("structured Claude Code write skipped: the replay is empty");
+            return Ok(None);
+        };
+
+        let workspace = ir
+            .workspace
+            .cwd
+            .as_deref()
+            .unwrap_or(std::path::Path::new("/tmp"));
+        let projects_dir = Self::projects_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine Claude Code projects directory"))?;
+        let target_path = projects_dir
+            .join(project_dir_key(workspace))
+            .join(format!("{target_session_id}.jsonl"));
+
+        debug!(
+            target_session_id,
+            target_path = %target_path.display(),
+            records = rendered.lines.len(),
+            "writing structured Claude Code session"
+        );
+
+        // Claude Code appends new turns to this file on resume; without a
+        // trailing newline its first appended record is concatenated onto
+        // casr's last line, corrupting it.
+        let mut content = rendered.lines.join("\n");
+        content.push('\n');
+        let outcome =
+            crate::pipeline::atomic_write(&target_path, content.as_bytes(), opts.force, self.slug())?;
+
+        info!(
+            target_session_id,
+            path = %outcome.target_path.display(),
+            fidelity = ?rendered.fidelity,
+            "structured Claude Code session written"
+        );
+
+        Ok(Some(StructuredWrite {
+            written: WrittenSession {
+                paths: vec![outcome.target_path],
+                session_id: target_session_id.clone(),
+                resume_command: self.resume_command(&target_session_id),
+                backup_path: outcome.backup_path,
+                warnings: rendered.warnings,
+            },
+            fidelity: rendered.fidelity,
+            losses: rendered.losses,
+        }))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +664,7 @@ fn claude_entry_type(role: &MessageRole) -> &'static str {
 /// These historical tool calls are never re-executed — they are replayed as
 /// context only — so coercing to `{"value": <original>}` is safe for any
 /// string that isn't itself a JSON object.
-fn coerce_tool_input(arguments: &serde_json::Value) -> serde_json::Value {
+pub(crate) fn coerce_tool_input(arguments: &serde_json::Value) -> serde_json::Value {
     match arguments {
         serde_json::Value::Object(_) => arguments.clone(),
         serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {

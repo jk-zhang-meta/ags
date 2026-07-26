@@ -9,6 +9,8 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::ir::Fidelity;
+
 /// Current schema version for all JSON envelopes and per-record outputs.
 ///
 /// Bump this when adding/removing/renaming fields in any response struct.
@@ -127,6 +129,24 @@ pub struct ResumeSuccess {
     pub written_paths: Option<Vec<String>>,
     pub resume_command: Option<String>,
     pub dry_run: bool,
+    /// How much of the session survived the conversion, as a snake_case grade
+    /// (`"conversation_only"`, `"history_incomplete"`, …).
+    ///
+    /// The one field a script needs to decide whether the converted session is
+    /// safe to resume unattended.
+    pub fidelity: Fidelity,
+    /// The command `--launch` / `--launch-dry-run` resolved to, shell-quoted.
+    ///
+    /// `null` when no launch was asked for. Present under `--json` so the
+    /// launcher no longer has to route its output to stderr to keep stdout
+    /// parseable.
+    pub launch_command: Option<String>,
+    /// Whether `launch_command` actually names the converted session.
+    ///
+    /// `false` for the providers that have no session-id resume form: the file
+    /// was written correctly, the agent simply will not be pointed at it.
+    /// `null` when no launch was asked for, which is not the same as `false`.
+    pub launch_targets_session: Option<bool>,
     pub warnings: Vec<String>,
 }
 
@@ -322,6 +342,9 @@ mod tests {
             written_paths: None,
             resume_command: None,
             dry_run: true,
+            fidelity: Fidelity::ConversationOnly,
+            launch_command: None,
+            launch_targets_session: None,
             warnings: vec![],
         };
         let json = serde_json::to_value(&rs).unwrap();
@@ -330,6 +353,10 @@ mod tests {
         assert!(json["target_session_id"].is_null());
         assert!(json["written_paths"].is_null());
         assert!(json["resume_command"].is_null());
+        assert_eq!(json["fidelity"], "conversation_only");
+        // Not `false`: no launch was asked for, so there is nothing to target.
+        assert!(json["launch_command"].is_null());
+        assert!(json["launch_targets_session"].is_null());
     }
 
     #[test]
@@ -343,6 +370,9 @@ mod tests {
             written_paths: Some(vec!["/tmp/written.jsonl".to_string()]),
             resume_command: Some("claude --resume sid-tgt".to_string()),
             dry_run: false,
+            fidelity: Fidelity::HistoryIncomplete,
+            launch_command: Some("claude --resume sid-tgt".to_string()),
+            launch_targets_session: Some(true),
             warnings: vec!["missing workspace".to_string()],
         };
         let json = serde_json::to_value(&rs).unwrap();
@@ -352,6 +382,9 @@ mod tests {
         assert_eq!(json["written_paths"][0], "/tmp/written.jsonl");
         assert_eq!(json["resume_command"], "claude --resume sid-tgt");
         assert_eq!(json["warnings"][0], "missing workspace");
+        assert_eq!(json["fidelity"], "history_incomplete");
+        assert_eq!(json["launch_command"], "claude --resume sid-tgt");
+        assert_eq!(json["launch_targets_session"], true);
     }
 
     // -----------------------------------------------------------------------

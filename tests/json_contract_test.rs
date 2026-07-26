@@ -664,7 +664,20 @@ fn contract_info_json_source_path_is_absolute() {
 // Contract: `resume --json` (success)
 // ---------------------------------------------------------------------------
 // Expected shape: {ok, source_provider, target_provider, source_session_id,
-//                  target_session_id, written_paths, resume_command, dry_run, warnings}
+//                  target_session_id, written_paths, resume_command, dry_run,
+//                  fidelity, launch_command, launch_targets_session, warnings}
+
+/// Every grade `Fidelity` can serialize to, so a renamed variant fails here
+/// rather than silently becoming an unknown string in a caller's parser.
+const FIDELITY_GRADES: &[&str] = &[
+    "byte_identical",
+    "native_equivalent",
+    "context_complete",
+    "context_no_reasoning",
+    "conversation_only",
+    "transcript_only",
+    "history_incomplete",
+];
 
 fn assert_resume_success_object(obj: &serde_json::Value) {
     let ctx = "resume_success";
@@ -679,6 +692,9 @@ fn assert_resume_success_object(obj: &serde_json::Value) {
             "written_paths",
             "resume_command",
             "dry_run",
+            "fidelity",
+            "launch_command",
+            "launch_targets_session",
             "warnings",
         ],
         ctx,
@@ -692,6 +708,18 @@ fn assert_resume_success_object(obj: &serde_json::Value) {
     assert_array_or_null(&obj["written_paths"], "written_paths", ctx);
     assert_string_or_null(&obj["resume_command"], "resume_command", ctx);
     assert_bool(&obj["dry_run"], "dry_run", ctx);
+    assert_string(&obj["fidelity"], "fidelity", ctx);
+    let grade = obj["fidelity"].as_str().unwrap();
+    assert!(
+        FIDELITY_GRADES.contains(&grade),
+        "{ctx}: fidelity {grade:?} is not one of {FIDELITY_GRADES:?}"
+    );
+    assert_string_or_null(&obj["launch_command"], "launch_command", ctx);
+    assert!(
+        obj["launch_targets_session"].is_boolean() || obj["launch_targets_session"].is_null(),
+        "{ctx}: launch_targets_session should be a bool or null, got {:?}",
+        obj["launch_targets_session"]
+    );
     assert_array(&obj["warnings"], "warnings", ctx);
 }
 
@@ -718,6 +746,13 @@ fn contract_resume_json_dry_run_cc_to_codex() {
     assert!(parsed["target_session_id"].is_null());
     assert!(parsed["written_paths"].is_null());
     assert!(parsed["resume_command"].is_null());
+    // The flat projection keeps roles and tool-call structure but not the
+    // protocol around them, and this session has nothing sealed to lose.
+    assert_eq!(parsed["fidelity"], "conversation_only");
+    // No launch was asked for. Null, not false: "not applicable" and "will not
+    // resume the converted session" are different answers.
+    assert!(parsed["launch_command"].is_null());
+    assert!(parsed["launch_targets_session"].is_null());
 }
 
 #[test]
@@ -826,6 +861,100 @@ fn contract_resume_json_gemini_to_codex() {
     assert_resume_success_object(&parsed);
     assert_eq!(parsed["source_provider"].as_str().unwrap(), "gemini");
     assert_eq!(parsed["target_provider"].as_str().unwrap(), "codex");
+}
+
+// ---------------------------------------------------------------------------
+// Contract: the launch fields
+//
+// These go through `--launch-dry-run`, never `--launch`, so that a regression
+// cannot start a real agent and attach it to the test runner's terminal.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn contract_resume_json_launch_command_is_in_the_envelope_not_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "resume", "cod", &session_id, "--launch-dry-run"])
+        .output()
+        .expect("resume should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON from resume: {e}\nOutput: {stdout}"));
+
+    assert_resume_success_object(&parsed);
+    let command = parsed["launch_command"]
+        .as_str()
+        .expect("a launch was asked for, so the envelope must carry its command");
+    let target_id = parsed["target_session_id"].as_str().unwrap();
+    assert_eq!(command, format!("codex resume {target_id}"));
+    assert_eq!(parsed["launch_targets_session"], true);
+
+    // The whole reason the fields exist: the command used to be printed to
+    // stderr because the envelope had nowhere to put it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("codex resume"),
+        "the command belongs in the envelope, not on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn contract_resume_json_launch_passthrough_flags_are_in_the_command() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "resume",
+            "cod",
+            &session_id,
+            "--launch-dry-run",
+            "--",
+            "--model",
+            "o3",
+        ])
+        .output()
+        .expect("resume should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON from resume: {e}\nOutput: {stdout}"));
+
+    let target_id = parsed["target_session_id"].as_str().unwrap();
+    assert_eq!(
+        parsed["launch_command"].as_str().unwrap(),
+        format!("codex resume {target_id} --model o3"),
+        "the envelope must report the command that would actually run"
+    );
+}
+
+#[test]
+fn contract_resume_json_reports_an_untargetable_launch_as_false() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    // Cursor has no session-id resume form: the file is written correctly, the
+    // editor just will not be pointed at it. A script has to be able to see
+    // that without parsing prose.
+    let output = casr_cmd(&tmp)
+        .args(["--json", "resume", "cur", &session_id, "--launch-dry-run"])
+        .output()
+        .expect("resume should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON from resume: {e}\nOutput: {stdout}"));
+
+    assert_resume_success_object(&parsed);
+    assert_eq!(parsed["launch_command"].as_str().unwrap(), "cursor .");
+    assert_eq!(parsed["launch_targets_session"], false);
 }
 
 // ---------------------------------------------------------------------------

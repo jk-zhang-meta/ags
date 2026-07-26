@@ -17,12 +17,16 @@ use std::{
 use casr::{
     discovery::{DetectionResult, ProviderRegistry},
     error::CasrError,
+    ir::{
+        Body, Branch, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, LossKind, SessionIr,
+        SourceRef, Visibility,
+    },
     model::{CanonicalMessage, CanonicalSession, MessageRole, ToolResult},
     pipeline::{ConversionPipeline, ConvertOptions, validate_session},
     providers::claude_code::ClaudeCode,
     providers::codex::Codex,
     providers::gemini::Gemini,
-    providers::{Provider, WriteOptions, WrittenSession},
+    providers::{Provider, StructuredWrite, WriteOptions, WrittenSession},
 };
 
 #[derive(Clone)]
@@ -46,6 +50,13 @@ struct MockState {
     write_outcome: Option<WriteOutcome>,
     write_calls: usize,
     last_written: Option<CanonicalSession>,
+    /// What `read_session_ir` returns. `None` models a provider with no
+    /// structured reader, which is the default and the majority.
+    ir_read: Option<SessionIr>,
+    /// Grade `write_session_ir` reports. `None` models a provider with no
+    /// structured writer, so the pipeline must fall back to the flat path.
+    structured_grade: Option<Fidelity>,
+    structured_write_calls: usize,
 }
 
 #[derive(Clone)]
@@ -110,8 +121,23 @@ impl MockProvider {
             Some(WriteOutcome::Error(message.to_string()));
     }
 
+    fn set_structured_read(&self, ir: SessionIr) {
+        self.state.lock().expect("mock state lock").ir_read = Some(ir);
+    }
+
+    fn set_structured_write(&self, grade: Fidelity) {
+        self.state.lock().expect("mock state lock").structured_grade = Some(grade);
+    }
+
     fn write_calls(&self) -> usize {
         self.state.lock().expect("mock state lock").write_calls
+    }
+
+    fn structured_write_calls(&self) -> usize {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .structured_write_calls
     }
 
     fn last_written(&self) -> Option<CanonicalSession> {
@@ -206,6 +232,102 @@ impl Provider for MockProvider {
     fn resume_command(&self, session_id: &str) -> String {
         format!("{} --resume {session_id}", self.alias)
     }
+
+    fn read_session_ir(&self, _path: &Path) -> anyhow::Result<Option<SessionIr>> {
+        Ok(self.state.lock().expect("mock state lock").ir_read.clone())
+    }
+
+    /// Mirrors what `write_session_ir` below will actually do, so the capability
+    /// flag cannot drift out of step with the capability in a mock the way it
+    /// could in a real provider.
+    fn supports_structured_write(&self) -> bool {
+        self.state
+            .lock()
+            .expect("mock state lock")
+            .structured_grade
+            .is_some()
+    }
+
+    fn write_session_ir(
+        &self,
+        _ir: &SessionIr,
+        _opts: &WriteOptions,
+    ) -> anyhow::Result<Option<StructuredWrite>> {
+        let mut state = self.state.lock().expect("mock state lock");
+        let Some(fidelity) = state.structured_grade else {
+            return Ok(None);
+        };
+        state.structured_write_calls += 1;
+        let session_id = format!("{}-structured-session", self.alias);
+        Ok(Some(StructuredWrite {
+            written: WrittenSession {
+                paths: vec![PathBuf::from(format!("/tmp/{}/structured.json", self.slug))],
+                resume_command: self.resume_command(&session_id),
+                session_id,
+                backup_path: None,
+                warnings: vec!["structured writer note".to_string()],
+            },
+            losses: Vec::new(),
+            fidelity,
+        }))
+    }
+}
+
+/// A model-visible IR event, with whatever capsules the case needs.
+fn ir_event(id: &str, body: Body, capsules: Vec<Capsule>) -> Event {
+    Event {
+        id: id.to_string(),
+        parent: None,
+        branch: Branch::Main,
+        turn: None,
+        ts: None,
+        visibility: Visibility::Model,
+        body,
+        capsules,
+        source: SourceRef {
+            line: 1,
+            sha256: String::new(),
+        },
+    }
+}
+
+/// An IR holding a single ordinary message — enough to be a structured read
+/// without exercising any loss.
+fn intact_ir() -> SessionIr {
+    let mut ir = SessionIr::new("mock-source", "sid-ir");
+    ir.events.push(ir_event(
+        "e1",
+        Body::Message {
+            role: casr::ir::Role::User,
+            blocks: vec![casr::ir::Block::Text {
+                text: "question one".to_string(),
+            }],
+        },
+        Vec::new(),
+    ));
+    ir
+}
+
+/// An IR whose live context is a sealed compaction: the conversation itself is
+/// inside a blob only the issuing vendor can read.
+fn sealed_compaction_ir() -> SessionIr {
+    let mut ir = intact_ir();
+    ir.events.push(ir_event(
+        "e2",
+        Body::SealedContext {
+            native_id: Some("cmp_test_001".to_string()),
+            meta: serde_json::Value::Null,
+        },
+        vec![Capsule {
+            kind: CapsuleKind::OpenaiCompactedContext,
+            bound: CapsuleBinding {
+                provider: "openai".to_string(),
+                model: None,
+            },
+            sealed: "c2VhbGVkLWNvbXBhY3RlZC1oaXN0b3J5".to_string(),
+        }],
+    ));
+    ir
 }
 
 fn msg(idx: usize, role: MessageRole, content: &str, ts: Option<i64>) -> CanonicalMessage {
@@ -396,6 +518,340 @@ fn pipeline_same_provider_short_circuit_skips_write() {
         .expect("same-provider should still return resume metadata");
     assert_eq!(written.paths.len(), 0);
     assert_eq!(written.session_id, "sid-same");
+    assert_eq!(
+        result.fidelity,
+        Fidelity::ByteIdentical,
+        "nothing was rewritten; the agent resumes its own bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Track selection and fidelity grading
+// ---------------------------------------------------------------------------
+
+/// A source and target wired for the given session, minus any structured
+/// support — the callers below opt into that individually.
+fn flat_pair(session_id: &str) -> (MockProvider, MockProvider, ConversionPipeline) {
+    pair_with_target_slug(session_id, "mock-target")
+}
+
+/// The same pair, with the target's slug chosen by the caller.
+///
+/// The structural read-back verifier resolves the target's capsule vendor from
+/// its slug, because that is the provider that was asked to write rather than
+/// something inside the file it produced. A mock called `mock-target` therefore
+/// has no known vendor and the comparison is skipped — correct behaviour, and
+/// useless for testing the comparison, so the tests that need it borrow a slug
+/// the comparator recognises.
+fn pair_with_target_slug(
+    session_id: &str,
+    target_slug: &str,
+) -> (MockProvider, MockProvider, ConversionPipeline) {
+    let src = MockProvider::new(
+        "Mock Source",
+        "mock-source",
+        "src",
+        vec![PathBuf::from("/tmp/src-root")],
+    );
+    let dst = MockProvider::new(
+        "Mock Target",
+        target_slug,
+        "tgt",
+        vec![PathBuf::from("/tmp/tgt-root")],
+    );
+
+    let source_path = PathBuf::from(format!("/tmp/src-root/{session_id}.json"));
+    let written_path = PathBuf::from(format!("/tmp/tgt-root/{session_id}-out.json"));
+    let session = valid_session_with_id(session_id);
+
+    src.set_owned_session(session_id, source_path.clone());
+    src.set_read_session(source_path, session.clone());
+    dst.set_write_success(WrittenSession {
+        paths: vec![written_path.clone()],
+        session_id: format!("target-{session_id}"),
+        resume_command: format!("tgt --resume target-{session_id}"),
+        backup_path: None,
+        warnings: Vec::new(),
+    });
+    dst.set_read_session(written_path, session);
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(src.clone()), Box::new(dst.clone())]),
+    };
+    (src, dst, pipeline)
+}
+
+#[test]
+fn pipeline_takes_the_structured_track_when_both_ends_support_it() {
+    let (src, dst, pipeline) = flat_pair("sid-structured");
+    src.set_structured_read(intact_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+
+    let result = pipeline
+        .convert("tgt", "sid-structured", options(false, None))
+        .expect("structured convert should succeed");
+
+    assert_eq!(dst.structured_write_calls(), 1);
+    assert_eq!(
+        dst.write_calls(),
+        0,
+        "the flat writer must not also run — that would write the session twice"
+    );
+    let written = result.written.expect("structured write returns files");
+    assert_eq!(written.session_id, "tgt-structured-session");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w == "structured writer note"),
+        "the structured writer's warnings must reach the user: {:?}",
+        result.warnings
+    );
+    assert_eq!(
+        result.fidelity,
+        Fidelity::ContextComplete,
+        "the grade is the writer's, carried unchanged"
+    );
+    assert!(result.losses.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The structured track's read-back verifier
+// ---------------------------------------------------------------------------
+
+/// An IR whose reasoning rides in an Anthropic capsule — foreign to a Codex
+/// target, so `Capsule::fits` predicts it cannot cross.
+fn anthropic_reasoning_ir() -> SessionIr {
+    let mut ir = intact_ir();
+    ir.events.push(ir_event(
+        "e2",
+        Body::Reasoning {
+            text: None,
+            summary: Vec::new(),
+        },
+        vec![Capsule {
+            kind: CapsuleKind::AnthropicThinkingSignature,
+            bound: CapsuleBinding {
+                provider: "anthropic".to_string(),
+                model: None,
+            },
+            sealed: "c2lnbmF0dXJl".to_string(),
+        }],
+    ));
+    ir
+}
+
+#[test]
+fn pipeline_verifies_the_structured_track_against_the_written_file() {
+    // The gap this closes: the structured track used to return with nothing
+    // checked at all, so the high-fidelity conversions were the unverified ones.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-verified", "codex");
+    src.set_structured_read(intact_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+    // What the target's structured reader finds on disk afterwards.
+    dst.set_structured_read(intact_ir());
+
+    let result = pipeline
+        .convert("tgt", "sid-verified", options(false, None))
+        .expect("a verified structured write should succeed");
+
+    assert_eq!(dst.structured_write_calls(), 1);
+    assert_eq!(
+        result.fidelity,
+        Fidelity::ContextComplete,
+        "a clean verification leaves the writer's grade alone"
+    );
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("could not be verified")),
+        "the comparison ran, so nothing should say it was skipped: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn pipeline_fails_a_structured_write_that_lost_the_conversation() {
+    // A verification failure is not a write failure with a nicer message, and
+    // it is not a reason to lower the grade and carry on: the file on disk is
+    // not the session, so it goes back.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-damaged", "codex");
+    src.set_structured_read(intact_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+    // Read-back holds no events at all: the message is simply gone, and no
+    // vendor boundary predicted that.
+    dst.set_structured_read(SessionIr::new("codex", "written"));
+
+    let error = pipeline
+        .convert("tgt", "sid-damaged", options(false, None))
+        .expect_err("a written file that is missing conversation must not pass");
+
+    let Some(CasrError::VerifyFailed { detail, .. }) = error.downcast_ref::<CasrError>() else {
+        panic!("expected VerifyFailed, got {error:?}");
+    };
+    assert!(
+        detail.contains("nothing predicted the loss"),
+        "the detail must distinguish this from a predicted vendor-boundary drop: {detail}"
+    );
+    assert!(
+        detail.contains("rollback succeeded"),
+        "an unverified write is rolled back: {detail}"
+    );
+}
+
+#[test]
+fn pipeline_says_when_a_structured_write_could_not_be_verified() {
+    // A target with a structured writer and no structured reader. Nothing was
+    // checked, and a check that did not run must not read as one that passed.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-unverifiable", "codex");
+    src.set_structured_read(intact_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+
+    let result = pipeline
+        .convert("tgt", "sid-unverifiable", options(false, None))
+        .expect("an unverifiable write is not a failed one");
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("no structured reader")
+                && warning.contains("could not be verified")),
+        "the skipped check must be stated: {:?}",
+        result.warnings
+    );
+    assert_eq!(result.fidelity, Fidelity::ContextComplete);
+}
+
+#[test]
+fn pipeline_reports_a_writer_that_graded_better_than_its_output() {
+    // The comparator derives a grade from the file independently. When the two
+    // disagree the writer's grade is still the one reported — substituting the
+    // comparator's would hide the disagreement as effectively as ignoring it —
+    // and the disagreement itself is surfaced.
+    let (src, dst, pipeline) = pair_with_target_slug("sid-overclaimed", "codex");
+    src.set_structured_read(anthropic_reasoning_ir());
+    dst.set_structured_write(Fidelity::ContextComplete);
+    // The Anthropic capsule could not cross into a Codex rollout and did not,
+    // which is correct — but a conversion that dropped reasoning is not
+    // `ContextComplete`.
+    dst.set_structured_read(intact_ir());
+
+    let result = pipeline
+        .convert("tgt", "sid-overclaimed", options(false, None))
+        .expect("the bytes are fine, so nothing is rolled back");
+
+    assert_eq!(
+        result.fidelity,
+        Fidelity::ContextComplete,
+        "the reported grade is still the writer's"
+    );
+    assert!(
+        result.warnings.iter().any(|warning| {
+            warning.contains("graded this conversion ContextComplete")
+                && warning.contains("only supports ContextNoReasoning")
+        }),
+        "the disagreement must be surfaced: {:?}",
+        result.warnings
+    );
+}
+
+#[test]
+fn pipeline_falls_back_to_the_flat_path_when_one_end_cannot() {
+    // Source reads structured, target cannot write it. Half a track is no
+    // track: the conversion still has to happen, on the flat one.
+    let (src, dst, pipeline) = flat_pair("sid-half");
+    src.set_structured_read(intact_ir());
+
+    let result = pipeline
+        .convert("tgt", "sid-half", options(false, None))
+        .expect("convert should fall back rather than fail");
+
+    assert_eq!(dst.structured_write_calls(), 0);
+    assert_eq!(dst.write_calls(), 1, "the flat writer must have run");
+    assert_eq!(result.fidelity, Fidelity::ConversationOnly);
+
+    // And the mirror image: a target that could write structured output, given
+    // a source that cannot produce any.
+    let (_src, dst, pipeline) = flat_pair("sid-other-half");
+    dst.set_structured_write(Fidelity::ContextComplete);
+
+    let result = pipeline
+        .convert("tgt", "sid-other-half", options(false, None))
+        .expect("convert should fall back rather than fail");
+
+    assert_eq!(
+        dst.structured_write_calls(),
+        0,
+        "with no IR to hand it, the structured writer is never asked"
+    );
+    assert_eq!(dst.write_calls(), 1);
+    assert_eq!(result.fidelity, Fidelity::ConversationOnly);
+}
+
+#[test]
+fn pipeline_grades_the_flat_projection_as_conversation_only() {
+    // No structured reader at all — the common case. `CanonicalSession` keeps
+    // roles and tool-call structure, so the honest grade is `ConversationOnly`
+    // rather than `TranscriptOnly`, and there is nothing to add about it.
+    let (_src, _dst, pipeline) = flat_pair("sid-flat");
+
+    let result = pipeline
+        .convert("tgt", "sid-flat", options(false, None))
+        .expect("flat convert should succeed");
+
+    assert_eq!(result.fidelity, Fidelity::ConversationOnly);
+    assert!(result.losses.is_empty());
+}
+
+#[test]
+fn pipeline_grades_a_dropped_sealed_compaction_as_history_incomplete() {
+    let (src, _dst, pipeline) = flat_pair("sid-sealed");
+    src.set_structured_read(sealed_compaction_ir());
+
+    let result = pipeline
+        .convert("tgt", "sid-sealed", options(false, None))
+        .expect("the conversion still succeeds; it is the launch that refuses");
+
+    assert_eq!(
+        result.fidelity,
+        Fidelity::HistoryIncomplete,
+        "the flat projection carries no capsules, so this is a hole in the \
+         conversation rather than a degraded rendering of it"
+    );
+    let loss = result
+        .losses
+        .iter()
+        .find(|loss| loss.kind == LossKind::SealedContext)
+        .expect("a hole in the conversation has to say how big and whose it is");
+    assert_eq!(loss.events, 1, "one sealed capsule was dropped");
+    assert_eq!(loss.grade, Fidelity::HistoryIncomplete);
+    let detail = &loss.note;
+    assert!(
+        detail.contains("1 compacted-history capsule(s)")
+            && detail.contains("32 bytes")
+            && detail.contains("sealed to openai")
+            && detail.contains("mock-target"),
+        "the detail must name the count, the bytes, the vendor and the target: {detail}"
+    );
+}
+
+#[test]
+fn pipeline_grades_a_dry_run_as_the_conversion_it_describes() {
+    // A dry run that reported a clean grade for a session the real conversion
+    // would gut is worse than no grade at all.
+    let (src, dst, pipeline) = flat_pair("sid-dry-sealed");
+    src.set_structured_read(sealed_compaction_ir());
+
+    let result = pipeline
+        .convert("tgt", "sid-dry-sealed", options(true, None))
+        .expect("dry run should succeed");
+
+    assert!(result.written.is_none());
+    assert_eq!(dst.write_calls(), 0);
+    assert_eq!(result.fidelity, Fidelity::HistoryIncomplete);
+    assert!(!result.losses.is_empty());
 }
 
 #[test]
@@ -1185,6 +1641,60 @@ impl LogCollector {
     }
 }
 
+/// The capture, installed once as the binary's global subscriber.
+///
+/// `tracing` caches each callsite's interest globally, and the first thread to
+/// reach a callsite decides it — a thread with no subscriber caches "never", and
+/// every later event at that callsite is dropped however many subscribers have
+/// joined since. A thread-local `set_default` is therefore in a race it cannot
+/// reliably win, and warming the callsites first only helps when the scheduler
+/// cooperates. Measured over fifteen runs of this binary: one failure before
+/// four more converting tests were added beside this one, eleven after. The same
+/// `info!` in the structured track is on every one of their paths.
+///
+/// A global subscriber settles the interest for every callsite once, before any
+/// assertion depends on it. It also sees every test's events, which is why
+/// recording is gated on [`RECORDING`]: only the thread that asked for a capture
+/// gets one, and without that the negative assertions — *this event must not
+/// appear* — would be answered by some other test's conversion.
+static CAPTURE: std::sync::OnceLock<LogCollector> = std::sync::OnceLock::new();
+
+thread_local! {
+    static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record this thread's tracing events until the guard is dropped.
+fn capture_tracing() -> TracingCapture {
+    let collector = CAPTURE.get_or_init(|| {
+        let collector = LogCollector::default();
+        let subscriber = tracing_subscriber::registry().with(
+            collector
+                .clone()
+                .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
+        );
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other test in this binary installs a subscriber");
+        collector
+    });
+    collector.events.lock().expect("log collector lock").clear();
+    RECORDING.with(|recording| recording.set(true));
+    TracingCapture(collector)
+}
+
+struct TracingCapture(&'static LogCollector);
+
+impl TracingCapture {
+    fn snapshot(&self) -> Vec<CapturedEvent> {
+        self.0.snapshot()
+    }
+}
+
+impl Drop for TracingCapture {
+    fn drop(&mut self) {
+        RECORDING.with(|recording| recording.set(false));
+    }
+}
+
 impl<S> tracing_subscriber::Layer<S> for LogCollector
 where
     S: tracing::Subscriber,
@@ -1194,6 +1704,9 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        if !RECORDING.with(|recording| recording.get()) {
+            return;
+        }
         let meta = event.metadata();
         let mut fields = BTreeMap::new();
         event.record(&mut FieldVisitor {
@@ -1236,34 +1749,33 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
     let _codex_env = EnvGuard::set("CODEX_HOME", &tmp.path().join("codex"));
     let cc_sid = seed_cc_fixture(&tmp.path().join("claude"));
 
-    let collector = LogCollector::default();
-    let subscriber = tracing_subscriber::registry().with(
-        collector
-            .clone()
-            .with_filter(tracing_subscriber::filter::LevelFilter::TRACE),
-    );
-    let _guard = tracing::subscriber::set_default(subscriber);
-
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode), Box::new(Codex)]),
     };
+    let convert = || {
+        pipeline
+            .convert(
+                "cod",
+                &cc_sid,
+                ConvertOptions {
+                    dry_run: false,
+                    force: false,
+                    verbose: false,
+                    enrich: false,
+                    source_hint: None,
+                    ..Default::default()
+                },
+            )
+            .expect("conversion should succeed")
+    };
 
-    pipeline
-        .convert(
-            "cod",
-            &cc_sid,
-            ConvertOptions {
-                dry_run: false,
-                force: false,
-                verbose: false,
-                enrich: false,
-                source_hint: None,
-                ..Default::default()
-            },
-        )
-        .expect("conversion should succeed");
+    // See `CAPTURE`: the subscriber is global and recording is per-thread, so
+    // there is no callsite-registration race left to warm around.
+    let capture = capture_tracing();
 
-    let events = collector.snapshot();
+    convert();
+
+    let events = capture.snapshot();
 
     assert!(
         events
@@ -1294,11 +1806,30 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
                 && event_has_message(e, "atomic write complete")),
         "missing atomic write INFO event; got {events:#?}"
     );
+    // Claude Code -> Codex takes the structured track, which returns before the
+    // flat verifier. That verifier compares the target's `read_session` against
+    // `canonical`, and a structured write legitimately preserves more than the
+    // flat projection, so running it would fail the better conversion. So the
+    // two pins below are a pair: the flat oracle must *not* run here, and the
+    // structural one must. An earlier revision of this test pinned only the
+    // absence, because there was no second oracle to pin — which made the
+    // missing step visible instead of letting it read as a passing one. There
+    // is one now.
     assert!(
-        events
-            .iter()
-            .any(|e| e.level == tracing::Level::DEBUG
-                && event_has_message(e, "Codex session parsed")),
-        "missing read-back verify DEBUG event; got {events:#?}"
+        events.iter().any(|e| e.level == tracing::Level::INFO
+            && event_has_message(e, "session written on the structured track")),
+        "missing structured-track INFO event; got {events:#?}"
+    );
+    assert!(
+        !events.iter().any(|e| e.level == tracing::Level::DEBUG
+            && event_has_message(e, "Codex session parsed")),
+        "the structured track must not run the flat read-back verifier: it \
+         compares against `canonical`, which is not what was written"
+    );
+    assert!(
+        events.iter().any(|e| e.level == tracing::Level::DEBUG
+            && event_has_message(e, "structured read-back verified")),
+        "the structured track must run the structural comparator: without it \
+         the high-fidelity conversions are the unverified ones; got {events:#?}"
     );
 }

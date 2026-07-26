@@ -5,7 +5,7 @@
 //! CLI entry point: parses arguments, dispatches subcommands, renders output.
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -17,7 +17,10 @@ use rich_rust::prelude::{Cell, Column, Console, JustifyMethod, Row, Style, Table
 use tracing_subscriber::EnvFilter;
 
 use casr::discovery::ProviderRegistry;
-use casr::pipeline::{ConversionPipeline, ConvertOptions};
+use casr::ir::Fidelity;
+use casr::launch::{LaunchSpec, SessionTargeting};
+use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
+use casr::providers::Provider;
 use casr::responses::{
     self, ErrorEnvelope, InfoResponse, ListEnvelope, ListItem, ProviderInfo, ResumeSuccess,
 };
@@ -56,6 +59,11 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Convert and resume a session from another provider.
+    ///
+    /// `--launch` and `--launch-dry-run` are mutually exclusive, and
+    /// `--launch-anyway` / `-- <agent flags>` only mean something alongside
+    /// one of them.
+    #[command(group(clap::ArgGroup::new("launching").args(["launch", "launch_dry_run"])))]
     Resume {
         /// Target provider alias (cc, cod, gmi, agy, cur, cln, aid, amp, opc, gpt).
         target: String,
@@ -94,6 +102,38 @@ enum Command {
         /// hidden reasoning).
         #[arg(long)]
         keep_reasoning: bool,
+
+        /// Start the target agent on the converted session instead of printing
+        /// a command to paste.
+        ///
+        /// On Unix this process is replaced by the agent, so it inherits the
+        /// terminal and there is no casr left waiting behind it.
+        ///
+        /// Four providers — Aider, Cline, Cursor, OpenCode — have no way to be
+        /// pointed at a specific session. For those the agent is started
+        /// plain, with a notice naming the file that was written, because the
+        /// converted session will not be the one it opens.
+        #[arg(long, conflicts_with = "dry_run")]
+        launch: bool,
+
+        /// Convert, then print the exact command `--launch` would run and stop.
+        ///
+        /// The session is still written; only the agent is not started.
+        #[arg(long, conflicts_with = "dry_run")]
+        launch_dry_run: bool,
+
+        /// Launch even when the conversion could not carry part of the
+        /// conversation across.
+        #[arg(long, requires = "launching")]
+        launch_anyway: bool,
+
+        /// Flags for the target agent, appended after the resume arguments.
+        ///
+        /// Refused if one of them is a flag the resume command already sets,
+        /// since that would start a different session than the one just
+        /// written.
+        #[arg(last = true, value_name = "AGENT_ARGS", requires = "launching")]
+        agent_args: Vec<String>,
     },
 
     /// List all discoverable sessions across installed providers.
@@ -269,6 +309,10 @@ fn main() -> ExitCode {
             max_context_tokens,
             max_tool_output,
             keep_reasoning,
+            launch,
+            launch_dry_run,
+            launch_anyway,
+            agent_args,
         } => cmd_resume(
             &target,
             &session_id,
@@ -280,6 +324,12 @@ fn main() -> ExitCode {
             max_tool_output,
             keep_reasoning,
             cli.json,
+            LaunchRequest {
+                launch,
+                dry_run: launch_dry_run,
+                anyway: launch_anyway,
+                agent_args,
+            },
         ),
         Command::List {
             provider,
@@ -294,20 +344,22 @@ fn main() -> ExitCode {
             &sort,
             cli.json,
             enrich_fs,
-        ),
+        )
+        .map(|()| ExitCode::SUCCESS),
         Command::Info {
             session_id,
             enrich_fs,
             source,
             peek,
             peek_lines,
-        } => cmd_info(&session_id, cli.json, enrich_fs, source, peek, peek_lines),
-        Command::Providers => cmd_providers(cli.json),
-        Command::Completions { shell } => cmd_completions(&shell),
+        } => cmd_info(&session_id, cli.json, enrich_fs, source, peek, peek_lines)
+            .map(|()| ExitCode::SUCCESS),
+        Command::Providers => cmd_providers(cli.json).map(|()| ExitCode::SUCCESS),
+        Command::Completions { shell } => cmd_completions(&shell).map(|()| ExitCode::SUCCESS),
     };
 
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(e) => {
             if cli.json {
                 let envelope = ErrorEnvelope::new(error_type_name(&e), format!("{e}"));
@@ -346,6 +398,22 @@ fn error_type_name(e: &anyhow::Error) -> &'static str {
 // Command implementations
 // ---------------------------------------------------------------------------
 
+/// What the user asked the launcher to do, kept together so the four flags
+/// travel as one argument rather than four more booleans.
+struct LaunchRequest {
+    launch: bool,
+    dry_run: bool,
+    anyway: bool,
+    agent_args: Vec<String>,
+}
+
+impl LaunchRequest {
+    /// Whether a launch was asked for at all, in either form.
+    fn wanted(&self) -> bool {
+        self.launch || self.dry_run
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_resume(
     target: &str,
@@ -358,7 +426,8 @@ fn cmd_resume(
     max_tool_output: usize,
     keep_reasoning: bool,
     json_mode: bool,
-) -> anyhow::Result<()> {
+    launch: LaunchRequest,
+) -> anyhow::Result<ExitCode> {
     let registry = ProviderRegistry::default_registry();
     let pipeline = ConversionPipeline { registry };
 
@@ -375,7 +444,23 @@ fn cmd_resume(
 
     let result = pipeline.convert(target, session_id, opts)?;
 
+    // Resolved before anything is printed, because the JSON envelope carries
+    // the command and the envelope is printed first. The error is held rather
+    // than propagated for the same reason the missing-agent report is deferred:
+    // a launch that cannot be prepared does not undo a conversion that wrote
+    // files, and the written paths are the useful part of that output.
+    let prepared: Option<(&dyn Provider, anyhow::Result<LaunchSpec>)> =
+        launch.wanted().then(|| {
+            let provider = pipeline
+                .registry
+                .find_by_alias(target)
+                .expect("convert() already resolved this alias");
+            let spec = prepare_launch(provider, &result, &launch);
+            (provider, spec)
+        });
+
     if json_mode {
+        let spec = prepared.as_ref().and_then(|(_, spec)| spec.as_ref().ok());
         let response = ResumeSuccess {
             ok: true,
             source_provider: result.source_provider.clone(),
@@ -388,6 +473,9 @@ fn cmd_resume(
                 .map(|w| w.paths.iter().map(|p| p.display().to_string()).collect()),
             resume_command: result.written.as_ref().map(|w| w.resume_command.clone()),
             dry_run: result.written.is_none(),
+            fidelity: result.fidelity,
+            launch_command: spec.map(LaunchSpec::display),
+            launch_targets_session: spec.map(|s| s.targeting() == SessionTargeting::ById),
             warnings: result.warnings.clone(),
         };
         println!("{}", serde_json::to_string_pretty(&response)?);
@@ -439,7 +527,160 @@ fn cmd_resume(
         }
     }
 
-    Ok(())
+    let Some((provider, spec)) = prepared else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    run_launch(provider, &result, spec?, &launch, json_mode)
+}
+
+/// The command a launch would run, resolved without running it.
+///
+/// Separate from [`run_launch`] because the JSON envelope reports the command
+/// and is printed before the launch happens, so the spec has to exist first.
+fn prepare_launch(
+    provider: &dyn Provider,
+    result: &ConversionResult,
+    launch: &LaunchRequest,
+) -> anyhow::Result<LaunchSpec> {
+    // `--launch` and `--launch-dry-run` both conflict with `--dry-run`.
+    let written = result
+        .written
+        .as_ref()
+        .expect("a launched conversion is never a dry run");
+
+    provider
+        .launch_spec(&written.session_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} cannot be started: its resume form {:?} is not a command line",
+                provider.name(),
+                written.resume_command
+            )
+        })?
+        .try_passthrough(launch.agent_args.iter().cloned())
+        .map_err(Into::into)
+}
+
+/// Start the target agent on the session the conversion just wrote.
+///
+/// Lost history and the untargetable-provider warning are both decided before
+/// the dry-run exit, so `--launch-dry-run` is a real check rather than a
+/// second, more optimistic code path. Whether the agent is on `PATH` is
+/// deliberately not: checking a converted-but-not-yet-installed target is one
+/// of the things the dry run is for.
+fn run_launch(
+    provider: &dyn Provider,
+    result: &ConversionResult,
+    spec: LaunchSpec,
+    launch: &LaunchRequest,
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let written = result
+        .written
+        .as_ref()
+        .expect("a launched conversion is never a dry run");
+
+    // A hole in the conversation blocks rather than warns: the agent would
+    // start missing history and neither it nor the user would be told. Every
+    // grade above this one is a degraded *rendering* of a whole conversation,
+    // which is survivable — and since `Fidelity` is ordered best-first, `>=`
+    // is "at least this bad" rather than "at least this good".
+    if result.fidelity >= Fidelity::HistoryIncomplete && !launch.anyway {
+        let mut refusal = format!("refusing to launch — {}.", result.fidelity.describe());
+        // The grade names the category; the losses name the capsules, the
+        // counts, and the vendor that sealed them, which is what the user can
+        // act on. Only the losses that forced this grade are worth printing
+        // here — a dropped-reasoning note alongside a missing-history refusal
+        // reads as though the two were comparable.
+        for loss in result
+            .losses
+            .iter()
+            .filter(|loss| loss.grade >= Fidelity::HistoryIncomplete)
+        {
+            refusal.push(' ');
+            refusal.push_str(&loss.note);
+        }
+        refusal.push_str(" Pass --launch-anyway to start it regardless.");
+        anyhow::bail!("{refusal}");
+    }
+
+    if spec.targeting() == SessionTargeting::NotTargeted {
+        launch_line(
+            json_mode,
+            &format!(
+                "{} {} has no way to be pointed at a specific session, so it will start \
+                 without resuming the converted one.",
+                "⚠".yellow(),
+                provider.name()
+            ),
+        );
+        for path in &written.paths {
+            launch_line(json_mode, &format!("  Converted session: {}", path.display()));
+        }
+    }
+
+    if launch.dry_run {
+        launch_line(json_mode, &spec.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Reported as a missing agent rather than as a failed conversion, because
+    // the conversion succeeded — the paths above are already on stdout.
+    if spec.program_path().is_none() {
+        anyhow::bail!(
+            "{} is not installed: `{}` is not on PATH. The session was converted and \
+             written; install the agent and run: {}",
+            provider.name(),
+            spec.program,
+            spec.display()
+        );
+    }
+
+    launch_agent(&spec)
+}
+
+/// Emit a launch-time line, unless the JSON envelope already carries it.
+///
+/// Under `--json` the same information is in `launch_command` and
+/// `launch_targets_session`, so printing it again would either corrupt stdout
+/// for the callers who asked for parseable output or duplicate it on stderr.
+fn launch_line(json_mode: bool, line: &str) {
+    if !json_mode {
+        println!("{line}");
+    }
+}
+
+/// Start the agent, replacing this process where the OS allows it.
+///
+/// `exec` rather than spawn+wait so the agent owns the terminal outright:
+/// signals, job control, and window-size changes reach it directly instead of
+/// a parent that is only blocking on `wait`, and no casr process lingers for
+/// the lifetime of the session.
+#[cfg(unix)]
+fn launch_agent(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
+    use std::os::unix::process::CommandExt;
+
+    // exec discards anything still buffered, including the written paths.
+    let _ = std::io::stdout().flush();
+    let error = spec.command().exec();
+    Err(anyhow::anyhow!(
+        "failed to start `{}`: {error}",
+        spec.program
+    ))
+}
+
+#[cfg(not(unix))]
+fn launch_agent(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
+    let _ = std::io::stdout().flush();
+    let status = spec
+        .command()
+        .status()
+        .map_err(|error| anyhow::anyhow!("failed to start `{}`: {error}", spec.program))?;
+    // A signal death carries no code; reporting it as success would tell a
+    // script the session ended cleanly when it was killed.
+    Ok(status
+        .code()
+        .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)))
 }
 
 fn cmd_list(

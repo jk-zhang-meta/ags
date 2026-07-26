@@ -13,8 +13,9 @@ use tracing::{debug, info, warn};
 
 use crate::discovery::{ProviderRegistry, SourceHint};
 use crate::error::CasrError;
+use crate::ir::{Body, Fidelity, Loss, LossKind, SessionIr};
 use crate::model::{CanonicalMessage, CanonicalSession, MessageRole, reindex_messages};
-use crate::providers::{WriteOptions, WrittenSession};
+use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
 
 /// Top-level orchestrator for session conversion.
 pub struct ConversionPipeline {
@@ -64,6 +65,22 @@ pub struct ConversionResult {
     pub canonical_session: CanonicalSession,
     pub written: Option<WrittenSession>,
     pub warnings: Vec<String>,
+    /// How much of the session survived the crossing.
+    ///
+    /// On the structured track this is whatever the writer reported in
+    /// [`StructuredWrite::fidelity`] — it is the only party that knows what it
+    /// had to leave behind, so nothing here second-guesses it. On the flat
+    /// track the pipeline grades the projection itself; see [`flat_fidelity`].
+    pub fidelity: Fidelity,
+    /// What [`ConversionResult::fidelity`] is made of.
+    ///
+    /// A `Fidelity` names the *category* of loss and deliberately carries no
+    /// payload; "1 capsule totalling 87 kB, sealed to openai" is the part a
+    /// user can act on, and it has to travel somewhere. Structured rather than
+    /// pre-rendered prose so that a caller can filter on [`LossKind`] — the
+    /// launch refusal cares only about [`LossKind::SealedContext`] — instead of
+    /// matching on sentences. Empty means the grade is its track's baseline.
+    pub losses: Vec<Loss>,
 }
 
 // ---------------------------------------------------------------------------
@@ -393,12 +410,22 @@ but resume may fail until the CLI is installed.",
         // 6. Dry-run short-circuit.
         if opts.dry_run {
             info!("dry run — skipping write and verify");
+            // Nothing was written, so there is no writer to ask for a grade.
+            // What a dry run can honestly report is what the flat projection
+            // would earn, which is also the only track available until a
+            // structured writer exists for the target.
+            let (fidelity, losses) = flat_fidelity(
+                read_source_ir(resolved.provider, &resolved.path).as_ref(),
+                target_provider.slug(),
+            );
             return Ok(ConversionResult {
                 source_provider: resolved.provider.slug().to_string(),
                 target_provider: target_provider.slug().to_string(),
                 canonical_session: canonical,
                 written: None,
                 warnings: all_warnings,
+                fidelity,
+                losses,
             });
         }
 
@@ -420,6 +447,94 @@ but resume may fail until the CLI is installed.",
                     warnings: Vec::new(),
                 }),
                 warnings: all_warnings,
+                // Nothing was converted and nothing was rewritten: the resume
+                // command points the agent back at its own bytes.
+                fidelity: Fidelity::ByteIdentical,
+                losses: Vec::new(),
+            });
+        }
+
+        // 7a1. Track selection.
+        //
+        // The structured track is taken only when both ends support it: an IR
+        // the target cannot consume is no better than no IR, and a structured
+        // writer handed a flat projection has nothing extra to write. Either
+        // half missing falls through to the flat path below.
+        //
+        // The target's half is now a capability check rather than a call.
+        // `write_session_ir` cannot be asked whether it exists without being
+        // handed an IR, so the probe used to cost a full second parse of the
+        // source — 281 MiB for the largest rollout in the corpus — to be told
+        // `Ok(None)`. [`Provider::supports_structured_write`] answers for free.
+        //
+        // The *read* below is still unconditional, and deliberately so. It has
+        // a second consumer: [`flat_fidelity`] needs the same IR to see a
+        // sealed compaction that the flat projection is about to delete, and
+        // grading such a conversion `ConversationOnly` when it is
+        // `HistoryIncomplete` is the silent degradation this crate exists to
+        // prevent. Gating the read on the target's capability would buy one
+        // parse and sell that grade; the trade is real, and it is not this
+        // change's to make.
+        //
+        // Selected here, above the budgeting and tool-normalization steps,
+        // because both of those edit `canonical` to suit a flat writer. The
+        // structured writer never sees `canonical`, so applying them would be
+        // work whose only effect is to misreport the message count; honouring
+        // the context budget on this track is the writer's job, over the IR's
+        // own `model_visible` view.
+        let write_opts = WriteOptions { force: opts.force };
+        let source_ir = read_source_ir(resolved.provider, &resolved.path);
+        if target_provider.supports_structured_write()
+            && let Some(ir) = source_ir.as_ref()
+            && let Some(StructuredWrite {
+                written,
+                fidelity,
+                losses,
+            }) =
+                target_provider.write_session_ir(ir, &write_opts)?
+        {
+            info!(
+                target_session_id = written.session_id,
+                ?fidelity,
+                "session written on the structured track"
+            );
+            all_warnings.extend(written.warnings.iter().cloned());
+
+            // 7a1b. Structural read-back verification.
+            //
+            // The flat verifier cannot be reused here: it compares the target's
+            // `read_session` against `canonical`, and `canonical` is not what
+            // was written — a structured write that legitimately preserved more
+            // than the projection would fail it. So the file is read back
+            // through `read_session_ir` and compared IR to IR by
+            // [`crate::compare`], whose whole point is that it can tell a
+            // predicted vendor-boundary drop from a hole.
+            match verify_structured_write(target_provider, ir, &written, fidelity) {
+                Ok(notes) => all_warnings.extend(notes),
+                Err(detail) => {
+                    warn!(detail, "structured read-back verification failed");
+                    let rollback_detail =
+                        match rollback_written_session(target_provider.slug(), &written) {
+                            Ok(()) => "rollback succeeded".to_string(),
+                            Err(rollback_error) => format!("rollback failed: {rollback_error}"),
+                        };
+                    return Err(CasrError::VerifyFailed {
+                        provider: target_provider.slug().to_string(),
+                        written_paths: written.paths.clone(),
+                        detail: format!("{detail}; {rollback_detail}"),
+                    }
+                    .into());
+                }
+            }
+
+            return Ok(ConversionResult {
+                source_provider: resolved.provider.slug().to_string(),
+                target_provider: target_provider.slug().to_string(),
+                canonical_session: canonical,
+                written: Some(written),
+                warnings: all_warnings,
+                fidelity,
+                losses,
             });
         }
 
@@ -493,8 +608,7 @@ but resume may fail until the CLI is installed.",
             }
         }
 
-        // 8. Write to target provider.
-        let write_opts = WriteOptions { force: opts.force };
+        // 8. Write to target provider, on the flat track.
         let written = target_provider.write_session(&canonical, &write_opts)?;
         info!(
             target_session_id = written.session_id,
@@ -550,14 +664,230 @@ but resume may fail until the CLI is installed.",
             }
         }
 
+        let (fidelity, losses) =
+            flat_fidelity(source_ir.as_ref(), target_provider.slug());
+
         Ok(ConversionResult {
             source_provider: resolved.provider.slug().to_string(),
             target_provider: target_provider.slug().to_string(),
             canonical_session: canonical,
             written: Some(written),
             warnings: all_warnings,
+            fidelity,
+            losses,
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fidelity grading
+// ---------------------------------------------------------------------------
+
+/// The source session's structured IR, when it has one.
+///
+/// A structured reader that errors is treated as an absent reader rather than
+/// as a failed conversion. The flat path does not need the IR, so refusing to
+/// convert a session that the flat path handles fine would be a regression
+/// introduced by the better track — exactly backwards.
+fn read_source_ir(provider: &dyn Provider, path: &Path) -> Option<SessionIr> {
+    match provider.read_session_ir(path) {
+        Ok(ir) => ir,
+        Err(error) => {
+            warn!(
+                provider = provider.slug(),
+                path = %path.display(),
+                %error,
+                "structured read failed; grading and writing on the flat track"
+            );
+            None
+        }
+    }
+}
+
+/// Read a structured write back off disk and compare it against the IR that
+/// produced it.
+///
+/// Returns the warnings to surface, or the detail of a verification failure.
+///
+/// # What a mismatch does, and why
+///
+/// A mismatch is *not* treated as a write failure with a different message, and
+/// it is emphatically not a reason to quietly lower
+/// [`ConversionResult::fidelity`]. Three outcomes, by what the comparison
+/// actually found:
+///
+/// - **Damage** — content missing that [`crate::ir::Capsule::fits`] did not
+///   predict, or sealed bytes it forbade that crossed anyway. The written file
+///   is rolled back and the conversion fails with [`CasrError::VerifyFailed`],
+///   exactly as the flat track behaves. That error already says "this is a bug
+///   in casr", which is what it is: the file on disk is not the session, and a
+///   resume from it would hand the model an incomplete history with nothing to
+///   show that anything was missing. Returning it as a *success* with a worse
+///   grade would bury a writer bug inside the vocabulary reserved for honest
+///   vendor-boundary losses, where nobody would ever go looking for it.
+/// - **A grade the file does not support** — the comparator's independently
+///   derived [`Fidelity`] is worse than the writer's claim. The bytes are fine,
+///   so nothing is rolled back; the disagreement is surfaced as a warning
+///   naming both grades. The writer's grade is still the one reported, because
+///   silently substituting the comparator's would hide the disagreement just as
+///   effectively as ignoring it.
+/// - **Unverifiable** — the target has a structured writer but no structured
+///   reader, or the vendor of its sealed formats is unknown to this version. No
+///   check was possible, so the conversion is not failed and the skip is stated
+///   in a warning rather than passing silently for a check that never ran.
+fn verify_structured_write(
+    target: &dyn Provider,
+    source_ir: &SessionIr,
+    written: &WrittenSession,
+    claimed: Fidelity,
+) -> Result<Vec<String>, String> {
+    let Some(path) = written.paths.first() else {
+        return Ok(vec![format!(
+            "Structured write to '{}' reported no output path, so it could not be verified.",
+            target.slug()
+        )]);
+    };
+
+    let target_ir = match target.read_session_ir(path) {
+        Ok(Some(ir)) => ir,
+        Ok(None) => {
+            return Ok(vec![format!(
+                "Wrote '{}' on the structured track but it has no structured reader, so the \
+                 result could not be verified.",
+                target.slug()
+            )]);
+        }
+        Err(error) => {
+            return Err(format!(
+                "unable to read the written session back through the structured reader: {error}"
+            ));
+        }
+    };
+
+    // Keyed on the provider that was asked to write, not on anything inside the
+    // file. `Origin::provider` records the endpoint a session was served by,
+    // and 109 of the 591 rollouts in the corpus were served by a gateway under
+    // its own name.
+    let Some(vendor) = crate::compare::vendor_of(target.slug()) else {
+        return Ok(vec![format!(
+            "Wrote '{}' on the structured track but this version does not know which vendor's \
+             sealed formats it can replay, so the result could not be verified.",
+            target.slug()
+        )]);
+    };
+
+    let report = crate::compare::compare(source_ir, &target_ir, vendor);
+    debug!(
+        source_events = report.source_events,
+        target_events = report.target_events,
+        added_events = report.added_events,
+        source_capsules = report.source_capsules,
+        target_capsules = report.target_capsules,
+        predicted = report.predicted.len(),
+        degraded = report.degraded.len(),
+        "structured read-back verified"
+    );
+
+    if !report.is_clean() {
+        return Err(format!(
+            "structured read-back found the written session is not the session that was \
+             converted: {}",
+            report.damage_detail()
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    let observed = report.fidelity();
+    if observed > claimed {
+        warnings.push(format!(
+            "The writer graded this conversion {claimed:?} but the written file only supports \
+             {observed:?}. {}",
+            report
+                .predicted
+                .iter()
+                .chain(&report.degraded)
+                .map(|loss| loss.note.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    if report.added_events > 0 {
+        warnings.push(format!(
+            "The written session holds {} model-visible event(s) the source did not, such as \
+             the markers casr writes where a sealed history could not be carried.",
+            report.added_events
+        ));
+    }
+    Ok(warnings)
+}
+
+/// Grade a conversion that went through the flat [`CanonicalSession`]
+/// projection, and describe the loss when it is a loss of conversation.
+///
+/// # Why the baseline is `ConversationOnly` and not `TranscriptOnly`
+///
+/// `CanonicalSession` is not a transcript. Every message keeps its
+/// [`MessageRole`], every [`crate::model::ToolCall`] keeps its name and its
+/// JSON arguments, and every [`crate::model::ToolResult`] keeps its `is_error`
+/// flag and its `call_id` link back to the call it answers. A reader handed
+/// that can still tell who spoke and which tool produced which output, which
+/// is more than "text survived; structure did not".
+///
+/// What the projection does lose is the protocol around that structure: Codex's
+/// `function_call` / `custom_tool_call` distinction collapses to a name plus
+/// arguments, compaction windows flatten into ordinary messages, model-visible
+/// events and UI chrome merge into one list, and capsules are not carried at
+/// all. That is precisely the line [`Fidelity::ConversationOnly`] draws —
+/// "tool protocol downgraded, or compaction structure flattened, but every
+/// piece of the conversation is still present". Grading it `TranscriptOnly`
+/// would understate what the projection delivers.
+///
+/// # When the baseline does not hold
+///
+/// "Every piece of the conversation is still present" is a claim, not a
+/// constant, and for one shape it is false. Codex hands compacted history back
+/// as a sealed [`Body::SealedContext`] capsule; `CanonicalSession` carries no
+/// capsules, so that history is deleted rather than degraded, and the grade
+/// drops to [`Fidelity::HistoryIncomplete`].
+///
+/// Only a source with a structured reader can be checked this way. For the rest
+/// `ir` is `None` and the baseline stands — not because they lost nothing, but
+/// because nothing here is entitled to claim they did.
+fn flat_fidelity(ir: Option<&SessionIr>, target_slug: &str) -> (Fidelity, Vec<Loss>) {
+    let baseline = Fidelity::ConversationOnly;
+
+    let Some(ir) = ir else {
+        return (baseline, Vec::new());
+    };
+
+    let sealed: Vec<_> = ir
+        .model_visible()
+        .into_iter()
+        .filter(|event| matches!(event.body, Body::SealedContext { .. }))
+        .flat_map(|event| event.capsules.iter())
+        .collect();
+    let Some(first) = sealed.first() else {
+        return (baseline, Vec::new());
+    };
+
+    let bytes: usize = sealed.iter().map(|capsule| capsule.sealed.len()).sum();
+    (
+        baseline.worse_of(Fidelity::HistoryIncomplete),
+        vec![Loss {
+            kind: LossKind::SealedContext,
+            events: sealed.len(),
+            capsules: sealed.len(),
+            bytes,
+            grade: Fidelity::HistoryIncomplete,
+            note: format!(
+                "{} compacted-history capsule(s) totalling {bytes} bytes are sealed to {} and \
+                 cannot be written into a {target_slug} session. That is conversation, not \
+                 reasoning: the resumed session is missing history and will not know it.",
+                sealed.len(),
+                first.kind.vendor(),
+            ),
+        }],
+    )
 }
 
 // ---------------------------------------------------------------------------

@@ -27,11 +27,12 @@ use tracing::{debug, info, trace, warn};
 use walkdir::WalkDir;
 
 use crate::discovery::DetectionResult;
+use crate::ir::SessionIr;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
 
 /// Codex provider implementation.
 pub struct Codex;
@@ -365,6 +366,103 @@ impl Provider for Codex {
 
     fn resume_command(&self, session_id: &str) -> String {
         format!("codex resume {session_id}")
+    }
+
+    /// Codex is on the high-fidelity track; see [`super::codex_ir`].
+    fn read_session_ir(&self, path: &Path) -> anyhow::Result<Option<SessionIr>> {
+        super::codex_ir::read(path).map(Some)
+    }
+
+    fn supports_structured_write(&self) -> bool {
+        true
+    }
+
+    /// Write the structured IR as a native rollout; see [`super::codex_ir_write`].
+    ///
+    /// Placement, naming, atomic write and thread-index registration are the
+    /// flat writer's, unchanged — the only thing this path does differently is
+    /// what goes *in* the file. `Ok(None)` when the replay is empty, so the
+    /// caller falls back to the flat projection rather than registering a
+    /// thread that resumes into nothing.
+    fn write_session_ir(
+        &self,
+        ir: &SessionIr,
+        opts: &WriteOptions,
+    ) -> anyhow::Result<Option<StructuredWrite>> {
+        let target_session_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let Some(rendered) = super::codex_ir_write::render(ir, &target_session_id, now) else {
+            debug!("structured Codex write skipped: the replay is empty");
+            return Ok(None);
+        };
+
+        let sessions_dir = Self::sessions_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine Codex sessions directory"))?;
+        let target_path = rollout_path(&sessions_dir, &target_session_id, &now);
+        let cwd = ir
+            .workspace
+            .cwd
+            .as_deref()
+            .unwrap_or(std::path::Path::new("/tmp"))
+            .to_string_lossy()
+            .to_string();
+
+        debug!(
+            target_session_id,
+            target_path = %target_path.display(),
+            events = rendered.lines.len(),
+            "writing structured Codex session"
+        );
+
+        // Codex appends new turns to the rollout on resume; without a trailing
+        // newline its first appended record lands on casr's last line.
+        let mut content = rendered.lines.join("\n");
+        content.push('\n');
+        let outcome =
+            crate::pipeline::atomic_write(&target_path, content.as_bytes(), opts.force, self.slug())?;
+
+        info!(
+            target_session_id,
+            path = %outcome.target_path.display(),
+            fidelity = ?rendered.fidelity,
+            "structured Codex session written"
+        );
+
+        let title = {
+            let title = truncate_title(&rendered.first_user_text, 100);
+            if title.is_empty() {
+                "Resumed session (via casr)".to_string()
+            } else {
+                title
+            }
+        };
+        let preview = if rendered.first_user_text.trim().is_empty() {
+            title.clone()
+        } else {
+            rendered.first_user_text.clone()
+        };
+        let mut warnings = rendered.warnings;
+        warnings.extend(Self::register_thread(
+            &target_session_id,
+            &outcome.target_path,
+            &cwd,
+            &title,
+            &rendered.first_user_text,
+            &preview,
+            &now,
+        ));
+
+        Ok(Some(StructuredWrite {
+            written: WrittenSession {
+                paths: vec![outcome.target_path],
+                session_id: target_session_id.clone(),
+                resume_command: self.resume_command(&target_session_id),
+                backup_path: outcome.backup_path,
+                warnings,
+            },
+            fidelity: rendered.fidelity,
+            losses: rendered.losses,
+        }))
     }
 }
 

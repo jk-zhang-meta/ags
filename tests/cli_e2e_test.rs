@@ -1547,6 +1547,359 @@ fn cli_resume_piagent_to_cc_works_with_source_hint() {
 }
 
 // ---------------------------------------------------------------------------
+// Launching the target agent
+//
+// Every test here goes through `--launch-dry-run`, or through `--launch` with
+// `PATH` emptied, so that a regression cannot start a real `claude` or `codex`
+// and leave an interactive agent attached to the test runner's terminal.
+// ---------------------------------------------------------------------------
+
+use casr::discovery::ProviderRegistry;
+use casr::launch::LaunchSpec;
+
+/// A Codex rollout whose live context is a sealed compaction.
+///
+/// Written inline rather than committed as a fixture: the point of the case is
+/// the `encrypted_content` blob, and a corpus file is the wrong place for
+/// material that only looks like provider-sealed state. The compaction is not
+/// the last line, because Codex's flat reader resets history to
+/// `replacement_history` and a session ending there has no messages left to
+/// convert — the refusal under test would never be reached.
+const CODEX_COMPACTED_ROLLOUT: &str = concat!(
+    r#"{"type":"session_meta","timestamp":1737100000.0,"payload":{"id":"codex-compacted-001","cwd":"/data/projects/backend","model_provider":"openai"}}"#,
+    "\n",
+    r#"{"type":"event_msg","timestamp":1737100001.0,"payload":{"type":"user_message","message":"Optimize the database query in users.rs"}}"#,
+    "\n",
+    r#"{"type":"response_item","timestamp":1737100010.0,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Indexing the lookup now."}]}}"#,
+    "\n",
+    r#"{"type":"compacted","timestamp":1737100020.0,"payload":{"window_id":"w2","previous_window_id":"w1","message":"Here is the summary produced by the other language model.","replacement_history":[{"type":"compaction","id":"cmp_test_001","encrypted_content":"c2VhbGVkLWNvbXBhY3RlZC1oaXN0b3J5"}]}}"#,
+    "\n",
+    r#"{"type":"event_msg","timestamp":1737100030.0,"payload":{"type":"user_message","message":"Now add connection pooling"}}"#,
+    "\n",
+    r#"{"type":"response_item","timestamp":1737100040.0,"payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Added an r2d2 pool."}]}}"#,
+    "\n",
+);
+
+/// Place a literal Codex rollout where discovery will find it.
+fn write_codex_rollout(tmp: &TempDir, session_id: &str, lines: &str) -> String {
+    let dir = tmp.path().join("codex/sessions/2026/01/01");
+    fs::create_dir_all(&dir).expect("create Codex sessions dir");
+    fs::write(
+        dir.join(format!("rollout-2026-01-01T00-00-00-{session_id}.jsonl")),
+        lines,
+    )
+    .expect("write Codex rollout");
+    session_id.to_string()
+}
+
+/// The last non-empty line, which is where the launcher prints its command.
+fn last_line(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+}
+
+/// The value of a `  Label → value` line in the human-readable output.
+fn labelled(stdout: &str, label: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.split_once(label))
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_else(|| panic!("no {label:?} line in:\n{stdout}"))
+}
+
+/// An empty directory, so no agent binary can be resolved from `PATH`.
+///
+/// Used by the tests that exercise the real `--launch` path: the assertions
+/// are about what happens *before* the exec, and an accidental exec of the
+/// developer's own `claude` would hang the suite rather than fail it.
+fn empty_path(tmp: &TempDir) -> PathBuf {
+    let dir = tmp.path().join("empty-bin");
+    fs::create_dir_all(&dir).expect("create empty PATH dir");
+    dir
+}
+
+#[test]
+fn cli_launch_dry_run_prints_a_command_that_parses_back_to_the_spec() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args(["resume", "cod", &session_id, "--launch-dry-run"])
+        .output()
+        .expect("launch dry run should run");
+    assert!(output.status.success(), "a dry-run launch must exit 0");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let target_id = labelled(&stdout, "Target →");
+
+    // The whole point of the structured spec: what is shown must parse back to
+    // what would be executed, program and arguments both.
+    let printed = LaunchSpec::from_command_line(last_line(&stdout))
+        .expect("the printed command must be a splittable command line");
+    let expected = ProviderRegistry::default_registry()
+        .find_by_alias("cod")
+        .expect("codex in registry")
+        .launch_spec(&target_id)
+        .expect("codex spec");
+    assert_eq!(
+        (printed.program, printed.args),
+        (expected.program, expected.args),
+        "the printed command and the spec disagree"
+    );
+}
+
+#[test]
+fn cli_launch_dry_run_appends_passthrough_flags() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "resume",
+            "cod",
+            &session_id,
+            "--launch-dry-run",
+            "--",
+            "--model",
+            "o3",
+            "--search",
+        ])
+        .output()
+        .expect("launch dry run should run");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let command = last_line(&stdout);
+    let target_id = labelled(&stdout, "Target →");
+    assert_eq!(
+        command,
+        format!("codex resume {target_id} --model o3 --search"),
+        "user flags belong after the resume arguments, unmodified"
+    );
+}
+
+#[test]
+fn cli_launch_refuses_a_passthrough_flag_that_would_retarget_the_session() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
+
+    // The real `--launch` path, not the dry run: the claim is that the conflict
+    // is caught *before* anything is started. `PATH` is empty so a regression
+    // that got as far as spawning would fail on the program instead.
+    let output = casr_cmd(&tmp)
+        .env("PATH", empty_path(&tmp))
+        .args([
+            "resume",
+            "cc",
+            &session_id,
+            "--launch",
+            "--",
+            "--resume",
+            "a-different-session",
+        ])
+        .output()
+        .expect("launch should run");
+
+    assert!(
+        !output.status.success(),
+        "re-specifying --resume must not be silently accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already set by the resume command"),
+        "expected the conflict message, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("is not installed"),
+        "the conflict must be reported before the launch is attempted, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn cli_launch_refuses_a_conversion_that_lost_part_of_the_conversation() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = write_codex_rollout(&tmp, "codex-compacted-001", CODEX_COMPACTED_ROLLOUT);
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "resume",
+            "cc",
+            &session_id,
+            "--source",
+            "cod",
+            "--launch-dry-run",
+        ])
+        .output()
+        .expect("launch dry run should run");
+
+    assert!(
+        !output.status.success(),
+        "launching into a session with a hole in its history must not be the default"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Written →"),
+        "the conversion itself succeeded and must still say where it wrote:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("compacted-history capsule")
+            && stderr.contains("missing history")
+            && stderr.contains("--launch-anyway"),
+        "the refusal must say what is missing and how to override it, got:\n{stderr}"
+    );
+
+    // And the override is an override, not a suggestion.
+    let output = casr_cmd(&tmp)
+        .args([
+            "resume",
+            "cc",
+            &session_id,
+            "--source",
+            "cod",
+            "--force",
+            "--launch-dry-run",
+            "--launch-anyway",
+        ])
+        .output()
+        .expect("launch dry run should run");
+    assert!(
+        output.status.success(),
+        "--launch-anyway must let the launch through: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        last_line(&stdout).starts_with("claude --resume "),
+        "expected the claude command, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn cli_launch_refusal_keeps_the_json_envelope_parseable() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = write_codex_rollout(&tmp, "codex-compacted-002", CODEX_COMPACTED_ROLLOUT);
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "resume",
+            "cc",
+            &session_id,
+            "--source",
+            "cod",
+            "--launch-dry-run",
+        ])
+        .output()
+        .expect("launch dry run should run");
+
+    assert!(!output.status.success(), "the refusal still fails the run");
+
+    // The conversion happened, so its envelope is on stdout and is still the
+    // only thing there — the refusal is an error, and errors have their own
+    // envelope on stderr.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must stay parseable JSON: {e}\nOutput: {stdout}"));
+    assert_eq!(parsed["ok"], true);
+    assert_eq!(
+        parsed["fidelity"], "history_incomplete",
+        "the grade a script would gate on must be in the envelope"
+    );
+    assert!(parsed["written_paths"].as_array().is_some_and(|p| !p.is_empty()));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let error: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("stderr must be an error envelope: {e}\nOutput: {stderr}"));
+    assert_eq!(error["ok"], false);
+    let message = error["message"].as_str().expect("message string");
+    assert!(
+        message.contains("compacted-history capsule")
+            && message.contains("missing history")
+            && message.contains("--launch-anyway"),
+        "the refusal must survive into JSON mode intact: {message}"
+    );
+}
+
+#[test]
+fn cli_launch_warns_when_the_agent_cannot_be_pointed_at_the_session() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args(["resume", "cur", &session_id, "--launch-dry-run"])
+        .output()
+        .expect("launch dry run should run");
+    assert!(
+        output.status.success(),
+        "an untargetable provider is a warning, not a refusal"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no way to be pointed at a specific session")
+            && stdout.contains("without resuming the converted one"),
+        "Cursor cannot open the converted session and the user has to be told:\n{stdout}"
+    );
+    let written = labelled(&stdout, "Written →");
+    assert!(
+        stdout.contains(&format!("Converted session: {written}")),
+        "the warning must name the file so the user can open it themselves:\n{stdout}"
+    );
+    assert_eq!(
+        last_line(&stdout),
+        "cursor .",
+        "the command is still printed; it just will not resume anything"
+    );
+}
+
+#[test]
+fn cli_launch_reports_a_missing_agent_as_missing_rather_than_as_a_failed_conversion() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .env("PATH", empty_path(&tmp))
+        .args(["resume", "cod", &session_id, "--launch"])
+        .output()
+        .expect("launch should run");
+
+    assert!(!output.status.success(), "there is nothing to start");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Converted") && stdout.contains("Written →"),
+        "the conversion succeeded and the written path is the useful part:\n{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is not installed") && stderr.contains("not on PATH"),
+        "expected a missing-agent report, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn cli_launch_flags_are_refused_where_they_would_do_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    // Silently ignoring these is the failure mode worth preventing: the user
+    // asked for a launch and would get a conversion.
+    for extra in [
+        vec!["--launch-anyway"],
+        vec!["--launch", "--launch-dry-run"],
+        vec!["--launch", "--dry-run"],
+    ] {
+        let mut cmd = casr_cmd(&tmp);
+        cmd.args(["resume", "cod", &session_id]).args(&extra);
+        cmd.assert()
+            .failure()
+            .stderr(predicate::str::contains("error:"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Completions command
 // ---------------------------------------------------------------------------
 
