@@ -4,6 +4,13 @@
 //! Mock-based tests (first section) inject controlled failures that real
 //! providers can't produce on demand. Real-provider tests (second section)
 //! exercise the full pipeline with real CC/Codex/Gemini providers.
+//!
+//! Every pipeline in this file is built with `store: None`, which is what
+//! `--no-store` gives the pipeline. That is not an omission: it means the whole
+//! file is a regression suite for the behaviour the store must not change, since
+//! with no store there is nothing to consult and `convert` reads the session it
+//! was given. The store's own effect on the pipeline is tested in
+//! `tests/store_pipeline_test.rs`.
 
 mod test_env;
 
@@ -440,6 +447,7 @@ fn pipeline_convert_happy_path_writes_and_verifies() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src.clone()), Box::new(dst.clone())]),
+        store: None,
     };
 
     let result = pipeline
@@ -479,6 +487,7 @@ fn pipeline_dry_run_skips_write() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
+        store: None,
     };
 
     let result = pipeline
@@ -508,6 +517,7 @@ fn pipeline_same_provider_short_circuit_skips_write() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(provider.clone())]),
+        store: None,
     };
 
     let result = pipeline
@@ -591,6 +601,7 @@ fn pair_with_target_slug(
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src.clone()), Box::new(dst.clone())]),
+        store: None,
     };
     (src, dst, pipeline)
 }
@@ -892,6 +903,7 @@ fn pipeline_warns_when_target_cli_missing_but_write_succeeds() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        store: None,
     };
 
     let result = pipeline
@@ -918,6 +930,7 @@ fn pipeline_unknown_target_alias_errors() {
     );
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src)]),
+        store: None,
     };
 
     let err = pipeline
@@ -946,6 +959,7 @@ fn pipeline_session_not_found_errors() {
     );
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        store: None,
     };
 
     let err = pipeline
@@ -969,6 +983,7 @@ fn pipeline_ambiguous_session_errors() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src_a), Box::new(src_b), Box::new(dst)]),
+        store: None,
     };
 
     let err = pipeline
@@ -1010,6 +1025,7 @@ fn pipeline_source_hint_alias_narrows_resolution() {
             Box::new(src_b),
             Box::new(dst.clone()),
         ]),
+        store: None,
     };
 
     let result = pipeline
@@ -1050,6 +1066,7 @@ fn pipeline_source_hint_path_bypasses_discovery() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
+        store: None,
     };
 
     let result = pipeline
@@ -1080,6 +1097,7 @@ fn pipeline_write_failure_propagates() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
+        store: None,
     };
 
     let err = pipeline
@@ -1124,6 +1142,7 @@ fn pipeline_readback_mismatch_fails_and_removes_unverified_output() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        store: None,
     };
     let err = pipeline
         .convert("tgt", "sid-readback-mismatch", options(false, None))
@@ -1178,6 +1197,7 @@ fn pipeline_readback_content_mismatch_fails_and_removes_unverified_output() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        store: None,
     };
     let err = pipeline
         .convert("tgt", "sid-readback-content-mismatch", options(false, None))
@@ -1228,6 +1248,7 @@ fn pipeline_readback_error_restores_backup_and_returns_verify_failed() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        store: None,
     };
     let err = pipeline
         .convert("tgt", "sid-readback-error", options(false, None))
@@ -1395,6 +1416,7 @@ fn pipeline_real_cc_to_codex_happy_path() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode), Box::new(Codex)]),
+        store: None,
     };
 
     let result = pipeline
@@ -1435,6 +1457,7 @@ fn pipeline_real_cc_to_gemini_happy_path() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode), Box::new(Gemini)]),
+        store: None,
     };
 
     let result = pipeline
@@ -1469,6 +1492,7 @@ fn pipeline_real_dry_run_skips_write() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode), Box::new(Codex)]),
+        store: None,
     };
 
     let result = pipeline
@@ -1505,6 +1529,7 @@ fn pipeline_real_same_provider_short_circuit() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode)]),
+        store: None,
     };
 
     let result = pipeline
@@ -1550,6 +1575,7 @@ fn pipeline_real_source_hint_narrows_resolution() {
             Box::new(Codex),
             Box::new(Gemini),
         ]),
+        store: None,
     };
 
     let result = pipeline
@@ -1582,6 +1608,7 @@ fn pipeline_real_session_not_found() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode), Box::new(Codex)]),
+        store: None,
     };
 
     let err = pipeline
@@ -1609,6 +1636,7 @@ fn pipeline_real_session_not_found() {
 fn pipeline_real_unknown_target_alias() {
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode)]),
+        store: None,
     };
 
     let err = pipeline
@@ -1765,6 +1793,7 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
 
     let pipeline = ConversionPipeline {
         registry: ProviderRegistry::new(vec![Box::new(ClaudeCode), Box::new(Codex)]),
+        store: None,
     };
     let convert = || {
         pipeline

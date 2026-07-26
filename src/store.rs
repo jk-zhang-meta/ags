@@ -900,18 +900,36 @@ impl Store {
     /// has actually happened. From the second incarnation on, each candidate is
     /// parsed once (the origin from `ir.json` when it is cached, which is what
     /// that cache is for).
-    pub fn best_source_for(&self, record: &Record, target: &dyn Provider) -> SourceChoice {
+    ///
+    /// # Why the registry is a parameter
+    ///
+    /// It used to be built here, with [`ProviderRegistry::default_registry`],
+    /// because the design's signature has no registry in it. The caller that
+    /// matters — [`crate::pipeline::ConversionPipeline`] — already owns one, and
+    /// two registries that could diverge is a latent bug: the pipeline reads the
+    /// chosen candidate through *its* provider and the ranking counted capsules
+    /// through a different instance of the same list. Sharing one instance also
+    /// removes the per-call construction of twenty-one boxed providers.
+    pub fn best_source_for(
+        &self,
+        record: &Record,
+        target: &dyn Provider,
+        registry: &ProviderRegistry,
+    ) -> SourceChoice {
         let target_slug = target.slug().to_string();
         let target_vendor = vendor_of(&target_slug);
+        // A single incarnation has nothing to choose between, so no candidate is
+        // parsed at all. The gate is the whole reason a first-ever conversion
+        // costs one `stat`.
         let comparing = record.incarnations.len() > 1;
-        let registry = comparing.then(ProviderRegistry::default_registry);
+        let registry = comparing.then_some(registry);
 
         let mut candidates: Vec<SourceCandidate> = record
             .incarnations
             .iter()
             .map(|inc| {
                 let (path, availability, origin_state) = self.locate(record, inc);
-                let capsules = match (&registry, availability.readable()) {
+                let capsules = match (registry, availability.readable()) {
                     (None, _) => Inventory::Unknown {
                         why: "only one incarnation: there is nothing to choose between".to_string(),
                     },
@@ -1723,7 +1741,7 @@ mod tests {
 
         let registry = ProviderRegistry::default_registry();
         let target = registry.find_by_slug("codex").expect("codex");
-        let choice = store.best_source_for(&record, target);
+        let choice = store.best_source_for(&record, target, &registry);
         let chosen = choice
             .chosen()
             .expect("the archived copy is still a source");
@@ -1796,7 +1814,7 @@ mod tests {
 
         let registry = ProviderRegistry::default_registry();
 
-        let to_codex = store.best_source_for(&record, registry.find_by_slug("codex").unwrap());
+        let to_codex = store.best_source_for(&record, registry.find_by_slug("codex").unwrap(), &registry);
         assert_eq!(to_codex.target_vendor, Some("openai"));
         assert_eq!(
             to_codex.chosen().expect("a source").key,
@@ -1805,7 +1823,7 @@ mod tests {
         );
         assert_eq!(to_codex.chosen().unwrap().capsules.fitting(), 7);
 
-        let to_cc = store.best_source_for(&record, registry.find_by_slug("claude-code").unwrap());
+        let to_cc = store.best_source_for(&record, registry.find_by_slug("claude-code").unwrap(), &registry);
         assert_eq!(to_cc.target_vendor, Some("anthropic"));
         assert_eq!(
             to_cc.chosen().expect("a source").key,
@@ -1846,7 +1864,7 @@ mod tests {
             .expect("cache");
 
         let registry = ProviderRegistry::default_registry();
-        let choice = store.best_source_for(&record, registry.find_by_slug("codex").unwrap());
+        let choice = store.best_source_for(&record, registry.find_by_slug("codex").unwrap(), &registry);
         let line = choice.explain(Some(&cc_key));
         assert!(line.starts_with("source: codex 01J (origin;"), "got {line}");
         assert!(

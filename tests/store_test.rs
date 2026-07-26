@@ -65,13 +65,18 @@ fn write_session(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-fn provider(slug: &str) -> &'static dyn Provider {
-    // The registry owns boxed providers; leak one registry for the test binary
-    // so the borrow can be handed around like the pipeline hands it around.
+/// One registry for the whole test binary, borrowed exactly the way the
+/// pipeline borrows its own: `best_source_for` takes it rather than building
+/// one, so that the ranking counts capsules through the same providers the
+/// caller will read the chosen candidate with.
+fn registry() -> &'static casr::discovery::ProviderRegistry {
     static REGISTRY: std::sync::OnceLock<casr::discovery::ProviderRegistry> =
         std::sync::OnceLock::new();
-    REGISTRY
-        .get_or_init(casr::discovery::ProviderRegistry::default_registry)
+    REGISTRY.get_or_init(casr::discovery::ProviderRegistry::default_registry)
+}
+
+fn provider(slug: &str) -> &'static dyn Provider {
+    registry()
         .find_by_slug(slug)
         .unwrap_or_else(|| panic!("no provider '{slug}'"))
 }
@@ -595,7 +600,7 @@ fn origin_resolution_reports_match_growth_and_loss() {
     println!("gone: {}", state.describe());
 
     // The choice reports the loss instead of papering over it.
-    let choice = store.best_source_for(&record, provider("codex"));
+    let choice = store.best_source_for(&record, provider("codex"), registry());
     assert!(choice.chosen().is_none(), "nothing left to read");
     let line = choice.explain(Some(&key));
     assert!(line.starts_with("no usable source for codex"), "got {line}");
@@ -641,7 +646,7 @@ fn archive_makes_a_record_survive_its_origin() {
         .expect("ingest");
     std::fs::remove_file(&path).expect("delete the original");
 
-    let choice = store.best_source_for(&record, provider("codex"));
+    let choice = store.best_source_for(&record, provider("codex"), registry());
     let chosen = choice.chosen().expect("the archived copy is a source");
     assert_eq!(chosen.availability, Availability::Archived);
     assert_eq!(
@@ -667,7 +672,7 @@ fn archive_makes_a_record_survive_its_origin() {
     std::fs::remove_file(&path2).expect("delete");
     assert!(
         store2
-            .best_source_for(&record2, provider("codex"))
+            .best_source_for(&record2, provider("codex"), registry())
             .chosen()
             .is_none(),
         "a reference buys availability, and availability is not backup"
@@ -712,7 +717,7 @@ fn best_source_depends_on_the_target_vendor() {
         .expect("cache the origin IR");
 
     // Same vendor as the sealed material: the origin is strictly better.
-    let to_codex = store.best_source_for(&record, provider("codex"));
+    let to_codex = store.best_source_for(&record, provider("codex"), registry());
     assert_eq!(to_codex.target_vendor, Some("openai"));
     assert_eq!(to_codex.chosen().expect("source").key, codex_key);
     assert_eq!(to_codex.chosen().unwrap().capsules.fitting(), 9);
@@ -725,7 +730,7 @@ fn best_source_depends_on_the_target_vendor() {
 
     // Foreign vendor: those nine capsules are worth nothing to Anthropic, so
     // the session that needs no conversion at all wins instead.
-    let to_cc = store.best_source_for(&record, provider("claude-code"));
+    let to_cc = store.best_source_for(&record, provider("claude-code"), registry());
     assert_eq!(to_cc.target_vendor, Some("anthropic"));
     assert_eq!(
         to_cc.chosen().expect("source").key,
@@ -743,7 +748,7 @@ fn best_source_depends_on_the_target_vendor() {
     // A target whose vendor this build does not know: neither vendor's capsules
     // can cross, the two are worth the same, and the store says the vendor is
     // unknown rather than guessing.
-    let to_gemini = store.best_source_for(&record, provider("gemini"));
+    let to_gemini = store.best_source_for(&record, provider("gemini"), registry());
     assert_eq!(to_gemini.target_vendor, None);
     for candidate in &to_gemini.candidates {
         assert_eq!(
@@ -820,7 +825,7 @@ fn a_single_incarnation_costs_no_parse_and_still_reports_its_origin() {
         .ingest_origin(&key, &path, OriginPolicy::Reference)
         .expect("ingest");
 
-    let choice = store.best_source_for(&record, provider("codex"));
+    let choice = store.best_source_for(&record, provider("codex"), registry());
     assert_eq!(choice.candidates.len(), 1);
     assert_eq!(choice.chosen().expect("source").key, key);
     assert!(
@@ -926,6 +931,119 @@ fn origin_lookup_on_the_largest_corpus_rollout_is_a_stat_not_a_hash() {
     );
 }
 
+/// What a realistic candidate list costs, split by which half of it is cached.
+///
+/// `ir.json` caches the **origin's** IR and nothing else, which `docs/STORE.md`
+/// flags as a consequence worth knowing before it surprises someone: ranking a
+/// *derived* candidate re-parses that candidate's file every time. This measures
+/// the surprise on real sessions rather than arguing about it — a record with an
+/// origin and two derived incarnations, which is what a conversation that has been
+/// converted twice looks like.
+///
+/// It asserts a budget rather than a ratio. The ratio is the wrong shape: the
+/// cached half is a `serde_json` load of an IR and the uncached half is a provider
+/// parse, and on a small session those are the same order of magnitude, so a
+/// ratio assertion would fail on session size rather than on a regression. What
+/// matters to a caller is whether selection is cheap next to the conversion it
+/// precedes, and a conversion of these sessions is tens of milliseconds.
+#[test]
+fn ranking_a_realistic_candidate_list_is_cheap_next_to_the_conversion() {
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("skipped: no home directory");
+        return;
+    };
+    let (Some((codex_path, _)), Some((cc_path, _))) = (
+        corpus_session_with_capsules(
+            &home.join(".codex").join("sessions"),
+            "codex",
+            200_000,
+            3_000_000,
+        ),
+        corpus_session_with_capsules(
+            &home.join(".claude").join("projects"),
+            "claude-code",
+            200_000,
+            3_000_000,
+        ),
+    ) else {
+        eprintln!("skipped: corpus has no session pair carrying sealed material");
+        return;
+    };
+
+    let (_tmp, store) = fresh();
+    let origin = SessionKey::new("codex", "origin");
+    let record = store
+        .ingest_origin(&origin, &codex_path, OriginPolicy::Reference)
+        .expect("ingest");
+    // Two derived incarnations of the same file: the point is the *count* of
+    // uncached candidates, and one real Claude transcript parsed twice costs
+    // exactly what two of them would.
+    let mut record = record;
+    for name in ["derived-1", "derived-2"] {
+        record = store
+            .record_conversion(
+                &record.id,
+                DerivedWrite {
+                    key: SessionKey::new("claude-code", name),
+                    path: cc_path.clone(),
+                    from: origin.clone(),
+                    fidelity: Fidelity::HistoryIncomplete,
+                    losses: Vec::new(),
+                },
+            )
+            .expect("record conversion");
+    }
+    assert_eq!(record.incarnations.len(), 3);
+
+    let target = provider("codex");
+
+    // First call: nothing is cached, so all three candidates are parsed and the
+    // origin's IR is written to `ir.json` on the way past.
+    let started = Instant::now();
+    let cold = store.best_source_for(&record, target, registry());
+    let cold_elapsed = started.elapsed();
+    assert_eq!(cold.chosen().expect("a source").key, origin);
+
+    // Every later call: the origin comes off `ir.json` and the two derived
+    // candidates are re-parsed, every time. This is the cost the design chose.
+    let mut warm_elapsed = std::time::Duration::MAX;
+    for _ in 0..3 {
+        let started = Instant::now();
+        let warm = store.best_source_for(&record, target, registry());
+        warm_elapsed = warm_elapsed.min(started.elapsed());
+        assert_eq!(warm.chosen().expect("a source").key, origin);
+    }
+
+    // The conversion this selection precedes, for scale: one parse of the origin
+    // through the provider that owns it.
+    let started = Instant::now();
+    let parsed = target
+        .read_session_ir(&codex_path)
+        .expect("read")
+        .expect("an IR");
+    let one_parse = started.elapsed();
+    assert!(!parsed.events.is_empty());
+
+    println!(
+        "candidate list: 1 codex origin ({} KiB) + 2 derived claude sessions ({} KiB each)",
+        std::fs::metadata(&codex_path)
+            .map(|m| m.len() / 1024)
+            .unwrap_or(0),
+        std::fs::metadata(&cc_path)
+            .map(|m| m.len() / 1024)
+            .unwrap_or(0)
+    );
+    println!("  first call, nothing cached:      {cold_elapsed:?}");
+    println!("  later calls, origin from ir.json: {warm_elapsed:?}");
+    println!("  one provider parse of the origin: {one_parse:?}");
+
+    assert!(
+        warm_elapsed < std::time::Duration::from_millis(500),
+        "ranking three real candidates took {warm_elapsed:?}; at that price the selection costs \
+         more than the conversion it exists to improve"
+    );
+}
+
 #[test]
 fn a_real_codex_origin_beats_a_real_claude_session_only_for_a_codex_target() {
     let Some(home) = dirs::home_dir() else {
@@ -978,7 +1096,7 @@ fn a_real_codex_origin_beats_a_real_claude_session_only_for_a_codex_target() {
         )
         .expect("record conversion");
 
-    let to_codex = store.best_source_for(&record, provider("codex"));
+    let to_codex = store.best_source_for(&record, provider("codex"), registry());
     println!("→ codex: {}", to_codex.explain(Some(&cc_key)));
     assert_eq!(to_codex.chosen().expect("source").key, codex_key);
     assert_eq!(
@@ -987,7 +1105,7 @@ fn a_real_codex_origin_beats_a_real_claude_session_only_for_a_codex_target() {
         "counted through Capsule::fits, on real bytes"
     );
 
-    let to_cc = store.best_source_for(&record, provider("claude-code"));
+    let to_cc = store.best_source_for(&record, provider("claude-code"), registry());
     println!("→ claude-code: {}", to_cc.explain(Some(&codex_key)));
     assert_eq!(
         to_cc.chosen().expect("source").key,

@@ -43,7 +43,7 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::conformance::{self, Report};
+use casr::conformance::{self, HopReport, Report};
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -215,6 +215,84 @@ fn structured_providers_conform_on_the_corpus() {
     }
     let report = sandboxed(|sandbox| conformance::run("corpus", &files, sandbox));
     finish("corpus", &report);
+}
+
+// ---------------------------------------------------------------------------
+// The second hop, both tiers
+// ---------------------------------------------------------------------------
+
+/// The measurement the store exists for, on the checked-in fixtures.
+///
+/// A second conversion hop used to ask the session the user named rather than the
+/// best source for its target, so `codex → claude → codex` came back with none of
+/// the original reasoning capsules while the bytes that replay perfectly never
+/// left `~/.codex/sessions`. This runs the chain both ways and prints what each
+/// arm delivered.
+///
+/// The fixtures tier proves the chain runs. Only the corpus tier puts a number on
+/// it worth quoting: a fixture carries a handful of capsules and a real rollout
+/// carries thousands.
+#[test]
+fn the_second_hop_does_not_lose_what_the_store_could_have_supplied() {
+    let files = fixture_files();
+    let report = sandboxed(|sandbox| conformance::second_hop("fixtures", &files, sandbox));
+    finish_hops("fixtures", &report);
+}
+
+/// The same chain on real sessions.
+#[test]
+#[ignore = "requires a local session corpus; set AGSX_CODEX_CORPUS / AGSX_CLAUDE_CORPUS"]
+fn the_second_hop_recovers_the_corpus_capsules_the_first_hop_could_not_carry() {
+    let files = corpus_files();
+    if files.is_empty() {
+        eprintln!(
+            "\n════ second hop, tier \"corpus\": DID NOT RUN — no AGSX_*_CORPUS root is set, so \
+             the payoff below was not measured against a real session.\n"
+        );
+        return;
+    }
+    let report = sandboxed(|sandbox| conformance::second_hop("corpus", &files, sandbox));
+    finish_hops("corpus", &report);
+}
+
+/// Print the counts, then fail on the objections.
+///
+/// The assertion is an inequality, not one of the numbers: the numbers belong to
+/// whatever corpus is on the machine, and baking one in would turn a suite that
+/// measures the store into one that measures this laptop. What is asserted is
+/// that consulting the store never delivers *less* sealed material than not
+/// consulting it, and that a chain whose source carried capsules does not arrive
+/// empty — the exact defect the store was built for.
+fn finish_hops(tier: &str, report: &HopReport) {
+    report.print();
+    assert!(
+        report.sessions() > 0,
+        "the {tier} second-hop tier measured no chain at all, so nothing below was checked"
+    );
+    assert!(
+        report.findings().is_empty(),
+        "the {tier} second-hop tier found {} failure(s):\n  {}",
+        report.findings().len(),
+        report.findings().join("\n  ")
+    );
+    let (source, with, without) = report.totals();
+    assert!(
+        with >= without,
+        "the {tier} tier delivered {with} capsule(s) through the store against {without} without \
+         it; the store may never cost sealed material"
+    );
+    if source > 0 {
+        assert!(
+            with > 0,
+            "the {tier} tier's sources carried {source} capsule(s) and the store-backed chain \
+             delivered none of them, which is the defect the store exists to fix"
+        );
+    }
+    eprintln!(
+        "  tier {tier:?} second hop RAN: {} chain(s); {source} capsule(s) in the sources, \
+         {with} delivered with the store, {without} without it.",
+        report.sessions()
+    );
 }
 
 // ---------------------------------------------------------------------------

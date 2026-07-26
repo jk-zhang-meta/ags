@@ -11,15 +11,69 @@ use std::{
 
 use tracing::{debug, info, warn};
 
-use crate::discovery::{ProviderRegistry, SourceHint};
+use crate::discovery::{ProviderRegistry, ResolvedSession, SourceHint};
 use crate::error::CasrError;
 use crate::ir::{Body, Fidelity, Loss, LossKind, SessionIr};
 use crate::model::{CanonicalMessage, CanonicalSession, MessageRole, reindex_messages};
 use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
+use crate::store::{DerivedWrite, OriginPolicy, SessionKey, SourceCandidate, SourceChoice, Store};
 
 /// Top-level orchestrator for session conversion.
 pub struct ConversionPipeline {
     pub registry: ProviderRegistry,
+    /// The session store, when one is in use.
+    ///
+    /// `None` is `--no-store`, and it is the *absence* of a store rather than a
+    /// second code path: with no store there is nothing to ask, so
+    /// [`ConversionPipeline::convert`] reads the session it was given, writes
+    /// where it was told, and records nothing — which is exactly what it did
+    /// before the store existed.
+    ///
+    /// Owned rather than borrowed so that the pipeline holds one store for the
+    /// same reason it holds one registry, and so that
+    /// [`crate::store::Store::best_source_for`] can be handed *this* registry
+    /// instead of building a second one that could disagree with it.
+    pub store: Option<Store>,
+}
+
+/// Which incarnation of a conversation the store chose to read, and what the
+/// alternatives would have cost.
+///
+/// Present on [`ConversionResult`] rather than only in a log line, because the
+/// store may read a session the user did not name and that has to be visible in
+/// the result. The rendering split is the store's:
+/// [`crate::store::SourceChoice`] decided without being told what the user
+/// asked for, and only [`SourceSelection::line`] is told.
+#[derive(Debug, Clone)]
+pub struct SourceSelection {
+    /// The store record this conversation belongs to — our identifier, the one
+    /// `resume <record-id>` takes.
+    pub record_id: String,
+    /// The session the user named, which the store is free not to read.
+    pub named: SessionKey,
+    /// Every incarnation the store ranked for this target, best first.
+    pub choice: SourceChoice,
+}
+
+impl SourceSelection {
+    /// The incarnation that was actually read.
+    pub fn chosen(&self) -> Option<&SourceCandidate> {
+        self.choice.chosen()
+    }
+
+    /// Whether the store read a session the user did not name.
+    ///
+    /// The one condition under which this selection has to be reported: when it
+    /// agrees with the user there is nothing to tell them.
+    pub fn overrode(&self) -> bool {
+        self.chosen().is_some_and(|chosen| chosen.key != self.named)
+    }
+
+    /// One line naming the source and what not taking the user's suggestion
+    /// saved.
+    pub fn line(&self) -> String {
+        self.choice.explain(Some(&self.named))
+    }
 }
 
 /// Options passed through the pipeline from CLI flags.
@@ -98,6 +152,12 @@ pub struct ConversionResult {
     /// launch refusal cares only about [`LossKind::SealedContext`] — instead of
     /// matching on sentences. Empty means the grade is its track's baseline.
     pub losses: Vec<Loss>,
+    /// Which incarnation the store chose to read, when a store was in use.
+    ///
+    /// `None` under `--no-store`, and also when the store was asked and had
+    /// nothing to say — a conversation it has never seen and could not ingest.
+    /// Either way the conversion read the session that was named.
+    pub source: Option<SourceSelection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +434,7 @@ but resume may fail until the CLI is installed.",
 
         // 2. Resolve source session.
         let source_hint = opts.source_hint.as_deref().map(SourceHint::parse);
-        let resolved = self
+        let mut resolved = self
             .registry
             .resolve_session(session_id, source_hint.as_ref())?;
 
@@ -390,6 +450,34 @@ but resume may fail until the CLI is installed.",
             messages = canonical.messages.len(),
             session_id = canonical.session_id,
             "source session read"
+        );
+
+        // 3b. Source selection.
+        //
+        // A conversion is lossy in a direction, so the second hop of
+        // `codex → claude → codex` can only carry what the first one left —
+        // unless it asks the store, which remembers that both sessions are the
+        // same conversation and can hand back the incarnation that still holds
+        // the sealed material. Nothing below this line knows the difference:
+        // `resolved` and `canonical` are simply the source that was chosen.
+        //
+        // # Why this sits just after the read and not just before it
+        //
+        // The store's only external identifier for a session is
+        // `(provider, provider_session_id)`, and the provider's own id is not
+        // knowable from a path — [`crate::discovery::ResolvedSession`] does not
+        // carry one, and `session_id` as typed may be a prefix or a filename
+        // suffix that several spellings share. Keying the store on what the user
+        // typed would file one conversation under several ids. So the id comes
+        // from the read, which costs one wasted flat read in the one case where
+        // the store overrides the choice — and that case was going to read a
+        // second file anyway.
+        let selection = self.select_source(
+            target_provider,
+            &mut resolved,
+            &mut canonical,
+            &opts,
+            &mut all_warnings,
         );
 
         // 4. Validate.
@@ -443,6 +531,7 @@ but resume may fail until the CLI is installed.",
                 warnings: all_warnings,
                 fidelity,
                 losses,
+                source: selection,
             });
         }
 
@@ -468,6 +557,9 @@ but resume may fail until the CLI is installed.",
                 // command points the agent back at its own bytes.
                 fidelity: Fidelity::ByteIdentical,
                 losses: Vec::new(),
+                // Nothing was written, so there is no new incarnation to
+                // record; the source the store chose is already in the record.
+                source: selection,
             });
         }
 
@@ -547,6 +639,20 @@ but resume may fail until the CLI is installed.",
                 }
             }
 
+            // 7a1c. Tell the store what we just wrote.
+            //
+            // After verification, never before it: a record of a conversion is a
+            // measurement of an event that happened, and a write that was rolled
+            // back did not happen.
+            self.record_write(
+                selection.as_ref(),
+                target_provider,
+                &written,
+                fidelity,
+                &losses,
+                &mut all_warnings,
+            );
+
             return Ok(ConversionResult {
                 source_provider: resolved.provider.slug().to_string(),
                 target_provider: target_provider.slug().to_string(),
@@ -555,6 +661,7 @@ but resume may fail until the CLI is installed.",
                 warnings: all_warnings,
                 fidelity,
                 losses,
+                source: selection,
             });
         }
 
@@ -684,8 +791,16 @@ but resume may fail until the CLI is installed.",
             }
         }
 
-        let (fidelity, losses) =
-            flat_fidelity(source_ir.as_ref(), target_provider.slug());
+        let (fidelity, losses) = flat_fidelity(source_ir.as_ref(), target_provider.slug());
+
+        self.record_write(
+            selection.as_ref(),
+            target_provider,
+            &written,
+            fidelity,
+            &losses,
+            &mut all_warnings,
+        );
 
         Ok(ConversionResult {
             source_provider: resolved.provider.slug().to_string(),
@@ -695,7 +810,165 @@ but resume may fail until the CLI is installed.",
             warnings: all_warnings,
             fidelity,
             losses,
+            source: selection,
         })
+    }
+
+    // -- the store ----------------------------------------------------------
+
+    /// Ask the store which incarnation of this conversation is the best source
+    /// for `target`, and read that one instead when it is not the one named.
+    ///
+    /// `None` means the conversion carries on with the session it was given,
+    /// which is what `--no-store` always means and what every other answer here
+    /// degrades to. **Nothing in here can fail a conversion.** A store that
+    /// cannot be read, a record that cannot be ingested, a chosen source that
+    /// will not parse — each is reported as a warning and then ignored, because
+    /// every one of them describes a broken *cache*, and refusing to convert a
+    /// session that converts fine today would make the store a liability.
+    ///
+    /// A `--dry-run` ingests nothing. It still *consults* the store, so the
+    /// source it reports is the source a real run would read, but a command whose
+    /// contract is "write nothing" may not create a record either.
+    fn select_source<'a>(
+        &'a self,
+        target: &dyn Provider,
+        resolved: &mut ResolvedSession<'a>,
+        canonical: &mut CanonicalSession,
+        opts: &ConvertOptions,
+        warnings: &mut Vec<String>,
+    ) -> Option<SourceSelection> {
+        let store = self.store.as_ref()?;
+        let named = SessionKey::new(resolved.provider.slug(), canonical.session_id.clone());
+
+        let record = match store.find_by_session(&named) {
+            Ok(Some(record)) => record,
+            Ok(None) if opts.dry_run => {
+                debug!(%named, "dry run: not ingesting an unknown origin");
+                return None;
+            }
+            Ok(None) => {
+                match store.ingest_origin(&named, &resolved.path, OriginPolicy::Reference) {
+                    Ok(record) => record,
+                    Err(err) => {
+                        warnings.push(format!(
+                            "The session store could not remember {named}, so this conversion \
+                             cannot be used as a better source later: {err}"
+                        ));
+                        return None;
+                    }
+                }
+            }
+            Err(err) => {
+                warnings.push(format!(
+                    "The session store could not be consulted, so {named} was read as named: {err}"
+                ));
+                return None;
+            }
+        };
+
+        let choice = store.best_source_for(&record, target, &self.registry);
+        let Some(chosen) = choice.chosen() else {
+            // The record exists but the store can read none of it — including,
+            // apparently, the file we just read successfully, which means its
+            // recorded reference has gone stale. Report all three resolutions
+            // rather than downgrade any of them silently, and carry on with what
+            // was named.
+            warnings.push(format!(
+                "The session store has this conversation as record {} but {}; reading {named} as \
+                 named.",
+                record.id,
+                choice.explain(None)
+            ));
+            return None;
+        };
+
+        if chosen.key == named {
+            debug!(record = %record.id, %named, "the store agrees with the session that was named");
+            return Some(SourceSelection {
+                record_id: record.id,
+                named,
+                choice,
+            });
+        }
+
+        let (key, path) = (chosen.key.clone(), chosen.path.clone());
+        let Some(provider) = self.registry.find_by_slug(&key.provider) else {
+            warnings.push(format!(
+                "The session store offers {key} as a better source than {named}, but this build \
+                 has no provider called '{}'; reading {named} as named.",
+                key.provider
+            ));
+            return None;
+        };
+        let fresh = match provider.read_session(&path) {
+            Ok(fresh) => fresh,
+            Err(err) => {
+                warnings.push(format!(
+                    "The session store offers {key} as a better source than {named}, but it could \
+                     not be read ({err}); reading {named} as named."
+                ));
+                return None;
+            }
+        };
+
+        info!(
+            record = %record.id,
+            %named,
+            chosen = %key,
+            "the store chose a different source for this target"
+        );
+        *resolved = ResolvedSession { provider, path };
+        *canonical = fresh;
+        Some(SourceSelection {
+            record_id: record.id,
+            named,
+            choice,
+        })
+    }
+
+    /// Remember a conversion the store should know about.
+    ///
+    /// Also never fails the conversion: the target file is written and verified
+    /// by the time this runs, and a store that could not be updated is a worse
+    /// cache, not a worse conversion.
+    ///
+    /// A write with no paths — the same-provider short-circuit — records nothing.
+    /// There is no new incarnation: the resume command points the agent back at
+    /// bytes the record already holds.
+    fn record_write(
+        &self,
+        selection: Option<&SourceSelection>,
+        target: &dyn Provider,
+        written: &WrittenSession,
+        fidelity: Fidelity,
+        losses: &[Loss],
+        warnings: &mut Vec<String>,
+    ) {
+        let (Some(store), Some(selection)) = (self.store.as_ref(), selection) else {
+            return;
+        };
+        let (Some(from), Some(path)) = (
+            selection.chosen().map(|chosen| chosen.key.clone()),
+            written.paths.first().cloned(),
+        ) else {
+            return;
+        };
+        let key = SessionKey::new(target.slug(), written.session_id.clone());
+        let derived = DerivedWrite {
+            key: key.clone(),
+            path,
+            from,
+            fidelity,
+            losses: losses.to_vec(),
+        };
+        match store.record_conversion(&selection.record_id, derived) {
+            Ok(_) => debug!(record = %selection.record_id, %key, "recorded conversion"),
+            Err(err) => warnings.push(format!(
+                "The session written to {key} could not be recorded in the session store, so a \
+                 later conversion will not know it is the same conversation: {err}"
+            )),
+        }
     }
 }
 

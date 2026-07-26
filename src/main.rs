@@ -131,6 +131,18 @@ enum Command {
         #[arg(long, requires = "launching")]
         launch_anyway: bool,
 
+        /// Do not consult the session store: read the session named here, write
+        /// where told, and record nothing.
+        ///
+        /// The store exists so that converting back to a provider you started
+        /// from can read the original session instead of a degraded copy of it.
+        /// That means it may read a session other than the one named — which is
+        /// always reported, and which this flag turns off. Also the escape hatch
+        /// for a read-only or shared home: nothing here writes outside the
+        /// target provider's own session directory.
+        #[arg(long)]
+        no_store: bool,
+
         /// Flags for the target agent, appended after the resume arguments.
         ///
         /// Refused if one of them is a flag the resume command already sets,
@@ -316,6 +328,7 @@ fn main() -> ExitCode {
             launch,
             launch_dry_run,
             launch_anyway,
+            no_store,
             agent_args,
         } => cmd_resume(
             &target,
@@ -327,6 +340,7 @@ fn main() -> ExitCode {
             max_context_tokens,
             max_tool_output,
             keep_reasoning,
+            no_store,
             cli.json,
             LaunchRequest {
                 launch,
@@ -418,6 +432,82 @@ impl LaunchRequest {
     }
 }
 
+/// The session store, unless `--no-store` said not to.
+///
+/// A store that will not open is a warning and a `None`, never an error: every
+/// conversion this tool did before the store existed still works without one, so
+/// a read-only home or a store written by a newer build must not take the tool
+/// with it. The failure is printed rather than swallowed, because a silently
+/// absent store would look exactly like a store that had nothing to say.
+///
+/// # Why a dry run will not create one
+///
+/// `Store::open` creates the store on first use, and `--dry-run` promises to
+/// write nothing at all — a promise the store's own manifest broke, caught by
+/// `trace_dry_run_omits_atomic_write`. Declining to create it costs a dry run no
+/// information: a store that does not exist yet holds no records, so the only
+/// thing it could have said is that it had never seen this conversation. An
+/// existing store is opened and consulted in full, so `--dry-run` still reports
+/// the source a real run would read.
+fn open_store(no_store: bool, dry_run: bool) -> Option<casr::store::Store> {
+    if no_store {
+        return None;
+    }
+    if dry_run && !casr::store::default_root().is_ok_and(|root| root.join("store.json").is_file()) {
+        return None;
+    }
+    match casr::store::Store::open() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            eprintln!(
+                "{} the session store is unavailable, so this conversion reads exactly the \
+                 session named and records nothing: {error}",
+                "⚠".yellow()
+            );
+            None
+        }
+    }
+}
+
+/// Turn one of our record ids into a session the pipeline can resolve.
+///
+/// `agsx resume cc <record-id>` is the point of having our own identifier: one id
+/// for a conversation however many providers it has been through. No provider has
+/// heard of it, so it is translated here, and the pair returned is `(session_id,
+/// source_hint)` — the hint pins the provider so that a native session id that
+/// happens to collide across providers cannot be resolved to the wrong one.
+///
+/// Anything that is not a record id is returned untouched, which is every
+/// ordinary invocation.
+fn redirect_record_id(
+    store: Option<&casr::store::Store>,
+    target: &str,
+    session_id: &str,
+    source: Option<String>,
+) -> (String, Option<String>) {
+    let untouched = (session_id.to_string(), source);
+    let Some(store) = store else {
+        return untouched;
+    };
+    // A `--source` was given explicitly, so the user is naming a provider
+    // session and not a record.
+    if untouched.1.is_some() {
+        return untouched;
+    }
+    let Ok(Some(record)) = store.get(session_id) else {
+        return untouched;
+    };
+    let registry = ProviderRegistry::default_registry();
+    let target_slug = registry
+        .find_by_alias(target)
+        .map(|provider| provider.slug().to_string())
+        .unwrap_or_else(|| target.to_string());
+    match casr::launch::session_named_by_record(&record, &target_slug) {
+        Some(key) => (key.provider_session_id.clone(), Some(key.provider.clone())),
+        None => untouched,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_resume(
     target: &str,
@@ -429,11 +519,18 @@ fn cmd_resume(
     max_context_tokens: usize,
     max_tool_output: usize,
     keep_reasoning: bool,
+    no_store: bool,
     json_mode: bool,
     launch: LaunchRequest,
 ) -> anyhow::Result<ExitCode> {
     let registry = ProviderRegistry::default_registry();
-    let pipeline = ConversionPipeline { registry };
+    let store = open_store(no_store, dry_run);
+    // The store may be holding the conversation under our own record id rather
+    // than a provider's session id, in which case the positional argument names
+    // no session any provider has heard of. Translated before the pipeline runs,
+    // so that everything downstream sees an ordinary source session.
+    let (session_id, source) = redirect_record_id(store.as_ref(), target, session_id, source);
+    let pipeline = ConversionPipeline { registry, store };
 
     let opts = ConvertOptions {
         dry_run,
@@ -446,7 +543,7 @@ fn cmd_resume(
         keep_reasoning,
     };
 
-    let result = pipeline.convert(target, session_id, opts)?;
+    let result = pipeline.convert(target, &session_id, opts)?;
 
     // Resolved before anything is printed, because the JSON envelope carries
     // the command and the envelope is printed first. The error is held rather
@@ -481,6 +578,10 @@ fn cmd_resume(
             launch_command: spec.map(LaunchSpec::display),
             launch_targets_session: spec.map(|s| s.targeting() == SessionTargeting::ById),
             warnings: result.warnings.clone(),
+            source_selection: result
+                .source
+                .as_ref()
+                .and_then(responses::SourceSelectionJson::of),
         };
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else if let Some(ref written) = result.written {
@@ -495,6 +596,7 @@ fn cmd_resume(
             "Source".dimmed(),
             result.canonical_session.session_id
         );
+        print_source_selection(&result);
         println!("  {} → {}", "Target".dimmed(), written.session_id);
         println!(
             "  {} → {}",
@@ -526,6 +628,7 @@ fn cmd_resume(
             "Messages".dimmed(),
             result.canonical_session.messages.len()
         );
+        print_source_selection(&result);
         for warning in &result.warnings {
             println!("  {} {warning}", "⚠".yellow());
         }
@@ -535,6 +638,17 @@ fn cmd_resume(
         return Ok(ExitCode::SUCCESS);
     };
     run_launch(provider, &result, spec?, &launch, json_mode)
+}
+
+/// Say so when the store read a session other than the one that was named.
+///
+/// Printed only then. When the store agrees with the user there is nothing to
+/// tell them, and a line that appears on every conversion is a line nobody reads
+/// — which is the same as not printing the one that matters.
+fn print_source_selection(result: &ConversionResult) {
+    if let Some(selection) = result.source.as_ref().filter(|s| s.overrode()) {
+        println!("  {} {}", "⤺".cyan(), selection.line());
+    }
 }
 
 /// The command a launch would run, resolved without running it.

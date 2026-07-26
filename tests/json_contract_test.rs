@@ -723,6 +723,127 @@ fn assert_resume_success_object(obj: &serde_json::Value) {
     assert_array(&obj["warnings"], "warnings", ctx);
 }
 
+/// `--no-store` emits exactly the key set `resume --json` emitted before the
+/// store existed.
+///
+/// The pin for the escape hatch, at the level a script sees it. `source_selection`
+/// is `skip_serializing_if = "Option::is_none"` precisely so this holds: a caller
+/// that worked yesterday gets the same object today, and the field's mere presence
+/// is the signal that the source was substituted.
+#[test]
+fn contract_resume_json_no_store_adds_no_field() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "resume", "cod", &session_id, "--no-store"])
+        .output()
+        .expect("resume --no-store should run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("Invalid JSON from resume: {e}\nOutput: {stdout}"));
+
+    // `assert_resume_success_object` asserts the exact key set, so this is the
+    // whole assertion: an extra field would fail it.
+    assert_resume_success_object(&parsed);
+}
+
+/// A store-backed second hop reports the substituted source as fields.
+///
+/// `codex → claude → codex`: the store has both incarnations by the third command
+/// and the origin needs no conversion at all, so it reads the origin and says so.
+/// The sentence is for a human; this is the contract a caller gets.
+#[test]
+fn contract_resume_json_reports_a_substituted_source() {
+    let tmp = TempDir::new().unwrap();
+    let codex_id = setup_codex_fixture(&tmp, "codex_reasoning", "jsonl");
+
+    // Hop one: out of Codex, which teaches the store that both sessions are one
+    // conversation.
+    let first = casr_cmd(&tmp)
+        .args(["--json", "resume", "cc", &codex_id])
+        .output()
+        .expect("codex -> claude should run");
+    assert!(
+        first.status.success(),
+        "hop one failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&first.stdout)).expect("hop one JSON");
+    let cc_id = first["target_session_id"]
+        .as_str()
+        .expect("hop one wrote a Claude session")
+        .to_string();
+
+    // Hop two: back into Codex, naming the Claude session.
+    let second = casr_cmd(&tmp)
+        .args(["--json", "resume", "cod", &cc_id])
+        .output()
+        .expect("claude -> codex should run");
+    assert!(
+        second.status.success(),
+        "hop two failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("Invalid JSON: {e}\n{stdout}"));
+
+    let selection = &parsed["source_selection"];
+    assert!(
+        selection.is_object(),
+        "hop two read a session the user did not name and must say so in the JSON, got:\n{stdout}"
+    );
+    assert_exact_keys(
+        selection,
+        &[
+            "record_id",
+            "provider",
+            "session_id",
+            "role",
+            "availability",
+            "origin_state",
+            "origin_detail",
+            "capsules",
+            "capsule_bytes",
+            "named_provider",
+            "named_session_id",
+            "cost_capsules",
+            "cost_capsule_bytes",
+        ],
+        "source_selection",
+    );
+    assert_eq!(selection["provider"], "codex");
+    assert_eq!(selection["session_id"], codex_id.as_str());
+    assert_eq!(selection["role"], "origin");
+    assert_eq!(selection["availability"], "ready");
+    // The cheap resolution, and it says which check it actually ran: same size
+    // and mtime, bytes not re-read.
+    assert_eq!(selection["origin_state"], "unchanged");
+    assert_eq!(selection["named_provider"], "claude-code");
+    assert_eq!(selection["named_session_id"], cc_id.as_str());
+    assert!(selection["cost_capsules"].is_u64());
+    assert!(selection["cost_capsule_bytes"].is_u64());
+    // Nothing was written: the best source for a Codex target was already a
+    // Codex session, so the resume command points back at its own bytes.
+    assert_eq!(parsed["fidelity"], "byte_identical");
+    assert_eq!(parsed["target_session_id"], codex_id.as_str());
+
+    // And the escape hatch on the very same command reverts to today's answer.
+    let bare = casr_cmd(&tmp)
+        .args(["--json", "resume", "cod", &cc_id, "--no-store"])
+        .output()
+        .expect("claude -> codex --no-store should run");
+    let bare: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&bare.stdout)).expect("no-store JSON");
+    assert_resume_success_object(&bare);
+    assert_eq!(bare["source_provider"], "claude-code");
+    assert_ne!(bare["target_session_id"], codex_id.as_str());
+}
+
 #[test]
 fn contract_resume_json_dry_run_cc_to_codex() {
     let tmp = TempDir::new().unwrap();

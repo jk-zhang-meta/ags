@@ -26,6 +26,37 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::store::{Record, SessionKey};
+
+/// The provider session a store record id stands for, when the target is
+/// `target_slug`.
+///
+/// `agsx resume cc <record-id>` has to become a provider session somewhere: the
+/// record id is ours, and no agent has ever heard of it. So the identifier the
+/// user has — one id for the whole conversation, however many providers it has
+/// been through — is translated here into the one the pipeline resolves and the
+/// agent can be pointed at.
+///
+/// The target's own incarnation comes first, and that ordering is the whole
+/// content of this function. It needs no conversion, so `--launch` starts the
+/// agent on the session it already has; the store's own ranking then still runs
+/// over the record and may prefer a better source anyway, which is why this only
+/// has to name *a* session of the conversation rather than the best one. The
+/// origin is the fallback, because it is the one incarnation every record has.
+///
+/// `None` for a record with no incarnations at all, which `fsck` reports as a
+/// broken record rather than something to launch.
+pub fn session_named_by_record<'a>(
+    record: &'a Record,
+    target_slug: &str,
+) -> Option<&'a SessionKey> {
+    record
+        .for_provider(target_slug)
+        .or_else(|| record.origin())
+        .or_else(|| record.incarnations.first())
+        .map(|incarnation| &incarnation.key)
+}
+
 /// Everything needed to start an agent on a converted session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchSpec {

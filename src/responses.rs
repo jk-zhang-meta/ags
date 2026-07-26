@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::ir::Fidelity;
+use crate::store::{Availability, OriginState};
 
 /// Current schema version for all JSON envelopes and per-record outputs.
 ///
@@ -148,6 +149,106 @@ pub struct ResumeSuccess {
     /// `null` when no launch was asked for, which is not the same as `false`.
     pub launch_targets_session: Option<bool>,
     pub warnings: Vec<String>,
+    /// The session store read a session other than the one that was named.
+    ///
+    /// Omitted entirely — not `null` — whenever the conversion read what it was
+    /// asked to, which includes every `--no-store` run. That is deliberate: a
+    /// script that worked before the store exists sees byte-identical JSON, and
+    /// the field's mere presence is the signal that the source was substituted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_selection: Option<SourceSelectionJson>,
+}
+
+/// Which incarnation the store read instead, and what the named one would have
+/// cost.
+///
+/// The human form is one sentence from `SourceChoice::explain`. This is the same
+/// information as fields, because a caller that has to `grep` a sentence for
+/// "would have cost 3 capsules" has no contract at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceSelectionJson {
+    /// Our identifier for the conversation — the one `resume <record-id>` takes.
+    pub record_id: String,
+    /// Provider slug of the session that was actually read.
+    pub provider: String,
+    /// That session's provider-native id.
+    pub session_id: String,
+    /// `"origin"` or `"derived"`.
+    pub role: String,
+    /// `"ready"` when the session's own file was read, `"archived"` when the
+    /// live origin was gone and the store's byte copy stood in.
+    pub availability: String,
+    /// How the origin reference resolved: `"unchanged"`, `"unchanged_verified"`,
+    /// `"grew"`, or `"unavailable"`. `null` for a derived incarnation, which the
+    /// store never snapshotted.
+    ///
+    /// All four are reported. `"unchanged"` without `_verified` is the cheap
+    /// answer — same size and mtime, bytes not re-read — and says so rather than
+    /// claiming a verification it did not run.
+    pub origin_state: Option<String>,
+    /// Why that resolution, in the store's own words. `null` when unchanged.
+    pub origin_detail: Option<String>,
+    /// Capsules in the chosen source that the target's vendor can replay.
+    pub capsules: usize,
+    /// Bytes of sealed material behind `capsules`.
+    pub capsule_bytes: usize,
+    /// Provider slug of the session the user named.
+    pub named_provider: String,
+    /// Provider-native id of the session the user named.
+    pub named_session_id: String,
+    /// Capsules that reading the named session instead would have cost.
+    pub cost_capsules: usize,
+    /// Bytes of sealed material behind `cost_capsules`.
+    pub cost_capsule_bytes: usize,
+}
+
+impl SourceSelectionJson {
+    /// The structured form of a selection, or `None` when the store read exactly
+    /// what it was asked to and there is nothing to report.
+    pub fn of(selection: &crate::pipeline::SourceSelection) -> Option<Self> {
+        if !selection.overrode() {
+            return None;
+        }
+        let chosen = selection.chosen()?;
+        let named = selection.choice.find(&selection.named);
+        let (origin_state, origin_detail) = match &chosen.origin_state {
+            None => (None, None),
+            Some(state) => match state {
+                OriginState::Unchanged { rehashed: false } => (Some("unchanged"), None),
+                OriginState::Unchanged { rehashed: true } => (Some("unchanged_verified"), None),
+                OriginState::Grew { .. } => (Some("grew"), Some(state.describe())),
+                OriginState::Unavailable { .. } => (Some("unavailable"), Some(state.describe())),
+            },
+        };
+        Some(Self {
+            record_id: selection.record_id.clone(),
+            provider: chosen.key.provider.clone(),
+            session_id: chosen.key.provider_session_id.clone(),
+            role: chosen.label().to_string(),
+            availability: match &chosen.availability {
+                Availability::Ready => "ready",
+                Availability::Archived => "archived",
+                // Not reachable through `chosen()`, which filters on
+                // readability; spelled out so a new variant is a compile error.
+                Availability::Unavailable { .. } => "unavailable",
+            }
+            .to_string(),
+            origin_state: origin_state.map(str::to_string),
+            origin_detail,
+            capsules: chosen.capsules.fitting(),
+            capsule_bytes: chosen.capsules.fitting_bytes(),
+            named_provider: selection.named.provider.clone(),
+            named_session_id: selection.named.provider_session_id.clone(),
+            cost_capsules: chosen
+                .capsules
+                .fitting()
+                .saturating_sub(named.map_or(0, |named| named.capsules.fitting())),
+            cost_capsule_bytes: chosen
+                .capsules
+                .fitting_bytes()
+                .saturating_sub(named.map_or(0, |named| named.capsules.fitting_bytes())),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +447,7 @@ mod tests {
             launch_command: None,
             launch_targets_session: None,
             warnings: vec![],
+            source_selection: None,
         };
         let json = serde_json::to_value(&rs).unwrap();
         assert_eq!(json["ok"], true);
@@ -374,6 +476,7 @@ mod tests {
             launch_command: Some("claude --resume sid-tgt".to_string()),
             launch_targets_session: Some(true),
             warnings: vec!["missing workspace".to_string()],
+            source_selection: None,
         };
         let json = serde_json::to_value(&rs).unwrap();
         assert_eq!(json["ok"], true);

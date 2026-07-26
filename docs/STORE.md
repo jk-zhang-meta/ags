@@ -23,9 +23,35 @@ Now chain it. Convert a Codex session to Claude Code, work there, then convert
 back to Codex. The second hop can only carry what the first one left, so the
 final Codex session arrives with **0 of the original 30,082 capsules** — even
 though the bytes that would have replayed perfectly were sitting in
-`~/.codex/sessions` the whole time. (Deduced from the two measured hops above,
-not separately measured; the conformance suite will measure it once the store
-can be asked for a source.)
+`~/.codex/sessions` the whole time.
+
+That was a deduction from the two measured hops above. It is now measured
+directly, by `conformance::second_hop` (driver:
+`tests/conformance_test.rs::the_second_hop_recovers_the_corpus_capsules_the_first_hop_could_not_carry`),
+which runs the whole chain through `ConversionPipeline` both ways:
+
+| chain | sessions | capsules in the source | delivered with the store | delivered with `--no-store` |
+|---|---|---|---|---|
+| codex → claude → codex | 592 | 30,483 | 30,483 | 0 |
+| claude → codex → claude | 183 | 4,532 | 4,532 | 0 |
+
+The suite asserts the inequality — consulting the store may never deliver less
+sealed material than not consulting it, and a chain whose source carried capsules
+may not arrive empty — and prints the numbers. It does not assert them, and the
+table above is one run rather than a constant: the corpus is live and grows while
+the suite runs against it (two runs an hour apart read 30,622 and 30,483 for the
+same chain). Baking a number in would turn a suite that measures the store into
+one that measures a particular laptop on a particular afternoon.
+
+One consequence of the ranking is visible in that table and is worth stating
+plainly, because it is a trade and not a free win. For a Codex target the origin
+wins on capsules *and* on needing no conversion, so the second hop returns the
+original Codex session and writes nothing at all. Every capsule survives, and
+anything the agent appended on the **Claude** side does not come back with it —
+the design has no way to merge two incarnations, and does not claim one. The
+choice is stated in the output (`source: codex 01J… (origin; you named
+claude-code a3f…, …)`), which is what makes it a choice the user can override
+with `--no-store` rather than a surprise.
 
 Nothing in the conversion is wrong. The loss is correct at each hop and
 reported at each hop. The defect is that the second hop *asked the wrong
@@ -137,6 +163,17 @@ to re-derive from *origin bytes*. The consequence is worth knowing before it
 surprises someone: ranking a **derived** candidate always re-parses that
 candidate's file, because there is no cache for it.
 
+Measured, that consequence costs nothing worth fixing. A record with one Codex
+origin (208 KiB) and two derived Claude incarnations (198 KiB each) — a
+conversation converted twice, which is the realistic shape — ranks in **1.63 ms**
+once `ir.json` exists, against **550 µs** for a single provider parse (release;
+11.6 ms and 4.0 ms unoptimised) and tens of milliseconds for the conversion the
+ranking precedes
+(`store_test::ranking_a_realistic_candidate_list_is_cheap_next_to_the_conversion`).
+So there is no derived-IR cache, and the reason is not only the ~1 ms: a derived
+session is the file an agent has been editing, so a cache of it would need an
+invalidation rule that the origin's `(size, mtime, prefix hash)` cannot supply.
+
 Also omitted, and additive to add later: any cross-machine sync story.
 
 `ingest_origin` on a key the store already knows as a `Derived` incarnation
@@ -149,8 +186,19 @@ defect in the first implementation, now pinned by a test.
 
 ```rust
 /// The best source for converting this conversation into `target`.
-fn best_source_for(&self, record: &Record, target: &dyn Provider) -> Source
+fn best_source_for(
+    &self,
+    record: &Record,
+    target: &dyn Provider,
+    registry: &ProviderRegistry,
+) -> SourceChoice
 ```
+
+The registry is a parameter and this document's signature did not have one. It
+was built inside the function instead, with `ProviderRegistry::default_registry`,
+and that is a latent bug rather than a saving: `pipeline.rs` already owns a
+registry, reads the chosen candidate through *its* providers, and would have been
+ranking through a different instance of the same list. One instance, injected.
 
 Note that it takes the target. There is no global ranking of incarnations,
 because sealed material is vendor-bound: a Codex origin beats a Claude
@@ -193,11 +241,53 @@ Consequences worth naming before they surprise someone:
   hatch and the regression test: the byte-identical codex→codex round trip has
   to keep passing through it.
 
+  As wired, the flag is the *absence* of a `Store`, not a second code path:
+  `ConversionPipeline::store` is `None`, so the selection step returns on its
+  first line and the record write returns on its first line. Pinned four ways —
+  no store directory appears
+  (`store_pipeline_test::no_store_consults_nothing_and_creates_nothing`), the
+  written bytes are identical to a store-backed run's modulo the ids and
+  timestamps a writer mints per call
+  (`…::no_store_writes_the_same_bytes_as_a_store_with_nothing_better`), the
+  codex→codex round trip still grades `ByteIdentical`, writes nothing and leaves
+  the source bytes untouched
+  (`…::codex_into_itself_stays_byte_identical_through_no_store`), and the
+  `resume --json` envelope gains no field
+  (`json_contract_test::contract_resume_json_no_store_adds_no_field`).
+
+  The store is therefore **on by default**: the flag's name presupposes it, and
+  the payoff above only exists if the store is consulted without being asked.
+  What stays conservative is everything around it. Origins are referenced and
+  never copied; a `--dry-run` consults an existing store but will not create one,
+  because `Store::open` writes `store.json` and a dry run promises to write
+  nothing; and **no store failure can fail a conversion** — an unopenable store,
+  a record that cannot be ingested, a chosen source that will not parse, a store
+  from a newer build that refuses writes, are each reported as a warning and then
+  ignored (`store_pipeline_test::a_store_the_pipeline_may_not_write_degrades_to_a_warning`).
+
 ## Where this plugs in
 
 - `pipeline.rs` gains a source-selection step ahead of the read, and a record
   write after a successful conversion. The conversion itself does not change.
+
+  One correction from wiring it. The selection sits immediately *after* the flat
+  read, not before it, and it cannot sit before it: the store's only external
+  identifier is `(provider, provider_session_id)`, and the provider's own id is
+  not knowable from a path — `ResolvedSession` carries no id, and `session_id` as
+  the user typed it may be a prefix or a filename suffix that several spellings
+  share, so keying on it would file one conversation under several ids. The id
+  therefore comes from the read. The price is one wasted flat read in the single
+  case where the store overrides the choice, which is the case that was going to
+  read a second file anyway.
 - `launch.rs` can resolve a record id to a target session id, so
   `resume <record-id> --launch cc` works with our identifier instead of
-  requiring the user to know the provider's.
+  requiring the user to know the provider's. `launch::session_named_by_record`
+  prefers the target's own incarnation — it needs no conversion, so `--launch`
+  starts the agent on a session it already has — and falls back to the origin,
+  the one incarnation every record has.
 - `ir.rs` gains nothing. `IR_VERSION` finally gets a reader.
+- The result carries the selection. `ConversionResult::source` is the choice plus
+  the session the user named, so the substitution is visible in the value and not
+  only in a log: `SourceSelection::line` renders the sentence, and
+  `responses::SourceSelectionJson` renders the same information as fields, omitted
+  entirely unless the source was substituted.

@@ -91,8 +91,10 @@ use crate::budget::ContextBudget;
 use crate::compare::{Comparison, compare, vendor_of};
 use crate::discovery::ProviderRegistry;
 use crate::ir::{Body, Event, Fidelity, Loss, SessionIr, Visibility};
+use crate::pipeline::{ConversionPipeline, ConvertOptions};
 use crate::providers::{Provider, WriteOptions};
 use crate::replay::{ExclusionReason, ReplayPlan, resolve};
+use crate::store::Store;
 
 /// How many example paths a finding list keeps before it starts counting only.
 const EXAMPLES: usize = 5;
@@ -1092,6 +1094,438 @@ impl Report {
             }
             if self.suppressed > 0 {
                 eprintln!("    ✗ … and {} more, suppressed", self.suppressed);
+            }
+            eprintln!();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The second hop
+// ---------------------------------------------------------------------------
+
+/// Measure what a second conversion hop costs, with the store and without it.
+///
+/// This is a sibling of [`run`] rather than a check inside it, and the split is
+/// deliberate. [`run`]'s subject is one provider's writer against its own
+/// reader, per file per target; it needs no store, no pipeline and no discovery.
+/// The second hop's subject is the pipeline's *source selection*: it needs a
+/// writable store root, it drives [`crate::pipeline::ConversionPipeline`] end to
+/// end, and its unit is a chain of two conversions rather than one crossing.
+/// Folding it into [`Report`] would have made that type a grab bag of two
+/// unrelated measurements.
+///
+/// # What it measures
+///
+/// For each source session claimed by structured provider `A`, and each other
+/// structured provider `B`:
+///
+/// 1. `A → B` with a store, so the store learns that both sessions are the same
+///    conversation.
+/// 2. `B → A` naming the session step 1 wrote, **with** the store.
+/// 3. `B → A` naming the same session, **without** it — which is `--no-store`,
+///    and is what the tool did before the store existed.
+///
+/// Then it counts the capsules in the session each of those two hops actually
+/// delivers: the file that was written, or — when the store chose a source that
+/// was already in `A`'s format and so needed no conversion at all — the file the
+/// resume command points at. Both are "the session the user ends up in", which
+/// is the only number the user experiences.
+///
+/// The ceiling is the source session's own capsule count, and it is reported
+/// beside the two results rather than assumed: a hop that recovers everything
+/// and a hop that recovers nothing look identical without it.
+///
+/// `sandbox` carries the same contract as [`run`]'s: every provider session root
+/// must already be redirected into it, every written path is asserted to land
+/// inside it, and the store roots this creates are inside it too.
+pub fn second_hop(tier: &str, files: &[PathBuf], sandbox: &Path) -> HopReport {
+    let registry = ProviderRegistry::default_registry();
+    let structured: Vec<String> = registry
+        .all_providers()
+        .into_iter()
+        .filter(|provider| provider.supports_structured_write())
+        .map(|provider| provider.slug().to_string())
+        .collect();
+
+    let mut report = HopReport {
+        tier: tier.to_string(),
+        files: files.len(),
+        ..HopReport::default()
+    };
+    // No store, ever. Built once: it is the control arm for every chain below,
+    // and `None` is the whole of what `--no-store` gives the pipeline.
+    let control = ConversionPipeline {
+        registry: ProviderRegistry::default_registry(),
+        store: None,
+    };
+
+    for (index, path) in files.iter().enumerate() {
+        let Some((source_slug, source_capsules)) = claimant(&registry, &structured, path) else {
+            continue;
+        };
+        for target_slug in &structured {
+            if target_slug == &source_slug {
+                continue;
+            }
+            chain(
+                &mut report,
+                &control,
+                path,
+                &source_slug,
+                target_slug,
+                source_capsules,
+                &sandbox.join(format!("hop-store-{index}-{target_slug}")),
+                sandbox,
+            );
+        }
+    }
+    report
+}
+
+/// Which structured provider's reader claims `path`, and how many capsules its
+/// model-visible replay holds.
+fn claimant(
+    registry: &ProviderRegistry,
+    structured: &[String],
+    path: &Path,
+) -> Option<(String, usize)> {
+    for slug in structured {
+        let provider = registry.find_by_slug(slug)?;
+        if let Ok(Some(ir)) = provider.read_session_ir(path)
+            && !resolve(&ir).events.is_empty()
+        {
+            return Some((slug.clone(), capsules_of(&ir)));
+        }
+    }
+    None
+}
+
+/// Capsules on the events the model would be shown.
+///
+/// Over [`SessionIr::model_visible`] and not every captured event, for the same
+/// reason [`crate::store`] counts it that way: a capsule on an event no replay
+/// includes is never handed to the target and is worth nothing to it.
+fn capsules_of(ir: &SessionIr) -> usize {
+    ir.model_visible()
+        .iter()
+        .map(|event| event.capsules.len())
+        .sum()
+}
+
+/// One `A → B → A` chain, measured both ways.
+#[allow(clippy::too_many_arguments)]
+fn chain(
+    report: &mut HopReport,
+    control: &ConversionPipeline,
+    path: &Path,
+    source_slug: &str,
+    target_slug: &str,
+    source_capsules: usize,
+    store_root: &Path,
+    sandbox: &Path,
+) {
+    let store = match Store::open_at(store_root) {
+        Ok(store) => store,
+        Err(error) => {
+            report.findings.push(format!(
+                "could not create a store under the sandbox: {error}"
+            ));
+            return;
+        }
+    };
+    let stored = ConversionPipeline {
+        registry: ProviderRegistry::default_registry(),
+        store: Some(store),
+    };
+
+    // Unlimited, and not the CLI's defaults, for the reason `cross` gives: this
+    // measures the conversion chain and not the budget policy. A budget that
+    // legitimately trims the oldest turns would take capsules with it, and the
+    // check could no longer tell that from a hop asking the wrong source.
+    let opts = |hint: &Path| ConvertOptions {
+        source_hint: Some(hint.display().to_string()),
+        ..ConvertOptions::default()
+    };
+    let named = |path: &Path| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default()
+    };
+
+    // Hop one: out of the provider that owns the session.
+    let first = match stored.convert(target_slug, &named(path), opts(path)) {
+        Ok(result) => result,
+        Err(error) => {
+            report.note(format!(
+                "{}: {source_slug} -> {target_slug} did not convert, so no chain starts here: \
+                 {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let Some(intermediate) = first
+        .written
+        .as_ref()
+        .and_then(|w| w.paths.first())
+        .cloned()
+    else {
+        report.note(format!(
+            "{}: {source_slug} -> {target_slug} wrote no file, so there is no session for a \
+             second hop to name",
+            path.display()
+        ));
+        return;
+    };
+    assert_inside(sandbox, &intermediate, target_slug);
+
+    // Hop two, both ways. The store's arm runs first so that the control arm
+    // cannot be handed a store the first arm warmed.
+    let with = stored.convert(source_slug, &named(&intermediate), opts(&intermediate));
+    let without = control.convert(source_slug, &named(&intermediate), opts(&intermediate));
+
+    let measure = |result: &Result<crate::pipeline::ConversionResult, anyhow::Error>| {
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => return None,
+        };
+        // The delivered session is the file that was written — or, when the
+        // chosen source was already in the target's format and needed no
+        // conversion, the file the resume command points back at.
+        let delivered = result
+            .written
+            .as_ref()
+            .and_then(|written| written.paths.first())
+            .cloned()
+            .or_else(|| {
+                result
+                    .source
+                    .as_ref()
+                    .and_then(|selection| selection.chosen())
+                    .map(|chosen| chosen.path.clone())
+            })?;
+        if delivered.starts_with(sandbox) {
+            assert_inside(sandbox, &delivered, source_slug);
+        }
+        let provider = control.registry.find_by_slug(source_slug)?;
+        let ir = provider.read_session_ir(&delivered).ok().flatten()?;
+        Some((delivered, capsules_of(&ir)))
+    };
+
+    let with_measured = measure(&with);
+    let without_measured = measure(&without);
+
+    // Written output goes as soon as it has been read: every source session in
+    // the corpus is converted twice here, and a sandbox that grows to three
+    // times the corpus is a suite nobody runs.
+    for produced in [&with, &without].into_iter().flatten() {
+        for written in produced.written.iter().flat_map(|w| w.paths.iter()) {
+            let _ = std::fs::remove_file(written);
+        }
+    }
+    let _ = std::fs::remove_file(&intermediate);
+
+    let tally = report
+        .chains
+        .entry((source_slug.to_string(), target_slug.to_string()))
+        .or_default();
+    tally.sessions += 1;
+    tally.source_capsules += source_capsules;
+
+    if let (Ok(result), Some((_, capsules))) = (&with, &with_measured) {
+        tally.with_store += capsules;
+        if result
+            .source
+            .as_ref()
+            .is_some_and(crate::pipeline::SourceSelection::overrode)
+        {
+            tally.overrode += 1;
+        }
+        if result.written.as_ref().is_some_and(|w| w.paths.is_empty()) {
+            tally.needed_no_conversion += 1;
+        }
+    }
+    if let Some((_, capsules)) = &without_measured {
+        tally.without_store += capsules;
+    }
+
+    // A hop the pipeline refuses or fails is a note and not an objection, and
+    // the distinction is the whole of what this check is entitled to claim. The
+    // corpus holds one-sided transcripts that `validate_session` correctly
+    // refuses, and the control arm here is the code path that predates the
+    // store — a defect it hits is evidence about a writer, not about source
+    // selection, and reporting it as a store failure would put a pre-existing
+    // bug behind a name nobody would look for it under.
+    for (arm, measured, outcome) in [
+        ("with a store", &with_measured, &with),
+        ("without one", &without_measured, &without),
+    ] {
+        if measured.is_none() {
+            report.note(format!(
+                "{}: {target_slug} -> {source_slug} {arm} delivered nothing measurable{}",
+                path.display(),
+                outcome
+                    .as_ref()
+                    .err()
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+
+    // The two objections, and they are the only two. Both are stated against the
+    // control arm rather than against a number, because the number belongs to
+    // whatever corpus is on the machine and the property belongs to the store.
+    match (&with_measured, &without_measured) {
+        (Some((_, with_capsules)), Some((_, without_capsules)))
+            if with_capsules < without_capsules =>
+        {
+            report.findings.push(format!(
+                "{}: {source_slug} -> {target_slug} -> {source_slug} delivered {with_capsules} \
+                 capsule(s) through the store but {without_capsules} without it; consulting the \
+                 store may not cost sealed material",
+                path.display()
+            ));
+        }
+        (None, Some(_)) => report.findings.push(format!(
+            "{}: {source_slug} -> {target_slug} -> {source_slug} delivered a session without the \
+             store and none with it, so consulting the store cost the whole conversion{}",
+            path.display(),
+            with.as_ref()
+                .err()
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        )),
+        (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
+    }
+}
+
+fn assert_inside(sandbox: &Path, produced: &Path, slug: &str) {
+    assert!(
+        produced.starts_with(sandbox),
+        "{slug} wrote {} outside the conformance sandbox {}. The provider's session root is not \
+         redirected — point `HOME` at the sandbox and clear any provider-specific home override \
+         before running the battery.",
+        produced.display(),
+        sandbox.display()
+    );
+}
+
+/// One `A → B → A` chain's totals, over every session in the tier.
+#[derive(Debug, Clone, Default)]
+struct ChainTally {
+    sessions: usize,
+    /// Capsules in the source sessions, which is the ceiling for both arms.
+    source_capsules: usize,
+    /// Capsules the chain delivered with the store consulted.
+    with_store: usize,
+    /// Capsules it delivered without one.
+    without_store: usize,
+    /// Times the store read a session other than the one the hop named.
+    overrode: usize,
+    /// Times the source it chose was already in the target's format, so the
+    /// second hop wrote nothing and pointed at bytes that were already there.
+    needed_no_conversion: usize,
+}
+
+/// What the second hop measured, and everything it objects to.
+#[derive(Debug, Default)]
+pub struct HopReport {
+    tier: String,
+    files: usize,
+    chains: BTreeMap<(String, String), ChainTally>,
+    /// Hops the pipeline refused or failed, with the first few reasons. Printed,
+    /// never asserted on: see the comment at the call site.
+    notes: Vec<String>,
+    note_count: usize,
+    findings: Vec<String>,
+}
+
+impl HopReport {
+    fn note(&mut self, note: String) {
+        self.note_count += 1;
+        if self.notes.len() < EXAMPLES {
+            self.notes.push(note);
+        }
+    }
+
+    /// Chains measured across every pair. Zero means nothing was checked.
+    pub fn sessions(&self) -> usize {
+        self.chains.values().map(|tally| tally.sessions).sum()
+    }
+
+    /// Everything that did not add up. What a caller asserts on.
+    pub fn findings(&self) -> &[String] {
+        &self.findings
+    }
+
+    /// Capsules delivered with the store, and without it, summed over every
+    /// chain — the two numbers the store exists to separate.
+    pub fn totals(&self) -> (usize, usize, usize) {
+        self.chains
+            .values()
+            .fold((0, 0, 0), |(src, with, without), tally| {
+                (
+                    src + tally.source_capsules,
+                    with + tally.with_store,
+                    without + tally.without_store,
+                )
+            })
+    }
+
+    /// Print every count, objections or not.
+    pub fn print(&self) {
+        eprintln!(
+            "\n════ second hop, tier {:?}: {} file(s), {} chain(s)",
+            self.tier,
+            self.files,
+            self.sessions()
+        );
+        for ((source, target), tally) in &self.chains {
+            eprintln!(
+                "\n  {source} → {target} → {source}   {} session(s)",
+                tally.sessions
+            );
+            eprintln!(
+                "    capsules in the source          {:>9}",
+                tally.source_capsules
+            );
+            eprintln!(
+                "    delivered with the store        {:>9}",
+                tally.with_store
+            );
+            eprintln!(
+                "    delivered without it            {:>9}",
+                tally.without_store
+            );
+            eprintln!("    store read a session not named  {:>9}", tally.overrode);
+            eprintln!(
+                "    chosen source needed no convert {:>9}",
+                tally.needed_no_conversion
+            );
+        }
+        if self.note_count > 0 {
+            eprintln!(
+                "\n  hops the pipeline refused or failed: {}",
+                self.note_count
+            );
+            for note in &self.notes {
+                eprintln!("    · {note}");
+            }
+            if self.note_count > self.notes.len() {
+                eprintln!("    · … and {} more", self.note_count - self.notes.len());
+            }
+        }
+        if self.findings.is_empty() {
+            eprintln!("\n  findings: none\n");
+        } else {
+            eprintln!("\n  findings ({}):", self.findings.len());
+            for finding in self.findings.iter().take(EXAMPLES) {
+                eprintln!("    ✗ {finding}");
+            }
+            if self.findings.len() > EXAMPLES {
+                eprintln!("    ✗ … and {} more", self.findings.len() - EXAMPLES);
             }
             eprintln!();
         }
