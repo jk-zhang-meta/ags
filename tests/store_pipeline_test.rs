@@ -484,6 +484,74 @@ impl Chain {
     }
 }
 
+/// `--archive` earns its cost exactly once, and this is the once: the live
+/// rollout is gone and the conversation has to come back out of the byte copy.
+///
+/// The archive is a copy of precisely the bytes the store snapshotted, so it is
+/// still the richest source for a Codex target and still holds nothing appended
+/// since. Letting it inherit the missing live file's `Unavailable` made it an
+/// *unknown*, an unknown makes the record unmergeable, and an unmergeable record
+/// defers to the session the user named — the Claude derivative, which is the one
+/// incarnation that carries none of the sealed material the copy was paid for. So
+/// the second hop arrived with zero capsules while a perfect copy of them sat in
+/// the record directory.
+#[test]
+fn an_archived_origin_is_what_the_second_hop_reads_once_the_rollout_is_gone() {
+    let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let _redirect = redirect(tmp.path());
+
+    let origin = tmp.path().join("rollout.jsonl");
+    std::fs::copy(fixture(CODEX_WITH_CAPSULES), &origin).expect("copy the fixture");
+    let origin_capsules = capsules_in("codex", &origin);
+    assert!(origin_capsules > 0, "the fixture must carry sealed material");
+
+    let stored = pipeline(Some(
+        Store::open_at(tmp.path().join("store")).expect("open store"),
+    ));
+    let first = convert(&stored, "cc", &origin).expect("codex -> claude");
+    let intermediate = delivered(&first);
+    assert_eq!(capsules_in("claude-code", &intermediate), 0);
+
+    // What `--archive` does, on the record the first hop just created: the
+    // origin's key comes back out of the record rather than being reconstructed,
+    // so this does not depend on how the id was derived.
+    let store = stored.store.as_ref().expect("a store-backed pipeline");
+    let record = store
+        .list()
+        .expect("list")
+        .into_iter()
+        .next()
+        .expect("one conversation");
+    let codex_key = record.origin().expect("an origin").key.clone();
+    store
+        .ingest_origin(&codex_key, &origin, OriginPolicy::Archive)
+        .expect("archive the origin");
+
+    // The user cleared out `~/.codex/sessions`. Only the copy is left.
+    std::fs::remove_file(&origin).expect("delete the live rollout");
+
+    let second = convert(&stored, "cod", &intermediate).expect("claude -> codex");
+    let selection = second.source.as_ref().expect("a reported source");
+    let chosen = selection.chosen().expect("a chosen source");
+    assert_eq!(
+        chosen.key, codex_key,
+        "the archive is still the best source for a codex target: {}",
+        selection.line()
+    );
+    assert_eq!(
+        capsules_in("codex", &delivered(&second)),
+        origin_capsules,
+        "every capsule --archive was paid for has to come back: {}",
+        selection.line()
+    );
+    assert!(
+        selection.line().contains("from the archived copy"),
+        "and the fallback is stated: {}",
+        selection.line()
+    );
+}
+
 /// The same chain with no store loses all of it — which is the defect, measured.
 #[test]
 fn the_same_second_hop_without_a_store_arrives_empty() {

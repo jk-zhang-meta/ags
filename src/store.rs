@@ -379,7 +379,22 @@ pub enum Advance {
 impl Advance {
     /// What a snapshot's resolution says about unseen content. `None` is an
     /// incarnation the store never snapshotted at all.
-    fn of(state: Option<&OriginState>) -> Self {
+    ///
+    /// [`Availability`] is a parameter for one case, and it is the case
+    /// `--archive` exists for. An origin served from its archived copy resolves
+    /// its *live* file as [`OriginState::Unavailable`] — that is why the archive
+    /// is being read — but the archive is a byte copy of exactly what was
+    /// snapshotted, so it cannot hold anything appended since and every
+    /// derivative was made from precisely these bytes. Letting it inherit the
+    /// missing file's unknown made `--archive` self-defeating: the unknown made
+    /// the record [`SourceChoice::unmergeable`], and an unmergeable record defers
+    /// to the session the user named — the derivative, which is the one
+    /// incarnation that does *not* hold the sealed material the archive was kept
+    /// for.
+    fn of(availability: &Availability, state: Option<&OriginState>) -> Self {
+        if let Availability::Archived = availability {
+            return Advance::Unmoved;
+        }
         match state {
             None => Advance::Unknown {
                 why: "the store has no snapshot of it, so growth cannot be measured".to_string(),
@@ -967,7 +982,43 @@ impl Store {
     ///
     /// The index is a cache, which is the answer to the objection that a single
     /// file is a single point of corruption. Only content is authoritative.
+    ///
+    /// # Why the scan is inside the lock
+    ///
+    /// A rebuild is `DELETE FROM sessions` followed by the rows *its own scan*
+    /// saw, so the scan is half of a read-modify-write and belongs under the same
+    /// [`locked`] transaction as the other half. Scanning first and locking
+    /// afterwards rebuilt the index from a snapshot another invocation had
+    /// already invalidated: an ingest that committed in between had its
+    /// `record.json` on disk and its index row deleted by the rebuild that
+    /// followed, so the session became unfindable and the next conversion minted
+    /// a second record for a conversation that already had one. Nothing reported
+    /// it, and `fsck` is the operation the store's whole crash-safety argument
+    /// leans on.
+    ///
+    /// This is the one place the store deliberately holds the lock across a
+    /// directory walk. It is the cost of a rebuild being correct, `fsck` is not
+    /// on the conversion path, and the walk is small-file work — the same work
+    /// [`Store::list`] does on every store written by a newer build.
     pub fn fsck(&self, rebuild_index: bool) -> anyhow::Result<Fsck> {
+        if !rebuild_index {
+            return Ok(self.scan()?.0);
+        }
+        self.ensure_writable()?;
+        let mut conn = self.write_index()?;
+        let write = locked(&mut conn)?;
+        let (mut report, records) = self.scan()?;
+        report.indexed = reindex(&write, &records)?;
+        write.commit()?;
+        report.index_rebuilt = true;
+        Ok(report)
+    }
+
+    /// Read every record directory, checking what it says about itself.
+    ///
+    /// The records come back with the report because a rebuild needs both, and
+    /// needs them from one pass taken at one moment.
+    fn scan(&self) -> anyhow::Result<(Fsck, Vec<Record>)> {
         let mut report = Fsck::default();
         let mut records = Vec::new();
 
@@ -1009,20 +1060,7 @@ impl Store {
                 Err(err) => report.problems.push(format!("{}: {err}", path.display())),
             }
         }
-
-        if rebuild_index {
-            self.ensure_writable()?;
-            let mut conn = self.write_index()?;
-            // Under the same lock as every other writer: a rebuild that
-            // interleaved with an ingest would delete the row that ingest had
-            // just written, leaving the record it describes unfindable until
-            // the next rebuild.
-            let write = locked(&mut conn)?;
-            report.indexed = reindex(&write, &records)?;
-            write.commit()?;
-            report.index_rebuilt = true;
-        }
-        Ok(report)
+        Ok((report, records))
     }
 
     // -- the one interesting function ---------------------------------------
@@ -1106,7 +1144,7 @@ impl Store {
                     path,
                     role: inc.role.clone(),
                     recorded_at: inc.recorded_at,
-                    advance: Advance::of(origin_state.as_ref()),
+                    advance: Advance::of(&availability, origin_state.as_ref()),
                     origin_state,
                     availability,
                     capsules,
@@ -1159,9 +1197,29 @@ impl Store {
         Ok(out)
     }
 
+    /// Publish a record durably enough that the index may never lead it.
+    ///
+    /// [`write_json`] makes `record.json` itself outlive a kill; what it cannot
+    /// see is that on a record's *first* commit the directory holding it is new
+    /// too. An unsynced `records/<id>` entry takes the `record.json` inside it
+    /// with it, which is the same forbidden state by a different route — see
+    /// [`locked`]. So a record's first publication syncs `records/` as well, and
+    /// later ones do not, because there is nothing new in it to lose.
+    ///
+    /// "First" is decided by `record.json` rather than by the directory, and that
+    /// is not a detail: `ingest_origin` creates the directory before it calls
+    /// here, and `--archive` fills it before that, so a directory that already
+    /// exists says nothing about whether its entry in `records/` is durable yet.
+    /// The published file is the thing whose absence actually means *first*.
     fn commit(&self, record: &Record) -> anyhow::Result<()> {
-        fs::create_dir_all(self.record_dir(&record.id))?;
-        write_json(&self.record_dir(&record.id).join(RECORD_FILE), record)
+        let dir = self.record_dir(&record.id);
+        let published = dir.join(RECORD_FILE);
+        let first = !published.is_file();
+        fs::create_dir_all(&dir)?;
+        if first {
+            sync_dir(&self.root.join(RECORDS_DIR));
+        }
+        write_json(&published, record)
     }
 
     /// Open the index, rebuilding it when it is missing or speaks a schema this
@@ -1263,6 +1321,12 @@ impl Store {
     /// hours in. So it stays readable and the divergence becomes
     /// [`Advance::Unknown`], which fails safe by deferring to what the user named
     /// rather than by hiding their work.
+    ///
+    /// The [`OriginState`] returned alongside an [`Availability::Archived`] path
+    /// is the *live* file's, deliberately: it is the reason the archive is being
+    /// read and the only thing that can explain the fallback to a user. What it
+    /// is not is a judgement of the archive's own content — see [`Advance::of`],
+    /// which reads `Archived` as [`Advance::Unmoved`] rather than inheriting it.
     fn locate(
         &self,
         record: &Record,
@@ -1857,6 +1921,12 @@ fn tally(ir: &SessionIr, target_vendor: Option<&str>) -> Inventory {
 /// and the row is not durable until `COMMIT`, so a kill at any point either
 /// rolls the row back or leaves a record the index does not know about yet. The
 /// index may lag the records. It may never lead them.
+///
+/// Ordering the two *calls* is only half of it, and the half a power cut does
+/// not respect. SQLite fsyncs its `COMMIT`; a rename is not durable until the
+/// directory holding it is fsynced, which is why [`write_json`] and
+/// [`Store::commit`] now do that. Without it the durable write happened second
+/// and the volatile one first, which is the forbidden state with extra steps.
 fn locked(conn: &mut Connection) -> anyhow::Result<rusqlite::Transaction<'_>> {
     Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
 }
@@ -1922,6 +1992,23 @@ fn read_record(path: &Path) -> anyhow::Result<Record> {
 /// would work, but its overwrite path is built for user session files: it
 /// renames the existing file to `.bak` first, which both litters the store and
 /// leaves a window where the record does not exist.
+///
+/// # Why the directory is synced too
+///
+/// `atomic_write` syncs the staging file's *contents*. The rename that publishes
+/// them is a change to the directory, and a directory change is not durable
+/// until the directory itself is synced — which nothing did. A syscall trace of
+/// one conversion showed the whole asymmetry: `fsync` of the staging file, two
+/// renames, then `fsync` of `index.sqlite-wal` for the `COMMIT`, and never once
+/// the record's own directory. SQLite fsyncs its commit; the store did not fsync
+/// the publication that commit is supposed to happen *after*. A kill in that
+/// window keeps the index row and loses the `record.json` it names — precisely
+/// the state [`locked`]'s ordering exists to make unreachable, and the one no
+/// rule can repair.
+///
+/// The cost is one metadata `fsync` per store write, two or three per
+/// conversion, against a conversion that has already written and fsynced a whole
+/// session file. It is paid on every conversion because the guarantee is.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     let name = path
@@ -1937,7 +2024,23 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
         let _ = fs::remove_file(&staging);
         return Err(err.into());
     }
+    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")));
     Ok(())
+}
+
+/// Make a directory entry that was just renamed or created outlive a kill.
+///
+/// Best effort, on purpose. On Unix this is `fsync` of the directory, which is
+/// what POSIX asks for and what the ordering in [`locked`] needs. Windows has no
+/// equivalent in `std` — a directory cannot even be opened as a `File` — so
+/// there the publication rests on NTFS's own metadata journalling, exactly as it
+/// did before. Failing the write over a sync we cannot issue would trade a
+/// durability guarantee we would not gain for a conversion we would lose, and
+/// "no store failure may fail a conversion" is the older rule.
+fn sync_dir(dir: &Path) {
+    if let Err(err) = fs::File::open(dir).and_then(|handle| handle.sync_all()) {
+        debug!(dir = %dir.display(), %err, "could not sync a store directory");
+    }
 }
 
 fn hash_prefix(path: &Path, limit: u64) -> std::io::Result<(String, u64)> {

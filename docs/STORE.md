@@ -204,11 +204,68 @@ That is also what makes a read racing a write safe: a lookup that the index
 answers for always finds a `record.json` already on disk, and `write_json`
 renames, so a reader sees the whole old file or the whole new one.
 
-Pinned by four tests in `store_test`: two invocations ingesting one session
+### Ordering the calls is only half of it
+
+A kill is one failure; a power cut is the other, and it does not respect the
+order the calls were issued in — only the order they were made durable in. That
+half was missing. `atomic_write` syncs the staging file's *contents*, but the
+rename that publishes them is a change to a **directory**, and a directory
+change is not durable until the directory itself is synced. Nothing synced it. A
+syscall trace of one conversion showed the asymmetry plainly:
+
+```
+fsync  records/<id>/.casr-tmp-…          # the staging file's contents
+rename .casr-tmp-…  -> record.json.agsx-new-…
+rename record.json.agsx-new-… -> record.json     # publication: not durable
+fsync  index.sqlite-wal                  # SQLite's COMMIT: durable
+```
+
+SQLite fsyncs its commit. The store did not fsync the publication that commit is
+supposed to happen *after*, so the volatile write went first and the durable one
+second — the forbidden row-with-no-record, reached the long way round. So
+`write_json` now fsyncs the directory it renamed into, and `commit` fsyncs
+`records/` on a record's **first** publication as well, because the
+`records/<id>` entry is new then too and an unsynced directory entry takes the
+`record.json` inside it with it. ("First" is decided by the absence of
+`record.json`, not of the directory: `ingest_origin` creates the directory
+before it commits and `--archive` fills it before that.)
+
+The cost is one metadata `fsync` per store write — two or three per conversion —
+against a conversion that has already written and fsynced a whole session file.
+It is paid on every conversion because the guarantee is. On Windows there is no
+directory fsync in `std` (a directory cannot be opened as a `File`), so the sync
+is best effort: the Unix path gets the guarantee and Windows rests on NTFS's own
+metadata journalling, exactly as it did before. Failing a write over a sync that
+platform cannot issue would break "no store failure may fail a conversion" for
+nothing.
+
+Reproduce the trace with an `LD_PRELOAD` shim over `fsync`/`rename` — no
+in-process test can see a syscall the kernel is asked for but not told to
+order — which is why this one is pinned by measurement rather than by a
+`#[test]`.
+
+### `fsck --rebuild-index` scans under the lock
+
+A rebuild is `DELETE FROM sessions` followed by the rows **its own scan** saw, so
+the scan is half of a read-modify-write and belongs under the same transaction as
+the other half. It was not: the scan ran first and the lock was taken after it,
+which rebuilt the index from a snapshot another invocation had already
+invalidated. Ingest session B while a rebuild is between its scan and its lock,
+and the rebuild deletes B's freshly committed row and rewrites only the records
+it saw. B's `record.json` is on disk and `find_by_session` misses it, so the next
+conversion mints a second record for a conversation that already had one.
+Nothing reports it — and `fsck` is the operation this whole argument leans on.
+
+This is the one place the store deliberately holds the lock across a directory
+walk. `fsck` is not on the conversion path, and the walk is the same small-file
+work `list` already does on every store written by a newer build.
+
+Pinned by five tests in `store_test`: two invocations ingesting one session
 converge on one record; two ingesting *different* sessions keep both (the
 index-creation race, which has nothing to do with either session); two
-conversions of one conversation keep both lineages and both loss lists; and a
-lookup racing an ingest never sees half a record. Each of them fails on the
+conversions of one conversation keep both lineages and both loss lists; a lookup
+racing an ingest never sees half a record; and a rebuild cannot erase a
+conversion that committed while it scanned. Each of them fails on the
 implementation this replaced.
 
 ## What it does not do: origin bytes are referenced, not archived
@@ -249,6 +306,20 @@ reference buys availability, and availability is not backup. Defaulting to a
 copy would have made the store quietly expensive; defaulting to a reference
 makes it quietly less durable, which is why the third case above is a reported
 outcome and not a silent downgrade.
+
+An archived origin resolves its **live** file as `Unavailable` — that is *why*
+the archive is being read, and it is the only thing that can explain the fallback
+to a user — but the archive itself is a byte copy of exactly what was
+snapshotted, so it cannot hold anything appended since and every derivative was
+made from precisely these bytes. It is therefore `Advance::Unmoved`, not an
+unknown inherited from the missing file. Inheriting it made `--archive`
+self-defeating: an unknown makes the record unmergeable, an unmergeable record
+defers to the session the user named, and the session the user named on the way
+back is the derivative — the one incarnation that does *not* hold the sealed
+material the archive was kept for. Archive a Codex origin, convert to Claude,
+delete the live rollout, convert back, and the archive was skipped in favour of
+zero recoverable capsules. Pinned by *an archived origin is still selectable
+after its live file is gone*.
 
 ## Shape
 

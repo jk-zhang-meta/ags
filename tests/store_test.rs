@@ -424,6 +424,95 @@ fn fsck_rebuilds_a_deleted_index_to_the_same_content() {
     );
 }
 
+/// A rebuild deletes every row and rewrites the ones *its own scan* saw, so the
+/// scan has to be inside the write lock rather than before it.
+///
+/// It was before it. A conversion that committed in between had its
+/// `record.json` on disk and its index row erased by the rebuild that followed —
+/// the session becomes unfindable, so the next conversion mints a second record
+/// for a conversation that already had one. That is a silent loss of visibility
+/// produced by the one operation the whole crash-safety argument leans on.
+#[test]
+fn a_rebuild_cannot_erase_a_conversion_that_committed_while_it_scanned() {
+    let (tmp, store) = fresh();
+    let a_path = write_session(tmp.path(), "a.jsonl", "{}\n");
+    let a_key = SessionKey::new("codex", "01JA");
+    store
+        .ingest_origin(&a_key, &a_path, OriginPolicy::Reference)
+        .expect("ingest a");
+
+    let b_path = write_session(tmp.path(), "b.jsonl", "{}\n");
+    let b_key = SessionKey::new("codex", "01JB");
+    let b_id = "b0000000-0000-4000-8000-00000000000b";
+
+    // Stand in for the other invocation by holding the store's own write lock.
+    // That is what makes the interleaving exact instead of lucky: the rebuild
+    // cannot reach the lock until this transaction commits, and it has to be
+    // done scanning before it tries.
+    let mut conn =
+        rusqlite::Connection::open(store.root().join("index.sqlite")).expect("open index");
+    conn.busy_timeout(std::time::Duration::from_secs(30))
+        .expect("busy timeout");
+    let held = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("begin immediate");
+
+    let report = std::thread::scope(|scope| {
+        let rebuild = scope.spawn(|| store.fsck(true).expect("fsck"));
+        // One record directory to walk; a fifth of a second is not a race.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Session B's ingest finishes, in the store's own order: record on disk
+        // first, index row second, commit last — all of it strictly before the
+        // rebuild can take the lock.
+        let dir = store.root().join("records").join(b_id);
+        std::fs::create_dir_all(&dir).expect("record dir");
+        let record = casr::store::Record {
+            id: b_id.to_string(),
+            created_at: 1,
+            updated_at: 1,
+            incarnations: vec![casr::store::Incarnation {
+                key: b_key.clone(),
+                path: b_path.clone(),
+                recorded_at: 1,
+                role: Role::Origin {
+                    snapshot: OriginSnapshot::of(&b_path).expect("snapshot"),
+                },
+            }],
+        };
+        std::fs::write(
+            dir.join("record.json"),
+            serde_json::to_vec(&record).expect("encode"),
+        )
+        .expect("publish record b");
+        held.execute(
+            "INSERT INTO sessions (provider, provider_session_id, record_id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![b_key.provider, b_key.provider_session_id, b_id],
+        )
+        .expect("claim b");
+        held.commit().expect("commit b");
+
+        rebuild.join().expect("rebuild thread")
+    });
+
+    println!(
+        "fsck: {} records, {} rows indexed, {} problems",
+        report.records,
+        report.indexed,
+        report.problems.len()
+    );
+    assert!(
+        store.find_by_session(&b_key).expect("lookup").is_some(),
+        "the rebuild erased the index row of a record that was already on disk"
+    );
+    assert_eq!(
+        report.records, 2,
+        "a rebuild has to reindex what is on disk when it takes the lock, not before"
+    );
+    assert_eq!(report.indexed, 2);
+    assert_eq!(index_rows(store.root()).len(), 2);
+}
+
 #[test]
 fn an_index_speaking_an_unknown_schema_is_rebuilt_rather_than_migrated() {
     let (tmp, store) = fresh();
@@ -683,6 +772,74 @@ fn archive_makes_a_record_survive_its_origin() {
             .chosen()
             .is_none(),
         "a reference buys availability, and availability is not backup"
+    );
+}
+
+/// The point of `--archive`, in the one situation it exists for: the live origin
+/// is gone and the conversation has to come back out of the byte copy.
+///
+/// The archive is *exactly* the bytes the store snapshotted, so it holds nothing
+/// appended since — every derivative was made from precisely these bytes. Reading
+/// the missing live file's `Unavailable` as the archive's own resolution made it
+/// an unknown, the unknown made the record unmergeable, and an unmergeable record
+/// defers to the session the user named: the Claude derivative, which is the one
+/// incarnation that does *not* hold the sealed material `--archive` was paid for.
+#[test]
+fn an_archived_origin_is_still_selectable_after_its_live_file_is_gone() {
+    let (tmp, store) = fresh();
+    let codex_path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let cc_path = write_session(tmp.path(), "cc.jsonl", "{}\n");
+    let codex_key = SessionKey::new("codex", "01JCODEX");
+    let cc_key = SessionKey::new("claude-code", "a3fCC");
+
+    let record = store
+        .ingest_origin(&codex_key, &codex_path, OriginPolicy::Archive)
+        .expect("ingest");
+    let record = store
+        .record_conversion(
+            &record.id,
+            DerivedWrite {
+                key: cc_key.clone(),
+                path: cc_path,
+                from: codex_key.clone(),
+                fidelity: Fidelity::ContextNoReasoning,
+                losses: Vec::new(),
+            },
+        )
+        .expect("record conversion");
+    store
+        .store_ir(
+            &record.id,
+            &ir_with_capsules("codex", CapsuleKind::OpenaiReasoningEncryptedContent, 9),
+        )
+        .expect("cache the origin IR");
+
+    // The user cleaned out `~/.codex/sessions`. Nothing touched the Claude side.
+    std::fs::remove_file(&codex_path).expect("delete the live origin");
+
+    let choice = store.best_source_for(&record, provider("codex"), registry());
+    let archived = choice.find(&codex_key).expect("the origin is a candidate");
+    assert_eq!(archived.availability, Availability::Archived);
+    assert!(
+        archived.advance.unmoved(),
+        "the archive is the bytes the store recorded and cannot have advanced, got {:?}",
+        archived.advance
+    );
+    assert!(
+        !choice.unmergeable(),
+        "nothing here diverged: {}",
+        choice.explain(Some(&cc_key))
+    );
+    let chosen = choice.resolve(Some(&cc_key)).expect("a source");
+    assert_eq!(
+        chosen.key, codex_key,
+        "converting back to codex has to read the archive, not the derivative: {}",
+        choice.explain(Some(&cc_key))
+    );
+    assert_eq!(
+        chosen.capsules.fitting(),
+        9,
+        "and the sealed material --archive was kept for comes back with it"
     );
 }
 
