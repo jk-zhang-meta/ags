@@ -85,6 +85,28 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
         .enumerate()
         .map(|(index, event)| (event.id.as_str(), index))
         .collect();
+    // `Event::id` is documented unique within the session, and this is the map
+    // that silently assumes it: a repeated id collapses here, one copy wins, and
+    // which one is arbitrary. Checked at this line rather than in each reader
+    // because every consumer of every provider's IR passes through `resolve` —
+    // `model_visible` is a view over it, so is the pipeline, so is the
+    // conformance battery — which makes it the one place a future reader cannot
+    // route around and nobody has to remember to opt into. Free in release, so
+    // the corpus tier is covered by `conformance::invariants`, which counts the
+    // same thing and reports it instead of panicking.
+    debug_assert_eq!(
+        position.len(),
+        ir.events.len(),
+        "{} of {} event ids in this {} session are duplicates. `Event::id` must be \
+         unique within the session: this map, `SessionIr::model_visible`'s `by_id` and \
+         `prune_forks`' record index all key on it, so a repeat means an arbitrary copy \
+         wins and the fidelity report double-counts the other. The reader has to \
+         recognise the re-emission or mint a distinct id for it — see \
+         `claude_code_ir::Sink::emit`",
+        ir.events.len() - position.len(),
+        ir.events.len(),
+        ir.origin.agent,
+    );
 
     let mut live: Vec<String> = Vec::new();
     let mut excluded: Vec<Excluded> = Vec::new();

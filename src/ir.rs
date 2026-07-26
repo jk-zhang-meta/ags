@@ -801,6 +801,23 @@ pub struct CaptureReport {
     pub unknown: u64,
     /// Capsules carried.
     pub capsules: u64,
+    /// Native records skipped because they restate an event already emitted.
+    ///
+    /// [`Event::id`] is unique within the session, and a provider that
+    /// re-appends a record it has already written has to say which of the two
+    /// this is. Claude Code does exactly that across a `/compact`, so non-zero
+    /// here is normal on that provider and means the reader *recognised* the
+    /// re-emission. A reader whose format has no re-emission reports zero, and
+    /// this number is the only thing standing between "recognised a restatement"
+    /// and "quietly dropped a record", so it is counted rather than assumed.
+    pub restated: u64,
+    /// Native records that reused an id with *different* content, and were
+    /// therefore kept under an id of their own rather than dropped.
+    ///
+    /// Non-zero is an anomaly: the provider reused an identifier for two
+    /// different things. Nothing is lost — the record is still in `events` — but
+    /// the collision is real and is reported instead of being resolved silently.
+    pub id_collisions: u64,
     /// Human-readable notes about anything degraded during capture.
     pub notes: Vec<String>,
 }

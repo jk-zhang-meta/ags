@@ -219,9 +219,9 @@ the local corpus is 3.5 GB and every session is written once per target.
 
 ### What it measured, and the one thing it found
 
-776 sessions on the reference corpus — 596 Codex rollouts, 180 Claude
-transcripts. Same-agent conservation is exact in both directions: 95,217 model
-events and 30,119 capsules for Codex, 21,095 and 4,058 for Claude Code, event
+779 sessions on the reference corpus — 597 Codex rollouts, 182 Claude
+transcripts. Same-agent conservation is exact in both directions: 95,275 model
+events and 30,143 capsules for Codex, 22,026 and 4,234 for Claude Code, event
 for event, capsule for capsule, nothing invented, every session graded
 `ContextComplete` with an empty loss list. Cross-agent, nothing is unexplained,
 nothing foreign is carried, no grade is overclaimed, and the 352 sealed Codex
@@ -229,24 +229,58 @@ compactions become 352 `[converted by casr]` markers. The counts move between
 runs because the corpus is being appended to; that is the point of printing them
 rather than pinning them.
 
-It also found one real defect, which is why it is red on that corpus:
+On its first run it found a real defect and went red, which is the only reason
+the defect is known:
 
-> One Claude transcript in 180 emits **10 duplicate `Event::id`s**. Claude Code
-> re-appends the records it preserves across a `/compact` verbatim — same
-> `uuid`, same `parentUuid`, same timestamp — immediately before the
+> One Claude transcript emitted **10 duplicate `Event::id`s**. Claude Code
+> re-appends the records it preserves across a `/compact` immediately before the
 > `compact_boundary`, and `claude_code_ir` mints one event per line, so the same
-> id is emitted twice. `Event::id` is documented unique within the session and
+> id was emitted twice. `Event::id` is documented unique within the session and
 > `resolve`'s `position` map, `model_visible`'s `by_id` map and `prune_forks`'
-> record index all key on it, so which copy survives is arbitrary. Today the
-> visible damage is 10 double-counted exclusions in the fidelity report, but the
-> latent path is worse: `claude_code_ir::push_system` builds a compaction's
-> `context` by partitioning the live set on `preservedMessages.allUuids`, so a
-> re-emitted record that Claude *does* name as preserved would enter the replay
-> twice and be shown to the target twice.
+> record index all key on it, so which copy survived was arbitrary.
 
-The check is not relaxed for it. A reader that cannot honour the uniqueness the
-IR documents has to recognise the re-emission or mint a distinct id, and until
-one of those happens the suite says so.
+The check was not relaxed for it; the reader was fixed. But the fix is worth
+recording, because the first description of the defect — including the one in
+this document — was wrong in a way that would have produced a broken fix.
+
+**The re-append is not verbatim.** That word was an assumption, and measuring
+all 691 transcripts destroyed it: byte-identity dedupes **0 of the 10**
+re-emissions, because Claude stamps a `slug` onto every re-appended copy, and
+nine of the ten also carry the *compaction's* `promptId` and the then-current
+`cwd`. Comparing whole records, in any form, finds nothing. What works is
+equality over the **`Event` the reader built**, minus exactly two fields:
+`source`, because a restatement is by definition a different line, and `turn`.
+
+`turn` is the interesting one, and it is a second defect the first description
+missed. `Event::turn` is `promptId`, the re-append re-stamps it with the
+compaction's own id, and `replay::roll_back` reads `turn` to mean "the last N
+typed turns". Had the reader adopted the re-appended value, four historically
+distinct turns would have collapsed into one and **a single rollback would have
+undone the entire preserved history**. First-occurrence-wins is therefore both
+the dedupe rule and the more accurate value — the same choice fixes both bugs.
+
+`ts` is deliberately *not* excluded even though it is identical on all ten
+today. If some future Claude release re-stamps the timestamp too, the record
+stops being recognised as a restatement and gets a distinct id **and a
+counter** — loud — instead of being silently dropped. Strictness that fails
+safe is free.
+
+Two mechanisms keep it fixed rather than merely repaired. In the reader a
+duplicate id is now unrepresentable: every emission goes through a single
+`Sink::emit` door. And `is_restatement` destructures `Event` with no `..`, so
+adding an IR field is a build break at the comparison itself — verified by
+probe, `E0027` at `claude_code_ir.rs:409`. The uniqueness invariant is enforced
+one level lower still, as a `debug_assert_eq!` on `resolve`'s `position` map,
+because `resolve` is a stronger chokepoint than the reader trait: the pipeline,
+`model_visible` and this very suite are all views over it, it also covers
+hand-built and deserialized IR, and no provider can route around it or has to
+opt in.
+
+A same-id record whose content genuinely differs is not dropped. It is kept
+under `<id>#dup<n>` — a non-numeric suffix, so it cannot collide with an
+existing `<uuid>#<slot>` and `record_of` still recovers the record — and
+counted. Corpus-wide that path fires zero times, which is the point of counting
+it rather than assuming it.
 
 ## 6. Grade at the worst point, and carry the grade
 

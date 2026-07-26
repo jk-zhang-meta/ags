@@ -326,10 +326,13 @@ fn invariants(report: &mut Report, path: &Path, ir: &SessionIr, plan: &ReplayPla
             "{}: {duplicate_ids} event id(s) occur more than once, but `Event::id` is documented \
              unique within the session and every map in `replay.rs` and `ir.rs` keys on it — \
              `resolve`'s `position` and `model_visible`'s `by_id` keep one of the copies and \
-             which one is arbitrary. Claude Code re-appends the records it preserves across a \
-             `/compact` verbatim, same uuid and same parent, so a reader that mints one event \
-             per line emits the same id twice; it has to recognise the re-emission or mint a \
-             distinct id for it",
+             which one is arbitrary. The known cause is a provider re-appending records it \
+             preserves across a compaction: Claude Code does this before `compact_boundary`, so \
+             a reader that mints one event per line emits the same id twice. Note that such a \
+             re-append is NOT byte-identical — Claude re-stamps `slug`, `promptId` and `cwd`, so \
+             comparing raw records recognises none of them; compare the built `Event` minus \
+             `source` and `turn`, keep the first occurrence, and mint a counted distinct id only \
+             when the content genuinely differs. See `claude_code_ir::is_restatement`",
             path.display()
         ));
     }

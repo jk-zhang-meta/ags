@@ -41,6 +41,29 @@
 //! "everything before this point" approximation the Codex reader is forced
 //! into.
 //!
+//! # The one thing Claude Code gives us twice
+//!
+//! Across a `/compact`, Claude re-appends the records it has to replay for the
+//! post-boundary context to be well-formed — the unresolved `tool_use` and its
+//! `tool_result`s — under **their original `uuid`s**, immediately before the
+//! `compact_boundary`. On corpus transcript `aeeed6b0` that is lines 1048–1057
+//! restating lines 16–694. One event per line then emits the same
+//! [`Event::id`] twice, and the id is documented unique within the session:
+//! `replay::resolve`'s `position` map, [`SessionIr::model_visible`]'s `by_id`
+//! and `prune_forks`' record index all key on it, so *which copy survives is
+//! arbitrary*.
+//!
+//! A re-emission carries nothing the IR does not already have. The preserved
+//! set arrives separately and exactly, through the boundary's
+//! `preservedMessages.allUuids`, which [`push_system`] already reads — so the
+//! re-append is a restatement, and the second copy is dropped. Every emission
+//! therefore goes through [`Sink::emit`], which makes a duplicate id
+//! unrepresentable in this reader's output rather than a thing to remember not
+//! to do. A record that reuses an id with *different* content is not a
+//! restatement and is kept, under a minted `<id>#dup<n>`, and counted in
+//! [`crate::ir::CaptureReport::id_collisions`]. See [`is_restatement`] for what
+//! "different" means and why it is not byte-identity.
+//!
 //! # Reasoning
 //!
 //! `thinking` blocks carry an empty `thinking` string and a `signature` of
@@ -48,7 +71,7 @@
 //! signature is the reasoning, sealed. It becomes a [`Capsule`]; the empty
 //! string is not worth carrying and is not carried.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
@@ -95,7 +118,7 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
 
     let mut ir = SessionIr::new("claude-code", String::new());
     ir.origin.provider = Some(ASSUMED_PROVIDER.to_string());
-    let mut live_model: Vec<String> = Vec::new();
+    let mut sink = Sink::new(ir);
 
     for (index, line) in reader.lines().enumerate() {
         let line = line
@@ -103,7 +126,7 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
         if line.trim().is_empty() {
             continue;
         }
-        ir.capture.lines_read += 1;
+        sink.ir.capture.lines_read += 1;
         let source = SourceRef {
             line: index as u64 + 1,
             sha256: format!("{:x}", Sha256::digest(line.as_bytes())),
@@ -112,35 +135,31 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
         let value: Value = match serde_json::from_str(&line) {
             Ok(value) => value,
             Err(error) => {
-                emit(
-                    &mut ir,
-                    &mut live_model,
-                    Event {
-                        id: format!("cc-{:06}", source.line),
-                        parent: None,
-                        branch: Branch::Main,
-                        turn: None,
-                        ts: None,
-                        visibility: Visibility::Ui,
-                        body: Body::Unknown {
-                            native_type: None,
-                            raw: Value::String(format!("unparseable JSON: {error}")),
-                        },
-                        capsules: Vec::new(),
-                        source,
+                sink.emit(Event {
+                    id: format!("cc-{:06}", source.line),
+                    parent: None,
+                    branch: Branch::Main,
+                    turn: None,
+                    ts: None,
+                    visibility: Visibility::Ui,
+                    body: Body::Unknown {
+                        native_type: None,
+                        raw: Value::String(format!("unparseable JSON: {error}")),
                     },
-                );
+                    capsules: Vec::new(),
+                    source,
+                });
                 continue;
             }
         };
 
-        apply_envelope(&mut ir, &value);
+        apply_envelope(&mut sink.ir, &value);
         let ctx = RecordContext::from(&value, &source);
 
         match value.get("type").and_then(Value::as_str) {
-            Some("assistant") => push_assistant(&mut ir, &mut live_model, &ctx, &value),
-            Some("user") => push_user(&mut ir, &mut live_model, &ctx, &value),
-            Some("system") => push_system(&mut ir, &mut live_model, &ctx, &value),
+            Some("assistant") => push_assistant(&mut sink, &ctx, &value),
+            Some("user") => push_user(&mut sink, &ctx, &value),
+            Some("system") => push_system(&mut sink, &ctx, &value),
             Some("attachment") => {
                 let body = Body::Attachment {
                     attachment_kind: value
@@ -151,7 +170,7 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
                         .to_string(),
                     data: value.get("attachment").cloned().unwrap_or(Value::Null),
                 };
-                emit(&mut ir, &mut live_model, ctx.event(0, Visibility::Ui, body, Vec::new()));
+                sink.emit(ctx.event(0, Visibility::Ui, body, Vec::new()));
             }
             Some(other) if UI_CONTROL_TYPES.contains(&other) => {
                 // `last-prompt` is chrome to render *and* the one thing in the
@@ -163,28 +182,25 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
                 if other == "last-prompt"
                     && let Some(leaf) = value.get("leafUuid").and_then(Value::as_str)
                 {
-                    ir.live_head = Some(leaf.to_string());
+                    sink.ir.live_head = Some(leaf.to_string());
                 }
                 let body = Body::Control {
                     control_kind: other.to_string(),
                     data: value.clone(),
                 };
-                emit(&mut ir, &mut live_model, ctx.event(0, Visibility::Ui, body, Vec::new()));
+                sink.emit(ctx.event(0, Visibility::Ui, body, Vec::new()));
             }
             other => {
                 let body = Body::Unknown {
                     native_type: other.map(str::to_string),
                     raw: value.clone(),
                 };
-                emit(
-                    &mut ir,
-                    &mut live_model,
-                    ctx.event(0, Visibility::Unclassified, body, Vec::new()),
-                );
+                sink.emit(ctx.event(0, Visibility::Unclassified, body, Vec::new()));
             }
         }
     }
 
+    let ir = sink.ir;
     if ir.origin.native_session_id.is_empty() {
         anyhow::bail!(
             "{} has no sessionId on any record; refusing to guess it",
@@ -276,12 +292,138 @@ impl RecordContext {
     }
 }
 
-fn emit(ir: &mut SessionIr, live_model: &mut Vec<String>, event: Event) {
-    if event.visibility == Visibility::Model {
-        live_model.push(event.id.clone());
+// ---------------------------------------------------------------------------
+// The emission door
+// ---------------------------------------------------------------------------
+
+/// The session being built, and the one door every event goes through.
+///
+/// This is a struct rather than three threaded parameters because of `seen`.
+/// [`Event::id`] is unique within the session, Claude Code breaks that on its
+/// own (see the module docs), and the only way to notice is to remember what has
+/// already been emitted. Holding that beside the session means the check happens
+/// once, at the single point of emission, instead of being a rule each of the
+/// four record handlers has to observe.
+struct Sink {
+    ir: SessionIr,
+    /// Ids of the model-visible events still live, in order. This is the set
+    /// [`push_system`] partitions on `preservedMessages.allUuids`.
+    live_model: Vec<String>,
+    /// Every id emitted so far, to its index in `ir.events`.
+    seen: HashMap<String, usize>,
+}
+
+impl Sink {
+    fn new(ir: SessionIr) -> Self {
+        Self {
+            ir,
+            live_model: Vec::new(),
+            seen: HashMap::new(),
+        }
     }
-    ir.capture.record(&event);
-    ir.events.push(event);
+
+    /// Add one event to the session, unless it restates one already there.
+    fn emit(&mut self, event: Event) {
+        let event = match self.seen.get(&event.id).copied() {
+            None => event,
+            Some(index) => {
+                if is_restatement(&self.ir.events[index], &event) {
+                    self.ir.capture.restated += 1;
+                    return;
+                }
+                self.rename(event)
+            }
+        };
+        if event.visibility == Visibility::Model {
+            self.live_model.push(event.id.clone());
+        }
+        self.seen.insert(event.id.clone(), self.ir.events.len());
+        self.ir.capture.record(&event);
+        self.ir.events.push(event);
+    }
+
+    /// Same id, different content: keep the event, under an id of its own.
+    ///
+    /// Dropping it would lose data, and keeping it under the id it arrived with
+    /// would leave the ambiguity this reader exists to remove. So it gets a
+    /// `#`-suffixed id — the shape already used for the blocks one record splits
+    /// into, so `replay::record_of` still recovers the native record — and the
+    /// collision is counted, because a provider reusing one identifier for two
+    /// different things is worth seeing rather than resolving quietly.
+    fn rename(&mut self, mut event: Event) -> Event {
+        // `events.len()` is strictly increasing, so this is unique by
+        // construction and needs no probing. `dup` is non-numeric, so it cannot
+        // be mistaken for — or collide with — a `<uuid>#<slot>` a multi-block
+        // record already minted.
+        let minted = format!("{}#dup{}", event.id, self.ir.events.len());
+        let reused = std::mem::replace(&mut event.id, minted);
+        self.ir.capture.id_collisions += 1;
+        self.ir.capture.note(format!(
+            "line {} reuses id {reused:?} with different content; kept as {:?}",
+            event.source.line, event.id
+        ));
+        event
+    }
+}
+
+/// Is `candidate` the event `existing` already is, restated?
+///
+/// # Why this is not byte-identity
+///
+/// Measured rather than assumed. Across 691 corpus transcripts there are ten
+/// re-emissions, and **not one of them is byte-identical** to its first
+/// occurrence: Claude stamps a `slug` onto the re-appended copy, a field this
+/// reader does not read at all. Nine of the ten additionally carry the
+/// *compaction's* `promptId` and the then-current `cwd`. A byte-identity rule —
+/// or any rule over the whole raw record — therefore fires on zero of the ten
+/// and leaves every duplicate id exactly where it was.
+///
+/// So the comparison is over the [`Event`] the reader built. That is also the
+/// only definition the compiler can keep honest: a list of JSON key names would
+/// drift the moment the reader learns a new field, silently loosening the rule,
+/// whereas the destructuring below breaks the build.
+///
+/// Two fields are excluded, each for a stated reason:
+///
+/// - `source` is the line number and that line's hash. A restatement is by
+///   definition a *different line*, so comparing it would make the rule fire
+///   never.
+/// - `turn` is `promptId`, and the re-append re-stamps it. All nine differing
+///   copies carry the compaction's own prompt id rather than the four distinct
+///   ones the records were typed under. `Event::turn` is what
+///   `replay::roll_back` reads as "the last N typed turns", so adopting the
+///   re-append's value would collapse four historical turns into one and let a
+///   single rollback undo the entire preserved history. Keeping the first
+///   occurrence is both the dedupe rule and the more accurate value.
+///
+/// `ts` is deliberately *not* excluded even though it is identical on all ten,
+/// so the strictness costs nothing measured — and it fails safe: a future
+/// re-append that also re-stamps the timestamp stops being recognised, and the
+/// record is then kept with a distinct id and counted, which is loud, rather
+/// than dropped, which would be silent.
+fn is_restatement(existing: &Event, candidate: &Event) -> bool {
+    // Destructured with no `..` on purpose. A field added to `Event` is a
+    // compile error here, naming this function as the place that has to decide
+    // whether the new field makes a re-emission a different event — the same
+    // rule `replay.rs` applies to `Body`, and for the same reason.
+    let Event {
+        id,
+        parent,
+        branch,
+        turn: _,
+        ts,
+        visibility,
+        body,
+        capsules,
+        source: _,
+    } = candidate;
+    existing.id == *id
+        && existing.parent == *parent
+        && existing.branch == *branch
+        && existing.ts == *ts
+        && existing.visibility == *visibility
+        && existing.body == *body
+        && existing.capsules == *capsules
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +465,7 @@ fn apply_envelope(ir: &mut SessionIr, value: &Value) {
     }
 }
 
-fn push_assistant(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordContext, value: &Value) {
+fn push_assistant(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
     let Some(content) = value
         .get("message")
         .and_then(|m| m.get("content"))
@@ -370,7 +512,7 @@ fn push_assistant(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &Record
                     text,
                     summary: Vec::new(),
                 };
-                emit(ir, live_model, ctx.event(slot, Visibility::Model, body, capsules));
+                sink.emit(ctx.event(slot, Visibility::Model, body, capsules));
                 slot += 1;
             }
             // Sealed the same way a signature is, and just as vendor-bound.
@@ -396,7 +538,7 @@ fn push_assistant(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &Record
                     text: None,
                     summary: Vec::new(),
                 };
-                emit(ir, live_model, ctx.event(slot, Visibility::Model, body, capsules));
+                sink.emit(ctx.event(slot, Visibility::Model, body, capsules));
                 slot += 1;
             }
             Some("tool_use") => {
@@ -421,7 +563,7 @@ fn push_assistant(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &Record
                         item.get("input").unwrap_or(&Value::Null),
                     ),
                 };
-                emit(ir, live_model, ctx.event(slot, Visibility::Model, body, Vec::new()));
+                sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
                 slot += 1;
             }
             _ => text_blocks.push(block_from_item(item)),
@@ -433,11 +575,11 @@ fn push_assistant(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &Record
             role: Role::Assistant,
             blocks: text_blocks,
         };
-        emit(ir, live_model, ctx.event(slot, Visibility::Model, body, Vec::new()));
+        sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
     }
 }
 
-fn push_user(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordContext, value: &Value) {
+fn push_user(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
     let Some(content) = value.get("message").and_then(|m| m.get("content")) else {
         return;
     };
@@ -456,7 +598,7 @@ fn push_user(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordConte
                 role: Role::User,
                 blocks: vec![Block::Text { text: text.clone() }],
             };
-            emit(ir, live_model, ctx.event(0, Visibility::Model, body, Vec::new()));
+            sink.emit(ctx.event(0, Visibility::Model, body, Vec::new()));
         }
         Value::Array(items) => {
             let mut text_blocks: Vec<Block> = Vec::new();
@@ -479,7 +621,7 @@ fn push_user(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordConte
                         output: blocks_from_content(item.get("content")),
                         structured: structured.clone(),
                     };
-                    emit(ir, live_model, ctx.event(slot, Visibility::Model, body, Vec::new()));
+                    sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
                     slot += 1;
                 } else {
                     text_blocks.push(block_from_item(item));
@@ -490,14 +632,14 @@ fn push_user(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordConte
                     role: Role::User,
                     blocks: text_blocks,
                 };
-                emit(ir, live_model, ctx.event(slot, Visibility::Model, body, Vec::new()));
+                sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
             }
         }
         _ => {}
     }
 }
 
-fn push_system(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordContext, value: &Value) {
+fn push_system(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
     let subtype = value
         .get("subtype")
         .and_then(Value::as_str)
@@ -508,7 +650,7 @@ fn push_system(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordCon
             control_kind: format!("system.{subtype}"),
             data: value.clone(),
         };
-        emit(ir, live_model, ctx.event(0, Visibility::Ui, body, Vec::new()));
+        sink.emit(ctx.event(0, Visibility::Ui, body, Vec::new()));
         return;
     }
 
@@ -534,7 +676,8 @@ fn push_system(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordCon
     // the live set Claude named as preserved, and the rest is what it dropped.
     // Ids of split blocks are `<uuid>#<slot>`; the preserved set names the
     // record, so compare on the record part.
-    let (context, supersedes): (Vec<String>, Vec<String>) = live_model
+    let (context, supersedes): (Vec<String>, Vec<String>) = sink
+        .live_model
         .iter()
         .cloned()
         .partition(|id| preserved.contains(id.split('#').next().unwrap_or(id)));
@@ -550,8 +693,8 @@ fn push_system(ir: &mut SessionIr, live_model: &mut Vec<String>, ctx: &RecordCon
             .and_then(Value::as_str)
             .map(str::to_string),
     };
-    *live_model = context;
-    emit(ir, live_model, ctx.event(0, Visibility::Model, body, Vec::new()));
+    sink.live_model = context;
+    sink.emit(ctx.event(0, Visibility::Model, body, Vec::new()));
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +971,136 @@ mod tests {
         let file = transcript(&[user("u1", "", "one")]);
         let ir = read(file.path()).expect("parse");
         assert_eq!(ir.live_head, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Re-emission across a `/compact`
+    // -----------------------------------------------------------------------
+
+    /// A `tool_result` re-appended before a `compact_boundary`, in the exact
+    /// shape the corpus has it: same `uuid`, same `parentUuid`, same
+    /// `timestamp`, same content — and a re-stamped `promptId` plus a `slug`
+    /// this reader never reads. Not one of the ten corpus re-emissions is
+    /// byte-identical, so a byte-identity rule would let both copies through.
+    #[test]
+    fn a_re_emission_that_only_restates_is_not_a_second_event() {
+        let result = |prompt: &str, slug: &str| {
+            format!(
+                r#"{{"type":"user","uuid":"u2","parentUuid":"u1","isSidechain":false,"sessionId":"s1","promptId":"{prompt}"{slug},"timestamp":"2026-07-25T10:00:02.000Z","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"t1","content":"ok","is_error":false}}]}},"toolUseResult":{{"stdout":"ok"}}}}"#
+            )
+        };
+        let file = transcript(&[
+            user("u1", "", "hi"),
+            result("typed-turn", ""),
+            result("compaction-turn", r#","slug":"eager-giggling-garden""#),
+        ]);
+        let ir = read(file.path()).expect("parse");
+
+        let ids: Vec<&str> = ir.events.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["u1", "u2"], "the restatement must not become an event");
+        assert_eq!(ir.capture.restated, 1, "and it must be counted as recognised");
+        assert_eq!(ir.capture.id_collisions, 0, "nothing collided; it restated");
+        assert_eq!(
+            ir.capture.lines_read, 3,
+            "the line was still read; only the event was skipped"
+        );
+        assert_eq!(
+            ir.events[1].turn.as_deref(),
+            Some("typed-turn"),
+            "the turn the record was typed under wins over the compaction's; \
+             `replay::roll_back` reads this as `the last N typed turns`, and \
+             adopting the re-append's value collapses the preserved history \
+             into one turn"
+        );
+    }
+
+    /// The same id with *different* content is not a restatement. Dropping it
+    /// would lose data, so it is kept under an id of its own and the collision
+    /// is counted rather than silently resolved.
+    #[test]
+    fn a_re_emission_that_changes_content_keeps_both_under_distinct_ids() {
+        let file = transcript(&[
+            user("u1", "", "hi"),
+            user("u2", "u1", "first"),
+            user("u2", "u1", "edited"),
+        ]);
+        let ir = read(file.path()).expect("parse");
+
+        assert_eq!(ir.events.len(), 3, "nothing may be dropped");
+        assert_eq!(ir.capture.id_collisions, 1);
+        assert_eq!(ir.capture.restated, 0);
+        assert_eq!(ir.events[1].id, "u2");
+        assert!(
+            ir.events[2].id.starts_with("u2#"),
+            "the minted id must keep the native record recoverable by \
+             `replay::record_of`, which splits on `#`: {:?}",
+            ir.events[2].id
+        );
+        assert_ne!(ir.events[1].id, ir.events[2].id);
+        assert!(
+            ir.capture.notes.iter().any(|note| note.contains("u2")),
+            "a reused identifier is an anomaly and must be visible: {:?}",
+            ir.capture.notes
+        );
+    }
+
+    /// The latent half of the defect, which the exclusion double-count only
+    /// hinted at: when Claude *does* name a re-emitted record as preserved, both
+    /// copies used to land in the compaction's `context` — the preserved set is
+    /// matched on the record part of the id — and the target would be shown the
+    /// same message twice.
+    #[test]
+    fn a_restated_record_that_is_preserved_enters_the_context_once() {
+        let file = transcript(&[
+            user("u1", "", "dropped"),
+            user("u2", "u1", "kept"),
+            // The re-append, immediately before the boundary.
+            user("u2", "u1", "kept"),
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"cb1","logicalParentUuid":"u2","sessionId":"s1","compactMetadata":{"trigger":"manual","preservedMessages":{"allUuids":["u2"]}}}"#.to_string(),
+        ]);
+        let ir = read(file.path()).expect("parse");
+
+        let (context, supersedes) = ir
+            .events
+            .iter()
+            .find_map(|event| match &event.body {
+                Body::Compaction {
+                    context,
+                    supersedes,
+                    ..
+                } => Some((context.clone(), supersedes.clone())),
+                _ => None,
+            })
+            .expect("compaction event");
+        assert_eq!(context, ["u2"], "the preserved record is shown once, not twice");
+        assert_eq!(supersedes, ["u1"]);
+
+        let plan = crate::replay::resolve(&ir);
+        assert_eq!(plan.events, ["u2"]);
+        assert_eq!(
+            plan.excluded.len(),
+            1,
+            "one exclusion, not two: an event dropped twice is counted twice in \
+             every fidelity report — {:?}",
+            plan.excluded
+        );
+    }
+
+    /// A record whose `uuid` is absent falls back to a line-derived id, so two
+    /// of them are distinct by construction and must not be mistaken for a
+    /// re-emission of one another.
+    #[test]
+    fn records_with_no_uuid_are_not_restatements_of_each_other() {
+        let file = transcript(&[
+            user("u1", "", "hi"),
+            r#"{"type":"mode","sessionId":"s1","mode":"default"}"#.to_string(),
+            r#"{"type":"mode","sessionId":"s1","mode":"default"}"#.to_string(),
+        ]);
+        let ir = read(file.path()).expect("parse");
+
+        assert_eq!(ir.capture.by_kind.get("control"), Some(&2));
+        assert_eq!(ir.capture.restated, 0);
+        assert_eq!(ir.capture.id_collisions, 0);
     }
 
     #[test]

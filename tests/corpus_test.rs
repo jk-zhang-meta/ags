@@ -538,6 +538,91 @@ fn claude_corpus_compaction_drops_only_unpreserved_messages() {
     }
 }
 
+/// `Event::id` is unique within the session, and Claude Code attacks that.
+///
+/// Across a `/compact` it re-appends the records it has to replay — the
+/// unresolved `tool_use` and its `tool_result`s — under their original `uuid`s,
+/// immediately before the `compact_boundary`. A reader minting one event per
+/// line emits the same id twice, and `replay::resolve`'s `position` map,
+/// `SessionIr::model_visible`'s `by_id` and `prune_forks`' record index all key
+/// on it, so an arbitrary copy wins and the fidelity report double-counts the
+/// other.
+///
+/// Three assertions, because a one-sided version of this passes on a reader that
+/// simply had nothing to find:
+///
+/// 1. **No session contains a duplicate id.** The property itself.
+/// 2. **The re-emission handling fires somewhere.** If it never does on a corpus
+///    that contains compactions, it has stopped being exercised — and an
+///    allowance that stops being exercised does not stay neutral, it widens
+///    until it covers a regression.
+/// 3. **Nothing is dropped for a *changed* record.** A re-emission whose content
+///    differs is kept under a minted `<id>#dup<n>` and counted separately, so
+///    `restated` can never be hiding a real edit.
+#[test]
+#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+fn claude_corpus_re_emissions_are_restated_not_duplicated() {
+    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 800)
+        .into_iter()
+        .filter(|path| is_claude_transcript(path))
+        .collect();
+    if files.is_empty() {
+        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        return;
+    }
+
+    let mut sessions = 0u64;
+    let mut events = 0u64;
+    let mut restated = 0u64;
+    let mut collisions = 0u64;
+    let mut duplicated: Vec<(PathBuf, usize)> = Vec::new();
+    for path in files {
+        let Ok(ir) = claude_code_ir::read(&path) else {
+            continue;
+        };
+        sessions += 1;
+        events += ir.events.len() as u64;
+        restated += ir.capture.restated;
+        collisions += ir.capture.id_collisions;
+        if ir.capture.restated > 0 || ir.capture.id_collisions > 0 {
+            println!(
+                "  {}: {} restated, {} collision(s)",
+                path.display(),
+                ir.capture.restated,
+                ir.capture.id_collisions
+            );
+        }
+        let distinct: std::collections::HashSet<&str> =
+            ir.events.iter().map(|event| event.id.as_str()).collect();
+        if distinct.len() != ir.events.len() {
+            duplicated.push((path, ir.events.len() - distinct.len()));
+        }
+    }
+    println!(
+        "{sessions} transcripts, {events} events, {restated} restated, {collisions} id collision(s)"
+    );
+
+    assert!(
+        duplicated.is_empty(),
+        "{} transcript(s) emit a duplicate `Event::id`, e.g. {:?}",
+        duplicated.len(),
+        &duplicated[..duplicated.len().min(3)]
+    );
+    assert!(
+        restated > 0,
+        "no transcript in {sessions} re-emitted a record, so the restatement rule \
+         ran on nothing and the assertion above proves only that this corpus had \
+         no duplicates to find"
+    );
+    assert_eq!(
+        collisions, 0,
+        "a transcript reused an id for content that differs — nothing was dropped, \
+         the record is still in `events` under a minted id, but Claude naming two \
+         different things the same thing is worth reading the note above rather \
+         than resolving quietly"
+    );
+}
+
 #[test]
 #[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
 fn claude_corpus_parent_links_resolve() {
