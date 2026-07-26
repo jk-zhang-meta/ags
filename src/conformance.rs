@@ -1101,6 +1101,184 @@ impl Report {
 }
 
 // ---------------------------------------------------------------------------
+// Synthesising the work an agent does in an intermediate session
+// ---------------------------------------------------------------------------
+
+/// Append `turns` synthesised user/assistant exchanges to a session `provider`
+/// owns, each carrying `marker` in its text, and report the bytes added.
+///
+/// # Why this exists
+///
+/// A chained measurement with nothing appended to the intermediate is degenerate:
+/// the intermediate is then a lossy projection of the origin and *returning the
+/// origin is trivially correct*, which validates the mechanism on the one case
+/// where the mechanism has no value — the user already had the origin. The case
+/// that matters is the one where the user worked in the intermediate, and that
+/// case only exists if something appends to it.
+///
+/// # Why appended and not rewritten
+///
+/// The store detects that a session moved on by growth: `(size, mtime)` first,
+/// then the recorded prefix hash as the confirming read. A synthesised turn has
+/// to leave that prefix alone or it reads as *diverged* rather than *advanced* —
+/// which is also what a real agent does, since both structured session formats
+/// are append-only JSONL logs.
+///
+/// # Why the shapes are named rather than derived
+///
+/// The turn is cloned from a line already in the file — so `cwd`, `sessionId`,
+/// `version` and the rest come from the session itself — and only the identity
+/// and the text are patched. What cannot be cloned is *where the text lives*,
+/// which is per-format. A provider this function has never been taught is an
+/// error rather than a silent no-op, because a chain measured without an append
+/// is exactly the degenerate chain above.
+pub fn append_turns(
+    path: &Path,
+    provider: &str,
+    marker: &str,
+    turns: usize,
+) -> anyhow::Result<u64> {
+    let text = std::fs::read_to_string(path)?;
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    let shape = TurnShape::of(provider).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no synthesised turn shape for '{provider}', so a chain through it would measure the \
+             degenerate case where nothing was appended"
+        )
+    })?;
+    let user = shape.template(&lines, "user").ok_or_else(|| {
+        anyhow::anyhow!("{} holds no {provider} user turn to clone", path.display())
+    })?;
+    let assistant = shape.template(&lines, "assistant").ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} holds no {provider} assistant turn to clone",
+            path.display()
+        )
+    })?;
+
+    let mut parent = lines
+        .iter()
+        .rev()
+        .find_map(|line| line.get("uuid").and_then(|id| id.as_str()))
+        .map(str::to_string);
+    let mut appended = String::new();
+    for turn in 0..turns {
+        for (role, template) in [("user", &user), ("assistant", &assistant)] {
+            let mut line = template.clone();
+            let uuid = uuid::Uuid::new_v4().as_hyphenated().to_string();
+            shape.patch(
+                &mut line,
+                role,
+                &format!("{marker} — appended {role} turn {}", turn + 1),
+                &uuid,
+                parent.as_deref(),
+            );
+            parent = Some(uuid);
+            appended.push_str(&serde_json::to_string(&line)?);
+            appended.push('\n');
+        }
+    }
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    file.write_all(appended.as_bytes())?;
+    file.flush()?;
+    Ok(appended.len() as u64)
+}
+
+/// Where one native session format keeps a turn's role, text and identity.
+///
+/// Two variants because two providers write structured sessions. A third would
+/// add a variant here and be covered by everything that calls
+/// [`append_turns`] — the same shape as the rest of this module, where the list
+/// under test is the registry and not a list.
+#[derive(Debug, Clone, Copy)]
+enum TurnShape {
+    /// `{"type": "user"|"assistant", "message": {...}, "uuid": …, "parentUuid": …}`
+    ClaudeCode,
+    /// `{"type": "response_item", "payload": {"role": …, "content": [{"text": …}]}}`,
+    /// or a user turn as `{"type": "event_msg", "payload": {"type":
+    /// "user_message", "message": …}}` — the rollout writer emits both shapes
+    /// depending on the history mode, and a template has to accept whichever the
+    /// file actually holds.
+    Codex,
+}
+
+impl TurnShape {
+    fn of(provider: &str) -> Option<Self> {
+        match provider {
+            "claude-code" => Some(TurnShape::ClaudeCode),
+            "codex" => Some(TurnShape::Codex),
+            _ => None,
+        }
+    }
+
+    /// The last line in the file that carries a turn in `role`, to clone.
+    fn template(&self, lines: &[serde_json::Value], role: &str) -> Option<serde_json::Value> {
+        let matches = |line: &&serde_json::Value| match self {
+            TurnShape::ClaudeCode => line.get("type").and_then(|t| t.as_str()) == Some(role),
+            TurnShape::Codex => {
+                let kind = line.get("type").and_then(|t| t.as_str());
+                let response_item = kind == Some("response_item")
+                    && line.pointer("/payload/role").and_then(|r| r.as_str()) == Some(role)
+                    && line.pointer("/payload/content/0/text").is_some();
+                let event_msg = role == "user"
+                    && kind == Some("event_msg")
+                    && line.pointer("/payload/type").and_then(|t| t.as_str())
+                        == Some("user_message")
+                    && line.pointer("/payload/message").is_some();
+                response_item || event_msg
+            }
+        };
+        lines.iter().rev().find(matches).cloned()
+    }
+
+    /// Give the cloned line a fresh identity and `text` as its only content.
+    fn patch(
+        &self,
+        line: &mut serde_json::Value,
+        role: &str,
+        text: &str,
+        uuid: &str,
+        parent: Option<&str>,
+    ) {
+        match self {
+            TurnShape::ClaudeCode => {
+                line["uuid"] = serde_json::Value::String(uuid.to_string());
+                line["parentUuid"] = match parent {
+                    Some(parent) => serde_json::Value::String(parent.to_string()),
+                    None => serde_json::Value::Null,
+                };
+                if role == "assistant" {
+                    line["message"]["content"] =
+                        serde_json::json!([{ "type": "text", "text": text }]);
+                    line["message"]["id"] = serde_json::Value::String(format!(
+                        "msg_casr_{}",
+                        uuid::Uuid::new_v4().as_simple()
+                    ));
+                } else {
+                    line["message"]["content"] = serde_json::Value::String(text.to_string());
+                }
+            }
+            TurnShape::Codex => {
+                // Whichever slot the cloned line actually uses; see the variant.
+                if line.pointer("/payload/message").is_some() {
+                    line["payload"]["message"] = serde_json::Value::String(text.to_string());
+                } else {
+                    line["payload"]["content"][0]["text"] =
+                        serde_json::Value::String(text.to_string());
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The second hop
 // ---------------------------------------------------------------------------
 
@@ -1122,11 +1300,12 @@ impl Report {
 ///
 /// 1. `A → B` with a store, so the store learns that both sessions are the same
 ///    conversation.
-/// 2. `B → A` naming the session step 1 wrote, **with** the store.
-/// 3. `B → A` naming the same session, **without** it — which is `--no-store`,
-///    and is what the tool did before the store existed.
+/// 2. **The untouched arm.** `B → A` naming the session step 1 wrote, with the
+///    store and again without it.
+/// 3. [`append_turns`] puts synthesised work into that intermediate.
+/// 4. **The appended arm.** `B → A` again, both ways.
 ///
-/// Then it counts the capsules in the session each of those two hops actually
+/// Then it counts the capsules in the session each of those hops actually
 /// delivers: the file that was written, or — when the store chose a source that
 /// was already in `A`'s format and so needed no conversion at all — the file the
 /// resume command points at. Both are "the session the user ends up in", which
@@ -1135,6 +1314,45 @@ impl Report {
 /// The ceiling is the source session's own capsule count, and it is reported
 /// beside the two results rather than assumed: a hop that recovers everything
 /// and a hop that recovers nothing look identical without it.
+///
+/// # Why there are two arms
+///
+/// Because one of them measures nothing. With nothing appended to the
+/// intermediate, the intermediate is a lossy projection of the origin and
+/// returning the origin is *trivially* correct — and trivially worthless, since
+/// the user already had the origin. That arm is kept because it is the store's
+/// payoff and losing it would be a silent regression, but on its own it validated
+/// the mechanism on exactly the case where the mechanism has no value, and it is
+/// the reason a real defect went unmeasured: for two hours of work appended to the
+/// intermediate the same ranking returned the origin, wrote nothing, and handed
+/// back the file the user already had.
+///
+/// # What it asserts, and what it deliberately no longer asserts
+///
+/// It used to assert that consulting the store never delivers less sealed
+/// material than not consulting it. That is **false** once the ranking is right:
+/// correctly preferring an advanced derivative over an older-but-richer origin
+/// delivers *fewer* capsules on purpose. The property that is both true and wanted
+/// is narrower and stronger:
+///
+/// > **The store may never deliver an outcome the user would not have got without
+/// > it.** `--no-store` is the baseline for both halves of what is delivered,
+/// > because without a store the user gets exactly the session they named,
+/// > converted.
+/// >
+/// > - **Conversation content is a floor, never a trade.** Anything the
+/// >   `--no-store` arm delivered must be in the store arm's session too. Turns
+/// >   exist in one incarnation only and no conversion can rebuild them, so losing
+/// >   one is unrecoverable and never justified by anything.
+/// > - **Sealed material is a floor unless it is bought.** The store arm may
+/// >   deliver fewer capsules than the `--no-store` arm only where it delivered
+/// >   content the `--no-store` arm did not. Capsules a derivative lacks are
+/// >   content its origin still holds; that makes them recoverable, and
+/// >   recoverable loss may be traded for unrecoverable loss avoided.
+/// >
+/// > And where nothing has advanced at all — the untouched arm — neither clause
+/// > can bite, so the old floor still holds there and is still asserted: the store
+/// > delivers at least what `--no-store` does.
 ///
 /// `sandbox` carries the same contract as [`run`]'s: every provider session root
 /// must already be redirected into it, every written path is asserted to land
@@ -1213,7 +1431,31 @@ fn capsules_of(ir: &SessionIr) -> usize {
         .sum()
 }
 
-/// One `A → B → A` chain, measured both ways.
+/// The stem of the text a synthesised turn carries; a fresh uuid is appended per
+/// chain.
+///
+/// "The work survived" is then a substring test on the bytes the chain delivered,
+/// which is decidable. An event count is not: two formats legitimately split one
+/// native line into a different number of events, so a count that went down could
+/// always be explained away as structural — which is how content loss stays
+/// invisible.
+///
+/// The uuid is not decoration. This suite runs against a live corpus of the
+/// author's own sessions, and one of those sessions is the one in which this
+/// constant was written — a fixed marker is a string the corpus already contains,
+/// so "the delivered session holds the appended work" would sometimes be true of
+/// a session nothing was appended to.
+const APPENDED_MARKER: &str = "agsx-second-hop-appended-work";
+
+/// Synthesised user/assistant exchanges appended to each intermediate.
+///
+/// Three is enough to be found again and small enough that the corpus tier stays
+/// a suite someone runs: this appends to, re-reads and re-converts every
+/// intermediate in the corpus.
+const APPENDED_TURNS: usize = 3;
+
+/// One `A → B → A` chain, measured with and without the store, before and after
+/// work is appended to the intermediate.
 #[allow(clippy::too_many_arguments)]
 fn chain(
     report: &mut HopReport,
@@ -1257,11 +1499,16 @@ fn chain(
     let first = match stored.convert(target_slug, &named(path), opts(path)) {
         Ok(result) => result,
         Err(error) => {
-            report.note(format!(
+            let message = format!(
                 "{}: {source_slug} -> {target_slug} did not convert, so no chain starts here: \
                  {error}",
                 path.display()
-            ));
+            );
+            if is_write_defect(&error) {
+                report.finding(message);
+            } else {
+                report.note(message);
+            }
             return;
         }
     };
@@ -1280,10 +1527,117 @@ fn chain(
     };
     assert_inside(sandbox, &intermediate, target_slug);
 
-    // Hop two, both ways. The store's arm runs first so that the control arm
-    // cannot be handed a store the first arm warmed.
-    let with = stored.convert(source_slug, &named(&intermediate), opts(&intermediate));
-    let without = control.convert(source_slug, &named(&intermediate), opts(&intermediate));
+    // The untouched arm: nothing has moved since the store recorded either
+    // session, which is the store's payoff and the degenerate case both.
+    hop_two(
+        report,
+        control,
+        &stored,
+        path,
+        source_slug,
+        target_slug,
+        source_capsules,
+        &intermediate,
+        sandbox,
+        Arm::Untouched,
+        None,
+    );
+
+    // Now the case that matters: the user worked in the intermediate. Appended
+    // rather than rewritten, so the store sees growth and not divergence — which
+    // is also what an agent working in an append-only log does.
+    let marker = format!("{APPENDED_MARKER}-{}", uuid::Uuid::new_v4().as_hyphenated());
+    match append_turns(&intermediate, target_slug, &marker, APPENDED_TURNS) {
+        Ok(added) => {
+            report
+                .chains
+                .entry((source_slug.to_string(), target_slug.to_string()))
+                .or_default()
+                .appended_bytes += added;
+            hop_two(
+                report,
+                control,
+                &stored,
+                path,
+                source_slug,
+                target_slug,
+                source_capsules,
+                &intermediate,
+                sandbox,
+                Arm::Appended,
+                Some(&marker),
+            );
+        }
+        Err(error) => report.note(format!(
+            "{}: nothing could be appended to the {target_slug} intermediate, so this chain only \
+             measured the degenerate case: {error}",
+            path.display()
+        )),
+    }
+
+    let _ = std::fs::remove_file(&intermediate);
+}
+
+/// Whether a refused hop is this crate's bug rather than a fact about the input.
+///
+/// A hop can fail for two unrelated reasons and they deserve opposite
+/// treatment. `ValidationError` means the session itself is unusable — the
+/// corpus holds one-sided transcripts, and refusing them is correct behaviour
+/// worth counting but not worth failing. `VerifyFailed` means the pipeline
+/// wrote a file and then could not read its own output back as the session it
+/// had just converted, which is a writer defect every time.
+///
+/// Matched on the typed variant rather than on the message, so renaming the
+/// error text cannot silently turn a failure back into a note.
+fn is_write_defect(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::error::CasrError>()
+        .is_some_and(|error| matches!(error, crate::error::CasrError::VerifyFailed { .. }))
+}
+
+/// Which of the two arms a measurement belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    /// Nothing appended to the intermediate.
+    Untouched,
+    /// [`APPENDED_TURNS`] synthesised exchanges appended to it.
+    Appended,
+}
+
+/// `B → A` twice — with the store and without — measured and tallied.
+#[allow(clippy::too_many_arguments)]
+fn hop_two(
+    report: &mut HopReport,
+    control: &ConversionPipeline,
+    stored: &ConversionPipeline,
+    path: &Path,
+    source_slug: &str,
+    target_slug: &str,
+    source_capsules: usize,
+    intermediate: &Path,
+    sandbox: &Path,
+    arm: Arm,
+    // The text the appended turns carry, when any were appended. `None` in the
+    // untouched arm, where there is no appended work and so nothing to find.
+    marker: Option<&str>,
+) {
+    // Unlimited, and not the CLI's defaults, for the reason `cross` gives: this
+    // measures the conversion chain and not the budget policy. A budget that
+    // legitimately trims the oldest turns would take capsules with it, and the
+    // check could no longer tell that from a hop asking the wrong source.
+    let opts = ConvertOptions {
+        source_hint: Some(intermediate.display().to_string()),
+        ..ConvertOptions::default()
+    };
+    let named = intermediate
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // The store's arm runs first so that the control arm cannot be handed a store
+    // the first arm warmed.
+    let with = stored.convert(source_slug, &named, opts.clone());
+    let without = control.convert(source_slug, &named, opts);
 
     let measure = |result: &Result<crate::pipeline::ConversionResult, anyhow::Error>| {
         let result = match result {
@@ -1310,31 +1664,46 @@ fn chain(
         }
         let provider = control.registry.find_by_slug(source_slug)?;
         let ir = provider.read_session_ir(&delivered).ok().flatten()?;
-        Some((delivered, capsules_of(&ir)))
+        // Read as bytes, not as events: see `APPENDED_MARKER`.
+        let held_work = marker.is_some_and(|marker| {
+            std::fs::read_to_string(&delivered)
+                .map(|text| text.contains(marker))
+                .unwrap_or(false)
+        });
+        Some(Delivered {
+            capsules: capsules_of(&ir),
+            held_work,
+        })
     };
 
     let with_measured = measure(&with);
     let without_measured = measure(&without);
 
     // Written output goes as soon as it has been read: every source session in
-    // the corpus is converted twice here, and a sandbox that grows to three
-    // times the corpus is a suite nobody runs.
+    // the corpus is converted four times here, and a sandbox that grows to
+    // several times the corpus is a suite nobody runs.
     for produced in [&with, &without].into_iter().flatten() {
         for written in produced.written.iter().flat_map(|w| w.paths.iter()) {
             let _ = std::fs::remove_file(written);
         }
     }
-    let _ = std::fs::remove_file(&intermediate);
 
-    let tally = report
+    let chain = report
         .chains
         .entry((source_slug.to_string(), target_slug.to_string()))
         .or_default();
+    let tally = match arm {
+        Arm::Untouched => &mut chain.untouched,
+        Arm::Appended => &mut chain.appended,
+    };
     tally.sessions += 1;
     tally.source_capsules += source_capsules;
 
-    if let (Ok(result), Some((_, capsules))) = (&with, &with_measured) {
-        tally.with_store += capsules;
+    if let (Ok(result), Some(measured)) = (&with, &with_measured) {
+        tally.with_store += measured.capsules;
+        if measured.held_work {
+            tally.store_kept_work += 1;
+        }
         if result
             .source
             .as_ref()
@@ -1346,59 +1715,114 @@ fn chain(
             tally.needed_no_conversion += 1;
         }
     }
-    if let Some((_, capsules)) = &without_measured {
-        tally.without_store += capsules;
+    if let Some(measured) = &without_measured {
+        tally.without_store += measured.capsules;
+        if measured.held_work {
+            tally.control_kept_work += 1;
+        }
     }
 
-    // A hop the pipeline refuses or fails is a note and not an objection, and
-    // the distinction is the whole of what this check is entitled to claim. The
-    // corpus holds one-sided transcripts that `validate_session` correctly
-    // refuses, and the control arm here is the code path that predates the
-    // store — a defect it hits is evidence about a writer, not about source
-    // selection, and reporting it as a store failure would put a pre-existing
-    // bug behind a name nobody would look for it under.
-    for (arm, measured, outcome) in [
+    // A hop the pipeline refuses splits by *cause*, and the split is the whole
+    // of what this check is entitled to claim either way.
+    //
+    // A refusal because the session is unusable is a fact about the corpus — it
+    // holds one-sided transcripts `validate_session` correctly refuses — and
+    // stays a note. A refusal because the file the pipeline just wrote does not
+    // read back as the session it converted is this crate's own bug, and has to
+    // fail. `CasrError::VerifyFailed` is exactly that line and it is already
+    // typed, so the split needs no string matching.
+    //
+    // Both used to be notes, and that is how a real writer defect hid here in
+    // plain sight: `claude-code -> codex -> claude-code` lost a reasoning event
+    // the writer never declared, printed among the notes for as long as the
+    // check existed. What made it invisible was not the reporting level alone —
+    // it was that the control arm is the code path predating the store, so an
+    // objection raised there reads as a store failure. That argument justifies
+    // not filing it *under the store's name*. It never justified not failing.
+    for (label, measured, outcome) in [
         ("with a store", &with_measured, &with),
         ("without one", &without_measured, &without),
     ] {
         if measured.is_none() {
-            report.note(format!(
-                "{}: {target_slug} -> {source_slug} {arm} delivered nothing measurable{}",
+            let message = format!(
+                "{}: {target_slug} -> {source_slug} ({arm:?} arm) {label} delivered nothing \
+                 measurable{}",
                 path.display(),
                 outcome
                     .as_ref()
                     .err()
                     .map(|error| format!(": {error}"))
                     .unwrap_or_default()
-            ));
+            );
+            match outcome.as_ref().err() {
+                Some(error) if is_write_defect(error) => report.finding(message),
+                Some(_) | None => report.note(message),
+            }
         }
     }
 
-    // The two objections, and they are the only two. Both are stated against the
-    // control arm rather than against a number, because the number belongs to
-    // whatever corpus is on the machine and the property belongs to the store.
+    // The objections, all of them stated against the control arm rather than
+    // against a number: the number belongs to whatever corpus is on the machine
+    // and the property belongs to the store.
+    let chain_name = format!("{source_slug} -> {target_slug} -> {source_slug}");
     match (&with_measured, &without_measured) {
-        (Some((_, with_capsules)), Some((_, without_capsules)))
-            if with_capsules < without_capsules =>
-        {
-            report.findings.push(format!(
-                "{}: {source_slug} -> {target_slug} -> {source_slug} delivered {with_capsules} \
-                 capsule(s) through the store but {without_capsules} without it; consulting the \
-                 store may not cost sealed material",
-                path.display()
-            ));
+        (Some(with_measured), Some(without_measured)) => {
+            // Content is a floor, never a trade.
+            if without_measured.held_work && !with_measured.held_work {
+                report.findings.push(format!(
+                    "{}: {chain_name} ({arm:?} arm) delivered the work appended to the \
+                     intermediate without the store and not with it, so consulting the store \
+                     silently dropped conversation content that exists in one incarnation only",
+                    path.display()
+                ));
+            }
+            // Sealed material is a floor unless it is bought with content.
+            if with_measured.capsules < without_measured.capsules
+                && !(with_measured.held_work && !without_measured.held_work)
+            {
+                report.findings.push(format!(
+                    "{}: {chain_name} ({arm:?} arm) delivered {} capsule(s) through the store \
+                     against {} without it, while delivering no conversation content that \
+                     `--no-store` did not; sealed material may only be given up to keep turns \
+                     that exist nowhere else",
+                    path.display(),
+                    with_measured.capsules,
+                    without_measured.capsules
+                ));
+            }
+            // And where nothing has advanced the old floor still holds, because
+            // neither clause above can bite: the origin is strictly better.
+            if arm == Arm::Untouched && with_measured.capsules < without_measured.capsules {
+                report.findings.push(format!(
+                    "{}: {chain_name} (untouched arm) delivered {} capsule(s) through the store \
+                     against {} without it; with nothing appended anywhere the store may not cost \
+                     sealed material",
+                    path.display(),
+                    with_measured.capsules,
+                    without_measured.capsules
+                ));
+            }
         }
         (None, Some(_)) => report.findings.push(format!(
-            "{}: {source_slug} -> {target_slug} -> {source_slug} delivered a session without the \
-             store and none with it, so consulting the store cost the whole conversion{}",
+            "{}: {chain_name} ({arm:?} arm) delivered a session without the store and none with \
+             it, so consulting the store cost the whole conversion{}",
             path.display(),
             with.as_ref()
                 .err()
                 .map(|error| format!(": {error}"))
                 .unwrap_or_default()
         )),
-        (Some(_), Some(_)) | (Some(_), None) | (None, None) => {}
+        (Some(_), None) | (None, None) => {}
     }
+}
+
+/// What one arm of one hop actually handed the user.
+#[derive(Debug, Clone, Copy)]
+struct Delivered {
+    /// Capsules the target's vendor can replay.
+    capsules: usize,
+    /// Whether the work appended to the intermediate is in these bytes.
+    held_work: bool,
 }
 
 fn assert_inside(sandbox: &Path, produced: &Path, slug: &str) {
@@ -1415,8 +1839,20 @@ fn assert_inside(sandbox: &Path, produced: &Path, slug: &str) {
 /// One `A → B → A` chain's totals, over every session in the tier.
 #[derive(Debug, Clone, Default)]
 struct ChainTally {
+    /// With nothing appended to the intermediate: the store's payoff, and the
+    /// case where returning the origin is trivially correct.
+    untouched: ArmTally,
+    /// After work was appended to the intermediate: the case that matters.
+    appended: ArmTally,
+    /// Bytes of synthesised work appended across the tier.
+    appended_bytes: u64,
+}
+
+/// One arm of one chain's totals.
+#[derive(Debug, Clone, Default)]
+struct ArmTally {
     sessions: usize,
-    /// Capsules in the source sessions, which is the ceiling for both arms.
+    /// Capsules in the source sessions, which is the ceiling for both halves.
     source_capsules: usize,
     /// Capsules the chain delivered with the store consulted.
     with_store: usize,
@@ -1427,6 +1863,26 @@ struct ChainTally {
     /// Times the source it chose was already in the target's format, so the
     /// second hop wrote nothing and pointed at bytes that were already there.
     needed_no_conversion: usize,
+    /// Times the store-backed chain delivered the work appended to the
+    /// intermediate. Zero by construction in the untouched arm.
+    store_kept_work: usize,
+    /// Times the `--no-store` chain did, which is the floor the store arm has to
+    /// meet.
+    control_kept_work: usize,
+}
+
+/// One arm's totals across every chain, as a caller asserts on them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArmTotals {
+    pub sessions: usize,
+    /// Capsules in the source sessions: the ceiling for both halves.
+    pub source_capsules: usize,
+    pub with_store: usize,
+    pub without_store: usize,
+    /// Chains whose store-backed hop delivered the appended work.
+    pub store_kept_work: usize,
+    /// Chains whose `--no-store` hop did.
+    pub control_kept_work: usize,
 }
 
 /// What the second hop measured, and everything it objects to.
@@ -1435,8 +1891,10 @@ pub struct HopReport {
     tier: String,
     files: usize,
     chains: BTreeMap<(String, String), ChainTally>,
-    /// Hops the pipeline refused or failed, with the first few reasons. Printed,
-    /// never asserted on: see the comment at the call site.
+    /// Hops refused for a reason that is a fact about the input rather than a
+    /// defect in this crate, with the first few reasons. Printed, never
+    /// asserted on. A refusal that *is* a defect goes to `findings` instead —
+    /// see `is_write_defect` and the comment at the call site.
     notes: Vec<String>,
     note_count: usize,
     findings: Vec<String>,
@@ -1450,9 +1908,20 @@ impl HopReport {
         }
     }
 
-    /// Chains measured across every pair. Zero means nothing was checked.
+    /// Something that has to fail the build, as opposed to a [`HopReport::note`]
+    /// which is only printed. Unlike notes these are never truncated: a caller
+    /// asserts on them, so dropping the sixth one would hide a defect.
+    fn finding(&mut self, finding: String) {
+        self.findings.push(finding);
+    }
+
+    /// Chains measured across every pair and both arms. Zero means nothing was
+    /// checked.
     pub fn sessions(&self) -> usize {
-        self.chains.values().map(|tally| tally.sessions).sum()
+        self.chains
+            .values()
+            .map(|chain| chain.untouched.sessions + chain.appended.sessions)
+            .sum()
     }
 
     /// Everything that did not add up. What a caller asserts on.
@@ -1460,17 +1929,30 @@ impl HopReport {
         &self.findings
     }
 
-    /// Capsules delivered with the store, and without it, summed over every
-    /// chain — the two numbers the store exists to separate.
-    pub fn totals(&self) -> (usize, usize, usize) {
+    /// The arm where nothing was appended to the intermediate: the store's
+    /// payoff, and the case where returning the origin is trivially correct.
+    pub fn untouched(&self) -> ArmTotals {
+        self.fold(|chain| &chain.untouched)
+    }
+
+    /// The arm where work was appended to the intermediate: the case the store
+    /// was getting wrong, and the only one where the choice costs anything.
+    pub fn appended(&self) -> ArmTotals {
+        self.fold(|chain| &chain.appended)
+    }
+
+    fn fold(&self, arm: impl Fn(&ChainTally) -> &ArmTally) -> ArmTotals {
         self.chains
             .values()
-            .fold((0, 0, 0), |(src, with, without), tally| {
-                (
-                    src + tally.source_capsules,
-                    with + tally.with_store,
-                    without + tally.without_store,
-                )
+            .map(arm)
+            .fold(ArmTotals::default(), |mut totals, tally| {
+                totals.sessions += tally.sessions;
+                totals.source_capsules += tally.source_capsules;
+                totals.with_store += tally.with_store;
+                totals.without_store += tally.without_store;
+                totals.store_kept_work += tally.store_kept_work;
+                totals.control_kept_work += tally.control_kept_work;
+                totals
             })
     }
 
@@ -1482,28 +1964,46 @@ impl HopReport {
             self.files,
             self.sessions()
         );
-        for ((source, target), tally) in &self.chains {
+        for ((source, target), chain) in &self.chains {
             eprintln!(
-                "\n  {source} → {target} → {source}   {} session(s)",
-                tally.sessions
+                "\n  {source} → {target} → {source}   {} bytes of work appended to the \
+                 intermediates",
+                chain.appended_bytes
             );
-            eprintln!(
-                "    capsules in the source          {:>9}",
-                tally.source_capsules
-            );
-            eprintln!(
-                "    delivered with the store        {:>9}",
-                tally.with_store
-            );
-            eprintln!(
-                "    delivered without it            {:>9}",
-                tally.without_store
-            );
-            eprintln!("    store read a session not named  {:>9}", tally.overrode);
-            eprintln!(
-                "    chosen source needed no convert {:>9}",
-                tally.needed_no_conversion
-            );
+            for (arm, tally) in [
+                ("nothing appended", &chain.untouched),
+                ("work appended", &chain.appended),
+            ] {
+                eprintln!("    ── {arm}, {} session(s)", tally.sessions);
+                eprintln!(
+                    "       capsules in the source          {:>9}",
+                    tally.source_capsules
+                );
+                eprintln!(
+                    "       delivered with the store        {:>9}",
+                    tally.with_store
+                );
+                eprintln!(
+                    "       delivered without it            {:>9}",
+                    tally.without_store
+                );
+                eprintln!(
+                    "       appended work kept, with store  {:>9}",
+                    tally.store_kept_work
+                );
+                eprintln!(
+                    "       appended work kept, without     {:>9}",
+                    tally.control_kept_work
+                );
+                eprintln!(
+                    "       store read a session not named  {:>9}",
+                    tally.overrode
+                );
+                eprintln!(
+                    "       chosen source needed no convert {:>9}",
+                    tally.needed_no_conversion
+                );
+            }
         }
         if self.note_count > 0 {
             eprintln!(

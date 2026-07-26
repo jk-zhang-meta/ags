@@ -120,6 +120,7 @@ pub fn render(
         downgraded_calls: 0,
         recast_roles: 0,
         dropped_empty: 0,
+        reshaped_reasoning: 0,
     };
 
     let mut records: Vec<Record> = Vec::new();
@@ -417,6 +418,7 @@ struct Writer {
     downgraded_calls: usize,
     recast_roles: usize,
     dropped_empty: usize,
+    reshaped_reasoning: usize,
 }
 
 impl Writer {
@@ -519,6 +521,19 @@ impl Writer {
                 self.dropped_empty
             ),
         );
+        push(
+            LossKind::Reasoning,
+            self.reshaped_reasoning,
+            0,
+            0,
+            Fidelity::ConversationOnly,
+            format!(
+                "{} reasoning block(s) carried readable words but no Anthropic signature to \
+                 replay them under, so the words were written as assistant text. They survive; \
+                 the thinking block does not.",
+                self.reshaped_reasoning
+            ),
+        );
         losses
     }
 
@@ -558,14 +573,20 @@ impl Writer {
 
             Body::Reasoning { text, summary } => {
                 // Across providers the capsule must be dropped, and with it the
-                // block: an empty `signature` is not a thinking block Anthropic
-                // will accept, and a placeholder costs context window while
-                // telling the model its own reasoning was truncated.
+                // thinking *block*: an empty `signature` is not a thinking block
+                // Anthropic will accept — all 9,504 corpus thinking blocks carry
+                // one — and a placeholder costs context window while telling the
+                // model its own reasoning was truncated.
                 let sealed = event
                     .capsules
                     .iter()
                     .find(|capsule| self.keeps(capsule, false))
-                    .map(|capsule| capsule.sealed.clone())?;
+                    .map(|capsule| capsule.sealed.clone());
+
+                let Some(sealed) = sealed else {
+                    return self.reshape_reasoning(text.as_deref(), summary);
+                };
+
                 let mut thinking = text.clone().unwrap_or_default();
                 if !summary.is_empty() {
                     if !thinking.is_empty() {
@@ -671,6 +692,50 @@ impl Writer {
             | Body::Control { .. }
             | Body::Unknown { .. } => None,
         }
+    }
+
+    /// Readable reasoning with no signature to replay it under, as assistant
+    /// text.
+    ///
+    /// [`Body::Reasoning`] keeps its readable words in `text` or in `summary`
+    /// depending on which vendor recorded them, and a conversion may move them
+    /// between the two — [`super::codex_ir_write`] folds Claude's `thinking`
+    /// string into Codex's `summary`, because Codex has no plaintext reasoning
+    /// field. Coming back the other way there is no signature to rebuild a
+    /// thinking block around, and there is no minting one: Anthropic verifies it.
+    ///
+    /// What there is, is words the model read. Claude Code has exactly one place
+    /// for those, so they go there. The thinking block is gone and that is a
+    /// [`Fidelity::ConversationOnly`] downgrade; the words are not gone, which is
+    /// the part a writer is never allowed to decide on its own. Dropping them
+    /// silently is the defect this replaced: `claude → codex → claude` deleted
+    /// one event per reasoning block and graded itself `ContextComplete`.
+    ///
+    /// One block per piece rather than one joined string, because a joined string
+    /// is a different string: [`crate::compare`] accounts for each piece of
+    /// readable reasoning separately, and `"a\n\nb"` where `"a"` and `"b"` were
+    /// expected is content that did not arrive.
+    fn reshape_reasoning(&mut self, text: Option<&str>, summary: &[String]) -> Option<Part> {
+        let blocks: Vec<Value> = text
+            .into_iter()
+            .chain(summary.iter().map(String::as_str))
+            .filter(|piece| !piece.trim().is_empty())
+            .map(|piece| json!({"type": "text", "text": piece}))
+            .collect();
+        if blocks.is_empty() {
+            // A husk: reasoning that is neither readable nor sealed. There is
+            // nothing here for the resumed session to be missing, and the
+            // reader would discard an empty record anyway.
+            return None;
+        }
+        self.reshaped_reasoning += 1;
+        Some(Part {
+            side: Side::Assistant,
+            blocks,
+            is_text: true,
+            provides: Vec::new(),
+            answers: None,
+        })
     }
 
     /// `tool_use.input`, which the Anthropic API requires to be an object.

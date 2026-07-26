@@ -34,7 +34,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use casr::budget::ContextBudget;
-use casr::ir::{Block, Body, Fidelity, Role, SessionIr, ToolInput, ToolOutcome};
+use casr::ir::{Block, Body, Fidelity, Loss, LossKind, Role, SessionIr, ToolInput, ToolOutcome};
 use casr::providers::{
     Provider, WriteOptions, claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write,
 };
@@ -924,4 +924,196 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
 
     let reread = claude_code_ir::read(path).expect("the written transcript parses");
     assert_identical(path, &source, &reread);
+}
+
+// ---------------------------------------------------------------------------
+// Two hops, same agent at both ends
+// ---------------------------------------------------------------------------
+
+/// `claude → codex → claude`, which is the level a single hop cannot reach.
+///
+/// Both writers are the inverse of their own reader, and both single-hop suites
+/// said so, and the chain still deleted an event. The input that broke it is one
+/// no *corpus* session holds and one only this crate's own writer produces:
+/// [`casr::ir::Body::Reasoning`] whose readable words are in `summary` and which
+/// carries no capsule at all. Real Codex never writes that: of 106,289 corpus
+/// reasoning items, 106,255 keep their substance in `encrypted_content` and the
+/// 34 that carry a `summary` fill it with the empty string. So
+/// `claude_code_ir_write` had never been handed one, and it dropped the event on
+/// the floor while grading the conversion `ContextComplete`.
+///
+/// Claude's `thinking` is the source of those words and Codex's `summary` is
+/// where hop one is documented to put them, so the chain is the only way to
+/// build the input — which is why this is two hops and not a third case in
+/// `claude_fixture_crosses_to_codex_with_its_tool_pairs_intact`.
+#[test]
+fn readable_reasoning_survives_a_round_trip_through_codex() {
+    let source = claude_code_ir::read(&conformance_fixture("cc_thinking_text.jsonl"))
+        .expect("fixture parses");
+    let words = "The retry policy is set in two places; the transport one wins.";
+    assert!(
+        items(&source)
+            .iter()
+            .any(|item| item.kind == "reasoning" && item.label == words),
+        "the fixture must start with readable reasoning or it tests nothing"
+    );
+
+    // Hop one: the words move into Codex's `summary`, because Codex has no
+    // plaintext reasoning field. The Anthropic signature cannot cross and does
+    // not; that is the vendor boundary, and it is predicted.
+    let (mid, _) = through_codex(&source).expect("hop one renders");
+    assert!(
+        items(&mid).iter().any(|item| item.kind == "reasoning"
+            && item.label.is_empty()
+            && item.blocks == vec![words.to_string()]),
+        "hop one must carry the words in `summary`: {:?}",
+        items(&mid)
+    );
+    assert_eq!(
+        mid.model_visible()
+            .iter()
+            .map(|event| event.capsules.len())
+            .sum::<usize>(),
+        0,
+        "an Anthropic signature is not replayable by OpenAI and must not cross"
+    );
+
+    // Hop two: there is no signature to rebuild a thinking block around, so the
+    // words are written as assistant text. What is not allowed is for them to
+    // vanish, and what is not allowed is for the writer to keep quiet about the
+    // shape it lost.
+    let rendered = claude_code_ir_write::render(
+        &mid,
+        "chain-session",
+        chrono::Utc::now(),
+        &ContextBudget::UNLIMITED,
+    )
+    .expect("hop two renders");
+    let back = reparse(&rendered.lines, claude_code_ir::read);
+
+    let report = casr::compare::compare(&mid, &back, "anthropic");
+    assert!(
+        report.is_clean(),
+        "hop two lost something nothing predicted: {}",
+        report.damage_detail()
+    );
+    assert_eq!(
+        report.source_events, report.target_events,
+        "every model-visible event must arrive"
+    );
+    assert_eq!(report.added_events, 0, "reshaping is not inventing");
+    assert_eq!(
+        report.degraded.len(),
+        1,
+        "the thinking block is gone and that is a shape change, not a deletion: {:?}",
+        report.degraded
+    );
+    assert_eq!(report.degraded[0].kind, LossKind::Reasoning);
+
+    // The writer's own account of it, which is the half `compare` cannot check:
+    // a loss list that does not mention the reshaping would grade the chain
+    // `ContextComplete`, which is exactly how the defect stayed invisible.
+    let reshaped: Vec<&Loss> = rendered
+        .losses
+        .iter()
+        .filter(|loss| loss.kind == LossKind::Reasoning && loss.note.contains("assistant text"))
+        .collect();
+    assert_eq!(reshaped.len(), 1, "{:?}", rendered.losses);
+    assert_eq!(reshaped[0].events, 1);
+    assert_eq!(reshaped[0].grade, Fidelity::ConversationOnly);
+    assert_eq!(
+        rendered.fidelity,
+        Fidelity::ConversationOnly,
+        "the grade is the fold of the loss list and nothing else"
+    );
+    assert!(
+        rendered.fidelity > Fidelity::ContextComplete,
+        "a conversion that reshaped an event may not report a complete one"
+    );
+
+    // End to end: the words the model read at the start are words the model can
+    // read at the end.
+    assert!(
+        readable_text(&back).contains_key(words),
+        "the reasoning text did not survive the chain: {:?}",
+        items(&back)
+    );
+}
+
+/// A reasoning event with neither readable words nor a capsule this target can
+/// keep is a husk, and dropping a husk deletes nothing.
+///
+/// The other half of the fix. Codex writes 34 reasoning items whose `summary` is
+/// a single empty string, and a writer that treated "has a `summary`" as "has
+/// something to say" would turn every one of them into an empty assistant
+/// record — content the source never had.
+#[test]
+fn an_empty_reasoning_summary_is_still_nothing_to_carry() {
+    let mut ir = SessionIr::new("codex", "husk");
+    ir.events = vec![
+        message_event("m1", Role::User, "hello"),
+        reasoning_event("r1", vec![String::new(), "   ".to_string()]),
+        message_event("m2", Role::Assistant, "hi"),
+    ];
+
+    let rendered = claude_code_ir_write::render(
+        &ir,
+        "husk-session",
+        chrono::Utc::now(),
+        &ContextBudget::UNLIMITED,
+    )
+    .expect("renders");
+    let back = reparse(&rendered.lines, claude_code_ir::read);
+
+    assert_eq!(back.model_visible().len(), 2, "{:?}", items(&back));
+    assert_eq!(rendered.fidelity, Fidelity::ContextComplete);
+    assert!(rendered.losses.is_empty(), "{:?}", rendered.losses);
+    let report = casr::compare::compare(&ir, &back, "anthropic");
+    assert!(report.is_clean(), "{}", report.damage_detail());
+    assert_eq!(report.added_events, 0);
+}
+
+fn conformance_fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/conformance")
+        .join(name)
+}
+
+fn bare_event(id: &str, body: Body) -> casr::ir::Event {
+    casr::ir::Event {
+        id: id.to_string(),
+        parent: None,
+        branch: casr::ir::Branch::Main,
+        turn: None,
+        ts: None,
+        visibility: casr::ir::Visibility::Model,
+        body,
+        capsules: Vec::new(),
+        source: casr::ir::SourceRef {
+            line: 1,
+            sha256: String::new(),
+        },
+    }
+}
+
+fn message_event(id: &str, role: Role, text: &str) -> casr::ir::Event {
+    bare_event(
+        id,
+        Body::Message {
+            role,
+            blocks: vec![Block::Text {
+                text: text.to_string(),
+            }],
+        },
+    )
+}
+
+fn reasoning_event(id: &str, summary: Vec<String>) -> casr::ir::Event {
+    bare_event(
+        id,
+        Body::Reasoning {
+            text: None,
+            summary,
+        },
+    )
 }

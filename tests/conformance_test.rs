@@ -257,12 +257,32 @@ fn the_second_hop_recovers_the_corpus_capsules_the_first_hop_could_not_carry() {
 
 /// Print the counts, then fail on the objections.
 ///
-/// The assertion is an inequality, not one of the numbers: the numbers belong to
-/// whatever corpus is on the machine, and baking one in would turn a suite that
-/// measures the store into one that measures this laptop. What is asserted is
-/// that consulting the store never delivers *less* sealed material than not
-/// consulting it, and that a chain whose source carried capsules does not arrive
-/// empty — the exact defect the store was built for.
+/// No number is asserted: they belong to whatever corpus is on the machine, and
+/// baking one in would turn a suite that measures the store into one that
+/// measures this laptop. What is asserted are properties, and they are not the
+/// ones this suite used to assert.
+///
+/// It used to assert that consulting the store never delivers less sealed
+/// material than not consulting it. That is now **false**, and it has to be:
+/// correctly preferring an advanced derivative over an older-but-richer origin
+/// delivers fewer capsules on purpose. The two properties that are true, and that
+/// are the ones actually wanted, are that **the store may never deliver an
+/// outcome the user would not have got without it** —
+///
+/// - conversation content is a floor and never a trade, because a turn exists in
+///   one incarnation only and nothing can rebuild it; and
+/// - sealed material is a floor unless it is *bought* with content, because a
+///   capsule a derivative lacks is content its origin still holds
+///
+/// — with the old floor kept where it is still provably right: the arm where
+/// nothing was appended anywhere, in which the origin is strictly better and the
+/// store must deliver at least what `--no-store` does.
+///
+/// The per-chain half of those lives in `conformance::second_hop`, which can name
+/// the file. What is left here is the tier-wide half, and one assertion that is
+/// really about this suite rather than about the store: the appended arm has to
+/// have run. A second-hop suite that only measures untouched intermediates is
+/// measuring the one case where returning the origin is trivially correct.
 fn finish_hops(tier: &str, report: &HopReport) {
     report.print();
     assert!(
@@ -275,23 +295,54 @@ fn finish_hops(tier: &str, report: &HopReport) {
         report.findings().len(),
         report.findings().join("\n  ")
     );
-    let (source, with, without) = report.totals();
+
+    let untouched = report.untouched();
+    let appended = report.appended();
+
     assert!(
-        with >= without,
-        "the {tier} tier delivered {with} capsule(s) through the store against {without} without \
-         it; the store may never cost sealed material"
+        appended.sessions > 0,
+        "the {tier} tier appended work to no intermediate at all, so every chain it measured was \
+         the degenerate one where the intermediate is a lossy projection of the origin and \
+         returning the origin is trivially correct"
     );
-    if source > 0 {
+    assert_eq!(
+        appended.store_kept_work, appended.control_kept_work,
+        "the {tier} tier delivered the work appended to the intermediate in {} chain(s) without \
+         the store and only {} with it; content is a floor, never a trade",
+        appended.control_kept_work, appended.store_kept_work
+    );
+    assert!(
+        untouched.with_store >= untouched.without_store,
+        "the {tier} tier delivered {} capsule(s) through the store against {} without it with \
+         nothing appended anywhere; where nothing has advanced the origin is strictly better and \
+         the store may not cost sealed material",
+        untouched.with_store,
+        untouched.without_store
+    );
+    if untouched.source_capsules > 0 {
         assert!(
-            with > 0,
-            "the {tier} tier's sources carried {source} capsule(s) and the store-backed chain \
-             delivered none of them, which is the defect the store exists to fix"
+            untouched.with_store > 0,
+            "the {tier} tier's sources carried {} capsule(s) and the store-backed chain delivered \
+             none of them, which is the defect the store exists to fix",
+            untouched.source_capsules
         );
     }
     eprintln!(
-        "  tier {tier:?} second hop RAN: {} chain(s); {source} capsule(s) in the sources, \
-         {with} delivered with the store, {without} without it.",
-        report.sessions()
+        "  tier {tier:?} second hop RAN: {} chain(s).\n    nothing appended: {} capsule(s) in the \
+         sources, {} delivered with the store, {} without it.\n    work appended:    {} \
+         capsule(s) in the sources, {} delivered with the store, {} without it; the appended work \
+         arrived in {}/{} store-backed chains and {}/{} without one.",
+        report.sessions(),
+        untouched.source_capsules,
+        untouched.with_store,
+        untouched.without_store,
+        appended.source_capsules,
+        appended.with_store,
+        appended.without_store,
+        appended.store_kept_work,
+        appended.sessions,
+        appended.control_kept_work,
+        appended.sessions,
     );
 }
 

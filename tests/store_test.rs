@@ -256,6 +256,7 @@ fn a_record_holds_one_origin_and_a_derived_incarnation_per_conversion() {
         from,
         fidelity,
         losses,
+        snapshot,
     } = &reloaded
         .for_provider("claude-code")
         .expect("derived")
@@ -269,6 +270,12 @@ fn a_record_holds_one_origin_and_a_derived_incarnation_per_conversion() {
     assert_eq!(losses.len(), 1);
     assert_eq!(losses[0].capsules, 30_082);
     assert_eq!(losses[0].kind, LossKind::Reasoning);
+    // And the file we wrote was snapshotted, which is what makes "the user has
+    // since worked in this session" answerable by one `stat` later.
+    assert!(
+        snapshot.is_some(),
+        "a derived incarnation carries its own snapshot, taken at record_conversion"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +769,165 @@ fn best_source_depends_on_the_target_vendor() {
         to_gemini.chosen().expect("source").key,
         codex_key,
         "tied on capsules, the more complete copy of the conversation wins"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The rung above capsules
+// ---------------------------------------------------------------------------
+
+/// A codex origin holding `capsules` sealed capsules, plus one claude derivative.
+///
+/// Returned with both paths so a caller can append to either and re-rank.
+fn diverging_pair(
+    store: &Store,
+    tmp: &Path,
+    capsules: usize,
+) -> (casr::store::Record, PathBuf, PathBuf) {
+    let codex_path = write_session(tmp, "rollout.jsonl", "{}\n");
+    let cc_path = write_session(tmp, "cc.jsonl", "{}\n");
+    let codex_key = SessionKey::new("codex", "01JCODEX");
+    let cc_key = SessionKey::new("claude-code", "a3fCC");
+
+    let record = store
+        .ingest_origin(&codex_key, &codex_path, OriginPolicy::Reference)
+        .expect("ingest");
+    let record = store
+        .record_conversion(
+            &record.id,
+            DerivedWrite {
+                key: cc_key,
+                path: cc_path.clone(),
+                from: codex_key,
+                fidelity: Fidelity::ContextNoReasoning,
+                losses: Vec::new(),
+            },
+        )
+        .expect("record conversion");
+    store
+        .store_ir(
+            &record.id,
+            &ir_with_capsules(
+                "codex",
+                CapsuleKind::OpenaiReasoningEncryptedContent,
+                capsules,
+            ),
+        )
+        .expect("cache the origin IR");
+    (record, codex_path, cc_path)
+}
+
+/// Growth outranks capsules, and the explanation states the cost of that.
+///
+/// The defect this rung exists for: with capsules on top, the origin's nine
+/// sealed capsules beat everything the user did in Claude afterwards, the second
+/// hop wrote nothing, and the appended turns were gone with no way back.
+#[test]
+fn an_advanced_derivative_outranks_an_older_origin_with_more_capsules() {
+    let (tmp, store) = fresh();
+    let (record, _codex_path, cc_path) = diverging_pair(&store, tmp.path(), 9);
+    let codex_key = SessionKey::new("codex", "01JCODEX");
+    let cc_key = SessionKey::new("claude-code", "a3fCC");
+
+    // Nothing has advanced: the derivative is a lossy projection of the origin,
+    // holds nothing it lacks, and the capsule rung decides.
+    let before = store.best_source_for(&record, provider("codex"), registry());
+    assert_eq!(before.chosen().expect("source").key, codex_key);
+    assert!(!before.unmergeable());
+
+    // Two hours of work in Claude.
+    std::fs::write(&cc_path, "{}\n{\"work\":\"two hours of it\"}\n").expect("append");
+
+    let after = store.best_source_for(&record, provider("codex"), registry());
+    assert_eq!(
+        after.chosen().expect("source").key,
+        cc_key,
+        "content nothing else holds outranks capsules the origin still holds"
+    );
+    assert!(
+        !after.unmergeable(),
+        "one side advanced, so the ranking settled it"
+    );
+    let line = after.explain(Some(&cc_key));
+    println!("{line}");
+    assert!(
+        line.contains("gives up 9 capsules") && line.contains("codex 01JCODEX still holds"),
+        "the cost of keeping the newer work has to be stated: {line}"
+    );
+}
+
+/// Both advanced: the ranking cannot settle it, so the named session is read.
+#[test]
+fn a_diverged_record_reads_the_named_session_and_names_both_costs() {
+    let (tmp, store) = fresh();
+    let (record, codex_path, cc_path) = diverging_pair(&store, tmp.path(), 9);
+    let codex_key = SessionKey::new("codex", "01JCODEX");
+    let cc_key = SessionKey::new("claude-code", "a3fCC");
+
+    std::fs::write(&codex_path, "{}\n{\"more\":\"codex work\"}\n").expect("append to the origin");
+    std::fs::write(&cc_path, "{}\n{\"more\":\"claude work\"}\n").expect("append to the derivative");
+
+    let choice = store.best_source_for(&record, provider("codex"), registry());
+    assert!(choice.unmergeable());
+    assert_eq!(choice.unmerged().len(), 2);
+
+    // Whichever the user names is what they get — which is exactly what
+    // `--no-store` would have delivered, so the store cannot make it worse.
+    for named in [&cc_key, &codex_key] {
+        assert_eq!(
+            choice.resolve(Some(named)).expect("a source").key,
+            *named,
+            "a record this design cannot merge defers to the session the user named"
+        );
+    }
+    let line = choice.explain(Some(&cc_key));
+    println!("{line}");
+    assert!(line.contains("cannot merge two incarnations"), "{line}");
+    assert!(
+        line.contains("is missing whatever the others hold"),
+        "{line}"
+    );
+    assert!(line.contains("gives up 9 capsules"), "{line}");
+}
+
+/// An unknown never hands the choice to the older-but-richer incarnation, and
+/// never hands it to the other one either. It stops choosing.
+#[test]
+fn an_unknown_makes_the_record_unmergeable_rather_than_unmoved() {
+    let (tmp, store) = fresh();
+    let (record, _codex_path, cc_path) = diverging_pair(&store, tmp.path(), 9);
+    let codex_key = SessionKey::new("codex", "01JCODEX");
+    let cc_key = SessionKey::new("claude-code", "a3fCC");
+
+    // A record from before derived incarnations were snapshotted. Never migrated.
+    let mut without = record.clone();
+    for incarnation in &mut without.incarnations {
+        if let Role::Derived { snapshot, .. } = &mut incarnation.role {
+            *snapshot = None;
+        }
+    }
+
+    let choice = store.best_source_for(&without, provider("codex"), registry());
+    assert!(
+        choice.unmergeable(),
+        "an unmeasurable derivative is an unknown, not a proof that it did not advance"
+    );
+    assert_eq!(choice.resolve(Some(&cc_key)).expect("source").key, cc_key);
+    assert_eq!(
+        choice.resolve(Some(&codex_key)).expect("source").key,
+        codex_key,
+        "and it may not be read as 'advanced' either, or naming the origin would cost 9 capsules \
+         on a guess"
+    );
+
+    // A derivative the agent rewrote rather than appended to is the same answer.
+    std::fs::write(&cc_path, "not the bytes we wrote\n").expect("rewrite");
+    let diverged = store.best_source_for(&record, provider("codex"), registry());
+    assert!(diverged.unmergeable());
+    assert_eq!(
+        diverged.resolve(Some(&cc_key)).expect("source").key,
+        cc_key,
+        "a rewritten derivative is still the user's own session and still readable"
     );
 }
 

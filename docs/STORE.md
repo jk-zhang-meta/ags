@@ -28,35 +28,91 @@ though the bytes that would have replayed perfectly were sitting in
 That was a deduction from the two measured hops above. It is now measured
 directly, by `conformance::second_hop` (driver:
 `tests/conformance_test.rs::the_second_hop_recovers_the_corpus_capsules_the_first_hop_could_not_carry`),
-which runs the whole chain through `ConversionPipeline` both ways:
+which runs the whole chain through `ConversionPipeline` both ways, and does it
+twice: once on an untouched intermediate, and once after synthesised turns have
+been appended to it.
 
-| chain | sessions | capsules in the source | delivered with the store | delivered with `--no-store` |
-|---|---|---|---|---|
-| codex → claude → codex | 592 | 30,483 | 30,483 | 0 |
-| claude → codex → claude | 183 | 4,532 | 4,532 | 0 |
+| chain | arm | sessions | capsules in the source | delivered with the store | delivered with `--no-store` | appended work delivered, store / `--no-store` |
+|---|---|---|---|---|---|---|
+| codex → claude → codex | nothing appended | 596 | 30,606 | 30,606 | 0 | — |
+| codex → claude → codex | work appended (7,786,896 B) | 596 | 30,606 | 0 | 0 | 596 / 596 |
+| claude → codex → claude | nothing appended | 179 | 4,526 | 4,526 | 0 | — |
+| claude → codex → claude | work appended (317,367 B) | 179 | 4,526 | 0 | 0 | 179 / 179 |
 
-The suite asserts the inequality — consulting the store may never deliver less
-sealed material than not consulting it, and a chain whose source carried capsules
-may not arrive empty — and prints the numbers. It does not assert them, and the
-table above is one run rather than a constant: the corpus is live and grows while
-the suite runs against it (two runs an hour apart read 30,622 and 30,483 for the
-same chain). Baking a number in would turn a suite that measures the store into
-one that measures a particular laptop on a particular afternoon.
+The numbers are printed, never asserted: the corpus is live and grows while the
+suite runs against it (four runs read 30,622, 30,483, 30,524 and 30,606 for the
+same chain). Baking one in would turn a suite that measures the store into one
+that measures a particular laptop on a particular afternoon.
 
-One consequence of the ranking is visible in that table and is worth stating
-plainly, because it is a trade and not a free win. For a Codex target the origin
-wins on capsules *and* on needing no conversion, so the second hop returns the
-original Codex session and writes nothing at all. Every capsule survives, and
-anything the agent appended on the **Claude** side does not come back with it —
-the design has no way to merge two incarnations, and does not claim one. The
-choice is stated in the output (`source: codex 01J… (origin; you named
-claude-code a3f…, …)`), which is what makes it a choice the user can override
-with `--no-store` rather than a surprise.
+The second row of each pair is the one worth reading twice. With work appended,
+the store delivers **zero** capsules where the untouched arm delivers all of
+them — and that is correct. It is the trade the corrected ranking exists to make:
+the appended turns exist in the Claude session only, nothing can rebuild them,
+and the 30,606 capsules the Codex origin holds are content that origin still has.
+The store also stops overriding there — it read the session the hop named in all
+775 appended chains, against all 775 in the untouched arm — because the session
+the user named is now the right one. See "what outranks what" below.
 
-Nothing in the conversion is wrong. The loss is correct at each hop and
-reported at each hop. The defect is that the second hop *asked the wrong
-source*. It read the degraded Claude session because that is the session the
-user named, when a strictly better source for a Codex target existed.
+### Why the untouched arm alone was worthless
+
+It was the whole measurement, and it measured the one case where the mechanism
+has no value. With nothing appended, the intermediate is a lossy projection of
+the origin, so returning the origin is *trivially* correct — and trivially
+worthless, because the user already had the origin. The 30,483/30,483/0 result
+was real and proved nothing about the case a user is actually in.
+
+That gap hid a real defect for exactly as long as it existed. Ranking capsules
+above growth meant a Codex origin beat a Claude derivative for a Codex target *no
+matter how much work the user had done in Claude*: the second hop returned the
+original Codex session, wrote nothing, and handed back the file the user already
+had, while two hours of appended turns went silently missing behind a line that
+reads like a win.
+
+So the suite appends before hop two (`conformance::append_turns`), and the
+appended turns are appended and not written over: growth is what the store
+detects, and a rewrite reads as *divergence* instead. That is also what a real
+agent does, since both structured session formats are append-only JSONL logs.
+
+### What the suite asserts now
+
+It used to assert that consulting the store never delivers less sealed material
+than not consulting it. That assertion is **false** once the ranking is right,
+and the appended rows above are it being false on purpose. The property that is
+both true and wanted is narrower and stronger:
+
+> **The store may never deliver an outcome the user would not have got without
+> it.** `--no-store` is the baseline for both halves of what is delivered,
+> because without a store the user gets exactly the session they named,
+> converted.
+>
+> - **Conversation content is a floor, never a trade.** Anything the `--no-store`
+>   arm delivered must be in the store arm's session too. A turn exists in one
+>   incarnation only and no conversion can rebuild it, so losing one is
+>   unrecoverable and is never justified by anything.
+> - **Sealed material is a floor unless it is bought.** The store arm may deliver
+>   fewer capsules than the `--no-store` arm only where it delivered content the
+>   `--no-store` arm did not.
+>
+> And where nothing has advanced at all — the untouched arm — neither clause can
+> bite, so the old floor still holds there and is still asserted: the store
+> delivers at least what `--no-store` does, and a chain whose source carried
+> capsules does not arrive empty.
+
+"The appended work arrived" is a substring test on the bytes the chain delivered,
+not an event count. An event count is not decidable here: two formats
+legitimately split one native line into a different number of events, so a count
+that went down could always be explained away as structural — which is how
+content loss stays invisible.
+
+One assertion is about the suite rather than about the store: the appended arm
+has to have run at all. A second-hop suite that only measures untouched
+intermediates is measuring the one case where returning the origin is trivially
+correct, and that is the state this suite was in.
+
+Nothing in the conversion is wrong, in either direction. The loss is correct at
+each hop and reported at each hop. The defect was that the second hop *asked the
+wrong source* — and then, once it started asking, that it asked with the rungs in
+the wrong order.
 
 That is the store's job: **remember that two provider sessions are the same
 conversation, so a conversion can choose its source instead of inheriting
@@ -145,11 +201,18 @@ $AGSX_STORE  (default: dirs::data_dir()/agsx, else ~/.agsx)
 ```
 
 A **record** is one conversation. It holds N **incarnations**, each a
-`(provider, provider_session_id)` pair with a role — one `Origin`, and one
-`Derived { from, fidelity, losses }` per conversion we performed. The record
-id is a fresh UUID minted at first ingest, not derived from content: sessions
-are append-only logs that keep growing, so a content-derived id would change
-under the conversation it names.
+`(provider, provider_session_id)` pair with a role — one
+`Origin { snapshot }`, and one `Derived { from, fidelity, losses, snapshot }`
+per conversion we performed. The record id is a fresh UUID minted at first
+ingest, not derived from content: sessions are append-only logs that keep
+growing, so a content-derived id would change under the conversation it names.
+
+Both roles carry a snapshot, and both snapshots answer the same question — has
+this file moved since we last looked? — by the same two cheap fields. An
+origin's is taken at ingest; a derived incarnation's at `record_conversion`, on
+the file this tool has just written. `Derived.snapshot` is an `Option` and
+absent means *unknown*, because records written before it existed are never
+migrated. See "detecting growth, and what an unknown does".
 
 A record holds **exactly one** `Origin`. An earlier draft said "one `Origin`"
 in one place and "the latest origin snapshot *per provider*" in another, which
@@ -170,9 +233,14 @@ once `ir.json` exists, against **550 µs** for a single provider parse (release;
 11.6 ms and 4.0 ms unoptimised) and tens of milliseconds for the conversion the
 ranking precedes
 (`store_test::ranking_a_realistic_candidate_list_is_cheap_next_to_the_conversion`).
-So there is no derived-IR cache, and the reason is not only the ~1 ms: a derived
-session is the file an agent has been editing, so a cache of it would need an
-invalidation rule that the origin's `(size, mtime, prefix hash)` cannot supply.
+So there is no derived-IR cache, and the reason is the ~1 ms. An earlier draft
+gave a second reason — that a derived session is the file an agent has been
+editing, so a cache of it would need an invalidation rule nothing could supply —
+and that reason has since stopped being true: a derived incarnation now carries
+its own `(size, mtime, prefix hash)` snapshot, taken when this tool wrote the
+file, because the ranking needs to know whether the agent appended to it. The
+invalidation rule exists. The ~1 ms is still not worth a second cache, so the
+answer is unchanged and the argument for it is one clause shorter.
 
 Also omitted, and additive to add later: any cross-machine sync story.
 
@@ -213,22 +281,127 @@ when the target is Gemini" still has to pick one. The order, declared once as
 the field order of a `Rank` and walked by the explanation so that the reason
 given is the reason that actually decided:
 
-readable → capsules that fit → needs-no-conversion → recorded completeness →
-origin-before-derived → recency.
+readable → **has content the other lacks** → capsules that fit →
+needs-no-conversion → recorded completeness → origin-before-derived → recency.
 
-The third rung is the one this document got wrong. It asserted that a Codex
-origin beats a Claude derivative for a Codex target, which is true, and left
-the symmetric case unstated — where it is **false**. For a Claude target the
-Codex origin does *not* win: converting it costs something and the Claude
-incarnation is already there. Without a needs-no-conversion rung the ranking
-would have been asymmetric in the wrong direction.
+The needs-no-conversion rung is the one an earlier draft of this document got
+wrong by omission. It asserted that a Codex origin beats a Claude derivative for
+a Codex target, which is true, and left the symmetric case unstated — where it is
+**false**. For a Claude target the Codex origin does *not* win: converting it
+costs something and the Claude incarnation is already there. Without a
+needs-no-conversion rung the ranking would have been asymmetric in the wrong
+direction.
+
+### What outranks what, and why growth outranks capsules
+
+The second rung is the one this document got wrong outright, by not having it.
+With capsules at the top, a Codex origin beat a Claude derivative for a Codex
+target *no matter how much work the user had done in Claude*, and the store
+answered a request to continue that work by handing back the file it started
+from. That is the store discarding the very thing it exists to protect.
+
+The two quantities are not the same kind of thing, and that is the whole
+argument. At the moment of derivation a derivative is a lossy **projection** of
+its origin, so every capsule it lacks is content the origin *still has* — the
+loss is recoverable, by reading the origin, which is exactly what the ranking
+does. Turns appended afterwards are content **nothing else has**: no other
+incarnation holds them and no conversion can reconstruct them. A recoverable loss
+may never outrank an unrecoverable one.
+
+Four cases, and the design has an answer for each:
+
+| origin advanced | derivative advanced | outcome |
+|---|---|---|
+| no | no | **origin wins.** Neither holds conversation content the other lacks — see the projection argument above — so the capsule rung decides, and it decides for the origin. The original behaviour, and correct. |
+| yes | no | **origin wins.** It has both the newer turns and the capsules; there is nothing to trade. |
+| no | yes | **the derivative wins**, and the capsule cost is stated. Never silently prefer older-but-richer. |
+| yes | yes | **genuine divergence.** This design cannot merge incarnations and does not claim to. |
+
+The last row resolves to *today's behaviour plus a loud warning*, not to a
+refusal: the session the user actually named is read, with the specific cost of
+each side reported. The reasoning is the load-bearing one, and it is the same
+invariant as "no store failure may fail a conversion" applied to a question the
+store cannot answer rather than to one it cannot reach — **without the store the
+user would have got the named session anyway, so falling back to it means the
+store can never make an outcome worse than not having the store.** A hard error
+would fail a conversion that `--no-store` performs fine; guessing would silently
+drop one side's work.
+
+What that gives up is small and worth naming: the *choice* is no longer strictly
+independent of what the user asked for. It is independent wherever the ranking
+can decide, and defers to the user only where it cannot — which is the stronger
+of the two available properties, since the alternative is deciding by coin-flip.
+`SourceChoice::chosen` is still the ranking's own answer, told nothing;
+`SourceChoice::resolve(named)` is what the pipeline reads.
+
+### Detecting growth, and what an unknown does
+
+By the same cheap check as an origin reference, because it is the same check:
+`(size, mtime)` decides, and the recorded prefix hash is the confirming read only
+when it must be. Ranking stays one `stat` per candidate — 561 ns and zero bytes
+read — against 3.903 s for a full SHA-256 of the largest rollout.
+
+That needs something the store did not record. `Role::Origin` had a snapshot;
+`Role::Derived` had only `from`, `fidelity` and `losses`, so growth in a
+derivative was invisible. It now carries its **own** snapshot, taken at
+`record_conversion` on the file we have just written — a one-time cost on warm
+bytes, paid once per conversion rather than once per ranking. It is the same
+`OriginSnapshot`/`OriginState` pair and not a parallel type: both roles want the
+same three answers from the same two cheap fields. Only `archived` is
+origin-only, and it is an `Option` that a derived incarnation leaves `None`; a
+session this tool wrote can be written again, so there is nothing to archive
+against its loss.
+
+What differs is not the answer but what is done with it, and the asymmetry is
+deliberate. An origin's snapshot *stands in for* bytes the store does not hold,
+so a file that diverged from it can no longer be claimed as that origin and the
+archived copy — or nothing — takes over. A derived session's snapshot is only a
+growth marker on a file this tool wrote; a derivative that diverged is still the
+user's own session, still right there, and still the thing they may have spent
+two hours in. So it stays readable and its divergence becomes an *unknown*.
+
+Records written before this existed have no derived snapshot, and there is no
+migration — the store's rule is that caches are rebuilt and records are never
+migrated, and a snapshot is a record: an observation of a file at a moment that
+has passed and cannot be retaken. An absent snapshot therefore means **unknown**,
+and an unknown must fail safe. "Fail safe" is not obvious here, so it is spelled
+out:
+
+- Reading an unknown as *did not advance* resurrects the original defect exactly:
+  the origin wins on capsules and the user's work disappears.
+- Reading it as *advanced* is worse in the other direction: the derivative would
+  then beat an origin the user explicitly named, dropping 30,606 capsules on a
+  guess. That is strictly worse than `--no-store`, which is the one thing the
+  store may never be.
+
+So an unknown ranks as holding unseen content — it never loses that rung to a
+candidate the store *can* vouch for — and it makes the record unmergeable, which
+is the same fallback as genuine divergence: read what the user named, and say
+why. It self-heals the next time a conversion writes that session.
+
+An unmergeable record is reported through `warnings` rather than through a new
+`source_selection` field. By that field's own rule there is nothing to report —
+no session was substituted — and growing the substitution contract to cover a
+case where nothing was substituted would make it mean two things.
+
+### What the explanation has to say
+
+`SourceChoice::explain(named)` used to frame every choice as strictly better: it
+said what taking the user's suggestion *would have cost* and never what not
+taking it *did* cost. That reads as a win in exactly the two rows where something
+real is being given up — the derivative-wins row and the divergence row — so it
+now states the cost in both directions. A line names, in order: the source and
+how its snapshot resolved; why the named session was not read, if it was not;
+that the record could not be merged, if it could not, with each unmerged
+incarnation's state; and what the chosen source **gives up** in sealed material
+that another readable incarnation still holds.
 
 Consequences worth naming before they surprise someone:
 
 - The store may read a session the user did not name. That has to be visible
   in the output, not just in the result: "source: codex `01J…` (origin;
   you named claude-code `a3f…`, which would have cost 3 capsules (10536 bytes
-  of sealed material))".
+  of sealed material) and holds nothing appended since)".
 - That line is not reachable from the signature above, which is never told what
   the user named — an under-specification in this document, not an error in it.
   The resolution is a deliberate split: `best_source_for` returns **every**

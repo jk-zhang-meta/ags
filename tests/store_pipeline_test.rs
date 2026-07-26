@@ -219,6 +219,271 @@ fn the_second_hop_reads_the_origin_the_first_hop_could_not_carry() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The four rows of the growth table
+// ---------------------------------------------------------------------------
+
+/// A conversation as a fresh store sees it, with both files writable.
+///
+/// The Codex origin is a *copy* of the fixture in `tmp`, not the fixture itself,
+/// so a row that needs the origin to have advanced can append to it. The repo's
+/// fixtures are only ever read.
+struct Chain {
+    tmp: tempfile::TempDir,
+    _redirect: Vec<EnvGuard>,
+    stored: ConversionPipeline,
+    origin: PathBuf,
+    intermediate: PathBuf,
+    origin_capsules: usize,
+}
+
+const MARKER: &str = "TWO-HOURS-OF-WORK-IN-CLAUDE";
+
+fn chain() -> Chain {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let redirect = redirect(tmp.path());
+
+    let origin = tmp.path().join("rollout.jsonl");
+    std::fs::copy(fixture(CODEX_WITH_CAPSULES), &origin).expect("copy the fixture");
+    let origin_capsules = capsules_in("codex", &origin);
+    assert!(
+        origin_capsules > 0,
+        "the fixture must carry sealed material"
+    );
+
+    let stored = pipeline(Some(
+        Store::open_at(tmp.path().join("store")).expect("open store"),
+    ));
+    let first = convert(&stored, "cc", &origin).expect("codex -> claude");
+    let intermediate = delivered(&first);
+    assert_eq!(
+        capsules_in("claude-code", &intermediate),
+        0,
+        "no openai capsule may cross into an anthropic session"
+    );
+
+    Chain {
+        tmp,
+        _redirect: redirect,
+        stored,
+        origin,
+        intermediate,
+        origin_capsules,
+    }
+}
+
+/// Two hours of work in the intermediate, as the append-only log records it.
+fn work_in(path: &Path, provider: &str, turns: usize) -> u64 {
+    casr::conformance::append_turns(path, provider, MARKER, turns)
+        .unwrap_or_else(|error| panic!("append to {}: {error}", path.display()))
+}
+
+fn holds_the_work(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
+        .contains(MARKER)
+}
+
+/// **Row 3 of the table.** The user worked in the derivative for two hours, so
+/// the derivative must win — and the capsule cost of that has to be stated.
+///
+/// This is the defect the corrected design exists for. Ranking capsules above
+/// growth returns the Codex origin here, writes nothing, and hands back the file
+/// the user already had: the fifty appended turns are simply gone, and the output
+/// line reads like a win.
+#[test]
+fn the_work_the_user_did_in_the_derivative_outranks_the_origin_s_capsules() {
+    let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let chain = chain();
+
+    let added = work_in(&chain.intermediate, "claude-code", 25);
+    assert!(added > 0, "the append added no bytes");
+    assert!(holds_the_work(&chain.intermediate));
+
+    let second = convert(&chain.stored, "cod", &chain.intermediate).expect("claude -> codex");
+    let delivered = delivered(&second);
+    let selection = second.source.as_ref().expect("a store-backed selection");
+
+    assert!(
+        holds_the_work(&delivered),
+        "the store delivered {} for a Codex target and the two hours of work appended to \
+         {} are not in it. It chose {}, which is older-but-richer: {}",
+        delivered.display(),
+        chain.intermediate.display(),
+        selection
+            .chosen()
+            .map(|chosen| chosen.key.to_string())
+            .unwrap_or_default(),
+        selection.line()
+    );
+    assert_eq!(
+        selection.chosen().expect("a chosen source").key,
+        SessionKey::new("claude-code", chain.intermediate_id()),
+        "the incarnation that holds content nothing else has must be the source"
+    );
+    // What that costs is stated, in the direction it is actually paid.
+    let line = selection.line();
+    assert!(
+        line.contains("gives up") && line.contains(&format!("{} capsules", chain.origin_capsules)),
+        "the capsule cost of keeping the newer work must be reported: {line}"
+    );
+}
+
+/// **Row 1 of the table.** Nothing appended anywhere: the origin still wins,
+/// because at the moment of derivation the derivative is a lossy projection of it
+/// and so holds nothing it lacks.
+#[test]
+fn with_nothing_appended_the_origin_still_wins() {
+    let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let chain = chain();
+
+    let second = convert(&chain.stored, "cod", &chain.intermediate).expect("claude -> codex");
+    let selection = second.source.as_ref().expect("a store-backed selection");
+    assert!(selection.overrode(), "{}", selection.line());
+    assert_eq!(
+        capsules_in("codex", &delivered(&second)),
+        chain.origin_capsules,
+        "with nothing appended the origin loses nothing and carries every capsule"
+    );
+}
+
+/// **Row 2 of the table.** Only the origin advanced, so it holds both the newer
+/// turns and the capsules.
+#[test]
+fn when_only_the_origin_advanced_it_holds_everything() {
+    let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let chain = chain();
+
+    work_in(&chain.origin, "codex", 5);
+
+    let second = convert(&chain.stored, "cod", &chain.intermediate).expect("claude -> codex");
+    let selection = second.source.as_ref().expect("a store-backed selection");
+    assert_eq!(
+        selection.chosen().expect("a chosen source").key,
+        SessionKey::new("codex", chain.origin_id()),
+        "{}",
+        selection.line()
+    );
+    assert!(
+        holds_the_work(&delivered(&second)),
+        "the origin's own newer turns must arrive: {}",
+        selection.line()
+    );
+}
+
+/// **Row 4 of the table.** Both advanced. Nothing here can merge two
+/// incarnations, so the session the user named is read — which is what they would
+/// have got with `--no-store` — and both costs are stated.
+#[test]
+fn genuine_divergence_reads_the_named_session_and_says_what_each_side_costs() {
+    let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let chain = chain();
+
+    work_in(&chain.origin, "codex", 5);
+    work_in(&chain.intermediate, "claude-code", 25);
+
+    let second = convert(&chain.stored, "cod", &chain.intermediate).expect("claude -> codex");
+    let selection = second.source.as_ref().expect("a store-backed selection");
+
+    assert!(
+        !selection.overrode(),
+        "a record this design cannot merge must fall back to the session the user named, which \
+         is what `--no-store` would have delivered: {}",
+        selection.line()
+    );
+    assert!(
+        holds_the_work(&delivered(&second)),
+        "the named session's own work must arrive: {}",
+        selection.line()
+    );
+    let line = selection.line();
+    for expected in ["cannot merge", "gives up", "is missing"] {
+        assert!(
+            line.contains(expected),
+            "a divergence has to state the cost of both sides; no {expected:?} in: {line}"
+        );
+    }
+    assert!(
+        second
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("cannot merge")),
+        "and it has to be loud, not only in the source line: {:?}",
+        second.warnings
+    );
+}
+
+/// A record written before derived snapshots existed cannot be judged, and an
+/// unknown must not be read as "did not advance" — that is the defect again.
+///
+/// It resolves the same way divergence does: read what the user named, which is
+/// never worse than `--no-store`, and say why.
+#[test]
+fn a_derived_incarnation_with_no_snapshot_falls_back_to_the_named_session() {
+    let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let chain = chain();
+
+    // Strip the snapshot the way a record written by the previous build has it:
+    // absent. Records are never migrated, so this shape is permanent.
+    let store_root = chain.tmp.path().join("store");
+    let record = std::fs::read_dir(store_root.join("records"))
+        .expect("records")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("record.json"))
+        .find(|path| path.is_file())
+        .expect("one record");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).expect("read")).expect("parse");
+    let mut stripped = 0;
+    for incarnation in json["incarnations"]
+        .as_array_mut()
+        .expect("incarnations")
+        .iter_mut()
+    {
+        let role = incarnation["role"].as_object_mut().expect("a role object");
+        if role.get("role").and_then(|tag| tag.as_str()) == Some("derived")
+            && role.remove("snapshot").is_some()
+        {
+            stripped += 1;
+        }
+    }
+    assert_eq!(stripped, 1, "one derived snapshot to strip");
+    std::fs::write(&record, serde_json::to_vec_pretty(&json).expect("encode")).expect("write");
+
+    let second = convert(&chain.stored, "cod", &chain.intermediate).expect("claude -> codex");
+    let selection = second.source.as_ref().expect("a store-backed selection");
+    assert!(
+        !selection.overrode(),
+        "an unknown must not hand the choice to the older-but-richer incarnation: {}",
+        selection.line()
+    );
+}
+
+impl Chain {
+    /// The Claude session id the first hop minted, which is how the store knows
+    /// the intermediate.
+    fn intermediate_id(&self) -> String {
+        self.intermediate
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    /// The Codex session id, read out of the copied rollout's own first line.
+    fn origin_id(&self) -> String {
+        let text = std::fs::read_to_string(&self.origin).expect("read the origin");
+        let first = text.lines().next().expect("a first line");
+        serde_json::from_str::<serde_json::Value>(first)
+            .ok()
+            .and_then(|line| {
+                line.pointer("/payload/id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .expect("the rollout names its own session id")
+    }
+}
+
 /// The same chain with no store loses all of it — which is the defect, measured.
 #[test]
 fn the_same_second_hop_without_a_store_arrives_empty() {

@@ -165,13 +165,29 @@ impl std::fmt::Display for SessionKey {
 // Origin references
 // ---------------------------------------------------------------------------
 
-/// What the store saw when it last looked at an origin session file.
+/// What the store saw when it last looked at a session file.
 ///
 /// `sha256` covers the first `size` bytes — which was the whole file at
 /// snapshot time. Storing the length the digest covers is what makes the
 /// append-only case decidable later: a live session log grows, and the
 /// question "is this still the file I hashed?" is really "does its first
 /// `size` bytes still hash to this?".
+///
+/// # Why one type for both roles
+///
+/// An origin is snapshotted at ingest and a derived incarnation at
+/// [`Store::record_conversion`], and the two want the same three answers from
+/// the same two cheap fields, so they share the type rather than growing a
+/// parallel one. What differs is what a caller *does* with the answer, not the
+/// answer: an origin's snapshot is a reference standing in for bytes the store
+/// does not hold, so divergence means the file can no longer be claimed as that
+/// origin; a derived incarnation's is only a growth marker, and a derivative
+/// that diverged is still the user's own session and still readable. See
+/// [`Store::locate`].
+///
+/// [`OriginSnapshot::archived`] is meaningful for an origin only. A derived
+/// session is a file this tool wrote and can write again; there is nothing to
+/// archive against its loss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginSnapshot {
     /// SHA-256 of the first `size` bytes.
@@ -327,6 +343,77 @@ impl OriginState {
     }
 }
 
+/// Whether an incarnation holds conversation content the store has never seen.
+///
+/// This is the rung above capsules, and the reason it has to be above them is
+/// that the two quantities are not the same kind of thing. At the moment of
+/// derivation a derivative is a lossy *projection* of its origin, so every
+/// capsule it lacks is content the origin still has — recoverable, by reading the
+/// origin. Turns appended afterwards are content **nothing else has**: no other
+/// incarnation holds them and no conversion can reconstruct them. Ranking a
+/// recoverable loss above an unrecoverable one is how a store built to save work
+/// came to discard it.
+///
+/// Detection is growth, by the same cheap check as [`OriginState`]: `(size,
+/// mtime)` decides, and the recorded prefix hash is the confirming read only
+/// when it must be. Ranking therefore stays one `stat` per candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Advance {
+    /// The file is the bytes the store recorded. Whatever it holds, some other
+    /// incarnation was derived from exactly this and holds it too.
+    Unmoved,
+    /// The file grew and its recorded prefix still matches: an append-only
+    /// session log that moved on. It holds turns nothing derived from it can.
+    Advanced { added_bytes: u64 },
+    /// The store cannot tell. A record written before derived incarnations were
+    /// snapshotted, or a file that no longer matches the prefix it recorded.
+    ///
+    /// Never read as [`Advance::Unmoved`]. Treating an unknown as "did not
+    /// advance" is precisely the assumption that let an older-but-richer origin
+    /// win over two hours of the user's work, so an unknown makes the record
+    /// [`SourceChoice::unmergeable`] instead: the store stops choosing and reads
+    /// what the user named, which is what they would have got without it.
+    Unknown { why: String },
+}
+
+impl Advance {
+    /// What a snapshot's resolution says about unseen content. `None` is an
+    /// incarnation the store never snapshotted at all.
+    fn of(state: Option<&OriginState>) -> Self {
+        match state {
+            None => Advance::Unknown {
+                why: "the store has no snapshot of it, so growth cannot be measured".to_string(),
+            },
+            Some(OriginState::Unchanged { .. }) => Advance::Unmoved,
+            Some(OriginState::Grew { added_bytes }) => Advance::Advanced {
+                added_bytes: *added_bytes,
+            },
+            Some(OriginState::Unavailable { reason }) => Advance::Unknown {
+                why: reason.clone(),
+            },
+        }
+    }
+
+    /// Whether the store can prove this incarnation holds nothing new.
+    pub fn unmoved(&self) -> bool {
+        match self {
+            Advance::Unmoved => true,
+            Advance::Advanced { .. } | Advance::Unknown { .. } => false,
+        }
+    }
+
+    /// One clause for a human, suitable for embedding in a list.
+    pub fn describe(&self) -> String {
+        match self {
+            Advance::Unmoved => "holds nothing appended since the store recorded it".to_string(),
+            Advance::Advanced { added_bytes } => {
+                format!("{added_bytes} bytes appended since the store recorded it")
+            }
+            Advance::Unknown { why } => format!("cannot be judged — {why}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
@@ -348,6 +435,21 @@ pub enum Role {
         from: SessionKey,
         fidelity: Fidelity,
         losses: Vec<Loss>,
+        /// What the file looked like the moment we finished writing it.
+        ///
+        /// The whole point is the *difference* from now: an agent that worked in
+        /// this session appended to it, and those turns exist nowhere else. One
+        /// `stat` answers it, so it costs the ranking nothing.
+        ///
+        /// `None` is a record written before derived incarnations were
+        /// snapshotted. It is not migrated — the store's rule is that caches are
+        /// rebuilt and records are never migrated, and this is a record: an
+        /// observation of a file at a moment that has passed and cannot be
+        /// retaken. `None` therefore means *unknown*, resolves to
+        /// [`Advance::Unknown`], and heals the next time a conversion writes
+        /// this session.
+        #[serde(default)]
+        snapshot: Option<OriginSnapshot>,
     },
 }
 
@@ -710,6 +812,13 @@ impl Store {
     }
 
     /// Remember a conversion we just performed.
+    ///
+    /// Snapshots the file we wrote, which is what makes "the user has since
+    /// worked in this session" detectable later — see [`Advance`]. It is a
+    /// one-time hash of a file this process just produced and still has warm,
+    /// paid once per conversion rather than once per ranking. A snapshot that
+    /// cannot be taken is recorded as absent rather than fatal: an unknown fails
+    /// safe, and losing the whole lineage over it would be a worse cache.
     pub fn record_conversion(
         &self,
         record_id: &str,
@@ -723,6 +832,17 @@ impl Store {
                 id: record_id.to_string(),
             })?;
 
+        let snapshot = match OriginSnapshot::of(&derived.path) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                warn!(
+                    path = %derived.path.display(),
+                    %err,
+                    "could not snapshot the session we just wrote; its growth will read as unknown"
+                );
+                None
+            }
+        };
         let fresh = Incarnation {
             key: derived.key.clone(),
             path: derived.path,
@@ -731,6 +851,7 @@ impl Store {
                 from: derived.from,
                 fidelity: derived.fidelity,
                 losses: derived.losses,
+                snapshot,
             },
         };
         match record
@@ -954,6 +1075,7 @@ impl Store {
                     path,
                     role: inc.role.clone(),
                     recorded_at: inc.recorded_at,
+                    advance: Advance::of(origin_state.as_ref()),
                     origin_state,
                     availability,
                     capsules,
@@ -1077,7 +1199,19 @@ impl Store {
         }
     }
 
-    /// Where to read a candidate, and whether it can be read at all.
+    /// Where to read a candidate, whether it can be read at all, and how its
+    /// recorded snapshot resolves.
+    ///
+    /// The two roles read the same snapshot and draw opposite conclusions from
+    /// `Unavailable`, which is the asymmetry worth stating. An origin's snapshot
+    /// *stands in for* bytes the store does not hold, so a file that diverged from
+    /// it can no longer be claimed as that origin and the archived copy — or
+    /// nothing — takes over. A derived session's snapshot is only a growth marker
+    /// on a file this tool wrote; a derivative that diverged is still the user's
+    /// own session, still right there, and still the thing they may have spent two
+    /// hours in. So it stays readable and the divergence becomes
+    /// [`Advance::Unknown`], which fails safe by deferring to what the user named
+    /// rather than by hiding their work.
     fn locate(
         &self,
         record: &Record,
@@ -1105,18 +1239,18 @@ impl Store {
                     }
                 }
             }
-            Role::Derived { .. } => {
-                if inc.path.is_file() {
-                    (inc.path.clone(), Availability::Ready, None)
-                } else {
-                    (
+            Role::Derived { snapshot, .. } => {
+                if !inc.path.is_file() {
+                    return (
                         inc.path.clone(),
                         Availability::Unavailable {
                             why: "the written session file is gone".to_string(),
                         },
                         None,
-                    )
+                    );
                 }
+                let state = snapshot.as_ref().map(|snapshot| snapshot.state(&inc.path));
+                (inc.path.clone(), Availability::Ready, state)
             }
         }
     }
@@ -1227,10 +1361,16 @@ pub struct SourceCandidate {
     /// Origin or derived, with the lineage the record recorded.
     pub role: Role,
     pub recorded_at: i64,
-    /// The three-way resolution of an origin reference. `None` for a derived
-    /// incarnation, which the store never snapshotted — the agent has been
-    /// editing it, so a hash would only ever say "diverged".
+    /// The three-way resolution of this incarnation's recorded snapshot.
+    ///
+    /// `None` only when there is no snapshot to resolve: a derived incarnation
+    /// from a record written before they were snapshotted. Both roles carry one
+    /// otherwise, and the two roles read `Unavailable` differently — see
+    /// [`Store::locate`].
     pub origin_state: Option<OriginState>,
+    /// Whether this incarnation holds conversation content the store has never
+    /// seen. Derived from `origin_state`, and the rung above capsules.
+    pub advance: Advance,
     pub availability: Availability,
     pub capsules: Inventory,
 }
@@ -1263,8 +1403,18 @@ impl SourceCandidate {
 struct Rank {
     /// Unreadable candidates last.
     unreadable: bool,
-    /// More capsules that fit the target, first. This is the decision the
-    /// design is built around and it is computed by `Capsule::fits`.
+    /// An incarnation that holds conversation content the others lack, first —
+    /// above capsules, and above needing no conversion.
+    ///
+    /// The rung the design originally did not have, and the one it was wrong
+    /// without. Capsules a derivative lacks are content its origin still holds;
+    /// turns appended to it afterwards are content nothing else holds and no
+    /// conversion can rebuild. See [`Advance`]. An [`Advance::Unknown`] counts as
+    /// holding unseen content here, so a candidate the store cannot vouch for
+    /// never loses this rung to one it can — and when the rung cannot be settled
+    /// at all, [`SourceChoice::resolve`] stops choosing rather than guess.
+    holds_unseen_content: Reverse<bool>,
+    /// More capsules that fit the target, first. Computed by `Capsule::fits`.
     fewer_capsules: Reverse<usize>,
     /// A session already in the target's format needs no conversion at all.
     needs_conversion: bool,
@@ -1280,6 +1430,7 @@ struct Rank {
 fn rank(candidate: &SourceCandidate, target_slug: &str) -> Rank {
     Rank {
         unreadable: !candidate.availability.readable(),
+        holds_unseen_content: Reverse(!candidate.advance.unmoved()),
         fewer_capsules: Reverse(candidate.capsules.fitting()),
         needs_conversion: candidate.key.provider != target_slug,
         completeness: candidate.completeness(),
@@ -1307,7 +1458,12 @@ pub struct SourceChoice {
 }
 
 impl SourceChoice {
-    /// The incarnation to read, or `None` when nothing in the record can be.
+    /// The head of the ranking, or `None` when nothing in the record can be read.
+    ///
+    /// This is the ranking's answer and nothing else: it is not told what the user
+    /// named, so it cannot be influenced by it. When the ranking cannot settle the
+    /// unseen-content rung, [`SourceChoice::resolve`] is the function that decides
+    /// what to actually read.
     pub fn chosen(&self) -> Option<&SourceCandidate> {
         self.candidates
             .first()
@@ -1319,14 +1475,98 @@ impl SourceChoice {
         self.candidates.iter().find(|c| &c.key == key)
     }
 
-    /// One line for the user, naming the source and what not taking their
-    /// suggestion saved.
+    /// Readable incarnations the store cannot prove hold nothing new: the ones
+    /// it measured as advanced, and the ones it could not measure at all.
     ///
-    /// `named` is the session the user asked for, when they asked for one. It
-    /// is a parameter here rather than of [`Store::best_source_for`] because the
-    /// choice does not depend on it — only the explanation does.
+    /// [`SourceChoice::unmergeable`] is the predicate over this list; the list
+    /// itself is what the explanation names, so the sentence and the decision
+    /// come from the same set.
+    pub fn unmerged(&self) -> Vec<&SourceCandidate> {
+        self.candidates
+            .iter()
+            .filter(|c| c.availability.readable() && !c.advance.unmoved())
+            .collect()
+    }
+
+    /// Whether the ranking's head cannot be trusted to be the whole
+    /// conversation.
+    ///
+    /// True in exactly two situations, and they resolve the same way because the
+    /// store's position in both is the same — *it does not know which incarnation
+    /// the user wants*:
+    ///
+    /// - **Genuine divergence.** Two or more readable incarnations advanced since
+    ///   the store recorded them. This design cannot merge incarnations and does
+    ///   not claim to.
+    /// - **An unknown.** Some readable incarnation's growth cannot be measured, so
+    ///   the store cannot rule divergence out. Ranked as though it had advanced,
+    ///   never as though it had not.
+    ///
+    /// A record with one readable incarnation is never unmergeable: there is
+    /// nothing to merge it with.
+    pub fn unmergeable(&self) -> bool {
+        let readable = self
+            .candidates
+            .iter()
+            .filter(|c| c.availability.readable())
+            .count();
+        if readable < 2 {
+            return false;
+        }
+        let unmerged = self.unmerged();
+        unmerged.len() > 1
+            || unmerged
+                .iter()
+                .any(|c| matches!(c.advance, Advance::Unknown { .. }))
+    }
+
+    /// The incarnation to actually read, given the session the user named.
+    ///
+    /// [`SourceChoice::chosen`] whenever the ranking settled it, which is the
+    /// ordinary case. When it could not — see [`SourceChoice::unmergeable`] — this
+    /// returns the session the user named instead of the ranking's head.
+    ///
+    /// # Why that is a fallback and not a refusal
+    ///
+    /// Without the store the user would have got the session they named anyway.
+    /// Falling back to it is therefore the one answer that **cannot make an
+    /// outcome worse than not having a store at all**, which is the same
+    /// invariant as "no store failure may fail a conversion" applied to a
+    /// question the store cannot answer rather than to one it cannot reach. A
+    /// hard error would fail a conversion that `--no-store` performs fine, and
+    /// guessing would silently drop one side's work. The cost of both sides is
+    /// reported instead, loudly.
+    ///
+    /// The property this gives up is small and worth naming: the *choice* is no
+    /// longer strictly independent of what the user asked for. It is independent
+    /// wherever the ranking can decide, and defers to them only where it cannot —
+    /// which is the stronger of the two available properties, since the
+    /// alternative is deciding by coin-flip.
+    pub fn resolve(&self, named: Option<&SessionKey>) -> Option<&SourceCandidate> {
+        if self.unmergeable()
+            && let Some(named) = named
+            && let Some(candidate) = self
+                .find(named)
+                .filter(|candidate| candidate.availability.readable())
+        {
+            return Some(candidate);
+        }
+        self.chosen()
+    }
+
+    /// One line for the user, naming the source and what choosing it costs in
+    /// both directions.
+    ///
+    /// `named` is the session the user asked for, when they asked for one. Two
+    /// things depend on it: which incarnation an unmergeable record resolves to,
+    /// and what the counterfactual clause can say.
+    ///
+    /// Both directions on purpose. An earlier version of this only ever framed the
+    /// choice as strictly better — it said what taking the user's suggestion would
+    /// have cost and never what not taking it did — and that reads as a win in
+    /// exactly the rows where something real is being given up.
     pub fn explain(&self, named: Option<&SessionKey>) -> String {
-        let Some(chosen) = self.chosen() else {
+        let Some(chosen) = self.resolve(named) else {
             let reasons = self
                 .candidates
                 .iter()
@@ -1354,13 +1594,18 @@ impl SourceChoice {
         if let Some(state @ OriginState::Grew { .. }) = &chosen.origin_state {
             inside.push_str(&format!(", {}", state.describe()));
         }
-        if let Some(named) = named
-            && named != &chosen.key
-        {
-            inside.push_str(&format!(
+        match named {
+            Some(named) if named != &chosen.key => inside.push_str(&format!(
                 "; you named {named}, {}",
                 self.because(chosen, named)
-            ));
+            )),
+            Some(_) | None => {}
+        }
+        if let Some(clause) = self.cannot_merge(chosen, named == Some(&chosen.key)) {
+            inside.push_str(&format!("; {clause}"));
+        }
+        if let Some(clause) = self.gives_up(chosen) {
+            inside.push_str(&format!("; {clause}"));
         }
         format!(
             "source: {} {} ({inside})",
@@ -1368,8 +1613,72 @@ impl SourceChoice {
         )
     }
 
+    /// Why a record this design cannot resolve was resolved the way it was, and
+    /// what each side of it holds.
+    ///
+    /// `None` when the ranking settled the choice, which is the ordinary case.
+    fn cannot_merge(&self, chosen: &SourceCandidate, chosen_was_named: bool) -> Option<String> {
+        if !self.unmergeable() {
+            return None;
+        }
+        let each = self
+            .unmerged()
+            .iter()
+            .map(|c| format!("{} {}", c.key, c.advance.describe()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "this design cannot merge two incarnations of one conversation and the store cannot \
+             rule out that more than one holds work the others do not ({each}), so {} ({}) was \
+             read and is missing whatever the others hold",
+            if chosen_was_named {
+                "the session you named"
+            } else {
+                "the best-ranked of them"
+            },
+            chosen.key
+        ))
+    }
+
+    /// The sealed material choosing `chosen` gives up, and which incarnation
+    /// still holds it.
+    ///
+    /// The half of the cost the earlier explanation never stated. It is real in
+    /// two of the four rows the design distinguishes — whenever growth outranks
+    /// capsules, or a record cannot be merged — and a line that names only the
+    /// gain reads as a win in exactly those rows.
+    fn gives_up(&self, chosen: &SourceCandidate) -> Option<String> {
+        let richer = self
+            .candidates
+            .iter()
+            .filter(|c| c.availability.readable() && c.key != chosen.key)
+            .max_by_key(|c| c.capsules.fitting())
+            .filter(|c| c.capsules.fitting() > chosen.capsules.fitting())?;
+        let capsules = richer.capsules.fitting() - chosen.capsules.fitting();
+        let bytes = richer
+            .capsules
+            .fitting_bytes()
+            .saturating_sub(chosen.capsules.fitting_bytes());
+        Some(if bytes > 0 {
+            format!(
+                "gives up {capsules} capsules ({bytes} bytes of sealed material) that {} still holds",
+                richer.key
+            )
+        } else {
+            format!(
+                "gives up {capsules} capsules that {} still holds",
+                richer.key
+            )
+        })
+    }
+
     /// Why `chosen` beat `named`, taking the fields of [`Rank`] in order so the
     /// stated reason is the one that actually decided it.
+    ///
+    /// It answers only the gain — what taking the user's suggestion would have
+    /// cost. The give-up half of the same choice is [`SourceChoice::gives_up`],
+    /// and both are rendered, because a line that names only the gain reads as a
+    /// win in the rows where something real is being paid.
     fn because(&self, chosen: &SourceCandidate, named: &SessionKey) -> String {
         let Some(other) = self.find(named) else {
             return "which is not an incarnation of this conversation".to_string();
@@ -1380,6 +1689,15 @@ impl SourceChoice {
                 Availability::Ready | Availability::Archived => "which is unavailable".to_string(),
             };
         }
+        // The rung above capsules: content the named session does not have, which
+        // no conversion from it could recover.
+        if !chosen.advance.unmoved() && other.advance.unmoved() {
+            return format!(
+                "which holds nothing appended since the store recorded it, while {} does — {}",
+                chosen.key,
+                chosen.advance.describe()
+            );
+        }
         let (mine, theirs) = (chosen.capsules.fitting(), other.capsules.fitting());
         if mine > theirs {
             let capsules = mine - theirs;
@@ -1387,12 +1705,19 @@ impl SourceChoice {
                 .capsules
                 .fitting_bytes()
                 .saturating_sub(other.capsules.fitting_bytes());
-            return if bytes > 0 {
+            let cost = if bytes > 0 {
                 format!(
                     "which would have cost {capsules} capsules ({bytes} bytes of sealed material)"
                 )
             } else {
                 format!("which would have cost {capsules} capsules")
+            };
+            // And the other direction, which is what makes this a statement of a
+            // trade rather than of a win: an unmoved named session holds nothing
+            // the chosen one is missing, so nothing is being given up for it.
+            return match &other.advance {
+                Advance::Unmoved => format!("{cost} and holds nothing appended since"),
+                Advance::Advanced { .. } | Advance::Unknown { .. } => cost,
             };
         }
         let native = chosen.key.provider == self.target;
@@ -1681,6 +2006,7 @@ mod tests {
             from: recorded_from,
             fidelity,
             losses,
+            snapshot,
         } = &derived.role
         else {
             panic!("expected a derived incarnation");
@@ -1688,6 +2014,10 @@ mod tests {
         assert_eq!(recorded_from, &from);
         assert_eq!(*fidelity, Fidelity::ContextNoReasoning);
         assert_eq!(losses, &[loss], "losses are records, not caches");
+        let snapshot = snapshot
+            .as_ref()
+            .expect("the file we wrote was snapshotted");
+        assert_eq!(snapshot.size, 3, "the snapshot is of the session we wrote");
     }
 
     #[test]

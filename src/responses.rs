@@ -178,13 +178,19 @@ pub struct SourceSelectionJson {
     /// `"ready"` when the session's own file was read, `"archived"` when the
     /// live origin was gone and the store's byte copy stood in.
     pub availability: String,
-    /// How the origin reference resolved: `"unchanged"`, `"unchanged_verified"`,
-    /// `"grew"`, or `"unavailable"`. `null` for a derived incarnation, which the
-    /// store never snapshotted.
+    /// How this incarnation's recorded snapshot resolved: `"unchanged"`,
+    /// `"unchanged_verified"`, `"grew"`, or `"unavailable"`.
     ///
     /// All four are reported. `"unchanged"` without `_verified` is the cheap
     /// answer — same size and mtime, bytes not re-read — and says so rather than
     /// claiming a verification it did not run.
+    ///
+    /// A derived incarnation carries one too, taken when this tool wrote the
+    /// session, and `"grew"` on a `"derived"` role is the signal that matters
+    /// most: the user has worked in that session since, and those turns exist
+    /// nowhere else. `null` only where there is no snapshot to resolve — a record
+    /// written before derived incarnations were snapshotted, which is never
+    /// migrated.
     pub origin_state: Option<String>,
     /// Why that resolution, in the store's own words. `null` when unchanged.
     pub origin_detail: Option<String>,
@@ -205,6 +211,14 @@ pub struct SourceSelectionJson {
 impl SourceSelectionJson {
     /// The structured form of a selection, or `None` when the store read exactly
     /// what it was asked to and there is nothing to report.
+    ///
+    /// That includes a record the store could not resolve — two incarnations that
+    /// each hold work the other does not, or one whose growth cannot be measured.
+    /// The store falls back to the session the user named there, so by this
+    /// field's own rule there is no substitution to report; what a caller needs to
+    /// see is carried by `warnings`, which is where the pipeline puts the cost of
+    /// both sides. Adding a field for it would grow the substitution contract to
+    /// cover a case where nothing was substituted.
     pub fn of(selection: &crate::pipeline::SourceSelection) -> Option<Self> {
         if !selection.overrode() {
             return None;

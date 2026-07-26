@@ -57,8 +57,13 @@ pub struct SourceSelection {
 
 impl SourceSelection {
     /// The incarnation that was actually read.
+    ///
+    /// [`crate::store::SourceChoice::resolve`] rather than `chosen`, so that a
+    /// record the ranking could not settle reads the session the user named —
+    /// which is what `--no-store` would have delivered — instead of the head of a
+    /// ranking that has no way to prefer one side of a divergence.
     pub fn chosen(&self) -> Option<&SourceCandidate> {
-        self.choice.chosen()
+        self.choice.resolve(Some(&self.named))
     }
 
     /// Whether the store read a session the user did not name.
@@ -868,7 +873,18 @@ but resume may fail until the CLI is installed.",
         };
 
         let choice = store.best_source_for(&record, target, &self.registry);
-        let Some(chosen) = choice.chosen() else {
+        // A record the ranking cannot settle is the one case where the store has
+        // to say something even though it changed nothing: it read what was named,
+        // and work that is not in the result exists somewhere else. Silence here
+        // is the defect, not the fallback.
+        if choice.unmergeable() {
+            warnings.push(format!(
+                "The session store cannot merge two incarnations of one conversation, so it read \
+                 {named} as named — {}",
+                choice.explain(Some(&named))
+            ));
+        }
+        let Some(chosen) = choice.resolve(Some(&named)) else {
             // The record exists but the store can read none of it — including,
             // apparently, the file we just read successfully, which means its
             // recorded reference has gone stale. Report all three resolutions
