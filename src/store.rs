@@ -58,7 +58,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
@@ -596,6 +596,16 @@ pub fn default_root() -> anyhow::Result<PathBuf> {
 /// Holds no open handles. Every operation opens what it needs and closes it,
 /// so two `agsx` invocations can use one store without either holding a lock
 /// across a conversion.
+///
+/// # Two invocations at once
+///
+/// Two terminals converting the same session, or a script that fans out, is an
+/// ordinary thing to do, so every mutation is serialised against the others by
+/// an `IMMEDIATE` transaction on `index.sqlite` — see [`locked`]. What is
+/// deliberately *outside* that lock is everything expensive: hashing an origin
+/// (281 MiB in the corpus) and the conversion itself. The lock covers reading a
+/// record, rewriting it, and pointing the index at it, which is milliseconds of
+/// small-file work.
 #[derive(Debug)]
 pub struct Store {
     root: PathBuf,
@@ -683,16 +693,13 @@ impl Store {
     /// this is a full scan of every record directory on every conversion. A
     /// store written by a newer build is scanned instead, because repairing its
     /// index would mean writing to it.
+    ///
+    /// A failed query is an error and not a miss. Reporting one as "the store
+    /// has never seen this session" is how a moment's lock contention became a
+    /// second record for a conversation that already had one.
     pub fn find_by_session(&self, key: &SessionKey) -> anyhow::Result<Option<Record>> {
         if let Some(conn) = self.index()? {
-            let found: Option<String> = conn
-                .query_row(
-                    "SELECT record_id FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
-                    rusqlite::params![key.provider, key.provider_session_id],
-                    |row| row.get(0),
-                )
-                .ok();
-            return match found {
+            return match lookup(&conn, key)? {
                 Some(id) => self.get(&id),
                 None => Ok(None),
             };
@@ -733,6 +740,10 @@ impl Store {
     /// that cannot be measured again — the written session has been edited by an
     /// agent since. A conversation's origin is a fact about where it came from,
     /// not about which file is freshest.
+    ///
+    /// The lookup and the write are one step against another invocation — see
+    /// [`locked`] — so two `agsx` runs ingesting one session converge on
+    /// one record instead of minting two and racing to claim the same key.
     pub fn ingest_origin(
         &self,
         key: &SessionKey,
@@ -741,10 +752,18 @@ impl Store {
     ) -> anyhow::Result<Record> {
         self.ensure_writable()?;
 
+        // Before the lock on purpose: this hashes the session file, and the
+        // largest rollout in the corpus is 281 MiB.
         let mut snapshot = OriginSnapshot::of(path)?;
 
-        if let Some(existing) = self.find_by_session(key)? {
-            let mut record = existing;
+        let mut conn = self.write_index()?;
+        let write = locked(&mut conn)?;
+
+        let existing = match lookup(&write, key)? {
+            Some(id) => self.get(&id)?,
+            None => None,
+        };
+        if let Some(mut record) = existing {
             if record.find(key).is_some_and(|inc| !inc.is_origin()) {
                 debug!(
                     record = %record.id,
@@ -774,7 +793,11 @@ impl Store {
                 None => record.incarnations.push(fresh),
             }
             record.updated_at = now_ms();
+            // The index already points at this record — that is how we found it
+            // — so there is nothing to claim; the transaction ends having only
+            // taken the lock.
             self.commit(&record)?;
+            write.commit()?;
             return Ok(record);
         }
 
@@ -796,17 +819,8 @@ impl Store {
             }],
         };
         self.commit(&record)?;
-
-        // Another invocation may have ingested the same session between our
-        // lookup and here. The index's primary key decides; the loser drops its
-        // directory and adopts the winner's record.
-        let owner = self.claim(key, &id)?;
-        if owner != id {
-            let _ = fs::remove_dir_all(self.record_dir(&id));
-            return self.get(&owner)?.ok_or_else(|| {
-                anyhow::anyhow!("index names record '{owner}', which is not there")
-            });
-        }
+        claim(&write, key, &id)?;
+        write.commit()?;
         debug!(record = %id, %key, "ingested origin");
         Ok(record)
     }
@@ -819,19 +833,20 @@ impl Store {
     /// paid once per conversion rather than once per ranking. A snapshot that
     /// cannot be taken is recorded as absent rather than fatal: an unknown fails
     /// safe, and losing the whole lineage over it would be a worse cache.
+    ///
+    /// The same read-modify-write as [`Store::ingest_origin`] and locked the
+    /// same way, for a sharper reason: two conversions of one conversation into
+    /// two targets are the obvious thing to run at once, and an unlocked
+    /// read-modify-write of `record.json` would drop one of them — along with
+    /// `losses`, which nothing can recompute.
     pub fn record_conversion(
         &self,
         record_id: &str,
         derived: DerivedWrite,
     ) -> anyhow::Result<Record> {
         self.ensure_writable()?;
-        let mut record = self
-            .get(record_id)?
-            .ok_or_else(|| StoreError::NoSuchRecord {
-                root: self.root.clone(),
-                id: record_id.to_string(),
-            })?;
 
+        // Before the lock, like the origin's: it hashes the file we wrote.
         let snapshot = match OriginSnapshot::of(&derived.path) {
             Ok(snapshot) => Some(snapshot),
             Err(err) => {
@@ -854,6 +869,17 @@ impl Store {
                 snapshot,
             },
         };
+        let mut conn = self.write_index()?;
+        let write = locked(&mut conn)?;
+
+        // Read inside the lock: the record we were handed may have grown an
+        // incarnation since the caller last saw it.
+        let mut record = self
+            .get(record_id)?
+            .ok_or_else(|| StoreError::NoSuchRecord {
+                root: self.root.clone(),
+                id: record_id.to_string(),
+            })?;
         match record
             .incarnations
             .iter_mut()
@@ -864,7 +890,8 @@ impl Store {
         }
         record.updated_at = now_ms();
         self.commit(&record)?;
-        self.claim(&derived.key, record_id)?;
+        claim(&write, &derived.key, record_id)?;
+        write.commit()?;
         Ok(record)
     }
 
@@ -985,10 +1012,14 @@ impl Store {
 
         if rebuild_index {
             self.ensure_writable()?;
-            let conn = self
-                .index()?
-                .ok_or_else(|| anyhow::anyhow!("index unavailable"))?;
-            report.indexed = reindex(&conn, &records)?;
+            let mut conn = self.write_index()?;
+            // Under the same lock as every other writer: a rebuild that
+            // interleaved with an ingest would delete the row that ingest had
+            // just written, leaving the record it describes unfindable until
+            // the next rebuild.
+            let write = locked(&mut conn)?;
+            report.indexed = reindex(&write, &records)?;
+            write.commit()?;
             report.index_rebuilt = true;
         }
         Ok(report)
@@ -1133,49 +1164,69 @@ impl Store {
         write_json(&self.record_dir(&record.id).join(RECORD_FILE), record)
     }
 
-    /// Point `key` at `record_id`, and report which record actually owns it.
-    fn claim(&self, key: &SessionKey, record_id: &str) -> anyhow::Result<String> {
-        let Some(conn) = self.index()? else {
-            return Ok(record_id.to_string());
-        };
-        conn.execute(
-            "INSERT INTO sessions (provider, provider_session_id, record_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT (provider, provider_session_id) DO NOTHING",
-            rusqlite::params![key.provider, key.provider_session_id, record_id],
-        )?;
-        Ok(conn.query_row(
-            "SELECT record_id FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
-            rusqlite::params![key.provider, key.provider_session_id],
-            |row| row.get(0),
-        )?)
-    }
-
     /// Open the index, rebuilding it when it is missing or speaks a schema this
     /// build does not.
     ///
     /// `Ok(None)` means "answer from the records instead": the store belongs to
     /// a newer build, and repairing its cache would be writing to it.
+    ///
+    /// # Why the rebuild is locked and the journal mode is not
+    ///
+    /// Deciding to rebuild is itself a read-modify-write — read `user_version`,
+    /// drop the table, refill it — and it was the sharper half of the store's
+    /// concurrency bug: two invocations both read version 0 on a fresh store,
+    /// and the second one's `DROP TABLE` deleted the row the first had just
+    /// written. So the decision is re-made under the same [`locked`]
+    /// transaction every other writer takes.
+    ///
+    /// `journal_mode=WAL`, by contrast, is a concurrency *optimisation* that
+    /// this code must not depend on, and it is the one statement `busy_timeout`
+    /// cannot cover: converting a rollback-journal database to WAL needs an
+    /// exclusive lock that SQLite will not wait for, so two invocations opening
+    /// a brand-new index in the same millisecond made one of them fail with
+    /// `SQLITE_BUSY` — the store's original symptom, on the very first
+    /// statement it ran. Every writer holds an `IMMEDIATE` transaction, which is
+    /// correct in either journal mode, so a refused conversion is logged and the
+    /// next uncontended open performs it.
     fn index(&self) -> anyhow::Result<Option<Connection>> {
         if self.newer.is_some() {
             return Ok(None);
         }
-        let conn = Connection::open(self.root.join(INDEX_FILE))?;
+        let mut conn = Connection::open(self.root.join(INDEX_FILE))?;
         conn.busy_timeout(Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        let schema: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if schema != INDEX_SCHEMA_VERSION {
-            debug!(
-                found = schema,
-                want = INDEX_SCHEMA_VERSION,
-                "rebuilding session index"
-            );
-            conn.execute_batch("DROP TABLE IF EXISTS sessions;")?;
-            conn.execute_batch(INDEX_SCHEMA)?;
-            conn.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
-            let records = self.list()?;
-            reindex(&conn, &records)?;
+        if let Err(err) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            debug!(%err, "leaving the session index in its current journal mode");
+        }
+        if schema_version(&conn)? != INDEX_SCHEMA_VERSION {
+            let write = locked(&mut conn)?;
+            // Re-read under the lock. Whoever we queued behind may have rebuilt
+            // it already, and rebuilding a second time would drop the rows they
+            // wrote.
+            if schema_version(&write)? != INDEX_SCHEMA_VERSION {
+                debug!(want = INDEX_SCHEMA_VERSION, "rebuilding session index");
+                write.execute_batch("DROP TABLE IF EXISTS sessions;")?;
+                write.execute_batch(INDEX_SCHEMA)?;
+                write.pragma_update(None, "user_version", INDEX_SCHEMA_VERSION)?;
+                let records = self.list()?;
+                reindex(&write, &records)?;
+            }
+            write.commit()?;
         }
         Ok(Some(conn))
+    }
+
+    /// The index a mutation holds open, ready for [`locked`].
+    ///
+    /// A writable store always has one: [`Store::ensure_writable`] has already
+    /// refused the only case [`Store::index`] answers `None`, so the error here
+    /// is unreachable rather than a second policy.
+    fn write_index(&self) -> anyhow::Result<Connection> {
+        self.index()?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the session index at {} is unavailable",
+                self.root.display()
+            )
+        })
     }
 
     fn archive(&self, record_id: &str, path: &Path) -> anyhow::Result<String> {
@@ -1779,6 +1830,67 @@ fn tally(ir: &SessionIr, target_vendor: Option<&str>) -> Inventory {
 // ---------------------------------------------------------------------------
 // Plumbing
 // ---------------------------------------------------------------------------
+
+/// The store's write lock, and the order the two writes go in.
+///
+/// A mutation runs as `BEGIN IMMEDIATE` … `COMMIT` on `index.sqlite`, which
+/// takes SQLite's write lock at the first statement rather than at the first
+/// write. That is what serialises two `agsx` invocations: the second blocks in
+/// `BEGIN` for up to the connection's `busy_timeout`, and by the time it reads
+/// the index the first one's record is already there. Nothing expensive belongs
+/// inside it — hashing an origin and the conversion itself both happen outside.
+///
+/// Inside the lock the order is always **`record.json` first, index row second,
+/// commit last**, and it is not arbitrary. The record directories are
+/// authoritative and the index is a cache rebuildable from them (`docs/STORE.md`),
+/// so consider the two states a kill between the two writes can leave:
+///
+/// - **a record with no index row.** The record is on disk, [`Store::find_by_session`]
+///   misses it, and [`Store::fsck`] with `rebuild_index` puts the row back —
+///   repairable, by the operation the design already has for exactly this.
+/// - **an index row naming a record that was never written.** A dangling pointer
+///   into nothing: every lookup of that session resolves to a record the store
+///   cannot load, and no rule can invent the content it names.
+///
+/// Only the first is repairable, so the ordering makes it the only one
+/// reachable. `record.json` is renamed into place before the row is inserted,
+/// and the row is not durable until `COMMIT`, so a kill at any point either
+/// rolls the row back or leaves a record the index does not know about yet. The
+/// index may lag the records. It may never lead them.
+fn locked(conn: &mut Connection) -> anyhow::Result<rusqlite::Transaction<'_>> {
+    Ok(conn.transaction_with_behavior(TransactionBehavior::Immediate)?)
+}
+
+/// The record the index says owns `key`, if it says anything.
+fn lookup(conn: &Connection, key: &SessionKey) -> anyhow::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT record_id FROM sessions WHERE provider = ?1 AND provider_session_id = ?2",
+            rusqlite::params![key.provider, key.provider_session_id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Point `key` at `record_id`.
+///
+/// Called under [`locked`] with the record already on disk, so the row it writes
+/// describes content that exists. An existing row for the same key is
+/// overwritten rather than kept, which is the same rule [`reindex`] applies for
+/// the same reason: the record is authoritative and the index is its cache, so
+/// where they disagree the index is the one that is wrong.
+fn claim(conn: &Connection, key: &SessionKey, record_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO sessions (provider, provider_session_id, record_id) VALUES (?1, ?2, ?3)
+         ON CONFLICT (provider, provider_session_id) DO UPDATE SET record_id = excluded.record_id",
+        rusqlite::params![key.provider, key.provider_session_id, record_id],
+    )?;
+    Ok(())
+}
+
+fn schema_version(conn: &Connection) -> anyhow::Result<i32> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
 
 fn reindex(conn: &Connection, records: &[Record]) -> anyhow::Result<usize> {
     conn.execute_batch("DELETE FROM sessions;")?;

@@ -149,6 +149,68 @@ Three things follow, and they are the whole reason the design is small:
   cannot be recomputed later — the target session has since been edited by the
   agent — so they are written down and never derived again.
 
+## Two invocations at once, and which write goes first
+
+Two terminals converting the same session, or a script that fans out, is an
+ordinary thing to do — and the first implementation could not survive it. Every
+mutation is a read-modify-write across *two* stores: look for an existing record
+for `(provider, session_id)`, write `record.json`, insert the index row. Nothing
+serialised those three steps, and nothing serialised the index's own lazy
+creation either, so two invocations produced any of:
+
+- `database is locked` (`SQLITE_BUSY`) on the **first statement either of them
+  ran**. `PRAGMA journal_mode=WAL` converts a rollback-journal database, which
+  needs an exclusive lock that SQLite does not wait for: `busy_timeout` does not
+  cover it, so on a store whose index does not exist yet — the first two
+  concurrent conversions ever — one invocation simply failed.
+- `Query returned no rows`, from the same cause one layer up. The index is
+  created on first use by reading `PRAGMA user_version` and rebuilding when it
+  does not match. Two invocations both read version 0 and both rebuild, so the
+  second one's `DROP TABLE` deleted the row the first had just inserted.
+- Two records for one conversation, or a silently lost conversion. The lookup
+  and the write were far apart, and `record_conversion` re-wrote a `record.json`
+  it had read before the other invocation's incarnation was in it — taking that
+  conversion's `losses`, which nothing can recompute, with it.
+
+So every mutation now runs inside one `BEGIN IMMEDIATE` … `COMMIT` on
+`index.sqlite`: `ingest_origin`, `record_conversion`, `fsck --rebuild-index`,
+and the index's own lazy creation, which re-reads `user_version` under the lock
+before deciding to rebuild. `IMMEDIATE` takes SQLite's write lock at `BEGIN`
+rather than at the first write, so the second invocation waits there and reads
+an index the first one has already finished with. WAL is still requested and is
+still worth having, but it is now an optimisation the code does not depend on: a
+refused conversion is logged, the next uncontended open performs it, and
+`IMMEDIATE` plus `busy_timeout` is correct in either journal mode.
+
+Nothing expensive is inside the lock. Hashing an origin (281 MiB in the corpus,
+3.9 s) happens before it, and the conversion itself was never near it; the lock
+covers reading a record, rewriting it, and pointing the index at it.
+
+**The order inside the lock is `record.json` first, index row second, commit
+last** — and that follows from "only content is authoritative" rather than from
+taste. A process killed between the two writes can leave exactly one of two
+states:
+
+| left behind | repairable? |
+|---|---|
+| a record with no index row | **yes** — `fsck --rebuild-index` reads it back out of the record directories, which is what that command is for |
+| an index row naming a record that was never written | **no** — every lookup of that session resolves to a record the store cannot load, and no rule can invent the content it names |
+
+The ordering makes the repairable state the only reachable one: `record.json` is
+renamed into place before the row is inserted, and the row is not durable until
+`COMMIT`, so a kill either rolls the row back or leaves a record the index does
+not know about yet. **The index may lag the records. It may never lead them.**
+That is also what makes a read racing a write safe: a lookup that the index
+answers for always finds a `record.json` already on disk, and `write_json`
+renames, so a reader sees the whole old file or the whole new one.
+
+Pinned by four tests in `store_test`: two invocations ingesting one session
+converge on one record; two ingesting *different* sessions keep both (the
+index-creation race, which has nothing to do with either session); two
+conversions of one conversation keep both lineages and both loss lists; and a
+lookup racing an ingest never sees half a record. Each of them fails on the
+implementation this replaced.
+
 ## What it does not do: origin bytes are referenced, not archived
 
 The tempting version of this design copies every origin session into the store

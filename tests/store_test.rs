@@ -1035,6 +1035,240 @@ fn two_invocations_ingesting_one_session_converge_on_one_record() {
     assert!(report.problems.is_empty(), "{:?}", report.problems);
 }
 
+/// The other half of the same race, and the one that says the fix is a lock and
+/// not a merge: two invocations that share nothing but the store must not
+/// interfere at all.
+///
+/// It failed for a reason that had nothing to do with either session — the index
+/// is created lazily on first use, and two invocations both deciding to create
+/// it would each drop the table the other had just filled.
+#[test]
+fn two_invocations_ingesting_different_sessions_keep_both() {
+    let (tmp, store) = fresh();
+    let codex_path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let cc_path = write_session(tmp.path(), "cc.jsonl", "{\"type\":\"user\"}\n");
+    let codex_key = SessionKey::new("codex", "01J");
+    let cc_key = SessionKey::new("claude-code", "a3f");
+
+    let (a, b) = std::thread::scope(|scope| {
+        let first =
+            scope.spawn(|| store.ingest_origin(&codex_key, &codex_path, OriginPolicy::Reference));
+        let second =
+            scope.spawn(|| store.ingest_origin(&cc_key, &cc_path, OriginPolicy::Reference));
+        (
+            first.join().expect("thread a").expect("ingest a"),
+            second.join().expect("thread b").expect("ingest b"),
+        )
+    });
+
+    assert_ne!(a.id, b.id, "two conversations, two records");
+    assert_eq!(store.list().expect("list").len(), 2);
+    assert_eq!(
+        index_rows(store.root()).len(),
+        2,
+        "neither invocation's index row was dropped by the other"
+    );
+    assert_eq!(
+        store
+            .find_by_session(&codex_key)
+            .expect("lookup")
+            .expect("hit")
+            .id,
+        a.id
+    );
+    assert_eq!(
+        store
+            .find_by_session(&cc_key)
+            .expect("lookup")
+            .expect("hit")
+            .id,
+        b.id
+    );
+    let report = store.fsck(false).expect("fsck");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+}
+
+/// Two conversions of one conversation at once — `--to cc` in one terminal and
+/// `--to gemini` in another — which is `ingest_origin`'s bug in the writer that
+/// has more to lose.
+///
+/// An unlocked read-modify-write of `record.json` drops one of the two
+/// incarnations, and with it that conversion's `losses`, which are records and
+/// not caches: nothing recomputes them. The index row for the dropped
+/// incarnation survives, so the cache is left naming a session its own record
+/// does not hold.
+#[test]
+fn two_conversions_of_one_conversation_keep_both_lineages() {
+    let (tmp, store) = fresh();
+    let origin_path = write_session(tmp.path(), "rollout.jsonl", "{}\n");
+    let origin = SessionKey::new("codex", "01J");
+    let record = store
+        .ingest_origin(&origin, &origin_path, OriginPolicy::Reference)
+        .expect("ingest");
+
+    let cc_path = write_session(tmp.path(), "cc.jsonl", "{\"type\":\"user\"}\n");
+    let gemini_path = write_session(tmp.path(), "gemini.json", "{}\n");
+    let cc_key = SessionKey::new("claude-code", "a3f");
+    let gemini_key = SessionKey::new("gemini-cli", "g1");
+    let loss = |capsules| Loss {
+        kind: LossKind::Reasoning,
+        events: 12,
+        capsules,
+        bytes: 4_096,
+        grade: Fidelity::ContextNoReasoning,
+        note: "openai capsules cannot cross vendors".to_string(),
+    };
+
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            store.record_conversion(
+                &record.id,
+                DerivedWrite {
+                    key: cc_key.clone(),
+                    path: cc_path.clone(),
+                    from: origin.clone(),
+                    fidelity: Fidelity::ContextNoReasoning,
+                    losses: vec![loss(30_082)],
+                },
+            )
+        });
+        let second = scope.spawn(|| {
+            store.record_conversion(
+                &record.id,
+                DerivedWrite {
+                    key: gemini_key.clone(),
+                    path: gemini_path.clone(),
+                    from: origin.clone(),
+                    fidelity: Fidelity::ContextNoReasoning,
+                    losses: vec![loss(17)],
+                },
+            )
+        });
+        first.join().expect("thread a").expect("record a");
+        second.join().expect("thread b").expect("record b");
+    });
+
+    let reloaded = store.get(&record.id).expect("get").expect("record");
+    assert_eq!(
+        reloaded.incarnations.len(),
+        3,
+        "the origin and both conversions: {:?}",
+        reloaded
+            .incarnations
+            .iter()
+            .map(|inc| inc.key.to_string())
+            .collect::<Vec<_>>()
+    );
+    for (key, capsules) in [(&cc_key, 30_082), (&gemini_key, 17)] {
+        let inc = reloaded.find(key).expect("incarnation");
+        let Role::Derived { losses, .. } = &inc.role else {
+            panic!("expected a derived incarnation for {key}");
+        };
+        assert_eq!(
+            losses,
+            &[loss(capsules)],
+            "losses are records; a lost update destroys them"
+        );
+    }
+
+    let rows = index_rows(store.root());
+    assert_eq!(rows.len(), 3, "one row per incarnation: {rows:?}");
+    for (provider, session_id, record_id) in rows {
+        assert_eq!(record_id, record.id);
+        assert!(
+            reloaded
+                .find(&SessionKey::new(provider.clone(), session_id.clone()))
+                .is_some(),
+            "the index names {provider} {session_id}, which the record does not hold"
+        );
+    }
+    let report = store.fsck(false).expect("fsck");
+    assert!(report.problems.is_empty(), "{:?}", report.problems);
+}
+
+/// A lookup racing an ingest: the read half of the same contention.
+///
+/// Two things are asserted, and the second is the one the write ordering buys.
+/// A reader never fails — a writer holding the store's lock is something to wait
+/// for, not an error to report — and a session the index answers for always
+/// resolves to a record that is already on disk and whole. That is only true
+/// because `record.json` is renamed into place *before* the index row that names
+/// it is committed.
+/// Sets its flag however the writer thread ends, including by panic.
+struct Release<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[test]
+fn a_lookup_racing_an_ingest_never_sees_half_a_record() {
+    let (tmp, store) = fresh();
+    let sessions: Vec<(SessionKey, PathBuf)> = (0..40)
+        .map(|i| {
+            (
+                SessionKey::new("codex", format!("01J-{i}")),
+                write_session(tmp.path(), &format!("rollout-{i}.jsonl"), "{}\n"),
+            )
+        })
+        .collect();
+    let done = std::sync::atomic::AtomicBool::new(false);
+
+    let (hits, polls) = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            // On drop, not at the end of the loop: a writer that fails must
+            // still release the reader, or a regression turns this test into a
+            // hang instead of a failure.
+            let _release = Release(&done);
+            for (key, path) in &sessions {
+                store
+                    .ingest_origin(key, path, OriginPolicy::Reference)
+                    .expect("ingest");
+            }
+        });
+        let reader = scope.spawn(|| {
+            let (mut hits, mut polls) = (0usize, 0usize);
+            while !done.load(std::sync::atomic::Ordering::Acquire) {
+                polls += 1;
+                for (key, _) in &sessions {
+                    let Some(record) = store.find_by_session(key).expect("lookup") else {
+                        continue;
+                    };
+                    hits += 1;
+                    // Whole, not half: the index answered for this session, so
+                    // the record it named is readable and holds it as an origin.
+                    let reloaded = store
+                        .get(&record.id)
+                        .expect("get")
+                        .expect("the index named a record that is not on disk");
+                    assert_eq!(reloaded.id, record.id);
+                    assert!(
+                        reloaded.find(key).is_some_and(|inc| inc.is_origin()),
+                        "record {} does not hold {key} as an origin",
+                        record.id
+                    );
+                }
+                for record in store.list().expect("list") {
+                    assert!(!record.incarnations.is_empty());
+                }
+            }
+            (hits, polls)
+        });
+        writer.join().expect("writer");
+        reader.join().expect("reader")
+    });
+
+    assert!(polls > 0, "the reader never ran alongside the writer");
+    println!("reader: {polls} passes, {hits} hits while the writer ingested 40 sessions");
+    assert_eq!(store.list().expect("list").len(), 40);
+    assert_eq!(index_rows(store.root()).len(), 40);
+    for (key, _) in &sessions {
+        assert!(store.find_by_session(key).expect("lookup").is_some());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Measured against the real corpus
 // ---------------------------------------------------------------------------
