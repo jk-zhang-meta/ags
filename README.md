@@ -86,7 +86,7 @@ claude --resume <new-session-id>
 |---|---|---|---|---|
 | Claude Code | `cc` | Yes | Yes | `claude --resume <session-id>` |
 | Codex | `cod` | Yes | Yes | `codex resume <session-id>` |
-| Antigravity | `agy` | Yes | No | `agy --conversation <uuid> --model "Gemini 3.1 Pro (High)"` |
+| Antigravity | `agy` | Yes | No | `agy --conversation <uuid>` |
 | Gemini CLI | `gmi` | Yes | Yes | `gemini --resume <session-id>` |
 | Cursor | `cur` | Yes | Yes | `cursor .` |
 | Cline | `cln` | Yes | Yes | `code .` |
@@ -365,6 +365,17 @@ something else by them:
   `XDG_DATA_HOME` is the only variable that moves Amp's data.
   `AMP_DATA_HOME` is real only inside Amp's editor plugins, so it is not read
   either.
+- **Aider has no home directory to point at.** It keeps one
+  `.aider.chat.history.md` per *repository*, at the git work-tree root, found by
+  walking up from wherever you started it (`aider/main.py` uses
+  `git.Repo(search_parent_directories=True)`); with no repository at all it
+  falls back to `./.aider.chat.history.md`. casr resolves the file the same way,
+  so it sees the same sessions aider does from anywhere inside a checkout.
+  `AIDER_CHAT_HISTORY_FILE` is aider's own override of that path — aider's
+  parser derives it from `--chat-history-file` via `auto_env_var_prefix="AIDER_"`
+  — and names one exact file. `AIDER_HOME` is casr's alone; aider never reads
+  it. It points casr at a tree of checkouts to scan, and is also where casr
+  writes converted sessions.
 - **`VIBE_HOME` is the `~/.vibe` root**, not the session-log directory; casr
   appends `logs/session` exactly as Vibe does.
 - **`OPENCLAW_HOME` replaces `$HOME`**, so OpenClaw's state lives at

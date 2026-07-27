@@ -458,11 +458,14 @@ fn fixture_agy_simple() {
     let expected = load_expected("agy_simple");
     assert_session_matches(&session, &expected, "agy_simple");
 
-    // Extra: the resume command must pin the mandated model and use --conversation.
+    // Extra: the resume command is the conversation id and nothing else.
+    // `agy --help` (1.1.7) documents `--conversation` for resume; `--model`
+    // takes a slug and `--effort` is a separate low|medium|high flag, and casr
+    // has no model information in the transcript to pin either from.
     let resume = Antigravity.resume_command(&session.session_id);
     assert_eq!(
         resume,
-        "agy --conversation aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --model \"Gemini 3.1 Pro (High)\""
+        "agy --conversation aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     );
 
     // Extra: the tool-only planner step extracted its tool call.

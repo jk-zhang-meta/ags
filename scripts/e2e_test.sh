@@ -838,12 +838,13 @@ assert_exit_ok "Antigravity→CC write succeeds"
 assert_json_field "agy→cc source is antigravity" ".source_provider" "antigravity"
 assert_json_field "agy→cc target is claude-code" ".target_provider" "claude-code"
 
-# An agy conversation reports the mandated model and the antigravity provider.
-log "TEST: Antigravity info reports provider + pinned model"
+# An agy conversation reports the antigravity provider and an unknown model:
+# agy transcripts record no model, so casr must report null, not a guess.
+log "TEST: Antigravity info reports provider + unknown model"
 run_casr "info agy" --json info "$agy_sid" --source agy
 assert_exit_ok "info agy conversation succeeds"
 assert_json_field "agy info provider is antigravity" ".provider" "antigravity"
-assert_json_field "agy info model pinned" ".model_name" "Gemini 3.1 Pro (High)"
+assert_json_field "agy info model is unknown" ".model_name" "null"
 
 # agy is read/resume-only: it must NOT accept being a conversion TARGET.
 log "TEST: Antigravity rejected as conversion target"

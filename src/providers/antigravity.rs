@@ -36,9 +36,41 @@
 //!
 //! ## Resume mechanism
 //!
-//! `agy --conversation <uuid> --model "Gemini 3.1 Pro (High)"`. The model pin
-//! is mandatory (see [`AGY_REQUIRED_MODEL`]); `agy` MUST always run on
-//! "Gemini 3.1 Pro (High)" and no other model.
+//! `agy --conversation <uuid>` — the conversation id and nothing else.
+//!
+//! ### Why no model is pinned
+//!
+//! casr used to emit `--model "Gemini 3.1 Pro (High)"` alongside it. Verified
+//! against the shipped `agy` 1.1.7 linux-x64 build (`antigravity --help`, run
+//! under a throwaway `HOME`), that flag surface is:
+//!
+//! ```text
+//!   --conversation  Resume a previous conversation by ID
+//!   --model         Model for the current CLI session
+//!   --effort        Reasoning effort for the current CLI session (low|medium|high)
+//! ```
+//!
+//! So model and reasoning effort are *two* flags, and `--model` takes the
+//! "stable, user-facing model slugs that appear in the `/model` picker"
+//! introduced in agy 1.1.5 — lowercase forms such as `gemini-3.1-pro`, which is
+//! what the binary's own string table contains. No parenthesized
+//! `"<Model> (<Effort>)"` label exists anywhere in it; that shape is a desktop
+//! picker caption, not a CLI value. The old command could therefore never
+//! resolve: since agy 1.1.2 an unresolvable `--model` hard-fails print mode
+//! with a non-zero exit, and in an interactive session silently falls back to
+//! another model with a warning.
+//!
+//! Emitting a *correct* pin would be no better. casr has nothing to derive one
+//! from: the transcript records no model (see [`Antigravity::read_session`]),
+//! so any slug casr chose would be casr's opinion, silently overriding whatever
+//! the user picked. agy already persists the user's own `/model` and `/effort`
+//! choice across sessions, so omitting both flags resumes on the model the user
+//! actually selected. The argument the other way — that pinning makes a resumed
+//! conversation reproducible across machines, and stops a cheap default model
+//! from inheriting an expensive conversation — is real, but it is a decision
+//! for the user's agy settings or their own command line, not for a resume
+//! command casr prints on their behalf. If a caller wants a pin, appending
+//! `--model <slug> --effort <low|medium|high>` is theirs to do.
 //!
 //! ## Write support
 //!
@@ -59,12 +91,6 @@ use crate::model::{
     truncate_title,
 };
 use crate::providers::{Provider, WriteOptions, WrittenSession};
-
-/// The one model `agy` is allowed to run on. Mirrors the shell-side single
-/// source of truth in
-/// `agentic_coding_flywheel_setup/scripts/lib/agy_model_guard.sh`
-/// (`AGY_REQUIRED_MODEL`). Every `agy` invocation casr emits MUST pin this.
-pub const AGY_REQUIRED_MODEL: &str = "Gemini 3.1 Pro (High)";
 
 /// Antigravity CLI provider implementation.
 pub struct Antigravity;
@@ -317,7 +343,11 @@ impl Provider for Antigravity {
             messages,
             metadata: serde_json::Value::Object(metadata),
             source_path: path.to_path_buf(),
-            model_name: Some(AGY_REQUIRED_MODEL.to_string()),
+            // Unknown, and left unknown. Transcript steps carry no model
+            // field, and the conversation `.db` keeps its trajectory as
+            // opaque protobuf blobs, so there is nothing here to read a
+            // model off. Naming one would be inventing it.
+            model_name: None,
         })
     }
 
@@ -338,8 +368,10 @@ impl Provider for Antigravity {
         ))
     }
 
+    /// `agy --conversation <uuid>`, with no `--model` / `--effort` pin. See the
+    /// module docs for why casr does not choose a model here.
     fn resume_command(&self, session_id: &str) -> String {
-        format!("agy --conversation {session_id} --model \"{AGY_REQUIRED_MODEL}\"")
+        format!("agy --conversation {session_id}")
     }
 }
 
@@ -466,8 +498,8 @@ fn step_to_message(step: &serde_json::Value) -> Option<CanonicalMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AGY_REQUIRED_MODEL, Antigravity, is_housekeeping_type, list_conversations_in,
-        role_for_source, step_to_message, unwrap_user_request,
+        Antigravity, is_housekeeping_type, list_conversations_in, role_for_source, step_to_message,
+        unwrap_user_request,
     };
     use crate::model::MessageRole;
     use crate::providers::Provider;
@@ -603,18 +635,31 @@ mod tests {
         assert_eq!(p.cli_alias(), "agy");
     }
 
+    /// The resume command must be exactly what the shipped `agy` accepts.
+    ///
+    /// `--conversation` is the only flag `agy 1.1.7 --help` documents for
+    /// resuming by id. It must not carry a model pin: `--model` takes a slug
+    /// and `--effort` is a separate `low|medium|high` flag, so a combined
+    /// display label like `"Gemini 3.1 Pro (High)"` resolves to nothing and
+    /// hard-fails `-p` mode (agy 1.1.2), and casr has no source of truth for
+    /// choosing a slug anyway.
     #[test]
-    fn resume_command_pins_required_model() {
+    fn resume_command_is_conversation_id_only() {
         let p = Antigravity;
         let cmd =
             <Antigravity as Provider>::resume_command(&p, "901d1db7-8590-4cb0-a7cb-35fac369d860");
         assert_eq!(
             cmd,
-            "agy --conversation 901d1db7-8590-4cb0-a7cb-35fac369d860 --model \"Gemini 3.1 Pro (High)\""
+            "agy --conversation 901d1db7-8590-4cb0-a7cb-35fac369d860"
         );
-        // The mandated model must appear verbatim.
-        assert!(cmd.contains(AGY_REQUIRED_MODEL));
-        assert!(cmd.contains("--conversation"));
+        assert!(
+            !cmd.contains("--model"),
+            "casr must not pin a model the user did not choose: {cmd}"
+        );
+        assert!(
+            !cmd.contains("--effort"),
+            "casr must not pin a reasoning effort the user did not choose: {cmd}"
+        );
     }
 
     #[test]
@@ -742,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn read_session_parses_transcript_and_pins_model() {
+    fn read_session_parses_transcript_and_leaves_model_unknown() {
         let (_guard, cli_dir) =
             make_agy_tree(&[("901d1db7-8590-4cb0-a7cb-35fac369d860", SAMPLE_TRANSCRIPT)]);
         let db = cli_dir
@@ -752,7 +797,12 @@ mod tests {
 
         assert_eq!(session.provider_slug, "antigravity");
         assert_eq!(session.session_id, "901d1db7-8590-4cb0-a7cb-35fac369d860");
-        assert_eq!(session.model_name.as_deref(), Some(AGY_REQUIRED_MODEL));
+        // No transcript step records a model, so the model is genuinely
+        // unknown and must be reported as unknown rather than guessed.
+        assert_eq!(
+            session.model_name, None,
+            "agy transcripts carry no model; casr must not invent one"
+        );
         // Housekeeping SYSTEM steps dropped; only user + model remain.
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].role, MessageRole::User);
@@ -786,7 +836,7 @@ mod tests {
         assert_eq!(session.session_id, "no-brain-uuid");
         assert_eq!(session.messages.len(), 0);
         assert!(session.title.is_none());
-        // Even with no transcript, the resume model is pinned.
-        assert_eq!(session.model_name.as_deref(), Some(AGY_REQUIRED_MODEL));
+        // With no transcript there is even less to read a model off.
+        assert_eq!(session.model_name, None);
     }
 }

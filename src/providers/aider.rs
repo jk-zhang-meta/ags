@@ -22,6 +22,26 @@
 //! A single `.aider.chat.history.md` may contain many sessions (append-only).
 //! casr uses a virtual path scheme `<history-file>/<session-id>` (like Cursor)
 //! to address individual sessions within a multi-session file.
+//!
+//! ## Where the history file lives
+//!
+//! Aider does not keep a central session store; it keeps one history file per
+//! *repository*, and it resolves the path itself. Verified against the
+//! aider 0.86.2 sdist:
+//!
+//! - `aider/args.py:274-287` — the default for `--chat-history-file` is
+//!   `os.path.join(git_root, ".aider.chat.history.md") if git_root else
+//!   ".aider.chat.history.md"`.
+//! - `aider/main.py:462` / `:60-66` — `git_root` is
+//!   `git.Repo(search_parent_directories=True).working_tree_dir`, i.e. the
+//!   nearest enclosing git work tree, **not** the process working directory.
+//! - `aider/args.py:41` — the parser is built with
+//!   `auto_env_var_prefix="AIDER_"`, which is what makes
+//!   `AIDER_CHAT_HISTORY_FILE` an alias for `--chat-history-file`.
+//!
+//! [`Aider::find_history_files`] reproduces that rule instead of approximating
+//! it, so running casr from anywhere inside a repository finds the same file
+//! aider would append to.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +58,10 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 /// Aider provider implementation.
 pub struct Aider;
 
+/// The fixed basename aider gives its Markdown chat history
+/// (`aider/args.py:274-287`).
+const HISTORY_FILE_NAME: &str = ".aider.chat.history.md";
+
 /// Represents a single parsed session within an Aider history file.
 struct ParsedSession {
     /// Deterministic session ID from the start timestamp.
@@ -49,8 +73,15 @@ struct ParsedSession {
 }
 
 impl Aider {
-    /// Root directory for Aider data.
-    /// Respects `AIDER_HOME` env var override.
+    /// Tree casr scans for history files, from `AIDER_HOME`.
+    ///
+    /// `AIDER_HOME` is **casr's own** override (the README's "casr's own
+    /// override" column), not one of aider's: the aider 0.86.2 sdist contains
+    /// no occurrence of the name, and aider has no `--home` argument for its
+    /// `auto_env_var_prefix="AIDER_"` parser to derive it from. It aims casr at
+    /// a tree of checkouts without touching aider. Aider's *own* variable,
+    /// `AIDER_CHAT_HISTORY_FILE`, is honoured separately in
+    /// [`Self::find_history_files`].
     fn home_dir() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("AIDER_HOME") {
             return Some(PathBuf::from(home));
@@ -58,16 +89,27 @@ impl Aider {
         None
     }
 
-    /// Find all `.aider.chat.history.md` files in known locations.
+    /// Find every `.aider.chat.history.md` casr can account for.
+    ///
+    /// Steps 2 and 3 reproduce aider's own resolution of the history path (see
+    /// the module docs for the exact sdist references): the file lives at the
+    /// *git work-tree root*, found by walking parents, and falls back to the
+    /// working directory only when there is no repository at all.
     fn find_history_files() -> Vec<PathBuf> {
+        Self::history_files_from(std::env::current_dir().ok().as_deref())
+    }
+
+    /// [`Self::find_history_files`] with the working directory injected, so the
+    /// git-root walk is testable without mutating process-global state.
+    fn history_files_from(cwd: Option<&Path>) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = Vec::new();
 
-        // 1. Check AIDER_HOME.
+        // 1. casr's own override: scan the tree it points at.
         if let Some(home) = Self::home_dir() {
             Self::scan_for_history_files(&home, &mut files, 4);
         }
 
-        // 2. Check explicit AIDER_CHAT_HISTORY_FILE.
+        // 2. Aider's own override, which names the file outright.
         if let Ok(path) = std::env::var("AIDER_CHAT_HISTORY_FILE") {
             let p = PathBuf::from(path);
             if p.is_file() && !files.contains(&p) {
@@ -75,11 +117,16 @@ impl Aider {
             }
         }
 
-        // 3. Check current working directory.
-        if let Ok(cwd) = std::env::current_dir() {
-            let candidate = cwd.join(".aider.chat.history.md");
-            if candidate.is_file() && !files.contains(&candidate) {
-                files.push(candidate);
+        // 3. Aider's default: the enclosing git work-tree root, else the CWD.
+        //    Checking the CWD alone found sessions only when the shell happened
+        //    to sit exactly at the repository root.
+        if let Some(cwd) = cwd {
+            let git_root = crate::discovery::find_git_root(cwd);
+            for dir in git_root.as_deref().into_iter().chain(std::iter::once(cwd)) {
+                let candidate = dir.join(HISTORY_FILE_NAME);
+                if candidate.is_file() && !files.contains(&candidate) {
+                    files.push(candidate);
+                }
             }
         }
 
@@ -96,7 +143,7 @@ impl Aider {
             .into_iter()
             .filter_map(Result::ok)
         {
-            if entry.file_name().to_str() == Some(".aider.chat.history.md")
+            if entry.file_name().to_str() == Some(HISTORY_FILE_NAME)
                 && entry.path().is_file()
                 && !files.contains(&entry.path().to_path_buf())
             {
@@ -124,7 +171,7 @@ impl Aider {
         if parent
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".aider.chat.history.md"))
+            .is_some_and(|n| n.ends_with(HISTORY_FILE_NAME))
         {
             let decoded = urlencoding::decode(filename).ok()?;
             return Some((parent.to_path_buf(), decoded.into_owned()));
@@ -487,16 +534,22 @@ impl Provider for Aider {
         let now = chrono::Utc::now();
         let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
 
-        // Determine target path.
+        // Determine target path. `AIDER_HOME` is casr's own explicit "write
+        // here" override and is used verbatim. The fallbacks go through the
+        // same git-root rule as discovery, because a history file written into
+        // a subdirectory of a repository is one aider will never read.
         let target_dir = if let Some(home) = Self::home_dir() {
             home
-        } else if let Some(ref ws) = session.workspace {
-            ws.clone()
         } else {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+            let dir = session
+                .workspace
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            crate::discovery::find_git_root(&dir).unwrap_or(dir)
         };
 
-        let target_path = target_dir.join(".aider.chat.history.md");
+        let target_path = target_dir.join(HISTORY_FILE_NAME);
 
         debug!(
             target_session_id,
@@ -1089,6 +1142,88 @@ Hi!
             Aider::parse_virtual_path(&virtual_path).expect("should parse virtual path");
         assert_eq!(parsed_path, history);
         assert_eq!(parsed_id, session_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // History-file discovery — must match aider's own path rule
+    // -----------------------------------------------------------------------
+
+    /// Build `<tmp>/repo` as a git work tree holding a history file, plus a
+    /// nested `<tmp>/repo/src/deep` to run "from". Returns both paths.
+    fn repo_with_history(tmp: &Path) -> (PathBuf, PathBuf) {
+        let repo = tmp.join("repo");
+        let nested = repo.join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("create nested dirs");
+        std::fs::create_dir(repo.join(".git")).expect("create .git dir");
+        let history = repo.join(HISTORY_FILE_NAME);
+        std::fs::write(
+            &history,
+            "# aider chat started at 2024-08-05 19:33:02\n\n#### hello  \n",
+        )
+        .expect("write history file");
+        (nested, history)
+    }
+
+    #[test]
+    fn history_file_found_from_a_subdirectory_of_the_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (nested, history) = repo_with_history(tmp.path());
+
+        // aider writes at the git work-tree root and finds it from anywhere
+        // inside the repo (`aider/main.py:462` → `search_parent_directories`).
+        // casr must resolve the same file, not just the one in the CWD.
+        let found = Aider::history_files_from(Some(&nested));
+        assert!(
+            found.contains(&history),
+            "expected {} to be discovered from {}, got {found:?}",
+            history.display(),
+            nested.display()
+        );
+    }
+
+    #[test]
+    fn history_file_found_at_the_git_root_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (nested, history) = repo_with_history(tmp.path());
+        let repo = nested.parent().unwrap().parent().unwrap();
+
+        let found = Aider::history_files_from(Some(repo));
+        assert!(found.contains(&history), "got {found:?}");
+        // The git-root and CWD candidates are the same path here — it must be
+        // reported once, not twice.
+        assert_eq!(
+            found.iter().filter(|p| **p == history).count(),
+            1,
+            "history file must not be duplicated: {found:?}"
+        );
+    }
+
+    #[test]
+    fn history_file_found_outside_any_repository() {
+        // With no git root, aider defaults to `./.aider.chat.history.md`
+        // (`aider/args.py:274-287`), so the CWD candidate must survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("no-repo");
+        std::fs::create_dir(&plain).expect("create dir");
+        let history = plain.join(HISTORY_FILE_NAME);
+        std::fs::write(&history, "# aider chat started at 2024-08-05 19:33:02\n")
+            .expect("write history file");
+
+        let found = Aider::history_files_from(Some(&plain));
+        assert!(found.contains(&history), "got {found:?}");
+    }
+
+    #[test]
+    fn no_history_file_means_no_candidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir(&empty).expect("create dir");
+
+        let found = Aider::history_files_from(Some(&empty));
+        assert!(
+            !found.iter().any(|p| p.starts_with(&empty)),
+            "must not invent a path that does not exist: {found:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

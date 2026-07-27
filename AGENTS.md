@@ -463,7 +463,7 @@ cross_agent_session_resumer/
 - Core aliases:
   - `cc` -> Claude Code
   - `cod` -> Codex
-  - `agy` -> Antigravity CLI (read/resume only; `agy --conversation <uuid> --model "Gemini 3.1 Pro (High)"`)
+  - `agy` -> Antigravity CLI (read/resume only; `agy --conversation <uuid>` — no model pin: `--model` takes a slug and `--effort` is a separate flag, and casr has no model to pin from)
   - `gmi` -> Gemini CLI (legacy)
   - `grk` -> Grok Build (read/resume only; `grok --resume <session-id>`)
 - Provider home overrides — casr's own:
