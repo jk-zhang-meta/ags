@@ -4,13 +4,13 @@
   "session_id": "openclaw_simple",
   "workspace": "/home/user/project",
   "title": "Add error handling to the database connection pool",
-  "message_count": 4,
-  "roles": ["User", "Assistant", "User", "Assistant"],
+  "message_count": 8,
+  "roles": ["User", "Assistant", "Tool", "User", "User", "User", "User", "Assistant"],
   "started_at_present": true,
   "ended_at_present": true,
   "model_name": "claude-opus-4-5",
   "has_tool_calls": true,
   "has_tool_results": false,
   "known_lossy_fields": [],
-  "notes": "OpenClaw JSONL with session header and sequential message IDs. Has toolCall content blocks in assistant messages."
+  "notes": "These are OpenClaw's own answers, not casr's: the 8 messages and their roles are what SessionManager.buildSessionContext() + convertToLlm() produce for this file, obtained by running both out of openclaw@2026.7.1-2. The file holds 14 entries, 12 on the live branch; the 2 off it are an abandoned rewrite the user rewound away and must not appear. The four consecutive User turns are, in order, a bashExecution record (which has no `content` field and is rendered by bashExecutionToText), a custom_message entry, a branch_summary, and a real user turn — each of which the pre-fix reader dropped, and the abandoned pair of which it resurrected."
 }

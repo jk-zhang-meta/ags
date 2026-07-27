@@ -640,6 +640,43 @@ fn fixture_openclaw_simple() {
         !tc_msgs.is_empty(),
         "openclaw_simple should have messages with tool calls"
     );
+
+    let all = session
+        .messages
+        .iter()
+        .map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The user rewound this branch away. OpenClaw's own buildSessionContext
+    // does not include it, so neither may casr: replaying it would show the
+    // target model work the user deleted.
+    assert!(
+        !all.contains("switch the whole pool to a different crate"),
+        "[openclaw_simple] abandoned branch was replayed"
+    );
+    assert!(
+        !all.contains("full replacement built on another crate"),
+        "[openclaw_simple] abandoned branch was replayed"
+    );
+
+    // Everything below reaches the model and used to be dropped on the floor.
+    for needle in [
+        // thinking blocks carry `.thinking`, not `.text`
+        "The pool has no error path at all",
+        // a bashExecution record has no `content` field at all
+        "Ran `cargo test db::pool`",
+        "Command exited with code 101",
+        // an entry-level custom_message "DOES participate in LLM context"
+        "Loaded skill: resilient-io",
+        // a branch_summary is model-visible
+        "Explored replacing the pool crate",
+    ] {
+        assert!(
+            all.contains(needle),
+            "[openclaw_simple] model-visible content dropped: {needle:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

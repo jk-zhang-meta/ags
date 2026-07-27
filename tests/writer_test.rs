@@ -1947,9 +1947,15 @@ fn writer_openclaw_session_header() {
         first_line["timestamp"].is_string(),
         "OpenClaw session header should have timestamp"
     );
-    assert!(
-        first_line["version"].is_string(),
-        "OpenClaw session header should have version"
+    // `CURRENT_SESSION_VERSION` in `@openclaw/ai@2026.7.1-2` is the number 3,
+    // and OpenClaw compares it numerically: `migrateToCurrentVersion` reads
+    // `header.version ?? 1` and returns early on `>= 3`. This used to assert
+    // `is_string()`, which only ever held because casr wrote the string
+    // "0.1.0" — a value that fails that comparison, so OpenClaw treated every
+    // casr-written transcript as needing migration and rewrote it.
+    assert_eq!(
+        first_line["version"], 3,
+        "OpenClaw session header version should be the current schema number"
     );
 }
 
