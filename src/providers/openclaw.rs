@@ -94,6 +94,14 @@
 //!
 //! Content blocks are `text` (`.text`), `thinking` (**`.thinking`**, not
 //! `.text`), `toolCall`, and `image`.
+//!
+//! A `toolCall` block is represented exactly once, and which channel carries it
+//! depends on the record. On an assistant turn it is structural — it comes back
+//! in [`CanonicalMessage::tool_calls`], because that is the record whose writer
+//! emits a real `toolCall` block. Everywhere else it has no structural channel
+//! and is rendered into the text as `[Tool: <name>]`. See [`ToolCallText`]:
+//! doing both on the assistant turn is what made every conversion into OpenClaw
+//! containing a tool call fail read-back verification and roll back.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
@@ -214,12 +222,41 @@ impl Transcript {
     }
 }
 
+/// Whether a `toolCall` block is this path's only record of the call.
+///
+/// Only the assistant arm of [`entry_message`] also calls
+/// [`extract_tool_calls`], so only there is the call already represented — and
+/// representing it twice is not merely redundant, it makes the format
+/// unwritable. The writer emits an assistant turn as a `text` block plus a
+/// `toolCall` block, which is exactly what `AssistantMessage.content` declares
+/// (`(TextContent | ThinkingContent | ToolCall)[]`,
+/// `dist/types-CFIUY_La.d.ts:206`); a reader that also renders the block into
+/// the text grows another `[Tool: …]` in `content` on every round trip, and
+/// `pipeline`'s read-back verification rejects the write.
+///
+/// Measured on `openclaw@2026.7.1-2` over the bytes casr writes for one such
+/// turn: `readTranscriptFileState` accepts both message rows and `convertToLlm`
+/// yields one assistant message holding one `text` part and one `toolCall`
+/// part. The vendor reads the call once out of that file, so the file is right
+/// and the second copy was the reader's.
+#[derive(Clone, Copy, PartialEq)]
+enum ToolCallText {
+    /// Render as `[Tool: <name>]` — nothing else on this path records it.
+    Rendered,
+    /// Skip: the caller returns the call in [`CanonicalMessage::tool_calls`].
+    Structural,
+}
+
 /// Flatten an OpenClaw `content` into a single string.
 ///
 /// `content` is a plain string or an array of typed blocks. Note `thinking`
 /// carries its prose under `thinking`, not `text` — reading `text` here yields
 /// empty reasoning on every session that has any.
-fn flatten_content(content: &serde_json::Value, out: &mut Transcript) -> String {
+fn flatten_content(
+    content: &serde_json::Value,
+    out: &mut Transcript,
+    tool_calls: ToolCallText,
+) -> String {
     if let Some(s) = content.as_str() {
         return s.to_string();
     }
@@ -240,13 +277,16 @@ fn flatten_content(content: &serde_json::Value, out: &mut Transcript) -> String 
                     parts.push(format!("[Thinking] {t}"));
                 }
             }
-            "toolCall" => {
+            "toolCall" if tool_calls == ToolCallText::Rendered => {
                 let name = block
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 parts.push(format!("[Tool: {name}]"));
             }
+            // Already returned structurally by the caller. Not counted as
+            // unrepresented, because it is represented.
+            "toolCall" => {}
             // Base64 image bytes. A string-typed message cannot hold them, so
             // they are counted rather than silently discarded.
             "image" => out.count("content block (image)"),
@@ -500,10 +540,9 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
             )
         }
         "custom_message" => {
-            let content = entry
-                .value
-                .get("content")
-                .map_or_else(String::new, |c| flatten_content(c, out));
+            let content = entry.value.get("content").map_or_else(String::new, |c| {
+                flatten_content(c, out, ToolCallText::Rendered)
+            });
             build(MessageRole::User, content, None)
         }
         "message" => {
@@ -528,7 +567,12 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
             match role_str {
                 "assistant" => {
                     let content_val = msg.get("content");
-                    let content = content_val.map_or_else(String::new, |c| flatten_content(c, out));
+                    // The only arm that also extracts the calls, and so the
+                    // only one where rendering them as text too would state
+                    // each call twice. See [`ToolCallText`].
+                    let content = content_val.map_or_else(String::new, |c| {
+                        flatten_content(c, out, ToolCallText::Structural)
+                    });
                     let tool_calls = content_val.map(extract_tool_calls).unwrap_or_default();
                     let author = msg
                         .get("model")
@@ -571,9 +615,9 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
                 // `isError` are the cost, and they are structural rather than
                 // model-visible: the prose the model was shown is `content`.
                 "toolResult" => {
-                    let content = msg
-                        .get("content")
-                        .map_or_else(String::new, |c| flatten_content(c, out));
+                    let content = msg.get("content").map_or_else(String::new, |c| {
+                        flatten_content(c, out, ToolCallText::Rendered)
+                    });
                     if content.trim().is_empty() {
                         out.count("message (toolResult, no text)");
                         return None;
@@ -602,9 +646,9 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
                 }
                 // "user" and "custom" both reach the model as a user turn.
                 _ => {
-                    let content = msg
-                        .get("content")
-                        .map_or_else(String::new, |c| flatten_content(c, out));
+                    let content = msg.get("content").map_or_else(String::new, |c| {
+                        flatten_content(c, out, ToolCallText::Rendered)
+                    });
                     if content.trim().is_empty() {
                         out.count(format!("message ({role_str}, no text)"));
                         return None;
@@ -1511,6 +1555,30 @@ mod tests {
         );
     }
 
+    /// The placeholder is dropped in the assistant arm and nowhere else.
+    ///
+    /// `flatten_content` is shared with the `user`/`custom`, `custom_message`
+    /// and `toolResult` paths, and none of those calls `extract_tool_calls`, so
+    /// none of them ever duplicated anything and on all three `[Tool: …]` is
+    /// the *only* record of the call. Widening the fix to `flatten_content`
+    /// itself would silently drop content from record types that never had the
+    /// bug — this is the assertion that says it did not.
+    #[test]
+    fn reader_tool_call_text_is_rendered_where_it_is_the_only_record() {
+        let session = read_openclaw(&[
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-14T09:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"see"},{"type":"toolCall","id":"tc1","name":"grep","arguments":{}}]}}"#,
+            r#"{"type":"custom_message","id":"m2","parentId":"m1","timestamp":"2026-02-14T09:00:02.000Z","content":[{"type":"text","text":"skill"},{"type":"toolCall","id":"tc2","name":"fetch","arguments":{}}]}"#,
+            r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-02-14T09:00:03.000Z","message":{"role":"toolResult","toolCallId":"tc1","toolName":"grep","content":[{"type":"text","text":"hit"},{"type":"toolCall","id":"tc3","name":"nested","arguments":{}}]}}"#,
+        ]);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[0].content, "see\n[Tool: grep]");
+        assert_eq!(session.messages[1].content, "skill\n[Tool: fetch]");
+        assert_eq!(session.messages[2].content, "hit\n[Tool: nested]");
+        // And none of the three claims the call structurally, so the text is
+        // not a second copy of anything.
+        assert!(session.messages.iter().all(|m| m.tool_calls.is_empty()));
+    }
+
     /// An assistant turn that is only a tool call has no text. Dropping empty
     /// content would lose the call with it.
     #[test]
@@ -1597,8 +1665,19 @@ mod tests {
         assert_eq!(session.messages[0].role, MessageRole::User);
         assert_eq!(session.messages[0].content, "Hello OpenClaw");
         assert_eq!(session.messages[1].role, MessageRole::Assistant);
-        assert!(session.messages[1].content.contains("Hi there!"));
-        assert!(session.messages[1].content.contains("[Tool: exec]"));
+        // This used to assert `content.contains("[Tool: exec]")`, and that
+        // assertion was encoding the defect rather than a requirement: an
+        // assistant turn's `toolCall` blocks are returned in `tool_calls`, so
+        // rendering them into the text as well stated the call twice and made
+        // every conversion into OpenClaw containing one fail read-back
+        // verification. What is real — the call is not lost — is asserted
+        // structurally just below, and `[Tool: …]` is still rendered for the
+        // three record types that have no structural channel (see
+        // [`ToolCallText`], and the test named
+        // `reader_tool_call_text_is_rendered_where_it_is_the_only_record`).
+        assert_eq!(session.messages[1].content, "Hi there!");
+        assert_eq!(session.messages[1].tool_calls.len(), 1);
+        assert_eq!(session.messages[1].tool_calls[0].name, "exec");
         assert_eq!(
             session.messages[1].author,
             Some("claude-opus-4-5".to_string())

@@ -12,7 +12,7 @@ mod test_env;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
-use casr::model::{CanonicalMessage, CanonicalSession, MessageRole};
+use casr::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall};
 use casr::providers::openclaw::OpenClaw;
 use casr::providers::{Provider, WriteOptions};
 use serde_json::json;
@@ -230,6 +230,149 @@ fn a_system_turn_survives_an_end_to_end_conversion_into_openclaw() {
         .filter(|entry| entry["type"] == "message")
         .count();
     assert_eq!(message_rows, 3, "all three turns reached the file");
+}
+
+// ---------------------------------------------------------------------------
+// A tool call is represented once, not twice
+// ---------------------------------------------------------------------------
+
+/// Every conversion into OpenClaw of a session containing a tool call failed
+/// outright, because the call was represented twice.
+///
+/// The writer emits an assistant turn as `[{type:"text"}, {type:"toolCall"}]`,
+/// which is exactly what `AssistantMessage.content` declares
+/// (`(TextContent | ThinkingContent | ToolCall)[]`,
+/// `dist/types-CFIUY_La.d.ts:205`). The reader then rendered the `toolCall`
+/// block into the text as `[Tool: <name>]` *and* returned the same call in
+/// `tool_calls`, so the placeholder the source reader had already put in
+/// `content` grew a second copy on every round trip and read-back verification
+/// rejected the write.
+///
+/// Measured on `openclaw@2026.7.1-2` over the bytes this test writes:
+/// `loadEntriesFromFile` → `buildSessionContext` → `convertToLlm` yields one
+/// assistant message with a single `toolCall` part named `bash`, and
+/// `readTranscriptFileState` accepts both message rows. The vendor reads one
+/// call out of the file; casr must too.
+#[test]
+fn a_tool_call_is_not_duplicated_by_a_write_and_read_back() {
+    let mut assistant = message(1, MessageRole::Assistant, "Sure.\n[Tool: bash]");
+    assistant.tool_calls = vec![ToolCall {
+        id: Some("c1".to_string()),
+        name: "bash".to_string(),
+        arguments: json!({"cmd": "tail"}),
+    }];
+    let session = session_with(
+        vec![message(0, MessageRole::User, "Tail the log"), assistant],
+        None,
+    );
+
+    let (readback, rendered) = write_then_read(&session);
+
+    assert_eq!(
+        readback.messages.len(),
+        session.messages.len(),
+        "rendered:\n{rendered}"
+    );
+    assert_eq!(
+        readback.messages[1].content, "Sure.\n[Tool: bash]",
+        "the tool call must not gain a second `[Tool: …]` on read-back: this is \
+         the content the pipeline compares, and a mismatch is a hard \
+         VerifyFailed + rollback\nrendered:\n{rendered}"
+    );
+    // And it is still there structurally, so nothing was traded away for the
+    // round trip: the file keeps the `toolCall` block the vendor type declares.
+    assert_eq!(readback.messages[1].tool_calls.len(), 1);
+    assert_eq!(readback.messages[1].tool_calls[0].name, "bash");
+    assert!(
+        rendered.contains(r#""type":"toolCall""#),
+        "the written file must still carry the block `AssistantMessage.content` \
+         declares\nrendered:\n{rendered}"
+    );
+}
+
+/// The end-to-end shape the bug was reported as: a real conversion, through the
+/// CLI, of a session whose assistant turn calls a tool.
+///
+/// ClawdBot is the source for the same reason as the system-turn case above —
+/// a flat directory of JSONL files, no manifest — and because its reader is one
+/// of the several that put `[Tool: <name>]` in `content` *and* populate
+/// `tool_calls` (`clawdbot.rs` `reader_extracts_tool_calls_and_thinking`).
+///
+/// Before the fix this printed
+/// `VerifyFailed … message content mismatch at idx 1: wrote 18 bytes, read back
+/// 31 bytes` and rolled the transcript back.
+#[test]
+fn a_tool_call_survives_an_end_to_end_conversion_into_openclaw() {
+    let tmp = tempfile::tempdir().unwrap();
+    let clawdbot = tmp.path().join("clawdbot");
+    std::fs::create_dir_all(&clawdbot).unwrap();
+    std::fs::write(
+        clawdbot.join("sess-with-toolcall.jsonl"),
+        [
+            r#"{"type":"session","version":2,"id":"sess-with-toolcall","timestamp":"2026-02-14T09:12:00.000Z","cwd":"/home/user/project"}"#,
+            r#"{"type":"message","id":"b2","parentId":null,"timestamp":"2026-02-14T09:12:05.000Z","message":{"role":"user","content":"Tail the log"}}"#,
+            r#"{"type":"message","id":"c3","parentId":"b2","timestamp":"2026-02-14T09:12:06.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Sure."},{"type":"toolCall","id":"c1","name":"bash","arguments":{"cmd":"tail"}}]}}"#,
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_casr");
+    let output = StdCommand::new(binary)
+        .args([
+            "--json",
+            "resume",
+            "ocl",
+            "sess-with-toolcall",
+            "--source",
+            "cwb",
+            "--force",
+        ])
+        .env("CLAWDBOT_HOME", &clawdbot)
+        .env("OPENCLAW_STATE_DIR", tmp.path().join("openclaw"))
+        .env("XDG_DATA_HOME", tmp.path().join("xdg-data"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("casr should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(
+        output.status.success(),
+        "ClawdBot→OpenClaw conversion of a session with a tool call must \
+         succeed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("resume --json output should parse");
+    assert_eq!(parsed["ok"], true, "{stdout}");
+    let written = parsed["written_paths"][0]
+        .as_str()
+        .expect("a written path")
+        .to_string();
+    let rendered = std::fs::read_to_string(&written).expect("written transcript is readable");
+
+    // One `[Tool: bash]` in the text, and one `toolCall` block beside it.
+    let assistant = entries(&rendered)
+        .into_iter()
+        .find(|entry| entry["message"]["role"] == "assistant")
+        .unwrap_or_else(|| panic!("an assistant row\nrendered:\n{rendered}"));
+    let blocks = assistant["message"]["content"]
+        .as_array()
+        .expect("block content")
+        .clone();
+    let text: Vec<&str> = blocks
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    assert_eq!(text, vec!["Sure.\n[Tool: bash]"], "rendered:\n{rendered}");
+    assert_eq!(
+        blocks.iter().filter(|b| b["type"] == "toolCall").count(),
+        1,
+        "rendered:\n{rendered}"
+    );
 }
 
 // ---------------------------------------------------------------------------
