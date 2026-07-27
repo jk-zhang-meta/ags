@@ -761,7 +761,12 @@ but resume may fail until the CLI is installed.",
         // of it. Settled here rather than after the write because nothing below
         // this line can change it — which is what lets a dry run return the same
         // two values without writing anything.
-        let (fidelity, losses) = flat_grade(&source_ir, target_provider.slug(), budget_losses);
+        let (fidelity, losses) = flat_grade(
+            &source_ir,
+            &canonical,
+            target_provider.slug(),
+            budget_losses,
+        );
 
         // 7a3. A dry run stops here, on the flat track.
         //
@@ -783,46 +788,76 @@ but resume may fail until the CLI is installed.",
             });
         }
 
-        // 7b. Normalize tool-only messages with empty content.
+        // 7b. Render tool traffic the target writer cannot carry into the text.
         //
-        // Some source formats (notably Codex with `originator: codex_exec`)
-        // produce canonical messages that have empty `content` but non-empty
-        // `tool_calls` and/or `tool_results`.  Target writers (e.g. Pi-Agent)
-        // either synthesize readable content from tool metadata or emit
-        // toolCall blocks that the reader flattens into text on read-back.
-        // Unless we mirror that synthesis here the read-back verification
-        // will see a content mismatch ("wrote 0 bytes, read back N bytes").
+        // # What this step is for
         //
-        // Fix: materialise the tool-call/result text into `content` on the
-        // canonical message itself so that write ↔ readback is consistent.
+        // A tool call reaches a target twice over: structurally, in
+        // [`CanonicalMessage::tool_calls`], and as prose, as `[Tool: <name>]`
+        // inside [`CanonicalMessage::content`]. Seven of the fifteen writable
+        // targets have only the second channel — clawdbot, vibe, factory,
+        // pi-agent, cursor, aider and chatgpt write `content` and nothing else
+        // — so for those, whatever `content` does not say when the writer runs
+        // is not in the session the model resumes. This step makes `content`
+        // self-sufficient for exactly those targets: it renders the calls the
+        // text does not already name. It is a **projection of structure into
+        // prose for a target that has no structure**, and everything about its
+        // two conditions follows from that.
         //
-        // This step is skipped for structured-tool targets (Claude Code), which
-        // round-trip `tool_use` / `tool_result` as native content blocks. Adding
-        // a synthesized text block there would corrupt the round-trip and cause
-        // the Anthropic API to reject the replayed history alongside the
-        // matching `tool_result`.
-        let target_preserves_tool_blocks = target_provider.slug() == "claude-code";
-        if !target_preserves_tool_blocks {
-            for msg in &mut canonical.messages {
-                if !msg.content.trim().is_empty() {
-                    continue;
-                }
+        // Read-back verification passing is a *consequence*, not the purpose.
+        // The verification compares `content` before and after the write, so a
+        // marker the target's reader synthesises has to already be here — but
+        // the reason it has to be here is that the model must see it.
+        //
+        // # Both conditions used to be proxies, and both proxies broke
+        //
+        // *Which targets.* The old gate was `slug != "claude-code"`, which
+        // named the one target known to round-trip `tool_use` blocks. Six more
+        // do: see [`writer_carries_tool_calls`]. Rendering into those wrote a
+        // `[Tool: grep]` placeholder *beside* the real call — casr minting the
+        // very duplicate its OpenClaw reader was fixed for not minting, on the
+        // 22,553 tool-call-only assistant turns in the corpus.
+        //
+        // *Which calls.* The old gate was `content.is_empty()`, standing in for
+        // "the source reader has not already rendered this". That held while
+        // every reader that populated `tool_calls` also wrote `[Tool: …]` into
+        // the text. It stopped holding when the OpenClaw reader was made
+        // structural-only: an assistant turn with text *and* a call then had
+        // non-empty content, skipped this step, and reached clawdbot/vibe/
+        // factory/pi-agent with the call gone from the only channel they have.
+        // The predicate is now the thing itself — render a call the text does
+        // not already name — so a reader that renders and a reader that does
+        // not both arrive at exactly one copy.
+        //
+        // Tool *results* keep the empty-content rule they have always had.
+        // Widening them is a separate question with a different answer: a
+        // `toolResult` message normally carries the observation in `content`
+        // already, and OpenClaw's writer takes the observation text from
+        // `content` rather than from `tool_results`, so a target moved off this
+        // path would lose the observation outright rather than gain a duplicate.
+        //
+        // What is left behind either way — the call's arguments and its id —
+        // is declared by [`tool_calls_rendered_as_text`], not dropped in
+        // silence.
+        let carries_tool_calls = writer_carries_tool_calls(target_provider.slug());
+        let carries_tool_results = target_provider.slug() == "claude-code";
+        for msg in &mut canonical.messages {
+            let mut parts: Vec<String> = Vec::new();
 
-                let has_tool_calls = !msg.tool_calls.is_empty();
-                let has_tool_results = !msg.tool_results.is_empty();
-
-                if !has_tool_calls && !has_tool_results {
-                    continue;
-                }
-
-                let mut parts: Vec<String> = Vec::new();
-
-                // Synthesize text for tool calls (matches Pi reader's format).
+            // Calls, for a target that has nowhere structural to put them, and
+            // only the ones the text does not already name.
+            if !carries_tool_calls {
                 for tc in &msg.tool_calls {
-                    parts.push(format!("[Tool: {}]", tc.name));
+                    let marker = format!("[Tool: {}]", tc.name);
+                    if !msg.content.contains(&marker) {
+                        parts.push(marker);
+                    }
                 }
+            }
 
-                // Synthesize text for tool results.
+            // Results: unchanged, gate and all. Only a message with no text of
+            // its own, and only the one target excluded before.
+            if !carries_tool_results && msg.content.trim().is_empty() {
                 for tr in &msg.tool_results {
                     if tr.is_error {
                         parts.push(format!("[Tool Error] {}", tr.content));
@@ -830,11 +865,16 @@ but resume may fail until the CLI is installed.",
                         parts.push(format!("[Tool Output] {}", tr.content));
                     }
                 }
-
-                if !parts.is_empty() {
-                    msg.content = parts.join("\n");
-                }
             }
+
+            if parts.is_empty() {
+                continue;
+            }
+            msg.content = if msg.content.trim().is_empty() {
+                parts.join("\n")
+            } else {
+                format!("{}\n{}", msg.content, parts.join("\n"))
+            };
         }
 
         // 8. Write to target provider, on the flat track.
@@ -1353,6 +1393,7 @@ fn verify_structured_write(
 /// the user asking whether that `N` was survivable.
 fn flat_grade(
     source_ir: &Result<Option<SessionIr>, String>,
+    canonical: &CanonicalSession,
     target_slug: &str,
     budget_losses: Vec<Loss>,
 ) -> (Fidelity, Vec<Loss>) {
@@ -1363,17 +1404,196 @@ fn flat_grade(
             .map_err(String::as_str),
         target_slug,
     );
-    for loss in budget_losses {
+    for loss in target_projection_losses(canonical, target_slug)
+        .into_iter()
+        .chain(budget_losses)
+    {
         fidelity = fidelity.worse_of(loss.grade);
         losses.push(loss);
     }
     (fidelity, losses)
 }
 
-fn flat_fidelity(
-    ir: Result<Option<&SessionIr>, &str>,
-    target_slug: &str,
-) -> (Fidelity, Vec<Loss>) {
+/// What the *target* cannot express about this session, as [`Loss`] values.
+///
+/// # Why this exists
+///
+/// [`flat_fidelity`] grades what the flat projection drops on the way *in*, and
+/// the budget grades what a cap removed. Nothing graded what the writer at the
+/// far end would have to change on the way *out*, so a conversion that turned a
+/// system prompt into a user turn and a structured tool call into the words
+/// `[Tool: exec]` reported `conversation_only` with an empty `losses` list — a
+/// grade with nothing behind it, which is exactly what [`Loss`] exists to
+/// prevent.
+///
+/// The structured track has had this since the Claude Code IR writer was
+/// written: `claude_code_ir_write::Writer::summarise` files its recast roles as
+/// [`LossKind::Metadata`] at [`Fidelity::ConversationOnly`] and its downgraded
+/// calls as [`LossKind::ToolProtocol`] at the same grade. This is the same
+/// vocabulary, with the same grades, for the fifteen writers that never had it.
+///
+/// # Why it is settled before the write and not observed after it
+///
+/// A dry run must report the grade the real run will produce, and a dry run
+/// stops at 7a3 without writing anything. Reading the answer back out of the
+/// written file would be both later than the dry run and, per the read-back's
+/// own caveat, a measurement of casr's reader rather than of the file.
+fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> Vec<Loss> {
+    let mut losses = Vec::new();
+
+    // Roles the target writer has no slot for, grouped by what it emits
+    // instead: one target can fold two source roles onto two different things
+    // (Kiro sends `System` to a user turn and `Other` to an assistant one), and
+    // "became a user turn" and "became an assistant turn" are not the same
+    // news. Insertion-ordered rather than sorted, so the note order follows the
+    // conversation.
+    let mut folds: Vec<(&'static str, usize)> = Vec::new();
+    for msg in &canonical.messages {
+        let Some(emitted) = folded_role(target_slug, &msg.role) else {
+            continue;
+        };
+        match folds.iter_mut().find(|(name, _)| *name == emitted) {
+            Some((_, count)) => *count += 1,
+            None => folds.push((emitted, 1)),
+        }
+    }
+    for (emitted, events) in folds {
+        losses.push(Loss {
+            kind: LossKind::Metadata,
+            events,
+            capsules: 0,
+            bytes: 0,
+            grade: Fidelity::ConversationOnly,
+            note: format!(
+                "{events} message(s) were written as {emitted}: a {target_slug} session has no \
+                 slot for the role they arrived with. The words survive; who said them does \
+                 not, and a resumed session cannot tell an instruction from something the user \
+                 typed."
+            ),
+        });
+    }
+
+    // Tool calls a text-only target can hold only as prose. Step 7b renders the
+    // name; the arguments and the call id have nowhere to go.
+    if !writer_carries_tool_calls(target_slug) {
+        let calls: usize = canonical.messages.iter().map(|m| m.tool_calls.len()).sum();
+        if calls > 0 {
+            losses.push(Loss {
+                kind: LossKind::ToolProtocol,
+                events: calls,
+                capsules: 0,
+                bytes: 0,
+                grade: Fidelity::ConversationOnly,
+                note: format!(
+                    "{calls} tool call(s) were written as `[Tool: <name>]` text: a {target_slug} \
+                     session has no structural place for a call, so the name survives and the \
+                     arguments and the call id do not."
+                ),
+            });
+        }
+    }
+
+    losses
+}
+
+/// What `target_slug`'s flat writer emits in place of `role`, or `None` when it
+/// can express `role` as itself.
+///
+/// # The oracle is the written file
+///
+/// Every row below was read out of the artifact each writer produces for a
+/// session holding one message of each role, not out of casr reading its own
+/// output back. The distinction matters in both directions. Gemini, ClawdBot,
+/// Vibe, Factory, Pi-Agent, ChatGPT and Codex write an unrecognised source role
+/// through under its own name, and casr's own `model::normalize_role` then maps
+/// `"developer"` back onto [`MessageRole::System`] — so a read-back would report
+/// a fold those files did not perform. Conversely Cursor and Kiro send a system
+/// turn somewhere a read-back reports blandly: Cursor writes bubble type 2 and
+/// Kiro an `AssistantMessage`, which is not "the operator distinction was lost"
+/// but "the operator is now speaking as the agent".
+///
+/// # Why `User` and `Assistant` are never folds
+///
+/// Every writable target distinguishes them; there is no target for which they
+/// are the news. Enumerated rather than wildcarded so that a role added to
+/// [`MessageRole`] has to be decided here.
+///
+/// # Why an unknown slug is `None`
+///
+/// `None` claims a writer lost nothing, which is the direction that hides a
+/// defect — so it is not left to a default to be right. `conformance_test`'s
+/// `no_writer_folds_a_role_without_declaring_it` drives every provider in the
+/// registry through its own writer and fails if the artifact and this table
+/// disagree, in either direction. A slug missing here is a slug that is not in
+/// the registry.
+pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str> {
+    match role {
+        MessageRole::User | MessageRole::Assistant => None,
+        // `claude_code.rs:703`, `cline.rs:316`, `openclaw.rs:1293`,
+        // `amp.rs:418`, `cursor.rs:1068`, `kiro.rs:1515`, `aider.rs:594`.
+        MessageRole::System => match target_slug {
+            "claude-code" | "cline" | "openclaw" => Some("plain user turns"),
+            "amp" => Some("`info` records"),
+            "cursor" => Some("assistant bubbles"),
+            "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
+            "aider" => Some("`>` blockquotes, the same channel tool output uses"),
+            _ => None,
+        },
+        // Same writers, and the source's own name for the turn goes with it.
+        MessageRole::Other(_) => match target_slug {
+            "claude-code" | "cline" | "openclaw" => Some("plain user turns"),
+            "amp" => Some("`info` records"),
+            "cursor" => Some("assistant bubbles"),
+            "kiro" => Some("`AssistantMessage` records, which Kiro replays as the agent"),
+            "aider" => Some("`>` blockquotes, the same channel tool output uses"),
+            _ => None,
+        },
+        // A tool observation folded onto the target's user record is how
+        // Anthropic-shaped formats carry one, and `tool_results` travels with
+        // it — but it is still a role the file cannot name, and the structured
+        // Claude Code writer has always counted it (`recast_roles`, "system/
+        // developer/tool message(s) were written as user records"). Counted
+        // here for the same reason, and only where the target has no
+        // `toolResult`/`ToolResults`/`tool` record of its own.
+        // Aider is deliberately absent: `>` blockquotes *are* its tool-output
+        // channel, so a tool observation written there is where it belongs. It
+        // is the system and unrecognised turns above, sharing that channel, that
+        // arrive as something they are not.
+        MessageRole::Tool => match target_slug {
+            "claude-code" | "cline" => Some("plain user turns"),
+            "amp" => Some("`info` records"),
+            "cursor" => Some("assistant bubbles"),
+            _ => None,
+        },
+    }
+}
+
+/// Whether the file `target_slug`'s flat writer produces carries
+/// [`crate::model::CanonicalMessage::tool_calls`] as structure.
+///
+/// `true` means the call reaches the resumed model as a call, so step 7b must
+/// not also render it as prose; `false` means the text is the only channel
+/// there is.
+///
+/// Measured by writing one session holding an assistant turn with a tool call
+/// through each writer and reading the artifact: Claude Code, Codex and Gemini
+/// emit `tool_use`, Amp emits `tool_use`, OpenClaw emits `toolCall`, Cline emits
+/// a tool block, Kiro emits `toolUse`, and OpenCode writes a tool part row.
+/// Cursor, Aider, ChatGPT, ClawdBot, Vibe, Factory and Pi-Agent write the
+/// message text and nothing else.
+///
+/// `false` for an unknown slug, which is both the conservative answer — a
+/// rendered marker is redundant where the call survives, and the only record of
+/// it where it does not — and what every provider but Claude Code got before
+/// this function existed.
+pub fn writer_carries_tool_calls(target_slug: &str) -> bool {
+    matches!(
+        target_slug,
+        "claude-code" | "codex" | "gemini" | "cline" | "amp" | "opencode" | "openclaw" | "kiro"
+    )
+}
+
+fn flat_fidelity(ir: Result<Option<&SessionIr>, &str>, target_slug: &str) -> (Fidelity, Vec<Loss>) {
     let baseline = Fidelity::ConversationOnly;
 
     let ir = match ir {
@@ -1754,6 +1974,16 @@ turn(s) between the task and the most recent history."
 ///
 /// This function maps every role to a small set of equivalence classes so the
 /// verification comparison is tolerant of this expected lossy round-trip.
+///
+/// # Tolerating it is not the same as not reporting it
+///
+/// This tolerance was for a long time the only place in the flat track that
+/// knew a role had folded, and it exists to *suppress* the signal — a fold is
+/// not a writer bug and must not fail verification and roll the write back. It
+/// is [`folded_role`] that declares the fold, before the write, as a [`Loss`],
+/// so the conversion says what it changed instead of quietly agreeing with
+/// itself. Widen the bucket here and the declaration there together, or the
+/// next fold is silent again.
 fn readback_role_bucket(role: &MessageRole) -> &'static str {
     match role {
         MessageRole::Assistant => "assistant",

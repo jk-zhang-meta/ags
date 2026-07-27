@@ -44,6 +44,10 @@ mod test_env;
 use std::path::{Path, PathBuf};
 
 use casr::conformance::{self, HopReport, Report};
+use casr::discovery::ProviderRegistry;
+use casr::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
+use casr::pipeline::{folded_role, writer_carries_tool_calls};
+use casr::providers::WriteOptions;
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -357,6 +361,241 @@ fn finish_hops(tier: &str, report: &HopReport) {
         appended.sessions,
         appended.control_kept_work,
         appended.sessions,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every writer, on what it cannot say
+// ---------------------------------------------------------------------------
+//
+// The two tiers above are the structured battery, and it has exactly two
+// subjects: a provider joins it by implementing `write_session_ir`. The
+// requirement below is for the other fifteen. It is here rather than in a file
+// of its own because it is the same kind of statement — a property every writer
+// owes, checked by running every writer — and because a provider author looking
+// for "what must my writer do" should find all of it in one place.
+
+/// Every provider-specific root that has no home-relative default of its own.
+///
+/// `HOME` covers the rest. Both of these fail their write outright when unset
+/// ("cannot determine ChatGPT home directory", "Cline storage not found"), and
+/// a requirement that silently skipped two of its fifteen subjects would be
+/// measuring what it could reach rather than what it claims.
+const EXTRA_ROOTS: [&str; 2] = ["CHATGPT_HOME", "CLINE_HOME"];
+
+/// Like [`sandboxed`], but for the flat writers: every root inside one scratch
+/// directory, none of them the developer's.
+fn sandboxed_for_flat_writers<T>(body: impl FnOnce(&Path) -> T) -> T {
+    let _lock = ENV.lock().expect("env lock");
+    let sandbox = tempfile::TempDir::new().expect("scratch directory");
+
+    let overrides: Vec<String> = std::env::vars()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            key != "HOME"
+                && (key.ends_with("_HOME") || key.ends_with("_DIR") || key.ends_with("_DB"))
+        })
+        .collect();
+    let _cleared: Vec<EnvGuard> = overrides.iter().map(|key| EnvGuard::remove(key)).collect();
+
+    let _home = EnvGuard::set("HOME", sandbox.path());
+    let _xdg: Vec<EnvGuard> = ["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"]
+        .iter()
+        .map(|key| EnvGuard::set(key, &sandbox.path().join(key.to_ascii_lowercase())))
+        .collect();
+    let _extra: Vec<EnvGuard> = EXTRA_ROOTS
+        .iter()
+        .map(|key| {
+            let root = sandbox.path().join(key.to_ascii_lowercase());
+            std::fs::create_dir_all(&root).expect("provider root");
+            EnvGuard::set(key, &root)
+        })
+        .collect();
+
+    body(sandbox.path())
+}
+
+fn message(idx: usize, role: MessageRole, content: &str) -> CanonicalMessage {
+    CanonicalMessage {
+        idx,
+        role,
+        content: content.to_string(),
+        timestamp: Some(1_700_000_000_000 + idx as i64 * 1000),
+        author: None,
+        tool_calls: Vec::new(),
+        tool_results: Vec::new(),
+        extra: serde_json::json!({}),
+    }
+}
+
+/// One turn of every role, plus the two shapes a tool call arrives in.
+///
+/// `Other` carries a name no reader normalises — `model::normalize_role` maps
+/// `"developer"` onto [`MessageRole::System`], so probing with that name would
+/// report a fold on the writers that faithfully wrote the name through.
+fn one_of_every_role(workspace: &Path) -> CanonicalSession {
+    let mut with_text = message(3, MessageRole::Assistant, "Hi there!");
+    with_text.tool_calls = vec![ToolCall {
+        id: Some("c1".to_string()),
+        name: "exec".to_string(),
+        arguments: serde_json::json!({"cmd": "ls"}),
+    }];
+    let mut call_only = message(4, MessageRole::Assistant, "");
+    call_only.tool_calls = vec![ToolCall {
+        id: Some("c2".to_string()),
+        name: "grep".to_string(),
+        arguments: serde_json::json!({"pat": "x"}),
+    }];
+    let mut observation = message(5, MessageRole::Tool, "matched 3 lines");
+    observation.author = Some("grep".to_string());
+    observation.tool_results = vec![ToolResult {
+        call_id: Some("c2".to_string()),
+        content: "matched 3 lines".to_string(),
+        is_error: false,
+    }];
+
+    CanonicalSession {
+        session_id: "role-conformance".to_string(),
+        provider_slug: "kiro".to_string(),
+        workspace: Some(workspace.to_path_buf()),
+        title: Some("role conformance".to_string()),
+        started_at: Some(1_700_000_000_000),
+        ended_at: Some(1_700_000_010_000),
+        messages: vec![
+            message(0, MessageRole::User, "Fix the bug"),
+            message(1, MessageRole::System, "You are a helpful assistant."),
+            message(2, MessageRole::Other("harness".to_string()), "Be terse."),
+            with_text,
+            call_only,
+            observation,
+        ],
+        metadata: serde_json::json!({}),
+        source_path: PathBuf::from("/tmp/source.json"),
+        model_name: Some("gpt-5".to_string()),
+    }
+}
+
+/// A writer that cannot express a role must not be the only thing that knows.
+///
+/// # The requirement
+///
+/// Seven of the fifteen flat writers have no slot for a system turn and send it
+/// somewhere else — Claude Code, Cline and OpenClaw to a plain user record, Amp
+/// to `info`, Cursor to an assistant bubble, Kiro to `Prompt`, Aider to a
+/// blockquote. Each of those mappings is right: the alternative is a row the
+/// target deletes on its next rewrite. What was wrong is that a conversion
+/// performing one reported `conversation_only` with an empty `losses` list, so
+/// the person resuming the session could not tell a system prompt they had been
+/// given from something they had typed.
+///
+/// `pipeline::folded_role` is where that is now declared, and this is what
+/// stops the declaration from being a comment that rots. It runs every provider
+/// in the registry through its own `write_session`, reads the session back, and
+/// fails in **both** directions: a fold nothing declared, and a declaration no
+/// writer performs. The next writer that folds a role gets a failing test rather
+/// than a silent conversion.
+///
+/// # What is being measured, and what it is not
+///
+/// The table `folded_role` holds was written from the fifteen written artifacts
+/// — the `"role"` field each writer emits — not from this round trip. Read-back
+/// is the drift alarm, not the oracle: it can only report a fold that a reader
+/// can see, and casr's readers normalise. That is why `Other` is probed under a
+/// name no reader rewrites, and why the roles this asserts on are the three the
+/// artifact and the read-back agree about.
+#[test]
+fn no_writer_folds_a_role_without_declaring_it() {
+    let probed = [
+        MessageRole::System,
+        MessageRole::Tool,
+        MessageRole::Other("harness".to_string()),
+    ];
+
+    let checked = sandboxed_for_flat_writers(|sandbox| {
+        let workspace = sandbox.join("project");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let session = one_of_every_role(&workspace);
+        let registry = ProviderRegistry::default_registry();
+        let mut checked = 0usize;
+
+        for provider in registry.all_providers() {
+            let slug = provider.slug();
+            // Antigravity and Grok refuse to be targets at all; a provider that
+            // cannot be written to cannot fold anything.
+            let Ok(written) = provider.write_session(&session, &WriteOptions { force: true })
+            else {
+                continue;
+            };
+            for path in &written.paths {
+                assert!(
+                    path.starts_with(sandbox),
+                    "{slug} wrote outside the sandbox, to {}",
+                    path.display()
+                );
+            }
+            let Some(first) = written.paths.first() else {
+                continue;
+            };
+            let readback = provider
+                .read_session(first)
+                .unwrap_or_else(|e| panic!("{slug} could not read back its own write: {e}"));
+
+            for role in &probed {
+                let Some(original) = session.messages.iter().find(|m| &m.role == role) else {
+                    continue;
+                };
+                // Matched on the words rather than on the index: several
+                // writers merge or drop turns, so position is not an identity.
+                let survived = readback
+                    .messages
+                    .iter()
+                    .find(|m| m.content.contains(original.content.trim()));
+                let observed = match survived {
+                    Some(m) => &m.role != role,
+                    // A turn that did not arrive at all is a different and worse
+                    // finding, and not the one this requirement is about.
+                    None => continue,
+                };
+                let declared = folded_role(slug, role);
+                assert_eq!(
+                    observed,
+                    declared.is_some(),
+                    "{slug}: a {role:?} turn came back as {:?}, and `pipeline::folded_role` says \
+                     {declared:?}. A writer that cannot express a role must declare the fold \
+                     there, so the conversion carries a Loss for it instead of changing who \
+                     spoke in silence.",
+                    survived.map(|m| &m.role),
+                );
+                checked += 1;
+            }
+
+            // The same statement for the tool channel: `writer_carries_tool_calls`
+            // decides whether pipeline step 7b renders a call as `[Tool: <name>]`
+            // prose, and it is wrong in one direction (a call written nowhere)
+            // or the other (a placeholder beside a real call).
+            let carried = readback
+                .messages
+                .iter()
+                .any(|m| m.tool_calls.iter().any(|tc| tc.name == "exec"));
+            assert_eq!(
+                carried,
+                writer_carries_tool_calls(slug),
+                "{slug}: the written session {} the tool call structurally, and \
+                 `pipeline::writer_carries_tool_calls` says {}. Step 7b renders the call as text \
+                 exactly when this is false; disagreeing means either a call nobody wrote down \
+                 or a placeholder beside a real one.",
+                if carried { "kept" } else { "dropped" },
+                writer_carries_tool_calls(slug),
+            );
+            checked += 1;
+        }
+        checked
+    });
+
+    assert!(
+        checked > 30,
+        "only {checked} writer/role pair(s) were checked; a requirement that runs on almost \
+         nothing passes on almost nothing"
     );
 }
 

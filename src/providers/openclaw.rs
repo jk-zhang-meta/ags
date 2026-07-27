@@ -1286,6 +1286,13 @@ fn render_session(session_id: &str, session: &CanonicalSession) -> String {
         // more: it also reaches the model as a user turn, this reader also
         // reads it back as [`MessageRole::User`], and its `customType` would
         // have to carry a role name OpenClaw itself never writes.
+        //
+        // The mapping is right and it is still a loss, so it is declared:
+        // `pipeline::folded_role("openclaw", …)` names it before the write and
+        // the conversion carries a [`crate::ir::Loss`] for it. Change this
+        // match and that table has to change with it —
+        // `conformance_test::no_writer_folds_a_role_without_declaring_it`
+        // drives this writer and fails if the two disagree.
         let role_str = match &msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",

@@ -1890,8 +1890,10 @@ fn pipeline_emits_trace_events_for_detection_read_write_verify() {
         "missing structured-track INFO event; got {events:#?}"
     );
     assert!(
-        !events.iter().any(|e| e.level == tracing::Level::DEBUG
-            && event_has_message(e, "Codex session parsed")),
+        !events
+            .iter()
+            .any(|e| e.level == tracing::Level::DEBUG
+                && event_has_message(e, "Codex session parsed")),
         "the structured track must not run the flat read-back verifier: it \
          compares against `canonical`, which is not what was written"
     );
@@ -1984,10 +1986,9 @@ fn a_grade_the_comparator_disproved_is_not_what_a_refusal_acts_on() {
          talk it into starting on a session with a hole in it"
     );
     assert!(
-        result
-            .fidelity_disagreement()
-            .is_some_and(|note| note.contains("ConversationOnly")
-                && note.contains("HistoryIncomplete")),
+        result.fidelity_disagreement().is_some_and(
+            |note| note.contains("ConversationOnly") && note.contains("HistoryIncomplete")
+        ),
         "the disagreement has to be sayable in one sentence: {:?}",
         result.fidelity_disagreement()
     );
@@ -2136,11 +2137,15 @@ fn pairing_repair_leaves_a_call_that_arrived_unanswered() {
         1,
         "an unanswered call is the source's own shape, not damage to repair"
     );
+    // Severing is the `HistoryIncomplete` half of `LossKind::ToolProtocol`:
+    // something the model was shown is gone. The `ConversationOnly` half of the
+    // same kind is the target writing a structured call as `[Tool: <name>]`
+    // text, which this target does and which is not damage to the pairing — so
+    // the assertion names the grade rather than the whole channel.
     assert!(
-        result
-            .losses
-            .iter()
-            .all(|loss| loss.kind != LossKind::ToolProtocol),
+        result.losses.iter().all(|loss| {
+            loss.kind != LossKind::ToolProtocol || loss.grade != Fidelity::HistoryIncomplete
+        }),
         "nothing was severed, so nothing should be reported as severed: {:?}",
         result.losses
     );
@@ -2341,7 +2346,10 @@ fn rollback_restores_each_backup_onto_the_file_it_came_from() {
     );
     assert!(!api.exists(), "an unverified output is removed");
     assert!(!ui.exists(), "every unverified output is removed");
-    assert!(!index_backup.exists(), "the backup is consumed by the restore");
+    assert!(
+        !index_backup.exists(),
+        "the backup is consumed by the restore"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2384,7 +2392,10 @@ fn a_forced_write_never_leaves_the_session_path_empty() {
         !vanished.load(std::sync::atomic::Ordering::Relaxed),
         "the session path was empty part way through a forced write"
     );
-    assert_eq!(content.len(), fs::metadata(&target).expect("target").len() as usize);
+    assert_eq!(
+        content.len(),
+        fs::metadata(&target).expect("target").len() as usize
+    );
 }
 
 #[test]
