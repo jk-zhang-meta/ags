@@ -114,6 +114,14 @@
       "category": "synthetic",
       "intent": "Uses 'gemini' role type instead of 'model'. Tests normalize_role mapping."
     },
+    "gmi_jsonl_rewind": {
+      "provider": "gemini",
+      "format": "jsonl",
+      "path": "gemini/gmi_jsonl_rewind.jsonl",
+      "expected": "expected/gmi_jsonl_rewind.json",
+      "category": "synthetic",
+      "intent": "Current Gemini JSONL: header, $set metadata updates, a message re-appended under an id already recorded, a $rewindTo that undoes two turns, and one record type this reader does not recognise. Proves the reader folds the log instead of concatenating it."
+    },
     "agy_simple": {
       "provider": "antigravity",
       "format": "sqlite+jsonl",

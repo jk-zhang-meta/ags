@@ -1,0 +1,16 @@
+{
+  "fixture_id": "gmi_jsonl_rewind",
+  "provider_slug": "gemini",
+  "session_id": "gmi-jsonl-rewind-001",
+  "workspace": null,
+  "title": "Add pagination to the users endpoint",
+  "message_count": 4,
+  "roles": ["User", "Assistant", "User", "Assistant"],
+  "started_at_present": true,
+  "ended_at_present": true,
+  "model_name": null,
+  "has_tool_calls": true,
+  "has_tool_results": true,
+  "known_lossy_fields": ["tokens", "kind", "summary"],
+  "notes": "JSONL fold. Ten records collapse to four messages: the two turns after $rewindTo:u-2 (u-2, g-2, both marked REWOUND) are gone, and the re-appended g-1 replaces the empty first version in place rather than appearing twice. The $recordTypeThisReaderHasNeverSeen line is synthetic and stands in for a future record type; it must be counted in metadata.unrecognized_records, not dropped."
+}

@@ -1560,7 +1560,20 @@ fn cmd_list(
                     };
                 }
 
+                // Same acceptance rule as the provider, for the same reason:
+                // gating on `.json` here hid every JSONL session from `list`
+                // independently of the reader, so fixing one without the other
+                // fixes nothing the user can see. `is_session_file_name` is the
+                // provider's, so the two cannot drift apart again.
+                //
+                // Keyed by the *file* id rather than the session id the body
+                // declares, because this fast path exists to avoid opening the
+                // files at all. A migrated session is `session-<ts>-<id8>.json`
+                // and `session-<ts>-<id8>.jsonl`, which share that key, so the
+                // pair still collapses to the `.jsonl`.
                 let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+                let mut seen: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 let entries = match std::fs::read_dir(&chats_dir) {
                     Ok(entries) => entries,
                     Err(_) => return Some(vec![]),
@@ -1573,15 +1586,34 @@ fn cmd_list(
                     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                         continue;
                     };
-                    if !(name.starts_with("session-") && name.ends_with(".json")) {
+                    if !casr::providers::gemini::is_session_file_name(name) {
                         continue;
                     }
                     let session_id = name
                         .strip_prefix("session-")
-                        .and_then(|n| n.strip_suffix(".json"))
+                        .map(|rest| {
+                            rest.strip_suffix(".jsonl")
+                                .or_else(|| rest.strip_suffix(".json"))
+                                .unwrap_or(rest)
+                        })
                         .unwrap_or(name)
                         .to_string();
-                    sessions.push((session_id, path));
+                    match seen.get(&session_id) {
+                        Some(&index) => {
+                            let live_is_jsonl =
+                                sessions[index].1.extension().and_then(|e| e.to_str())
+                                    == Some("jsonl");
+                            if !live_is_jsonl
+                                && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                            {
+                                sessions[index].1 = path;
+                            }
+                        }
+                        None => {
+                            seen.insert(session_id.clone(), sessions.len());
+                            sessions.push((session_id, path));
+                        }
+                    }
                 }
                 Some(sessions)
             }

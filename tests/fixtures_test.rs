@@ -363,6 +363,43 @@ fn fixture_gmi_gemini_role() {
     assert_session_matches(&session, &expected, "gmi_gemini_role");
 }
 
+/// The format current Gemini actually writes, and the fold that reads it.
+///
+/// Every other `gmi_*` fixture is legacy whole-file JSON, which is why this
+/// reader could be blind to `.jsonl` for twenty-odd releases with a green
+/// suite. Against the old reader this fails at the first line —
+/// `read_session` was a whole-file `serde_json::from_reader`, so a JSONL file
+/// is `trailing characters at line 2 column 1`.
+#[test]
+fn fixture_gmi_jsonl_rewind() {
+    let path = fixtures_dir().join("gemini/gmi_jsonl_rewind.jsonl");
+    let session = Gemini
+        .read_session(&path)
+        .expect("gmi_jsonl_rewind should parse");
+    let expected = load_expected("gmi_jsonl_rewind");
+    assert_session_matches(&session, &expected, "gmi_jsonl_rewind");
+
+    // The fixture's rewound turns are the only ones marked REWOUND, so this is
+    // a whole-session statement and not a spot check on two indices.
+    for message in &session.messages {
+        assert!(
+            !message.content.contains("REWOUND"),
+            "the user rewound past this turn; Gemini has no record of it and \
+             neither may we: {:?}",
+            message.content
+        );
+    }
+
+    // Unrecognised records are counted rather than dropped, and named.
+    let unrecognized = &session.metadata["unrecognized_records"];
+    assert_eq!(unrecognized["unclassified"], 1);
+    assert_eq!(unrecognized["unparseable_lines"], 0);
+    assert_eq!(
+        unrecognized["keys"],
+        serde_json::json!(["$recordTypeThisReaderHasNeverSeen"])
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Grok Build (grk) fixtures
 // ---------------------------------------------------------------------------
