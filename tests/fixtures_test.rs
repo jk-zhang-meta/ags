@@ -756,7 +756,10 @@ fn fixture_opc_current_schema() {
     assert_eq!(results[0].content, "Read complete");
     assert!(!results[0].is_error);
     assert_eq!(results[1].content, "exit status 1");
-    assert!(results[1].is_error, "an errored tool part is an error result");
+    assert!(
+        results[1].is_error,
+        "an errored tool part is an error result"
+    );
 
     assert_eq!(session.model_name.as_deref(), Some("gpt-5"));
     assert_eq!(session.metadata["prompt_tokens"], 1234);
@@ -774,7 +777,10 @@ fn fixture_opc_both_layouts_are_readable() {
         .read_session(&fixtures_dir().join("opencode-current/opencode.db"))
         .expect("current layout should parse");
 
-    assert_eq!(legacy.metadata["opencode_schema"], "sessions/messages/files");
+    assert_eq!(
+        legacy.metadata["opencode_schema"],
+        "sessions/messages/files"
+    );
     assert_eq!(current.metadata["opencode_schema"], "session/message/part");
     assert!(!legacy.messages.is_empty());
     assert!(!current.messages.is_empty());

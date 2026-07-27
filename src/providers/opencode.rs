@@ -232,19 +232,54 @@ impl OpenCode {
     }
 
     /// Resolve target DB path for writes.
+    ///
+    /// A database that already exists beats one casr would have to invent,
+    /// because the only useful outcome of `casr resume opc <session>` is a
+    /// session OpenCode can open. A fresh workspace-local database is not one:
+    /// current OpenCode reads a single database in its own data directory, so
+    /// inventing one there makes the conversion succeed, report a fidelity
+    /// grade, and leave the user nothing to resume — success and emptiness at
+    /// the same time, which is the same defect on the write side that the
+    /// reader was just fixed for.
+    ///
+    /// Reaching into the agent's live state is the price of the session being
+    /// resumable at all. Codex already makes the same trade, registering a
+    /// converted thread into `~/.codex/state_*.sqlite`.
+    ///
+    /// Because of this, *every* caller of `write_session` reads the process
+    /// environment. Tests that exercise it therefore live in
+    /// `tests/opencode_write_test.rs`, where `XDG_DATA_HOME` and friends can be
+    /// redirected — `src/lib.rs` forbids unsafe code, so an in-crate test
+    /// cannot call `set_var` and cannot isolate itself from a real install.
     fn choose_target_db_path(session: &CanonicalSession) -> anyhow::Result<PathBuf> {
+        // 1. An explicit override is the user naming the target, so it wins over
+        //    anything discovery could infer.
         if let Some(env_db) = Self::env_db_path() {
             return Ok(env_db);
         }
 
+        // 2. A database already sitting beside the workspace. Current OpenCode
+        //    never puts one there, so its presence means somebody deliberately
+        //    did — an older OpenCode, or a user who keeps a per-project store.
         if let Some(workspace) = &session.workspace {
-            return Ok(workspace.join(DATA_DIRNAME).join(DB_FILENAME));
+            let workspace_db = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
+            if workspace_db.is_file() {
+                return Ok(workspace_db);
+            }
         }
 
+        // 3. Any database discovery found — in practice the one OpenCode itself
+        //    writes and reads.
         if let Some(existing) = Self::find_db_files().into_iter().next() {
             return Ok(existing);
         }
 
+        // 4. Nothing exists anywhere. Create beside the workspace, else the cwd
+        //    — and `write_session_legacy` warns that what lands here is not
+        //    something this OpenCode will read.
+        if let Some(workspace) = &session.workspace {
+            return Ok(workspace.join(DATA_DIRNAME).join(DB_FILENAME));
+        }
         let cwd = std::env::current_dir().context("failed to determine current directory")?;
         Ok(cwd.join(DATA_DIRNAME).join(DB_FILENAME))
     }
@@ -1799,11 +1834,10 @@ fn build_current_parts(message: &CanonicalMessage) -> Vec<serde_json::Value> {
 
         // OpenCode pairs a result to its call by `callID`, so the result is
         // folded into the call's state rather than emitted separately.
-        let matched = message
-            .tool_results
-            .iter()
-            .enumerate()
-            .find(|(i, result)| !claimed[*i] && result.call_id.as_deref() == call.id.as_deref());
+        let matched =
+            message.tool_results.iter().enumerate().find(|(i, result)| {
+                !claimed[*i] && result.call_id.as_deref() == call.id.as_deref()
+            });
         if let Some((i, _)) = matched {
             claimed[i] = true;
         }
@@ -1883,75 +1917,21 @@ fn role_to_opencode(role: &MessageRole) -> &str {
     }
 }
 
+/// Note on what is *not* tested here.
+///
+/// Every path that reaches [`OpenCode::choose_target_db_path`] reads the
+/// process environment, so a test that exercised it in-crate would consult the
+/// developer's real OpenCode install. `src/lib.rs` declares
+/// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in edition
+/// 2024, so an in-crate test cannot redirect `XDG_DATA_HOME` and cannot isolate
+/// itself. Those tests live in `tests/opencode_write_test.rs`, which can.
+///
+/// What stays here needs no environment: pure parsing, virtual-path round
+/// trips, and schema questions asked about a path the test was handed.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::Provider;
-    use std::sync::{LazyLock, Mutex};
-
-    static OPENCODE_ENV: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-    struct CwdGuard {
-        original: PathBuf,
-    }
-
-    impl CwdGuard {
-        fn change_to(path: &Path) -> Self {
-            let original = std::env::current_dir().expect("read current dir");
-            std::env::set_current_dir(path).expect("set current dir");
-            Self { original }
-        }
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
-    fn sample_session(workspace: &Path) -> CanonicalSession {
-        CanonicalSession {
-            session_id: "source-session".to_string(),
-            provider_slug: "claude-code".to_string(),
-            workspace: Some(workspace.to_path_buf()),
-            title: Some("Fix OpenCode adapter".to_string()),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_010_000),
-            messages: vec![
-                CanonicalMessage {
-                    idx: 0,
-                    role: MessageRole::User,
-                    content: "Please inspect src/main.rs".to_string(),
-                    timestamp: Some(1_700_000_000_000),
-                    author: None,
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: serde_json::json!({}),
-                },
-                CanonicalMessage {
-                    idx: 1,
-                    role: MessageRole::Assistant,
-                    content: "Inspecting now.".to_string(),
-                    timestamp: Some(1_700_000_005_000),
-                    author: Some("gpt-5".to_string()),
-                    tool_calls: vec![ToolCall {
-                        id: Some("call-1".to_string()),
-                        name: "Read".to_string(),
-                        arguments: serde_json::json!({"path":"src/main.rs"}),
-                    }],
-                    tool_results: vec![ToolResult {
-                        call_id: Some("call-1".to_string()),
-                        content: "Read complete".to_string(),
-                        is_error: false,
-                    }],
-                    extra: serde_json::json!({}),
-                },
-            ],
-            metadata: serde_json::json!({}),
-            source_path: workspace.join("source.jsonl"),
-            model_name: Some("gpt-5".to_string()),
-        }
-    }
 
     #[test]
     fn provider_metadata_and_resume_command() {
@@ -1978,191 +1958,6 @@ mod tests {
         let parsed = OpenCode::parse_virtual_path(&virtual_path).expect("should parse");
         assert_eq!(parsed.0, db.as_path());
         assert_eq!(parsed.1, sid);
-    }
-
-    #[test]
-    fn writer_reader_roundtrip_preserves_core_content() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let source = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("write should succeed");
-
-        assert_eq!(written.resume_command, "opencode");
-        assert_eq!(written.paths.len(), 1);
-        let db_path = written
-            .paths
-            .first()
-            .and_then(|p| p.parent())
-            .expect("virtual path parent");
-        assert!(db_path.is_file(), "db file should exist");
-
-        let readback = OpenCode
-            .read_session(&written.paths[0])
-            .expect("readback should succeed");
-
-        assert_eq!(readback.provider_slug, "opencode");
-        assert_eq!(readback.messages.len(), source.messages.len());
-        assert_eq!(readback.messages[0].role, MessageRole::User);
-        assert_eq!(readback.messages[0].content, source.messages[0].content);
-        assert_eq!(readback.messages[1].role, MessageRole::Assistant);
-        assert_eq!(readback.messages[1].content, source.messages[1].content);
-        assert_eq!(readback.workspace.as_deref(), Some(workspace.as_path()));
-        // The target id is now derived stably from the source session id so that
-        // re-conversion is idempotent and `--force` can overwrite in place.
-        assert_eq!(readback.session_id, source.session_id);
-    }
-
-    /// Regression for #14: writing the same OpenCode session twice must fail
-    /// without `--force` (clean SessionConflict, not a raw SQLite duplicate-key
-    /// error) and succeed with `--force`, overwriting the existing row in place
-    /// rather than orphaning a duplicate.
-    #[test]
-    fn write_twice_with_force_overwrites_in_place() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let source = sample_session(&workspace);
-
-        // First write succeeds.
-        let first = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("first write should succeed");
-        let db_path = first.paths[0].parent().expect("db parent").to_path_buf();
-
-        // Second write WITHOUT force must be a clean conflict, not a panic or a
-        // raw "failed to insert OpenCode session" error.
-        let conflict = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect_err("second write without --force should conflict");
-        match conflict.downcast_ref::<crate::error::CasrError>() {
-            Some(crate::error::CasrError::SessionConflict { session_id, .. }) => {
-                assert_eq!(session_id, &source.session_id);
-            }
-            other => panic!("expected SessionConflict, got {other:?}"),
-        }
-
-        // Second write WITH force succeeds and overwrites in place.
-        let second = OpenCode
-            .write_session(&source, &WriteOptions { force: true })
-            .expect("force write should succeed");
-
-        // Same stable target id both times.
-        assert_eq!(first.session_id, second.session_id);
-        assert_eq!(second.session_id, source.session_id);
-
-        // Exactly one session row and no orphaned/duplicated message rows.
-        let conn = OpenCode::open_db(&db_path).expect("open db");
-        let session_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-            .expect("count sessions");
-        assert_eq!(session_count, 1, "force must overwrite, not duplicate");
-
-        let message_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .expect("count messages");
-        assert_eq!(
-            message_count,
-            source.messages.len() as i64,
-            "messages from the prior write must be replaced, not accumulated"
-        );
-
-        // The overwritten session still reads back cleanly.
-        let readback = OpenCode
-            .read_session(&second.paths[0])
-            .expect("readback after force overwrite");
-        assert_eq!(readback.messages.len(), source.messages.len());
-    }
-
-    #[test]
-    fn owns_session_returns_virtual_path() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let source = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("write should succeed");
-        let found = OpenCode.owns_session(&written.session_id);
-
-        assert_eq!(found.as_deref(), Some(written.paths[0].as_path()));
-    }
-
-    #[test]
-    fn read_session_from_db_path_returns_latest_root_session() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        // Distinct source ids so both land as separate root sessions in one DB
-        // (target ids are now derived stably from the source session id).
-        let mut first = sample_session(&workspace);
-        first.session_id = "older-source".to_string();
-        first.title = Some("Older Session".to_string());
-        first.started_at = Some(1_700_000_000_000);
-        let _first_written = OpenCode
-            .write_session(&first, &WriteOptions { force: false })
-            .expect("first write");
-
-        let mut second = sample_session(&workspace);
-        second.session_id = "newer-source".to_string();
-        second.title = Some("Newer Session".to_string());
-        second.started_at = Some(1_800_000_000_000);
-        let second_written = OpenCode
-            .write_session(&second, &WriteOptions { force: false })
-            .expect("second write");
-
-        let db_path = second_written
-            .paths
-            .first()
-            .and_then(|p| p.parent())
-            .expect("db path parent")
-            .to_path_buf();
-
-        let read_latest = OpenCode
-            .read_session(&db_path)
-            .expect("read from db should pick latest");
-        assert_eq!(read_latest.title.as_deref(), Some("Newer Session"));
-    }
-
-    #[test]
-    fn detect_reports_db_presence() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let source = sample_session(&workspace);
-        OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("write should succeed");
-
-        let detection = OpenCode.detect();
-        assert!(
-            detection.installed,
-            "db presence should mark provider installed"
-        );
-        assert!(
-            detection
-                .evidence
-                .iter()
-                .any(|ev| ev.contains("opencode.db")),
-            "evidence should include db detection"
-        );
     }
 
     #[test]
@@ -2439,118 +2234,7 @@ mod tests {
 
     // ── writer edge cases ───────────────────────────────────────────────
 
-    #[test]
-    fn writer_no_title_generates_from_first_user_message() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let mut session = sample_session(&workspace);
-        session.title = None;
-
-        let written = OpenCode
-            .write_session(&session, &WriteOptions { force: false })
-            .expect("write");
-        let readback = OpenCode.read_session(&written.paths[0]).expect("readback");
-
-        // Title should be derived from first user message
-        assert!(readback.title.is_some());
-        let title = readback.title.unwrap();
-        assert!(title.contains("inspect"));
-    }
-
-    #[test]
-    fn writer_no_timestamps_uses_current_time() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let mut session = sample_session(&workspace);
-        session.started_at = None;
-        session.ended_at = None;
-        for msg in &mut session.messages {
-            msg.timestamp = None;
-        }
-
-        let written = OpenCode
-            .write_session(&session, &WriteOptions { force: false })
-            .expect("write");
-        let readback = OpenCode.read_session(&written.paths[0]).expect("readback");
-
-        assert!(readback.started_at.is_some());
-        assert!(readback.ended_at.is_some());
-    }
-
-    #[test]
-    fn writer_model_name_propagated_to_messages() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let session = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&session, &WriteOptions { force: false })
-            .expect("write");
-        let readback = OpenCode.read_session(&written.paths[0]).expect("readback");
-
-        // The model_name should be detected from message authors
-        assert!(readback.model_name.is_some());
-    }
-
     // ── reader edge cases ───────────────────────────────────────────────
-
-    #[test]
-    fn reader_metadata_includes_token_counts() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let session = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&session, &WriteOptions { force: false })
-            .expect("write");
-        let readback = OpenCode.read_session(&written.paths[0]).expect("readback");
-
-        // Metadata should include OpenCode-specific fields
-        assert!(readback.metadata.get("opencode_db").is_some());
-        assert!(readback.metadata.get("prompt_tokens").is_some());
-        assert!(readback.metadata.get("completion_tokens").is_some());
-        assert!(readback.metadata.get("cost").is_some());
-    }
-
-    #[test]
-    fn reader_message_extra_has_opencode_fields() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let session = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&session, &WriteOptions { force: false })
-            .expect("write");
-        let readback = OpenCode.read_session(&written.paths[0]).expect("readback");
-
-        for msg in &readback.messages {
-            assert!(
-                msg.extra.get("opencode_message_id").is_some(),
-                "each message should have opencode_message_id in extra"
-            );
-            assert!(
-                msg.extra.get("opencode_parts").is_some(),
-                "each message should have opencode_parts in extra"
-            );
-        }
-    }
 
     // ── dedup_existing_files ────────────────────────────────────────────
 
@@ -2581,49 +2265,6 @@ mod tests {
     }
 
     // ── list_sessions ───────────────────────────────────────────────────
-
-    #[test]
-    fn list_sessions_returns_all_sessions_from_db() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        // Write two distinct sessions (distinct source ids → distinct rows)
-        let mut first = sample_session(&workspace);
-        first.session_id = "first-source".to_string();
-        first.title = Some("First Session".to_string());
-        first.started_at = Some(1_700_000_000_000);
-        let first_written = OpenCode
-            .write_session(&first, &WriteOptions { force: false })
-            .expect("first write");
-
-        let mut second = sample_session(&workspace);
-        second.session_id = "second-source".to_string();
-        second.title = Some("Second Session".to_string());
-        second.started_at = Some(1_800_000_000_000);
-        let second_written = OpenCode
-            .write_session(&second, &WriteOptions { force: false })
-            .expect("second write");
-
-        let listed = OpenCode.list_sessions().expect("should return Some");
-        assert!(
-            listed.len() >= 2,
-            "expected at least 2 sessions, got {}",
-            listed.len()
-        );
-
-        let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(
-            ids.contains(&first_written.session_id.as_str()),
-            "first session should be listed"
-        );
-        assert!(
-            ids.contains(&second_written.session_id.as_str()),
-            "second session should be listed"
-        );
-    }
 
     // ── current schema (session/message/part) ───────────────────────────
     //
@@ -2716,199 +2357,6 @@ CREATE TABLE `project` (
         );
     }
 
-    /// Writing into a live OpenCode database must produce rows that OpenCode
-    /// reads — which means its tables, not casr's.
-    #[test]
-    fn writer_matches_a_current_schema_target() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        // The write target already exists and is a current-schema database.
-        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
-        make_current_db(&db_path);
-
-        let source = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("write should succeed");
-        assert!(
-            written.warnings.is_empty(),
-            "writing into a real OpenCode database is not a degraded write"
-        );
-
-        let conn = OpenCode::open_db(&db_path).expect("open");
-        let sessions: i64 = conn
-            .query_row("SELECT COUNT(*) FROM session", [], |r| r.get(0))
-            .expect("count session");
-        let messages: i64 = conn
-            .query_row("SELECT COUNT(*) FROM message", [], |r| r.get(0))
-            .expect("count message");
-        let parts: i64 = conn
-            .query_row("SELECT COUNT(*) FROM part", [], |r| r.get(0))
-            .expect("count part");
-        assert_eq!(sessions, 1);
-        assert_eq!(messages, source.messages.len() as i64);
-        assert!(parts >= messages, "every message contributes at least a part");
-        assert!(
-            !OpenCode::table_exists(&conn, "sessions"),
-            "casr must not graft its legacy tables onto a live OpenCode database"
-        );
-
-        // OpenCode brands session ids; an unbranded one is listed but cannot be
-        // opened by `opencode export` and friends.
-        assert!(
-            written.session_id.starts_with("ses_"),
-            "written id {} is not one OpenCode accepts",
-            written.session_id
-        );
-
-        let readback = OpenCode
-            .read_session(&written.paths[0])
-            .expect("readback should succeed");
-        assert_eq!(readback.metadata["opencode_schema"], "session/message/part");
-        assert_eq!(readback.messages.len(), source.messages.len());
-        assert_eq!(readback.messages[0].content, source.messages[0].content);
-        assert_eq!(readback.messages[1].content, source.messages[1].content);
-        assert_eq!(readback.messages[1].tool_calls.len(), 1);
-        assert_eq!(readback.messages[1].tool_calls[0].name, "Read");
-        assert_eq!(readback.messages[1].tool_results.len(), 1);
-        assert_eq!(readback.messages[1].tool_results[0].content, "Read complete");
-        assert_eq!(readback.workspace.as_deref(), Some(workspace.as_path()));
-    }
-
-    /// An OpenCode old enough to own a legacy database still gets the legacy
-    /// layout. Trading one layout for the other would move the bug rather than
-    /// fix it.
-    #[test]
-    fn writer_matches_a_legacy_schema_target() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
-        let conn = OpenCode::open_db_rw(&db_path).expect("create");
-        OpenCode::ensure_schema(&conn).expect("legacy schema");
-        drop(conn);
-
-        let source = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("write should succeed");
-        assert!(
-            written.warnings.is_empty(),
-            "an existing legacy database is its owner's real store, not a degraded target"
-        );
-
-        let conn = OpenCode::open_db(&db_path).expect("open");
-        assert!(!OpenCode::table_exists(&conn, "session"));
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-            .expect("count sessions");
-        assert_eq!(count, 1);
-
-        let readback = OpenCode
-            .read_session(&written.paths[0])
-            .expect("readback");
-        assert_eq!(
-            readback.metadata["opencode_schema"],
-            "sessions/messages/files"
-        );
-        assert_eq!(readback.messages.len(), source.messages.len());
-    }
-
-    /// casr cannot bootstrap a current-schema database from nothing — OpenCode's
-    /// migrator runs on open and aborts with "table `project` already exists".
-    /// So it writes the legacy layout and says so, instead of reporting a
-    /// success that no OpenCode will ever show.
-    #[test]
-    fn creating_a_database_from_nothing_warns_that_opencode_will_not_read_it() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        let source = sample_session(&workspace);
-        let written = OpenCode
-            .write_session(&source, &WriteOptions { force: false })
-            .expect("write should succeed");
-
-        assert_eq!(written.warnings.len(), 1, "a fresh database is a caveat");
-        let warning = &written.warnings[0];
-        assert!(
-            warning.contains("will not show this session"),
-            "warning must say the session is invisible to OpenCode: {warning}"
-        );
-        assert!(
-            warning.contains("OPENCODE_DB_PATH"),
-            "warning must say how to fix it: {warning}"
-        );
-    }
-
-    /// Regression: a transcript whose message order disagrees with its own
-    /// timestamps used to read back reordered, because both layouts are read
-    /// with `ORDER BY <created>, id`. Measured on a real 478-message Claude Code
-    /// session, where a tool result is stamped a millisecond before the message
-    /// it follows.
-    #[test]
-    fn out_of_order_timestamps_still_round_trip_in_order() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-
-        for (label, prepare) in [
-            ("current", true),
-            ("legacy", false),
-        ] {
-            let workspace = tmp.path().join(format!("ws-{label}"));
-            std::fs::create_dir_all(workspace.join(DATA_DIRNAME)).expect("data dir");
-            let _cwd = CwdGuard::change_to(&workspace);
-            let db_path = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
-            if prepare {
-                make_current_db(&db_path);
-            } else {
-                let conn = OpenCode::open_db_rw(&db_path).expect("create");
-                OpenCode::ensure_schema(&conn).expect("legacy schema");
-            }
-
-            let mut source = sample_session(&workspace);
-            source.messages = (0..6)
-                .map(|i| CanonicalMessage {
-                    idx: i,
-                    role: if i % 2 == 0 {
-                        MessageRole::User
-                    } else {
-                        MessageRole::Assistant
-                    },
-                    content: format!("message number {i}"),
-                    // Deliberately non-monotonic: 3 lands before 2.
-                    timestamp: Some(1_700_000_000_000 + if i == 2 { 5 } else { i as i64 }),
-                    author: None,
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: serde_json::json!({}),
-                })
-                .collect();
-
-            let written = OpenCode
-                .write_session(&source, &WriteOptions { force: false })
-                .expect("write");
-            let readback = OpenCode.read_session(&written.paths[0]).expect("readback");
-
-            let got: Vec<&str> = readback
-                .messages
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect();
-            let want: Vec<&str> = source.messages.iter().map(|m| m.content.as_str()).collect();
-            assert_eq!(got, want, "[{label}] message order must survive the round trip");
-        }
-    }
-
     #[test]
     fn opencode_session_id_brands_foreign_ids_deterministically() {
         // Already an OpenCode id: left alone, so re-reading a session casr wrote
@@ -2962,9 +2410,8 @@ CREATE TABLE `project` (
 
     #[test]
     fn parse_current_parts_falls_back_to_reasoning_then_tool_output() {
-        let (content, _, _) = parse_current_parts(&[
-            serde_json::json!({"type":"reasoning","text":"only thinking"}),
-        ]);
+        let (content, _, _) =
+            parse_current_parts(&[serde_json::json!({"type":"reasoning","text":"only thinking"})]);
         assert_eq!(content, "only thinking");
 
         let (content, _, _) = parse_current_parts(&[serde_json::json!({
@@ -2992,23 +2439,5 @@ CREATE TABLE `project` (
             vec![100, 100, 100, 300],
             "clamped values must be ones the session already contains"
         );
-    }
-
-    #[test]
-    fn list_sessions_empty_db_returns_empty_vec() {
-        let _lock = OPENCODE_ENV.lock().expect("mutex lock");
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let workspace = tmp.path().join("workspace");
-        std::fs::create_dir_all(workspace.join(".opencode")).expect("data dir");
-        let _cwd = CwdGuard::change_to(&workspace);
-
-        // Create empty DB with schema
-        let db_path = workspace.join(".opencode/opencode.db");
-        let conn = OpenCode::open_db_rw(&db_path).expect("create db");
-        OpenCode::ensure_schema(&conn).expect("schema");
-        drop(conn);
-
-        let listed = OpenCode.list_sessions().expect("should return Some");
-        assert!(listed.is_empty(), "empty DB should have no sessions");
     }
 }
