@@ -15,6 +15,46 @@
 //! ## Legacy JSON format
 //!
 //! Single object: `{ "session": { "id", "cwd" }, "items": [ {role, content, timestamp} ] }`
+//!
+//! ## What Codex itself will list — measured, not assumed
+//!
+//! Everything below was measured against `@openai/codex` 0.145.0 (the shipped
+//! `codex app-server`, driven over stdio with `thread/list`) by planting real
+//! rollouts at chosen paths under a throwaway `CODEX_HOME`. It is what
+//! [`Codex::is_session_path`] and [`Codex::list_sessions`] encode.
+//!
+//! * **Position.** The scan reaches exactly
+//!   `<sessions|archived_sessions>/<a>/<b>/<c>/rollout-*` — one file, three
+//!   directories, no more and no less. The same rollout planted directly in
+//!   `sessions/`, one level down, two levels down, four levels down or five
+//!   levels down is not listed.
+//! * **Those three components are integers, not a date.** `2026/07/18` lists;
+//!   so do `2026/7/8`, `+026/07/18`, `0000/00/00`, `2026/255/18` and
+//!   `65535/07/18`. `65536/07/18`, `2026/256/18`, `2026/07/256`, `70000/07/18`,
+//!   `-1/07/18`, `aaaa/bb/cc`, `a026/07/18`, `2026/07/1a`, `2026/0_7/18`,
+//!   `2026/07/ 18` and `2026/07/18.0` do not. Those widths are exactly
+//!   `u16 / u8 / u8` and Rust's `FromStr`, which is why [`is_rollout_layout`]
+//!   parses rather than pattern-matches: it reproduces every one of those
+//!   observations, including the `+` and the two overflow boundaries, without
+//!   guessing at a calendar rule the artifact does not apply.
+//! * **Extension.** `.jsonl` and `.jsonl.zst` are rollouts; `.json` and `.ZST`
+//!   are not, at the correct depth, with genuine rollout content. 0.145.0
+//!   compresses rollouts in place (`rollout/src/compression.rs`), so a
+//!   `.jsonl.zst` is an ordinary session of the user's — see
+//!   [`reject_compressed_rollout`] for why casr reports rather than decodes it.
+//! * **Prefix.** `rollout-` is required; the same content under another name is
+//!   not listed.
+//! * **Content, not position.** `thread/list` filters on the `ThreadSourceKind`
+//!   it derives from `session_meta.payload.source`, and omitting `sourceKinds`
+//!   "defaults to interactive sources". A `subagent` source is excluded there
+//!   while sitting in the same day directory as its parent, so no path
+//!   predicate can express it — see [`is_subagent_rollout`]. The default also
+//!   drops `source: "exec"`, which casr keeps on purpose;
+//!   [`Codex::list_sessions`] says why.
+//! * **Archived.** `archived_sessions/` is a flat *sibling* of `sessions/`, and
+//!   a rollout's archive state is which of the two it is under. `thread/list`
+//!   returns archived threads only when asked (`archived: true`), so casr
+//!   resolves an archived session by id but does not list it.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -39,6 +79,22 @@ use crate::providers::{
 
 /// Codex provider implementation.
 pub struct Codex;
+
+/// The `CODEX_HOME` subdirectory holding live rollouts.
+const SESSIONS_DIR: &str = "sessions";
+
+/// The `CODEX_HOME` subdirectory holding archived rollouts.
+///
+/// A flat sibling of [`SESSIONS_DIR`], not a child of it: `codex doctor`
+/// checks that "rows under `archived_sessions` are archived and rows under
+/// `sessions` are active", and a rollout moved to
+/// `<CODEX_HOME>/archived_sessions/<y>/<m>/<d>/` comes back from `thread/list`
+/// with `archived: true` set while one under
+/// `<CODEX_HOME>/sessions/archived_sessions/…` does not.
+const ARCHIVED_SESSIONS_DIR: &str = "archived_sessions";
+
+/// The compressed rollout extension 0.145.0 writes.
+const ROLLOUT_ZST_SUFFIX: &str = ".jsonl.zst";
 
 /// Generate the Codex rollout file path for a new session.
 ///
@@ -68,7 +124,31 @@ impl Codex {
 
     /// Sessions directory where rollout files live.
     fn sessions_dir() -> Option<PathBuf> {
-        Self::home_dir().map(|h| h.join("sessions"))
+        Self::home_dir().map(|h| h.join(SESSIONS_DIR))
+    }
+
+    /// Where `codex archive <id>` moves a rollout to.
+    ///
+    /// Its own top-level directory, not a subdirectory of
+    /// [`Codex::sessions_dir`]; see [`ARCHIVED_SESSIONS_DIR`].
+    fn archived_sessions_dir() -> Option<PathBuf> {
+        Self::home_dir().map(|h| h.join(ARCHIVED_SESSIONS_DIR))
+    }
+
+    /// Both rollout roots, live first, whether or not they exist yet.
+    fn rollout_root_paths() -> Vec<PathBuf> {
+        [Self::sessions_dir(), Self::archived_sessions_dir()]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The rollout roots that are directories right now.
+    fn rollout_roots() -> Vec<PathBuf> {
+        Self::rollout_root_paths()
+            .into_iter()
+            .filter(|dir| dir.is_dir())
+            .collect()
     }
 }
 
@@ -115,18 +195,51 @@ impl Provider for Codex {
         }
     }
 
+    /// Both `sessions/` and `archived_sessions/`.
+    ///
+    /// The archived root is here so that `casr <path-to-an-archived-rollout>`
+    /// is attributed to Codex — `ProviderRegistry::resolve_session` decides
+    /// ownership of an explicit path by `path.starts_with(root)`, and with only
+    /// the live root an archived rollout fell through to the signature-sniffing
+    /// fallback. It is deliberately *not* what `list` reads; see
+    /// [`Codex::list_sessions`].
     fn session_roots(&self) -> Vec<PathBuf> {
-        match Self::sessions_dir() {
-            Some(dir) if dir.is_dir() => vec![dir],
-            _ => vec![],
-        }
+        Self::rollout_roots()
     }
 
+    /// The rollouts a user could resume in Codex, minus the agent's own.
+    ///
+    /// Two exclusions, and they are different kinds of statement.
+    ///
+    /// `archived_sessions/` is left out because `thread/list` returns archived
+    /// threads only for an explicit `archived: true` — a plain call does not
+    /// see them, and `codex archive` exists precisely to take a session out of
+    /// the picker. [`Codex::owns_session`] still finds one by id, because
+    /// asking to convert a named session is not the same question as asking
+    /// what there is.
+    ///
+    /// Subagent rollouts are left out because Codex excludes them by
+    /// `sourceKinds`, which is a fact about the record and not about where it
+    /// sits: they are written into the same `<y>/<m>/<d>` directory as the
+    /// thread that spawned them. On the corpus this was measured against that
+    /// is 576 of 660 files — a listing that shows them is not a longer answer
+    /// to the user's question, it is a different one.
+    ///
+    /// One measured difference is deliberately *not* reproduced. A default
+    /// `thread/list` also drops `source: "exec"` — pointed at a store holding
+    /// three `cli`, two `exec` and two subagent rollouts it returned the three
+    /// `cli`; `sourceKinds: ["exec"]` returned the two. But a `codex exec` run
+    /// is the user's own work, not the agent's plumbing, and casr converts
+    /// sessions rather than offering them to Codex's picker: withholding those
+    /// 39 of the user's 660 would be losing sessions to match a filter whose
+    /// purpose is a resume menu. If that trade is ever revisited, it is one
+    /// line here, and the fact it turns on is recorded above.
     fn list_sessions(&self) -> Option<SessionListing> {
         let sessions_dir = Self::sessions_dir()?;
 
         let mut listing = SessionListing::default();
-        for entry in WalkDir::new(&sessions_dir).max_depth(5) {
+        // Three directories and the file: the exact reach of Codex's own scan.
+        for entry in WalkDir::new(&sessions_dir).max_depth(4) {
             let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
                 continue;
             };
@@ -135,32 +248,67 @@ impl Provider for Codex {
                 continue;
             }
 
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
 
+            // One read answers both questions the listing has about this file.
+            // A compressed rollout answers neither — see
+            // `reject_compressed_rollout`; it is listed on its filename and
+            // reported when the reader gets to it.
+            let meta = session_meta_payload(path);
+            if meta.as_ref().is_some_and(is_subagent_rollout) {
+                trace!(
+                    path = %path.display(),
+                    "skipping Codex subagent rollout: `codex resume` does not offer it"
+                );
+                continue;
+            }
+
             // Prefer authoritative ID from session_meta payload; otherwise
-            // retain filename stem for best-effort diagnostics.
-            let session_id = session_meta_id(path).unwrap_or_else(|| stem.to_string());
+            // retain the filename for best-effort diagnostics.
+            let session_id = meta
+                .as_ref()
+                .and_then(|payload| payload.get("id"))
+                .and_then(|id| id.as_str())
+                .map_or_else(|| rollout_stem(name).to_string(), ToString::to_string);
             listing.sessions.push((session_id, path.to_path_buf()));
         }
 
         Some(listing)
     }
 
-    /// Codex names every rollout `rollout-<timestamp>-<uuid>.jsonl` under
-    /// `sessions/YYYY/MM/DD/`. `history.jsonl`, `config.toml`, `auth.json` and
-    /// `log/` sit beside `sessions/`, but the prefix is checked anyway because
-    /// it is the tool's actual rule and the directory is not casr's to promise.
+    /// A Codex rollout is
+    /// `<CODEX_HOME>/<sessions|archived_sessions>/<y>/<m>/<d>/rollout-*.jsonl[.zst]`.
+    ///
+    /// All three halves of that are the artifact's own rule and all three were
+    /// measured; the module comment records what was planted and what came
+    /// back. The root is resolved rather than matched by name, which is what
+    /// separates `<home>/sessions/2026/07/28/` from
+    /// `<home>/sessions/archived_sessions/2026/07/28/` — the second is three
+    /// levels under a directory *called* `archived_sessions` and four levels
+    /// under `sessions/`, and 0.145.0 lists neither it nor anything else at
+    /// that depth. Naming the root also stops a rollout someone copied to
+    /// `~/Downloads/sessions/2026/07/28/` being claimed as a live session.
     fn is_session_path(&self, path: &Path) -> bool {
-        path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            n.starts_with("rollout-") && (n.ends_with(".jsonl") || n.ends_with(".json"))
-        })
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_rollout_file_name)
+            && is_rollout_layout(path, &Self::rollout_root_paths())
     }
 
+    /// Resolve a named session, including ones `list` deliberately withholds.
+    ///
+    /// Listing answers "what is there"; this answers "where is the one I
+    /// named", and the two have different right answers. An archived rollout,
+    /// a subagent rollout and a legacy `rollout-*.json` are all sessions the
+    /// user can point at by id, and refusing to resolve them would turn an
+    /// exclusion from the picker into data loss. Only a compressed rollout is
+    /// resolved-and-then-refused, by the reader rather than here, so that the
+    /// refusal names the file.
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let sessions_dir = Self::sessions_dir()?;
-        if !sessions_dir.is_dir() {
+        let roots = Self::rollout_roots();
+        if roots.is_empty() {
             return None;
         }
 
@@ -181,48 +329,54 @@ impl Provider for Codex {
         // check is repeated because this is the branch that deliberately reads
         // the identifier as a path, and it should say which paths it means.
         if Path::new(session_id).is_relative() {
-            let as_path = sessions_dir.join(session_id);
-            for ext in ["", ".jsonl", ".json"] {
-                let candidate = if ext.is_empty() {
-                    as_path.clone()
-                } else {
-                    as_path.with_extension(&ext[1..])
-                };
-                if candidate.is_file() {
-                    debug!(path = %candidate.display(), "found Codex session by path");
-                    return Some(candidate);
+            for root in &roots {
+                let as_path = root.join(session_id);
+                for suffix in ["", ".jsonl", ROLLOUT_ZST_SUFFIX, ".json"] {
+                    // Appended, not `with_extension`: the compressed form has
+                    // two extensions and `with_extension` would replace the
+                    // first rather than add the second.
+                    let mut name = as_path.clone().into_os_string();
+                    name.push(suffix);
+                    let candidate = PathBuf::from(name);
+                    if candidate.is_file() {
+                        debug!(path = %candidate.display(), "found Codex session by path");
+                        return Some(candidate);
+                    }
                 }
             }
         }
 
         // Scan rollout files recursively.
-        for entry in WalkDir::new(&sessions_dir)
-            .max_depth(5)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && (name.starts_with("rollout-")
-                    && (name.ends_with(".jsonl") || name.ends_with(".json")))
-                && path.is_file()
-            {
+        for root in &roots {
+            for entry in WalkDir::new(root).max_depth(4).into_iter().flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                // Wider than `is_session_path` on purpose: the legacy
+                // whole-file `.json` form is not something Codex lists any
+                // more, but a user who still has one can still name it.
+                if !name.starts_with("rollout-")
+                    || !(name.ends_with(".jsonl")
+                        || name.ends_with(ROLLOUT_ZST_SUFFIX)
+                        || name.ends_with(".json"))
+                    || !path.is_file()
+                {
+                    continue;
+                }
+
                 // Check if the relative path (minus extension) matches session_id.
-                if let Ok(rel) = path.strip_prefix(&sessions_dir) {
-                    let rel_str = rel.with_extension("").to_string_lossy().to_string();
-                    if rel_str == session_id {
-                        debug!(path = %path.display(), "found Codex session");
-                        return Some(path.to_path_buf());
-                    }
+                if let Ok(rel) = path.strip_prefix(root)
+                    && let Some(parent) = rel.parent()
+                    && parent.join(rollout_stem(name)).to_string_lossy() == session_id
+                {
+                    debug!(path = %path.display(), "found Codex session");
+                    return Some(path.to_path_buf());
                 }
 
                 // Match by UUID suffix embedded in rollout filename:
                 // rollout-YYYY-MM-DDThh-mm-ss-<session-id>.jsonl
-                let name_no_ext = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
-                if name_no_ext.ends_with(session_id) {
+                if rollout_stem(name).ends_with(session_id) {
                     debug!(path = %path.display(), "found Codex session by filename suffix");
                     return Some(path.to_path_buf());
                 }
@@ -239,6 +393,8 @@ impl Provider for Codex {
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading Codex session");
+
+        reject_compressed_rollout(path)?;
 
         // Try JSONL first, fall back to legacy JSON.
         let content = std::fs::read_to_string(path)
@@ -386,6 +542,7 @@ impl Provider for Codex {
 
     /// Codex is on the high-fidelity track; see [`super::codex_ir`].
     fn read_session_ir(&self, path: &Path) -> anyhow::Result<Option<SessionIr>> {
+        reject_compressed_rollout(path)?;
         super::codex_ir::read(path).map(Some)
     }
 
@@ -1438,17 +1595,28 @@ impl Codex {
         messages: Vec<CanonicalMessage>,
         skipped: usize,
     ) -> anyhow::Result<CanonicalSession> {
-        // Derive session ID from relative path if not in content.
+        // Derive session ID from relative path if not in content. Both roots,
+        // because an archived rollout is still a session with an id, and
+        // `sessions/`-only left it named after its bare filename instead.
         let session_id = session_id.unwrap_or_else(|| {
-            if let Some(sessions_dir) = Self::sessions_dir()
-                && let Ok(rel) = path.strip_prefix(&sessions_dir)
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            for root in [Self::sessions_dir(), Self::archived_sessions_dir()]
+                .into_iter()
+                .flatten()
             {
-                return rel.with_extension("").to_string_lossy().to_string();
+                if let Ok(rel) = path.strip_prefix(&root)
+                    && let Some(parent) = rel.parent()
+                {
+                    return parent
+                        .join(rollout_stem(name))
+                        .to_string_lossy()
+                        .to_string();
+                }
             }
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string()
+            match rollout_stem(name) {
+                "" => "unknown".to_string(),
+                stem => stem.to_string(),
+            }
         });
 
         let title = messages
@@ -1674,8 +1842,13 @@ fn codex_parse_arguments_value(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Extract `session_meta.payload.id` from a Codex rollout file.
-fn session_meta_id(path: &Path) -> Option<String> {
+/// Extract the `session_meta` payload from a Codex rollout file.
+///
+/// `None` for a file with no `session_meta` in its first 64 lines, and for a
+/// compressed rollout, whose bytes this cannot read. Both mean "unknown", and
+/// callers must not read "unknown" as "no" — [`Codex::list_sessions`] lists a
+/// rollout it could not classify rather than dropping it.
+fn session_meta_payload(path: &Path) -> Option<serde_json::Value> {
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok).take(64) {
@@ -1688,13 +1861,123 @@ fn session_meta_id(path: &Path) -> Option<String> {
             Err(_) => continue,
         };
         if envelope.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
-            return envelope
-                .pointer("/payload/id")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
+            return envelope.get("payload").cloned();
         }
     }
     None
+}
+
+/// Extract `session_meta.payload.id` from a Codex rollout file.
+fn session_meta_id(path: &Path) -> Option<String> {
+    session_meta_payload(path)?
+        .get("id")?
+        .as_str()
+        .map(ToString::to_string)
+}
+
+/// Whether this rollout is one `codex resume` will not offer.
+///
+/// 0.145.0 records what started a thread in `session_meta.payload.source`
+/// (`SessionSource`), and `thread/list` filters on the `ThreadSourceKind` it
+/// derives from that. Omitting `sourceKinds` "defaults to interactive
+/// sources", and a `thread/list` against real rollouts returned the `cli` ones
+/// and neither of the two `{"subagent":{"thread_spawn":…}}` ones; asking for
+/// `["subAgentThreadSpawn"]` returned exactly those two. The subagent variants
+/// the artifact's own `SubAgentSource` enum names are `review`, `compact`,
+/// `thread_spawn`, `memory_consolidation` and `other`, so the discriminator is
+/// the outer `subagent` tag rather than a list of inner ones that would go
+/// stale the next time Codex adds a kind of subagent.
+///
+/// This cannot be a path rule. A subagent rollout is written into the same
+/// `<y>/<m>/<d>` directory, with the same `rollout-` name, as the thread that
+/// spawned it — the only thing that distinguishes it is inside the file.
+fn is_subagent_rollout(payload: &serde_json::Value) -> bool {
+    payload.pointer("/source/subagent").is_some()
+}
+
+/// Does this filename name a Codex rollout?
+///
+/// The `rollout-` prefix plus `.jsonl` or `.jsonl.zst`, and nothing else.
+/// `.json` is excluded deliberately: a genuine rollout renamed to
+/// `rollout-….json` and planted at the correct depth is not returned by
+/// `thread/list`, so listing one would be casr inventing a session. The legacy
+/// whole-file `{session, items}` form is still *read* — by
+/// [`Codex::read_legacy_json`], reached by content — and still resolved by
+/// [`Codex::owns_session`]; it is only the enumeration that no longer claims
+/// it. `.ZST` is excluded for the same reason: it was planted and not listed.
+fn is_rollout_file_name(name: &str) -> bool {
+    name.starts_with("rollout-") && (name.ends_with(".jsonl") || name.ends_with(ROLLOUT_ZST_SUFFIX))
+}
+
+/// The identifier-bearing part of a rollout filename.
+///
+/// [`Path::file_stem`] cannot answer this: for `rollout-x.jsonl.zst` it says
+/// `rollout-x.jsonl`, which matches no session id and no relative-path form.
+fn rollout_stem(name: &str) -> &str {
+    name.strip_suffix(ROLLOUT_ZST_SUFFIX)
+        .or_else(|| name.strip_suffix(".jsonl"))
+        .or_else(|| name.strip_suffix(".json"))
+        .unwrap_or(name)
+}
+
+/// Whether `path` sits where Codex's scanner reaches:
+/// `<root>/<u16>/<u8>/<u8>/<file>` for one of `roots`.
+///
+/// The parses are the rule, not a stand-in for one. Measured against 0.145.0,
+/// `2026/7/8`, `+026/07/18`, `0000/00/00`, `2026/255/18` and `65535/07/18` all
+/// list, while `65536/07/18`, `70000/07/18`, `2026/256/18`, `2026/07/256`,
+/// `-1/07/18`, `2026/0_7/18`, `2026/07/ 18`, `2026/07/18.0`, `a026/07/18` and
+/// `2026/07/1a` do not — which is exactly `u16`/`u8`/`u8` through Rust's
+/// `FromStr` and is neither a `*/*/*` glob nor a calendar check. Encoding a
+/// date check instead would drop `2026/255/18`, a directory the artifact
+/// accepts; encoding a bare glob would pick up `aaaa/bb/cc`, one it does not.
+fn is_rollout_layout(path: &Path, roots: &[PathBuf]) -> bool {
+    let mut ancestors = path.ancestors().skip(1);
+    let (Some(day), Some(month), Some(year), Some(root)) = (
+        ancestors.next(),
+        ancestors.next(),
+        ancestors.next(),
+        ancestors.next(),
+    ) else {
+        return false;
+    };
+    fn component(dir: &Path) -> Option<&str> {
+        dir.file_name().and_then(|name| name.to_str())
+    }
+    roots.iter().any(|candidate| candidate == root)
+        && component(year).is_some_and(|c| c.parse::<u16>().is_ok())
+        && component(month).is_some_and(|c| c.parse::<u8>().is_ok())
+        && component(day).is_some_and(|c| c.parse::<u8>().is_ok())
+}
+
+/// Refuse a rollout casr can see but cannot decode, by name.
+///
+/// 0.145.0 compresses rollouts in place — `rollout/src/compression.rs`, whose
+/// outcomes include `compressed`, `skipped_already_compressed` and
+/// `plain_exists` — leaving `rollout-….jsonl.zst` where the `.jsonl` was, and
+/// `thread/list` goes on listing the thread. casr has no zstd decoder and
+/// adding one would be a new C toolchain dependency for a format the shipped
+/// corpus this was measured against contains none of.
+///
+/// So it reports. `cmd_list` turns this `Err` into a `skipped` row naming the
+/// path and the reason, which is the #38/#40 bargain this codebase already
+/// made: a session the user can see is missing is a bug they can act on, and a
+/// session silently absent is one they cannot. Dropping `.jsonl.zst` from
+/// [`is_rollout_file_name`] instead would have been the quiet failure.
+fn reject_compressed_rollout(path: &Path) -> anyhow::Result<()> {
+    let compressed = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(ROLLOUT_ZST_SUFFIX));
+    if compressed {
+        let display = path.display();
+        anyhow::bail!(
+            "{display} is a zstd-compressed Codex rollout and casr has no zstd \
+             decoder. Decompress it first (`zstd -d {display}`) and convert the \
+             resulting .jsonl."
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
