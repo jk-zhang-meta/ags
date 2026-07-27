@@ -1971,11 +1971,14 @@ fn writer_openclaw_output_valid_jsonl() {
 
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    // session header + 4 messages.
+    // session header + model_change + 4 messages. The `model_change` line is
+    // there because `simple_session()` names a model, and OpenClaw carries the
+    // session model in an entry rather than in the header — its `SessionHeader`
+    // has no `modelId` field to put it in.
     assert_eq!(
         lines.len(),
-        5,
-        "OpenClaw should write session header + 4 message lines"
+        6,
+        "OpenClaw should write session header + model_change + 4 message lines"
     );
     for (i, line) in lines.iter().enumerate() {
         if let Err(e) = serde_json::from_str::<serde_json::Value>(line) {
@@ -2000,8 +2003,15 @@ fn writer_openclaw_message_ids_are_sequential() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
 
-    // Skip header, check message IDs are m1, m2, m3, m4.
-    for (i, entry) in lines.iter().skip(1).enumerate() {
+    // Message IDs are m1, m2, m3, m4. Selected by entry type rather than by
+    // skipping a fixed prefix: the header is not the only non-message line —
+    // a session that names a model also carries a `model_change` entry — and
+    // a positional skip silently starts asserting against the wrong rows when
+    // that changes.
+    let messages: Vec<&serde_json::Value> =
+        lines.iter().filter(|e| e["type"] == "message").collect();
+    assert_eq!(messages.len(), 4, "expected the 4 message lines");
+    for (i, entry) in messages.iter().enumerate() {
         let expected_id = format!("m{}", i + 1);
         assert_eq!(
             entry["id"].as_str().unwrap(),

@@ -20,11 +20,20 @@
 //!   is a *navigation control* rather than conversation (`transcript-tree.ts`:
 //!   "Leaf rows are navigation controls: they select targetId as the active
 //!   leaf");
-//! - widens the message union. `pi`'s `Message` is user/assistant/toolResult.
-//!   OpenClaw's `AgentMessage` (`dist/types-D0CdrmU4.d.ts`) adds
-//!   `bashExecution` and `custom` as *persisted* roles — and neither has a
-//!   `content` field. A reader that reaches for `content` finds nothing and
-//!   drops a shell transcript the model was shown.
+//! - renames a member of the message union. Both `Message`s are
+//!   user/assistant/toolResult (`dist/types-CFIUY_La.d.ts:232`), and both
+//!   `AgentMessage`s widen it the same way (`dist/types-D0CdrmU4.d.ts:343`) —
+//!   `bashExecution` is already `pi`'s (`dist/core/messages.d.ts:16-27` in
+//!   `pi@0.32.3`), so the fork's change is that `pi`'s `hookMessage` is
+//!   OpenClaw's `custom`. A reader written against `pi`'s role names finds no
+//!   `hookMessage` here and drops every one of them.
+//!
+//!   Of the two, only `bashExecution` has no `content`: its model-visible text
+//!   has to be built by `bashExecutionToText`, and a reader that reaches for
+//!   `content` drops a shell transcript the model was shown. `custom` does
+//!   declare `content: string | (TextContent | ImageContent)[]`
+//!   (`dist/types-D0CdrmU4.d.ts:294`) — as the table below already says, and as
+//!   the parser has always read it.
 //!
 //! So the parse stays here. What is shared with pi is only the shape of the
 //! answer — [`Transcript::unrepresented`] follows
@@ -159,6 +168,9 @@ struct Entry {
     parent: Option<String>,
     /// `type: "leaf"` — selects the active leaf rather than carrying content.
     leaf_control: bool,
+    /// `appendMode: "side"` — parked beside the live branch on purpose, rather
+    /// than left behind by a rewind. See [`read_transcript`].
+    side_append: bool,
     value: serde_json::Value,
 }
 
@@ -330,12 +342,14 @@ fn scan(path: &Path, out: &mut Transcript) -> anyhow::Result<(Vec<Entry>, Option
 
         let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
+        // `SessionHeader` is exactly `{type, version?, id, timestamp, cwd,
+        // parentSession?}`. It carries no `modelId`: this reader used to look
+        // for one, inherited from `pi_session`, whose header does have
+        // `provider`/`modelId`. Nothing writes it here, so the model comes from
+        // `model_change` alone — see the state markers in `read_transcript`.
         if kind == "session" {
             out.header_id = value.get("id").and_then(|v| v.as_str()).map(String::from);
             out.cwd = value.get("cwd").and_then(|v| v.as_str()).map(String::from);
-            if let Some(m) = value.get("modelId").and_then(|v| v.as_str()) {
-                out.model_id = Some(m.to_string());
-            }
             if let Some(ts) = value.get("timestamp").and_then(parse_timestamp) {
                 out.started_at = Some(ts);
             }
@@ -405,6 +419,7 @@ fn scan(path: &Path, out: &mut Transcript) -> anyhow::Result<(Vec<Entry>, Option
             id,
             parent,
             leaf_control: is_leaf,
+            side_append,
             value,
         });
     }
@@ -619,22 +634,52 @@ fn read_transcript(path: &Path) -> anyhow::Result<Transcript> {
 
     let branch = live_branch(&entries, leaf.as_deref());
 
-    // Everything in the file but off the live branch is a path the user
-    // abandoned. Replaying it would resurrect content OpenClaw removed.
+    // Everything in the file but off the live branch produces no message, but
+    // not for one reason, and the report has to say which.
+    //
+    // `abandoned` is a path the *user* rewound away from: `SessionManager
+    // .branch(id)` moved the leaf back and the next append became a sibling,
+    // leaving the old turns in the file forever.
+    //
+    // `side branch` is not that. `appendMode: "side"` marks a row parked by
+    // `mergePromptReleasedSessionEntries` — "preserve entries appended while
+    // the active prompt released its file lock; attach them as a side branch so
+    // rewrites retain external state without moving the prepared reply branch
+    // or adding delivery mirrors to its context". Nobody rewound anything, and
+    // reporting it as a rewind describes a session that did not happen.
     let on_branch: HashSet<&str> = branch.iter().map(|e| e.id.as_str()).collect();
-    let abandoned = entries
+    let mut abandoned = 0u64;
+    let mut side = 0u64;
+    for entry in entries
         .iter()
         .filter(|e| !e.leaf_control && !on_branch.contains(e.id.as_str()))
-        .count();
+    {
+        if entry.side_append {
+            side += 1;
+        } else {
+            abandoned += 1;
+        }
+    }
     if abandoned > 0 {
         *out.unrepresented
             .entry("abandoned".to_string())
-            .or_insert(0) += abandoned as u64;
+            .or_insert(0) += abandoned;
+    }
+    if side > 0 {
+        *out.unrepresented
+            .entry("side branch".to_string())
+            .or_insert(0) += side;
     }
 
-    // State markers are read along the whole branch first: `buildSessionContext`
-    // resolves the model from the last `model_change` (or the last assistant
-    // turn) regardless of where compaction cuts.
+    // State markers are read along the whole branch first, because
+    // `buildSessionContext` resolves them regardless of where compaction cuts.
+    //
+    // It resolves the model from the last `model_change` *or* the last
+    // assistant turn, whichever comes later on the path. Only the
+    // `model_change` half is taken here: OpenClaw appends one when a session
+    // starts and again on every switch, so a transcript that states a model
+    // states it here, and an assistant turn's `model` is already read as that
+    // message's `author` rather than the session's.
     for entry in &branch {
         match entry.kind.as_str() {
             "model_change" => {
@@ -1075,9 +1120,20 @@ impl Provider for OpenClaw {
 /// - **Tool results.** Written as `toolResult` messages, which is where
 ///   OpenClaw keeps them; they used to be dropped entirely.
 ///
-/// Fields casr cannot know — `usage`, `stopReason`, `api` — are left absent
-/// rather than filled with zeros. A zero token count is a claim, and a false
-/// one; absence is what casr actually knows.
+/// - **The session's model.** A `model_change` entry, because `SessionHeader`
+///   has nowhere to put one and `buildSessionContext` reads it from nowhere
+///   else.
+///
+/// Fields casr cannot know — `usage`, `stopReason`, `api`, `provider` — are left
+/// absent rather than filled with zeros. A zero token count is a claim, and a
+/// false one; absence is what casr actually knows.
+///
+/// That is a tolerated deviation, not a sanctioned one: `AssistantMessage`
+/// declares `usage: Usage` and `stopReason: StopReason` as *required*
+/// (`dist/types-CFIUY_La.d.ts:213-214`). It is safe because nothing enforces
+/// them on a persisted row — `isAgentMessage` checks only `content` for an
+/// assistant turn (`dist/transcript-rewrite-BHL7q_3D.js`), and OpenClaw's
+/// consumers guard — so the file stays readable. Filling them would not.
 fn render_session(session_id: &str, session: &CanonicalSession) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -1086,19 +1142,52 @@ fn render_session(session_id: &str, session: &CanonicalSession) -> String {
         .as_ref()
         .and_then(|w| w.to_str())
         .unwrap_or("/tmp");
+    let started = session
+        .started_at
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     let header = serde_json::json!({
         "type": "session",
         "version": SESSION_VERSION,
         "id": session_id,
-        "timestamp": session.started_at
-            .and_then(chrono::DateTime::from_timestamp_millis)
-            .map(|dt| dt.to_rfc3339())
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        "timestamp": started,
         "cwd": workspace,
     });
     lines.push(serde_json::to_string(&header).unwrap_or_default());
 
     let mut parent: Option<String> = None;
+
+    // The session's model, in the one record OpenClaw reads it from.
+    //
+    // `SessionHeader` is exactly `{type, version?, id, timestamp, cwd,
+    // parentSession?}` (`dist/session-manager-RXl7XED7.d.ts`) — there is no
+    // header field to put it in, and `buildSessionContext` resolves the model
+    // from `model_change` entries and assistant turns, never from the header.
+    // OpenClaw itself appends one of these when a session starts and again on
+    // every switch, so this is the shape rather than an approximation of it.
+    //
+    // `provider` is omitted because casr does not observe it: `model_name` is a
+    // model id, and inferring "anthropic" from a `claude-` prefix would be a
+    // claim casr cannot support. That has a measured cost on
+    // `openclaw@2026.7.1-2` and it is the smaller one: OpenClaw's runtime still
+    // resolves `modelId` from this entry, but `isSessionEntry` requires a
+    // non-empty `provider` string, so `readTranscriptFileState` drops the row
+    // if OpenClaw ever rewrites the transcript, and `modelRegistry.find` cannot
+    // restore the model without it. A wrong provider would not restore it
+    // either — it would only make the failure say something false first.
+    if let Some(model_id) = session.model_name.as_deref().filter(|m| !m.is_empty()) {
+        let id = "mc1".to_string();
+        let entry = serde_json::json!({
+            "type": "model_change",
+            "id": id,
+            "parentId": parent,
+            "timestamp": started,
+            "modelId": model_id,
+        });
+        lines.push(serde_json::to_string(&entry).unwrap_or_default());
+        parent = Some(id);
+    }
 
     for (i, msg) in session.messages.iter().enumerate() {
         let ts_ms = msg
@@ -1108,12 +1197,31 @@ fn render_session(session_id: &str, session: &CanonicalSession) -> String {
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
 
+        // Only the five roles in [`PERSISTED_MESSAGE_ROLES`] exist. `system` is
+        // not one of them, and neither is whatever the source tool called a
+        // turn: `Message` is `UserMessage | AssistantMessage |
+        // ToolResultMessage` (`dist/types-CFIUY_La.d.ts`), widened by
+        // `AgentMessage` (`dist/types-D0CdrmU4.d.ts`) with `bashExecution` and
+        // `custom` only.
+        //
+        // Measured on `openclaw@2026.7.1-2` against a `{"role":"system"}` row:
+        // `convertToLlm` drops it (`default: return;`), so the model never sees
+        // it, and `isAgentMessage` rejects it (`default: return false;`), so
+        // `readTranscriptFileState` accepts only the *other* rows and OpenClaw
+        // deletes it from the file on the next rewrite.
+        //
+        // So it becomes a user turn — the same slot `bashExecution`, `custom`,
+        // `custom_message` and both summary records land in, and the same
+        // mapping the reader applies coming the other way (see the table in the
+        // module docs). `custom_message` was the alternative and preserves no
+        // more: it also reaches the model as a user turn, this reader also
+        // reads it back as [`MessageRole::User`], and its `customType` would
+        // have to carry a role name OpenClaw itself never writes.
         let role_str = match &msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
-            MessageRole::System => "system",
             MessageRole::Tool => "toolResult",
-            MessageRole::Other(r) => r.as_str(),
+            MessageRole::System | MessageRole::Other(_) => "user",
         };
 
         let inner = if role_str == "assistant" {
