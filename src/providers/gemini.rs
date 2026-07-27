@@ -1,7 +1,13 @@
 //! Gemini CLI provider — reads/writes sessions under `~/.gemini/tmp/`.
 //!
-//! Session files: `<hash>/chats/session-<timestamp>-<id8>.{json,jsonl}`
+//! Session files: `<project-id>/chats/session-<timestamp>-<id8>.{json,jsonl}`
 //! Resume command: `gemini --resume <session-id>`
+//!
+//! `<project-id>` names the workspace two different ways depending on the
+//! version that created it — `SHA256(path)` before 0.52.0, a registry slug
+//! after — and a migrated install has both at once. Reading sessions never
+//! needs to know which; deciding *which workspace a session belongs to* does,
+//! and that is [`project_dir_matches`].
 //!
 //! # Two formats, and neither one is the old one
 //!
@@ -97,16 +103,144 @@ use crate::providers::{
 /// Gemini CLI provider implementation.
 pub struct Gemini;
 
-/// Compute the Gemini project hash directory name from a workspace path.
-///
-/// Algorithm: `SHA256(absolute_workspace_path)` as lowercase hex.
+/// `SHA256(absolute_workspace_path)` as lowercase hex — Gemini's `getProjectHash`.
 ///
 /// Example: `/data/projects/foo` → `sha256(b"/data/projects/foo")` (64 hex chars)
+///
+/// This is still current, but it no longer names the project *directory*. In
+/// `@google/gemini-cli-core@0.52.0`, `dist/src/utils/paths.js:263`:
+///
+/// ```text
+/// export function getProjectHash(projectRoot) {
+///     return crypto.createHash('sha256').update(projectRoot).digest('hex');
+/// }
+/// ```
+///
+/// It survives in two places: the `projectHash` field every session header
+/// still carries (`dist/src/services/chatRecordingService.js:328`), and the
+/// *old* directory name that 0.52.0's migration reads
+/// (`dist/src/config/storage.js:197`). The directory a current Gemini writes
+/// to is [`project_dir_matches`]'s subject instead.
 pub fn project_hash(workspace: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(workspace.to_string_lossy().as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// The ownership marker Gemini's `ProjectRegistry` writes into every project
+/// directory it hands out, holding that project's absolute root path.
+///
+/// `@google/gemini-cli-core@0.52.0`, `dist/src/config/projectRegistry.js:17`:
+/// `const PROJECT_ROOT_FILE = '.project_root';`
+const PROJECT_ROOT_FILE: &str = ".project_root";
+
+/// Does `project_dir` — one `~/.gemini/tmp/<id>` directory — hold `workspace`'s
+/// sessions?
+///
+/// `None` is the third answer and the load-bearing one: *this directory names
+/// no workspace* is a different fact from *this directory names another one*,
+/// and collapsing them either hides sessions or invents memberships.
+///
+/// # Why the slug cannot be computed
+///
+/// Before 0.52.0 the directory was [`project_hash`], a pure function of the
+/// path, so casr could ask "is this `SHA256(ws)`?" and be done. 0.52.0
+/// replaced it with a registry slug (`dist/src/config/storage.js:186`,
+/// `projectIdentifier = await registry.getShortId(this.getProjectRoot())`),
+/// minted in `dist/src/config/projectRegistry.js:255-261`:
+///
+/// ```text
+/// const baseName = path.basename(projectPath) || 'project';
+/// const slug = this.slugify(baseName);
+/// let counter = 0;
+/// const existingIds = new Set(Object.values(existingMappings));
+/// while (true) {
+///     const candidate = counter === 0 ? slug : `${slug}-${counter}`;
+///     counter++;
+/// ```
+///
+/// The counter advances past whatever the *registry and the disk* already
+/// claim, so `/a/foo` and `/b/foo` become `foo` and `foo-1` in whichever order
+/// they were first opened. The slug is therefore not a function of the
+/// workspace path and reversing it is not possible — two paths share a
+/// basename, and `slugify` (`:346-352`) is lossy besides, folding every
+/// non-`[a-z0-9]` byte to `-`.
+///
+/// # So it is read back instead
+///
+/// Gemini writes the answer down. `ensureOwnershipMarkers` (`:310-345`) puts
+/// `normalizePath(projectPath)` into `<id>/.project_root` for every base
+/// directory, and the CLI's own reverse lookup — `findExistingSlugForPath`
+/// (`:225-254`) — is exactly this: read the marker, compare the path. The
+/// marker is created with `flag: 'wx'`, re-verified on every `getShortId`, and
+/// deliberately outlives the registry JSON, which is reset to `{}` when
+/// corrupt precisely because "ownership markers on disk will allow
+/// self-healing" (`:64`).
+///
+/// # Both layouts, at once
+///
+/// The hash form has not gone away. The migration *copies*:
+/// `dist/src/config/storageMigration.js:35` is
+/// `await fs.promises.cp(oldPath, newPath, { recursive: true })` with no
+/// unlink anywhere in the file, so a project that has been opened under 0.52.0
+/// owns a marked slug directory *and* a frozen hash directory, both real and
+/// both this workspace's. A project that has not been opened under 0.52.0 yet
+/// still has only the hash directory — migration is per-project and runs on
+/// that project's first 0.52.0 launch (`dist/src/config/storage.js:187`), not
+/// once per install.
+pub fn project_dir_matches(project_dir: &Path, workspace: &Path) -> Option<bool> {
+    if let Some(owner) = project_root_marker(project_dir) {
+        return Some(normalize_project_path(&owner) == normalize_project_path(workspace));
+    }
+    let name = project_dir.file_name().and_then(|n| n.to_str())?;
+    (name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| name == project_hash(workspace))
+}
+
+/// The `~/.gemini/tmp/<id>` directory Gemini has already registered for
+/// `workspace`, if one exists.
+///
+/// A read-only twin of `ProjectRegistry.findExistingSlugForPath`
+/// (`@google/gemini-cli-core@0.52.0`,
+/// `dist/src/config/projectRegistry.js:225-254`): scan the base directory for
+/// an ownership marker naming this workspace. Only a marker counts, never the
+/// hash name — the point of asking is to find the directory a *current* Gemini
+/// reads from, and after a migration both exist.
+fn registered_project_dir(tmp: &Path, workspace: &Path) -> Option<PathBuf> {
+    let wanted = normalize_project_path(workspace);
+    std::fs::read_dir(tmp).ok()?.flatten().find_map(|entry| {
+        let dir = entry.path();
+        let owner = project_root_marker(&dir)?;
+        (normalize_project_path(&owner) == wanted).then_some(dir)
+    })
+}
+
+/// The workspace path a project directory's ownership marker names.
+///
+/// Trimmed, as Gemini trims it on every read of the same file
+/// (`projectRegistry.js:208`, `:240`, `:273`, `:319`). An empty marker names
+/// nothing and is not an answer.
+fn project_root_marker(project_dir: &Path) -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(project_dir.join(PROJECT_ROOT_FILE)).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+/// `ProjectRegistry.normalizePath` (`projectRegistry.js:73-79`): resolve, then
+/// lowercase on win32 only.
+///
+/// The resolve half needs no code here — the marker already holds a resolved
+/// path, and Rust compares `Path`s component-wise, so a trailing separator on
+/// the workspace side is already ignored. The case fold does: on Windows the
+/// marker is written lowercased, so a byte comparison against the workspace the
+/// user typed would miss.
+fn normalize_project_path(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(path.to_string_lossy().to_lowercase())
+    } else {
+        path.to_path_buf()
+    }
 }
 
 /// Generate a Gemini session filename from a session ID and timestamp.
@@ -539,11 +673,11 @@ impl Provider for Gemini {
         let tmp_dir = Self::tmp_dir()
             .ok_or_else(|| anyhow::anyhow!("cannot determine Gemini tmp directory"))?;
 
-        // Use workspace hash for project directory, or a fallback hash.
         let workspace_path = session
             .workspace
             .as_deref()
             .unwrap_or(std::path::Path::new("/tmp"));
+        // The header field, which is still the hash on every Gemini version.
         let hash = session
             .metadata
             .get("project_hash")
@@ -551,7 +685,24 @@ impl Provider for Gemini {
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| project_hash(workspace_path));
-        let chats_dir = tmp_dir.join(&hash).join("chats");
+
+        // The directory is a separate question, and writing the hash into it
+        // unconditionally is how a converted session becomes one Gemini never
+        // shows. Once a project has been opened under 0.52.0 its slug
+        // directory is non-empty, and `StorageMigration.migrateDirectory`
+        // returns without copying when the destination "contains more than
+        // just the .project_root file"
+        // (`@google/gemini-cli-core@0.52.0`,
+        // `dist/src/config/storageMigration.js:23-30`) — so a hash directory
+        // written afterwards is never picked up, by that path or any other.
+        //
+        // Writing into the registered directory instead puts the session where
+        // the CLI already reads. Where there is no registered directory the
+        // hash is still right, and better than a guessed slug: the project's
+        // next 0.52.0 launch finds a fresh destination and copies it across.
+        let chats_dir = registered_project_dir(&tmp_dir, workspace_path)
+            .unwrap_or_else(|| tmp_dir.join(&hash))
+            .join("chats");
         let filename = session_filename(&target_session_id, &now);
         let target_path = chats_dir.join(&filename);
 
@@ -1385,7 +1536,7 @@ mod tests {
     use super::{
         Gemini, gemini_message_content, gemini_message_entry, gemini_message_type,
         is_session_file_name, merge_gemini_extra_fields, normalize_workspace_candidate,
-        project_hash, session_filename,
+        project_dir_matches, project_hash, session_filename,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -1402,6 +1553,73 @@ mod tests {
             hash,
             "b7da685261f0fff76430fd68dd709a693a8abac1c72c19c49f2fd1c7424c6d4e"
         );
+    }
+
+    /// A directory that answers neither way must say so, not say "no".
+    ///
+    /// `Some(false)` here would delete the session from a `--workspace`
+    /// listing without anyone counting it; `None` is what makes the caller
+    /// report the exclusion instead.
+    #[test]
+    fn project_dir_without_marker_or_hash_is_undetermined() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("some-fixture");
+        std::fs::create_dir(&dir).expect("dir");
+        assert_eq!(
+            project_dir_matches(&dir, Path::new("/data/projects/x")),
+            None
+        );
+    }
+
+    /// An empty or whitespace-only marker names no workspace, so the hash rule
+    /// gets its turn — and on a slug directory there is no hash either.
+    #[test]
+    fn empty_marker_does_not_answer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("slugged");
+        std::fs::create_dir(&dir).expect("dir");
+        std::fs::write(dir.join(".project_root"), "  \n").expect("marker");
+        assert_eq!(
+            project_dir_matches(&dir, Path::new("/data/projects/x")),
+            None
+        );
+    }
+
+    /// Gemini writes the marker with no trailing newline, and re-reads it with
+    /// `.trim()` regardless (`projectRegistry.js:208`); an editor that adds one
+    /// must not break the match.
+    #[test]
+    fn marker_is_trimmed_before_comparison() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("myapp");
+        std::fs::create_dir(&dir).expect("dir");
+        std::fs::write(dir.join(".project_root"), "/data/projects/myapp\n").expect("marker");
+        assert_eq!(
+            project_dir_matches(&dir, Path::new("/data/projects/myapp")),
+            Some(true)
+        );
+        assert_eq!(
+            project_dir_matches(&dir, Path::new("/data/projects/other")),
+            Some(false)
+        );
+    }
+
+    /// The marker outranks the directory name, which is what lets a migrated
+    /// project keep a hash-named directory that a later rename made wrong.
+    #[test]
+    fn marker_outranks_a_hash_directory_name() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let workspace = Path::new("/data/projects/renamed");
+        let dir = tmp
+            .path()
+            .join(project_hash(Path::new("/data/projects/old")));
+        std::fs::create_dir(&dir).expect("dir");
+        std::fs::write(
+            dir.join(".project_root"),
+            workspace.to_string_lossy().as_bytes(),
+        )
+        .expect("marker");
+        assert_eq!(project_dir_matches(&dir, workspace), Some(true));
     }
 
     #[test]

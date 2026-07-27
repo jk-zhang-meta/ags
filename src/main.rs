@@ -1499,22 +1499,22 @@ fn cmd_list(
                 }
             }
             "gemini" => {
-                let expected_hash = casr::providers::gemini::project_hash(ws.as_path());
-                let observed_hash = path
+                // `tmp/<id>/chats/<file>` — the project directory is the
+                // grandparent. Which layout named it, and whether that name or
+                // the marker beside it answers, is the provider's to know:
+                // testing for a 64-hex directory here reported `Unknown` for
+                // every session a current Gemini writes, because 0.52.0 names
+                // the directory with a registry slug.
+                match path
                     .parent()
                     .and_then(|p| p.parent())
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str());
-                match observed_hash {
-                    Some(hash) if hash == expected_hash => WorkspaceHint::Matches,
-                    Some(hash)
-                        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
-                    {
-                        WorkspaceHint::Differs
-                    }
-                    // Fixture/legacy layouts do not hash the workspace, so the
-                    // directory name is not evidence either way.
-                    Some(_) | None => WorkspaceHint::Unknown,
+                    .and_then(|dir| {
+                        casr::providers::gemini::project_dir_matches(dir, ws.as_path())
+                    }) {
+                    Some(true) => WorkspaceHint::Matches,
+                    Some(false) => WorkspaceHint::Differs,
+                    // Neither marked nor hashed: not evidence either way.
+                    None => WorkspaceHint::Unknown,
                 }
             }
             _ => WorkspaceHint::Unknown,
@@ -1554,36 +1554,42 @@ fn cmd_list(
                 // drift from the env-var precedence the provider implements.
                 let gemini_home = casr::providers::gemini::Gemini::home_dir()?;
                 let tmp_root = gemini_home.join("tmp");
-                let hash = casr::providers::gemini::project_hash(ws.as_path());
-                let chats_dir = tmp_root.join(hash).join("chats");
-                if !chats_dir.is_dir() {
-                    // Fallback to generic provider enumeration when tmp/ has
-                    // legacy/non-hash chat roots (fixtures or older layouts).
-                    // Otherwise, return empty early to avoid an expensive scan.
-                    let mut unreadable = Vec::new();
-                    let has_legacy_chat_roots = read_dir_reporting(&tmp_root, &mut unreadable)
-                        .into_iter()
-                        .any(|entry| {
-                            let path = entry.path();
-                            if !path.is_dir() || !path.join("chats").is_dir() {
-                                return false;
-                            }
-                            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                                return true;
-                            };
-                            !(name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()))
-                        });
-                    return if has_legacy_chat_roots {
-                        // Hand the whole question to the provider, which will
-                        // report its own failures; this scan's are its to find
-                        // again rather than to double-report here.
-                        None
-                    } else {
-                        Some(SessionListing {
-                            sessions: Vec::new(),
-                            unreadable,
-                        })
-                    };
+
+                // One pass over `tmp/`, asking the provider about each project
+                // directory, because a workspace can own two of them at once:
+                // 0.52.0 migrates by *copying* the pre-0.52.0 `SHA256(ws)`
+                // directory into its new slug directory and leaving the
+                // original behind. Computing the hash path and stopping there
+                // found the frozen copy and hid every session written since —
+                // and on a machine with no pre-0.52.0 history it found nothing
+                // at all.
+                let mut listing = SessionListing::default();
+                let mut chats_dirs: Vec<PathBuf> = Vec::new();
+                let mut undetermined = false;
+                for entry in read_dir_reporting(&tmp_root, &mut listing.unreadable) {
+                    let dir = entry.path();
+                    let chats = dir.join("chats");
+                    if !chats.is_dir() {
+                        continue;
+                    }
+                    match casr::providers::gemini::project_dir_matches(&dir, ws.as_path()) {
+                        Some(true) => chats_dirs.push(chats),
+                        Some(false) => {}
+                        None => undetermined = true,
+                    }
+                }
+                if undetermined {
+                    // Hand the whole question to the provider, which will
+                    // report its own failures; this scan's are its to find
+                    // again rather than to double-report here.
+                    //
+                    // Any undetermined directory forces this, not just one
+                    // that leaves no matches: answering from the directories
+                    // that *did* classify would drop the rest without the
+                    // caller ever counting them, so `--workspace` would go
+                    // back to hiding sessions silently — the failure this
+                    // whole path exists downstream of.
+                    return None;
                 }
 
                 // Same acceptance rule as the provider, for the same reason:
@@ -1596,46 +1602,48 @@ fn cmd_list(
                 // declares, because this fast path exists to avoid opening the
                 // files at all. A migrated session is `session-<ts>-<id8>.json`
                 // and `session-<ts>-<id8>.jsonl`, which share that key, so the
-                // pair still collapses to the `.jsonl`.
-                let mut listing = SessionListing::default();
+                // pair still collapses to the `.jsonl`. The same key also
+                // collapses the two copies a migration leaves of one session.
                 let mut seen: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
-                for entry in read_dir_reporting(&chats_dir, &mut listing.unreadable) {
-                    let path = entry.path();
-                    if !path.is_file() {
-                        continue;
-                    }
-                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                        continue;
-                    };
-                    if !casr::providers::gemini::is_session_file_name(name) {
-                        continue;
-                    }
-                    let session_id = name
-                        .strip_prefix("session-")
-                        .map(|rest| {
-                            rest.strip_suffix(".jsonl")
-                                .or_else(|| rest.strip_suffix(".json"))
-                                .unwrap_or(rest)
-                        })
-                        .unwrap_or(name)
-                        .to_string();
-                    match seen.get(&session_id) {
-                        Some(&index) => {
-                            let live_is_jsonl = listing.sessions[index]
-                                .1
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                == Some("jsonl");
-                            if !live_is_jsonl
-                                && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                            {
-                                listing.sessions[index].1 = path;
-                            }
+                for chats_dir in &chats_dirs {
+                    for entry in read_dir_reporting(chats_dir, &mut listing.unreadable) {
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
                         }
-                        None => {
-                            seen.insert(session_id.clone(), listing.sessions.len());
-                            listing.sessions.push((session_id, path));
+                        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        if !casr::providers::gemini::is_session_file_name(name) {
+                            continue;
+                        }
+                        let session_id = name
+                            .strip_prefix("session-")
+                            .map(|rest| {
+                                rest.strip_suffix(".jsonl")
+                                    .or_else(|| rest.strip_suffix(".json"))
+                                    .unwrap_or(rest)
+                            })
+                            .unwrap_or(name)
+                            .to_string();
+                        match seen.get(&session_id) {
+                            Some(&index) => {
+                                let live_is_jsonl = listing.sessions[index]
+                                    .1
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    == Some("jsonl");
+                                if !live_is_jsonl
+                                    && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                                {
+                                    listing.sessions[index].1 = path;
+                                }
+                            }
+                            None => {
+                                seen.insert(session_id.clone(), listing.sessions.len());
+                                listing.sessions.push((session_id, path));
+                            }
                         }
                     }
                 }
