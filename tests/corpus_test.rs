@@ -665,3 +665,210 @@ fn claude_corpus_parent_links_resolve() {
         "{dangling} of {total} parent links do not resolve"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `info --json`'s per-event-type summary
+// ---------------------------------------------------------------------------
+
+/// Every corpus session yields a summary, and every count on the structured
+/// track is a number.
+///
+/// `EventSummary::of_ir` is a total function over `Body` by construction — the
+/// match has no wildcard arm — so what this actually exercises is the claim
+/// that it stays total against real bytes rather than against the thirteen
+/// hand-built events in the unit test: no panic, no `null`, and every event
+/// landing in exactly one bucket for whatever shapes the two agents are
+/// currently emitting.
+fn assert_summaries_derivable(
+    label: &str,
+    files: Vec<PathBuf>,
+    read: fn(&std::path::Path) -> anyhow::Result<SessionIr>,
+) {
+    if files.is_empty() {
+        eprintln!("{label}: corpus unset or empty; skipping");
+        return;
+    }
+
+    let mut sessions = 0usize;
+    let mut totals: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut events = 0u64;
+    for path in &files {
+        let Ok(ir) = read(path) else { continue };
+        sessions += 1;
+        events += ir.events.len() as u64;
+
+        let summary = casr::responses::EventSummary::of_ir(&ir);
+        let mut bucketed = 0u64;
+        for (kind, count) in summary.counts() {
+            let count = count.unwrap_or_else(|| {
+                panic!(
+                    "{label}: {} reported a null {kind}; the structured track \
+                     knows every count, and null is reserved for a reader that \
+                     cannot tell",
+                    path.display()
+                )
+            });
+            bucketed += count;
+            *totals.entry(kind).or_insert(0) += count;
+        }
+        assert_eq!(
+            bucketed as usize,
+            ir.events.len(),
+            "{label}: {} has {} events but {bucketed} bucketed — a `Body` \
+             variant is being counted twice or not at all",
+            path.display(),
+            ir.events.len()
+        );
+
+        // The reader's own tally is built independently, one `Body::kind()` per
+        // emitted event. Agreeing with it on real sessions is what says the
+        // match arms are wired to the fields their names claim.
+        for (kind, count) in &ir.capture.by_kind {
+            let ours = summary
+                .counts()
+                .iter()
+                .find(|(name, _)| name == kind)
+                .and_then(|(_, count)| *count)
+                .unwrap_or_else(|| panic!("{label}: no summary field for kind {kind}"));
+            assert_eq!(
+                ours,
+                *count,
+                "{label}: {} disagrees with the capture report on {kind}",
+                path.display()
+            );
+        }
+    }
+
+    println!("{label}: {sessions} sessions, {events} events");
+    for (kind, count) in &totals {
+        println!("  {kind:<15}{count}");
+    }
+    assert!(sessions > 0, "{label}: nothing parsed");
+    assert!(
+        totals.get("message").copied().unwrap_or(0) > 0,
+        "{label}: a corpus with no messages at all means the summary is not \
+         reading what it thinks it is"
+    );
+}
+
+#[test]
+#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+fn codex_corpus_summaries_are_derivable() {
+    assert_summaries_derivable(
+        "codex",
+        corpus_files("AGSX_CODEX_CORPUS", "jsonl", 400),
+        codex_ir::read,
+    );
+}
+
+#[test]
+#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+fn claude_corpus_summaries_are_derivable() {
+    assert_summaries_derivable(
+        "claude-code",
+        corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 1600)
+            .into_iter()
+            .filter(|path| is_claude_transcript(path))
+            .take(400)
+            .collect(),
+        claude_code_ir::read,
+    );
+}
+
+/// `summary` and `live_summary` are two answers, not one answer twice.
+///
+/// The whole-file counts and the replayable counts were briefly going to be one
+/// field. This is the measurement that says they cannot be: on 400 real Codex
+/// rollouts the two agree on **zero** of them, and the median session's live
+/// context is a small fraction of what its file holds. A caller comparing a
+/// Codex source's file against its Claude conversion — which is written from
+/// the live context — would fail every good conversion it ever saw.
+///
+/// The thresholds are deliberately far looser than the measured values. This
+/// exists to catch the two fields collapsing back into one, or the replay fold
+/// quietly becoming a no-op, not to pin a corpus that changes every day.
+fn assert_live_diverges_from_all(
+    label: &str,
+    files: Vec<PathBuf>,
+    read: fn(&std::path::Path) -> anyhow::Result<SessionIr>,
+    max_identical_percent: usize,
+) {
+    if files.is_empty() {
+        eprintln!("{label}: corpus unset or empty; skipping");
+        return;
+    }
+
+    let (mut sessions, mut identical) = (0usize, 0usize);
+    let (mut all_events, mut live_events) = (0u64, 0u64);
+    for path in &files {
+        let Ok(ir) = read(path) else { continue };
+        sessions += 1;
+        let all = casr::responses::EventSummary::of_ir(&ir);
+        let live = casr::responses::EventSummary::of_live(&ir);
+        if all == live {
+            identical += 1;
+        }
+        for ((kind, all_count), (_, live_count)) in all.counts().iter().zip(live.counts().iter()) {
+            let (all_count, live_count) = (
+                all_count.expect("structured track knows every count"),
+                live_count.expect("structured track knows every count"),
+            );
+            assert!(
+                live_count <= all_count,
+                "{label}: {} has more live {kind} ({live_count}) than it has \
+                 at all ({all_count}); the fold cannot invent events",
+                path.display()
+            );
+            all_events += all_count;
+            live_events += live_count;
+        }
+    }
+    assert!(sessions > 0, "{label}: nothing parsed");
+
+    let identical_percent = identical * 100 / sessions;
+    println!(
+        "{label}: {sessions} sessions, {identical} identical ({identical_percent}%), \
+         live/all {live_events}/{all_events}"
+    );
+    assert!(
+        identical_percent <= max_identical_percent,
+        "{label}: {identical_percent}% of sessions have summary == live_summary. \
+         If that is genuinely true now, the two fields are redundant and one \
+         should go; if it is not, the replay fold has stopped folding."
+    );
+    assert!(
+        live_events < all_events,
+        "{label}: the fold removed nothing across the whole corpus"
+    );
+}
+
+#[test]
+#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+fn codex_corpus_live_summary_diverges_from_summary() {
+    // Measured 0%. Compaction alone is in 303 of 400, and the visibility gate
+    // moves `control`, `env_snapshot` and `turn_config` in all 400.
+    assert_live_diverges_from_all(
+        "codex",
+        corpus_files("AGSX_CODEX_CORPUS", "jsonl", 400),
+        codex_ir::read,
+        20,
+    );
+}
+
+#[test]
+#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+fn claude_corpus_live_summary_diverges_from_summary() {
+    // Measured 0% (1 of 200). Claude's live fraction is much higher than
+    // Codex's — median 97% — but "nearly all" is not "all", and 5,054 of 8,837
+    // messages across the sample are not live.
+    assert_live_diverges_from_all(
+        "claude-code",
+        corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 1600)
+            .into_iter()
+            .filter(|path| is_claude_transcript(path))
+            .take(400)
+            .collect(),
+        claude_code_ir::read,
+        30,
+    );
+}

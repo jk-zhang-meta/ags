@@ -177,8 +177,16 @@ enum Command {
 
     /// Show details for a specific session.
     Info {
-        /// Session ID to inspect.
-        session_id: String,
+        /// Session ID, or the path to a session file.
+        ///
+        /// The two are told apart by the filesystem: the argument is a path
+        /// when it names a file that exists (or, for the providers whose
+        /// session paths are `<db-file>/<id>`, when its parent does), and a
+        /// session ID otherwise. Nothing syntactic can separate them — a Codex
+        /// session ID is itself `2026/07/27/rollout-…`, so a rule about slashes
+        /// or dots would swallow it. Use `./name.jsonl` for a file in the
+        /// current directory whose name would otherwise read as an ID.
+        session: String,
 
         /// Enrich output with filesystem-derived data (e.g. repo_name from git root).
         #[arg(long)]
@@ -188,6 +196,16 @@ enum Command {
         /// a provider alias/slug (e.g. `opc`, `cc`) or a direct session file path.
         #[arg(long)]
         source: Option<String>,
+
+        /// Force the reader instead of detecting one: a provider slug or alias
+        /// (e.g. `codex`, `claude-code`, `cc`).
+        ///
+        /// Most useful alongside a path argument, where detection has only the
+        /// file's own shape to go on. With a session ID it also decides which
+        /// provider is asked to find it. The slug it resolves to is what
+        /// `--json` reports as `detected_format`.
+        #[arg(long)]
+        from: Option<String>,
 
         /// Append a Transcript Tail section showing the last few turns of the
         /// session (the most recent turns help you recognize a session).
@@ -365,13 +383,16 @@ fn main() -> ExitCode {
         )
         .map(|()| ExitCode::SUCCESS),
         Command::Info {
-            session_id,
+            session,
             enrich_fs,
             source,
+            from,
             peek,
             peek_lines,
-        } => cmd_info(&session_id, cli.json, enrich_fs, source, peek, peek_lines)
-            .map(|()| ExitCode::SUCCESS),
+        } => cmd_info(
+            &session, cli.json, enrich_fs, source, from, peek, peek_lines,
+        )
+        .map(|()| ExitCode::SUCCESS),
         Command::Providers => cmd_providers(cli.json).map(|()| ExitCode::SUCCESS),
         Command::Completions { shell } => cmd_completions(&shell).map(|()| ExitCode::SUCCESS),
     };
@@ -921,7 +942,8 @@ fn cmd_list(
         file_size_bytes: u64,
         unique_user_messages: usize,
         avg_agent_response_chars: f64,
-        tool_uses: usize,
+        /// `None` where nothing could count them; see `ListItem::tool_uses`.
+        tool_uses: Option<usize>,
         path: PathBuf,
     }
 
@@ -1231,13 +1253,23 @@ fn cmd_list(
         count
     }
 
-    fn tool_uses_from_source_file(provider_slug: &str, path: &Path) -> usize {
+    /// Scan a source file for tool uses, for the providers that have a scanner.
+    ///
+    /// `None` means "there is no scanner for this provider", which is not the
+    /// same claim as `Some(0)`. The arm used to be `_ => 0`, so the seventeen
+    /// providers with no scanner reported zero tool uses for every session they
+    /// have ever had. A count nothing produced is not a count.
+    ///
+    /// The wildcard stays, because this matches on a provider slug rather than
+    /// on an enum and no exhaustiveness is available to enforce; what changed
+    /// is that it now returns the absence rather than inventing a number.
+    fn tool_uses_from_source_file(provider_slug: &str, path: &Path) -> Option<usize> {
         match provider_slug {
-            "codex" => codex_tool_uses_from_file(path),
-            "gemini" => gemini_tool_uses_from_file(path),
-            "claude-code" => claude_tool_uses_from_file(path),
-            "factory" => factory_tool_uses_from_file(path),
-            _ => 0,
+            "codex" => Some(codex_tool_uses_from_file(path)),
+            "gemini" => Some(gemini_tool_uses_from_file(path)),
+            "claude-code" => Some(claude_tool_uses_from_file(path)),
+            "factory" => Some(factory_tool_uses_from_file(path)),
+            _ => None,
         }
     }
 
@@ -1309,7 +1341,7 @@ fn cmd_list(
         provider_slug: &str,
         session: &casr::model::CanonicalSession,
         path: &Path,
-    ) -> (u64, usize, f64, usize) {
+    ) -> (u64, usize, f64, Option<usize>) {
         let file_size_bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
 
         let mut unique_user_messages: std::collections::HashSet<String> =
@@ -1347,8 +1379,12 @@ fn cmd_list(
             0.0
         };
 
+        // A non-zero canonical count is the count. A zero is ambiguous — most
+        // flat readers never populate `tool_calls` at all — so it defers to the
+        // provider's own scanner, and where there is no scanner the answer is
+        // `None`: nothing here established that the session has no tool calls.
         let tool_uses = if canonical_tool_uses > 0 {
-            canonical_tool_uses
+            Some(canonical_tool_uses)
         } else {
             tool_uses_from_source_file(provider_slug, path)
         };
@@ -1824,7 +1860,11 @@ fn cmd_list(
                 let size_kb = s.file_size_display();
                 let unique_users = format_with_commas(s.unique_user_messages as u64);
                 let avg_agent = s.avg_agent_chars_display();
-                let tool_uses = format_with_commas(s.tool_uses as u64);
+                // `?` rather than `0`: no provider scanner could count these,
+                // and a column of zeroes reads as "this agent uses no tools".
+                let tool_uses = s
+                    .tool_uses
+                    .map_or_else(|| "?".to_string(), |n| format_with_commas(n as u64));
                 let started = s.started_at_display();
                 let last_active = s.last_active_display(now_millis);
                 let last_active_cell_style = last_active_style(s.last_active_at, now_millis);
@@ -1851,17 +1891,94 @@ fn cmd_list(
 }
 
 fn cmd_info(
-    session_id: &str,
+    argument: &str,
     json_mode: bool,
     enrich_fs: bool,
     source: Option<String>,
+    from: Option<String>,
     peek: bool,
     peek_lines: Option<usize>,
 ) -> anyhow::Result<()> {
     let registry = ProviderRegistry::default_registry();
-    let source_hint = source.as_deref().map(casr::discovery::SourceHint::parse);
-    let resolved = registry.resolve_session(session_id, source_hint.as_ref())?;
-    let session = resolved.provider.read_session(&resolved.path)?;
+
+    // A path and an ID are told apart by the filesystem, as the help states: an
+    // argument that names an existing file is a path, anything else is an ID.
+    // The rule cannot be syntactic, because a Codex session ID *is*
+    // `2026/07/27/rollout-…` and a rule about separators would eat it.
+    //
+    // Routing a path through `SourceHint::Path` also fixes what an ID lookup
+    // did with one. `Codex::owns_session` joins the argument onto its sessions
+    // directory, and joining an absolute path discards the left side — so a
+    // Claude transcript handed to `info` as a path resolved as *Codex*, was
+    // parsed by the Codex reader, and reported `provider: "codex"` with zero
+    // messages for an 18-message session.
+    let as_path = Path::new(argument);
+    let path_argument = (as_path.is_file() || as_path.parent().is_some_and(Path::is_file))
+        .then(|| as_path.to_path_buf());
+
+    // `--from` forces the reader. Resolved up front so an unknown slug fails
+    // before anything is parsed, and so the error names the known aliases.
+    let forced = from
+        .as_deref()
+        .map(|alias| {
+            registry.find_by_alias(alias).ok_or_else(|| {
+                casr::error::CasrError::UnknownProviderAlias {
+                    alias: alias.to_string(),
+                    known_aliases: registry.known_aliases(),
+                }
+            })
+        })
+        .transpose()?;
+
+    let (provider, path): (&dyn Provider, PathBuf) = match (forced, path_argument) {
+        // A path plus a forced reader needs no resolution at all.
+        (Some(provider), Some(path)) => (provider, path),
+        // An ID plus a forced reader: that provider is the one asked to find it.
+        (Some(provider), None) => {
+            let hint = casr::discovery::SourceHint::Alias(provider.slug().to_string());
+            (
+                provider,
+                registry.resolve_session(argument, Some(&hint))?.path,
+            )
+        }
+        // No forced reader: a path argument outranks `--source`, being the more
+        // specific of the two, and otherwise `--source` behaves as it always has.
+        (None, path_argument) => {
+            let hint = path_argument
+                .map(casr::discovery::SourceHint::Path)
+                .or_else(|| source.as_deref().map(casr::discovery::SourceHint::parse));
+            let resolved = registry.resolve_session(argument, hint.as_ref())?;
+            (resolved.provider, resolved.path)
+        }
+    };
+
+    let session = provider.read_session(&path)?;
+
+    // The two tracks can account for different things, and the difference is
+    // reported rather than papered over: a structured reader counts real `Body`
+    // variants, a flat one counts what a `CanonicalSession` holds and says
+    // `null` for the rest. Which track a provider is on is a property of the
+    // provider, so asking costs nothing; the second parse is only paid where it
+    // buys a real answer.
+    //
+    // Both questions are answered from the one IR: `summary` is the whole file
+    // and `live_summary` is what the replay fold leaves standing. On the flat
+    // track they are the same object, because that track has no fold.
+    let (summary, live_summary) = match provider
+        .supports_structured_read()
+        .then(|| provider.read_session_ir(&path))
+        .transpose()?
+        .flatten()
+    {
+        Some(ir) => (
+            responses::EventSummary::of_ir(&ir),
+            responses::EventSummary::of_live(&ir),
+        ),
+        None => {
+            let flat = responses::EventSummary::of_flat(&session);
+            (flat.clone(), flat)
+        }
+    };
 
     let native_name = casr::model::native_name_from_metadata(&session.metadata);
     // The tail shows when `--peek` is passed OR `--peek-lines N` is given on its
@@ -1889,10 +2006,13 @@ fn cmd_info(
             schema_version: responses::SCHEMA_VERSION,
             session_id: session.session_id.clone(),
             provider: session.provider_slug.clone(),
+            detected_format: provider.slug().to_string(),
             title: session.title.clone(),
             native_name: native_name.clone(),
             workspace: session.workspace.as_ref().map(|w| w.display().to_string()),
             messages: session.messages.len(),
+            summary,
+            live_summary,
             started_at: session.started_at,
             ended_at: session.ended_at,
             model_name: session.model_name.clone(),
@@ -1908,6 +2028,12 @@ fn cmd_info(
         println!("{}\n", "Session Info".bold());
         println!("  {} {}", "ID:".dimmed(), session.session_id.cyan());
         println!("  {} {}", "Provider:".dimmed(), session.provider_slug);
+        // Only when it disagrees. Repeating the provider slug on the line below
+        // itself is noise; a reader that read the session as something other
+        // than what the session says it is, is the whole message.
+        if provider.slug() != session.provider_slug {
+            println!("  {} {}", "Read as:".dimmed(), provider.slug().yellow());
+        }
         if let Some(ref name) = native_name {
             println!("  {} {name}", "Name:".dimmed());
         }
@@ -1938,6 +2064,18 @@ fn cmd_info(
             "  {} {user_count} user, {asst_count} assistant",
             "Roles:".dimmed()
         );
+
+        // `?` where the reader cannot tell, never 0. Zero counts are left out
+        // entirely — they say nothing a reader can act on, and the point of the
+        // line is what the session has and what cannot be known about it.
+        //
+        // The second line is shown only when the fold actually removed
+        // something. Where they agree, repeating the same numbers under a
+        // different label reads as two facts when there is one.
+        println!("  {} {}", "Events:".dimmed(), summary.describe());
+        if live_summary != summary {
+            println!("  {} {}", "Live:".dimmed(), live_summary.describe());
+        }
 
         if let Some(ref tail) = transcript_tail {
             println!(

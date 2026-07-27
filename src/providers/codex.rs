@@ -166,16 +166,26 @@ impl Provider for Codex {
         // then scan files for matching UUIDs.
 
         // Try as relative path (with or without extension).
-        let as_path = sessions_dir.join(session_id);
-        for ext in ["", ".jsonl", ".json"] {
-            let candidate = if ext.is_empty() {
-                as_path.clone()
-            } else {
-                as_path.with_extension(&ext[1..])
-            };
-            if candidate.is_file() {
-                debug!(path = %candidate.display(), "found Codex session by path");
-                return Some(candidate);
+        //
+        // `is_relative` is load-bearing, not a formality. `join` discards the
+        // receiver when handed an absolute path, so without it any absolute
+        // path at all came back out of here as a "Codex session" — including
+        // Claude Code transcripts, which then got parsed by the Codex reader.
+        // The registry refuses such an argument before this is reached; the
+        // check is repeated because this is the branch that deliberately reads
+        // the identifier as a path, and it should say which paths it means.
+        if Path::new(session_id).is_relative() {
+            let as_path = sessions_dir.join(session_id);
+            for ext in ["", ".jsonl", ".json"] {
+                let candidate = if ext.is_empty() {
+                    as_path.clone()
+                } else {
+                    as_path.with_extension(&ext[1..])
+                };
+                if candidate.is_file() {
+                    debug!(path = %candidate.display(), "found Codex session by path");
+                    return Some(candidate);
+                }
             }
         }
 

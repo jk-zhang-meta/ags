@@ -178,6 +178,28 @@ impl ProviderRegistry {
     // Session resolution — the full algorithm
     // -----------------------------------------------------------------------
 
+    /// Ask a provider whether it owns `session_id`, with the identifier rule
+    /// applied first.
+    ///
+    /// The single place an identifier is handed to a provider, because it is
+    /// the single place the guard below has to hold. See
+    /// [`session_id_is_identifier`].
+    fn owned_by<'p>(
+        provider: &'p dyn Provider,
+        session_id: &str,
+    ) -> Option<(&'p dyn Provider, PathBuf)> {
+        if !session_id_is_identifier(session_id) {
+            debug!(
+                provider = provider.name(),
+                session_id, "refusing to treat a filesystem path as a session id"
+            );
+            return None;
+        }
+        provider
+            .owns_session(session_id)
+            .map(|path| (provider, path))
+    }
+
     /// Resolve a session ID to its source provider and file path.
     ///
     /// This is the main entry point for the `casr <target> resume <session-id>`
@@ -331,8 +353,8 @@ impl ProviderRegistry {
                     known_aliases: self.known_aliases(),
                 })?;
 
-        match provider.owns_session(session_id) {
-            Some(path) => {
+        match Self::owned_by(provider, session_id) {
+            Some((provider, path)) => {
                 info!(
                     provider = provider.name(),
                     path = %path.display(),
@@ -380,14 +402,14 @@ impl ProviderRegistry {
             providers_checked.push(provider.name().to_string());
             trace!(provider = provider.name(), session_id, "searching");
 
-            if let Some(path) = provider.owns_session(session_id) {
+            if let Some((provider, path)) = Self::owned_by(provider.as_ref(), session_id) {
                 debug!(
                     provider = provider.name(),
                     path = %path.display(),
                     session_id,
                     "candidate match"
                 );
-                matches.push((provider.as_ref(), path));
+                matches.push((provider, path));
             }
         }
 
@@ -442,6 +464,45 @@ impl ProviderRegistry {
             .map(|p| format!("{} ({})", p.cli_alias(), p.name()))
             .collect()
     }
+}
+
+/// Whether `session_id` may be handed to [`Provider::owns_session`] at all.
+///
+/// # The bug this exists to make unrepresentable
+///
+/// Every provider builds a candidate path by joining the identifier onto one of
+/// its own roots — `sessions_dir.join(session_id)` in Codex,
+/// `dir.join(format!("{session_id}.jsonl"))` in Claude Code and Kiro, and so on
+/// for the rest. [`std::path::Path::join`] **discards the receiver when the
+/// argument is absolute**, so an absolute path handed in as an identifier comes
+/// straight back out as if the provider had found it under its own root.
+///
+/// Measured: `owns_session` on an absolute path was claimed by three of the
+/// seventeen registered providers — `claude-code`, `codex` and `kiro` — and
+/// which of them wins is decided by registration order and by whether the path
+/// happens to end in that provider's extension. A Claude Code transcript passed
+/// to `casr info` was therefore read by the *Codex* parser and reported as
+/// `provider: "codex"` with zero messages. With `--source cod` the same
+/// mismatch reaches `resume`, which converts the wrong file and writes a
+/// session out of it.
+///
+/// # Why the check is here and not in each provider
+///
+/// This is the one place a user-supplied string is declared to *be* an
+/// identifier. Fixing the three providers that collide today would leave the
+/// next provider free to reintroduce it — the join is the natural way to write
+/// `owns_session`, and nothing about writing it that way looks wrong. Rejecting
+/// the input at the boundary makes the whole class unreachable through the
+/// registry, which is how every session in the product is resolved.
+///
+/// Relative paths are deliberately still allowed: a Codex session id genuinely
+/// *is* `2026/07/27/rollout-…`, and that form joins onto the sessions directory
+/// exactly as intended. Only the absolute case is a lie.
+///
+/// A caller with a real path wants [`SourceHint::Path`], which resolves by
+/// path on purpose and identifies the owner from the provider roots.
+fn session_id_is_identifier(session_id: &str) -> bool {
+    !Path::new(session_id).is_absolute()
 }
 
 fn normalize_provider_token(token: &str) -> String {

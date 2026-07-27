@@ -305,7 +305,7 @@ fn cli_list_json_is_valid_array() {
         parsed.is_object(),
         "list --json should be an envelope object"
     );
-    assert_eq!(parsed["schema_version"], 3);
+    assert_eq!(parsed["schema_version"], 4);
     let items = parsed["items"].as_array().expect("items should be array");
     assert!(!items.is_empty());
     let first = &items[0];

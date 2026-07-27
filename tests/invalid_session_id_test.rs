@@ -251,3 +251,95 @@ fn cc_owns_session_empty_returns_none() {
         result
     );
 }
+
+// ===========================================================================
+// An absolute path is not a session identifier
+// ===========================================================================
+
+/// The registry must never resolve an absolute path handed in as a session ID.
+///
+/// Every provider builds its candidate with `root.join(session_id)` (or
+/// `join(format!("{session_id}.jsonl"))`), and `Path::join` throws the receiver
+/// away when the argument is absolute. Measured before the fix: `owns_session`
+/// on an absolute path was claimed by `claude-code`, `codex` and `kiro`, so
+/// `casr info <a-claude-transcript>` was parsed by the *Codex* reader and
+/// reported `provider: "codex"` with zero messages — and with `--source cod`
+/// the same mismatch reached `resume`.
+///
+/// Asserted through the registry rather than per provider because that is the
+/// one place a string is declared to be an identifier, and therefore the only
+/// place the guard can cover a provider nobody has written yet.
+#[test]
+fn registry_never_resolves_an_absolute_path_as_a_session_id() {
+    let _cc = CC_ENV.lock().unwrap();
+    let _cod = CODEX_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().expect("tmpdir");
+
+    // A real session file, under a real provider root, that the registry would
+    // happily resolve *by id*. Naming it by path must not work.
+    let projects = tmp.path().join("claude/projects/-tmp-demo");
+    std::fs::create_dir_all(&projects).expect("mkdir");
+    let session = projects.join("11111111-2222-3333-4444-555555555555.jsonl");
+    std::fs::write(
+        &session,
+        "{\"sessionId\":\"11111111-2222-3333-4444-555555555555\",\"type\":\"user\",\
+         \"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+    )
+    .expect("write");
+
+    let _cc_env = EnvGuard::set("CLAUDE_HOME", &tmp.path().join("claude"));
+    let _cod_env = EnvGuard::set("CODEX_HOME", &tmp.path().join("codex"));
+
+    let registry = ProviderRegistry::default_registry();
+
+    for absolute in [
+        session.to_string_lossy().to_string(),
+        // The extension-less form is the one the `{id}.jsonl` providers took.
+        session.with_extension("").to_string_lossy().to_string(),
+    ] {
+        let resolved = registry.resolve_session(&absolute, None);
+        assert!(
+            resolved.is_err(),
+            "an absolute path is not an identifier, but the registry resolved \
+             {absolute} to {:?}",
+            resolved.map(|r| (r.provider.slug().to_string(), r.path))
+        );
+    }
+
+    // A relative identifier still resolves — Codex session ids genuinely are
+    // `2026/07/27/rollout-…`, so the guard must reject only the absolute case.
+    assert!(
+        casr::providers::claude_code::ClaudeCode
+            .owns_session("11111111-2222-3333-4444-555555555555")
+            .is_some(),
+        "the plain identifier must still resolve"
+    );
+}
+
+/// Codex reads its identifier as a path on purpose, so it says which paths.
+#[test]
+fn codex_owns_session_declines_an_absolute_path() {
+    let _lock = CODEX_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().expect("tmpdir");
+    let sessions = tmp.path().join("sessions/2026/07/27");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    let rollout = sessions.join("rollout-1.jsonl");
+    std::fs::write(&rollout, "{}\n").expect("write");
+    let _env = EnvGuard::set("CODEX_HOME", tmp.path());
+
+    // The relative form is the one this branch exists for, and still works.
+    assert_eq!(
+        Codex.owns_session("2026/07/27/rollout-1").as_deref(),
+        Some(rollout.as_path()),
+        "a relative path id is a supported Codex form"
+    );
+
+    // Somewhere else entirely, which `join` would have handed straight back.
+    let foreign = tmp.path().join("not-codex.jsonl");
+    std::fs::write(&foreign, "{}\n").expect("write");
+    let claimed = Codex.owns_session(&foreign.to_string_lossy());
+    assert!(
+        claimed.is_none(),
+        "Codex claimed a file outside its own sessions dir: {claimed:?}"
+    );
+}

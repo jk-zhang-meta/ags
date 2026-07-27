@@ -125,6 +125,17 @@ pub trait Provider: Send + Sync {
     fn session_roots(&self) -> Vec<PathBuf>;
 
     /// Check if `session_id` belongs to this provider; return the file path if so.
+    ///
+    /// `session_id` is an identifier, never a filesystem path. Implementors
+    /// build a candidate by joining it onto one of their own roots, and
+    /// [`std::path::Path::join`] discards the receiver when the argument is
+    /// absolute — so an absolute path arriving here is returned verbatim and
+    /// the provider claims a file it has never owned. Three of the registered
+    /// providers were doing exactly that.
+    ///
+    /// [`crate::discovery::ProviderRegistry`] rejects such an argument before
+    /// any implementor sees it, which is why implementors need no guard of
+    /// their own. Resolve a real path with [`crate::discovery::SourceHint::Path`].
     fn owns_session(&self, session_id: &str) -> Option<PathBuf>;
 
     /// Read a session from its native format into canonical IR.

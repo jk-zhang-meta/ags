@@ -9,7 +9,8 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::ir::Fidelity;
+use crate::ir::{Body, Fidelity, SessionIr};
+use crate::model::CanonicalSession;
 use crate::store::{Availability, OriginState};
 
 /// Current schema version for all JSON envelopes and per-record outputs.
@@ -19,7 +20,15 @@ use crate::store::{Availability, OriginState};
 /// 3 added `losses`, `verified_fidelity` and `launch_error` to
 /// [`ResumeSuccess`], and made its `ok` false when a launch could not be
 /// prepared.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// 4 added `detected_format`, `summary` and `live_summary` to
+/// [`InfoResponse`], so that a caller can see which reader produced the
+/// numbers, what the session holds by event type, and what of it the agent
+/// would actually see. Both summaries report `null`, not `0`, for a count
+/// their reader cannot establish — see [`EventSummary`]. It also made
+/// [`ListItem::tool_uses`] an `Option`, because 17 of the 21 providers had no
+/// way to count tool uses and were reporting `0` for every session.
+pub const SCHEMA_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // `list --json`
@@ -60,7 +69,20 @@ pub struct ListItem {
     pub unique_user_messages: usize,
     pub avg_agent_response_chars: f64,
     pub avg_agent_response_chars_rounded: u64,
-    pub tool_uses: usize,
+    /// Tool invocations in the session, or `null` where nothing could count them.
+    ///
+    /// `list` counts these from [`crate::model::CanonicalMessage::tool_calls`],
+    /// and falls back to a per-provider scan of the source file when that comes
+    /// back empty — because an empty `tool_calls` means "this reader does not
+    /// populate the field" on most providers and "no tool calls" on a few, and
+    /// nothing distinguishes the two from the outside.
+    ///
+    /// Only four providers have such a scan. The other seventeen used to fall
+    /// off the end of the match and report `0`, so every Aider, Cline, Cursor,
+    /// Amp, OpenCode, ChatGPT, Vibe, Kiro, Grok and OpenClaw session in every
+    /// `list --json` claimed to have made no tool calls at all. `null` says the
+    /// only true thing available: nothing here could count them.
+    pub tool_uses: Option<usize>,
     pub path: String,
     /// Workspace name derived from session metadata (directory basename or title).
     pub workspace_name: Option<String>,
@@ -69,6 +91,239 @@ pub struct ListItem {
     /// Repository name from filesystem git root (only when `--enrich-fs` is set).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Per-event-type counts
+// ---------------------------------------------------------------------------
+
+/// Events broken down by type, for one of the two questions below.
+///
+/// One field per [`Body`] variant, named exactly as [`Body::kind`] names it so
+/// the two cannot drift apart, and serialized in that order with the four
+/// keys an external consumer already parses — `message`, `reasoning`,
+/// `tool_call`, `tool_result` — first.
+///
+/// # Two questions, two fields
+///
+/// `info --json` reports this shape twice, because "what is in this session"
+/// and "what would the agent actually see" are different questions with
+/// different answers, and a caller cannot derive either from the other.
+///
+/// - `summary` ([`Self::of_ir`]) counts every event in the file, superseded
+///   history included.
+/// - `live_summary` ([`Self::of_live`]) counts what [`crate::replay::resolve`]
+///   says survives: after compaction has replaced the history, rollbacks have
+///   removed turns, abandoned forks have been pruned and the visibility gate
+///   has dropped the chrome.
+///
+/// Reporting only the first was measured against the corpus and is wrong for
+/// the use this field exists for. Across 400 real Codex rollouts, **zero** had
+/// `summary == live_summary`; the median session's live context is 12% of its
+/// file (p05 2%, worst 0.6%), and 156,419 of 174,329 messages are superseded
+/// or gated away. Claude Code is closer but not equal — 1 of 200 identical,
+/// median 97%, and 5,054 of 8,837 messages not live. A checker comparing a
+/// Codex source's *file* against its Claude conversion — which writes the live
+/// context, not the superseded history — would fail every good conversion it
+/// ever saw. Comparing `live_summary` to `live_summary` is the check that
+/// holds; `summary` is what tells a human how much the file has been through.
+///
+/// Note that compaction is not the only cause and could not have been the only
+/// field: `control`, `env_snapshot` and `turn_config` differ in 400 of 400
+/// Codex sessions on the visibility gate alone, where only 303 are compacted.
+///
+/// # `null` is not `0`
+///
+/// `Some(n)` is a count. `None` — serialized as `null`, and never omitted —
+/// means *the reader that produced this cannot tell*. That distinction is the
+/// entire reason the field is worth having. The consumer this exists for counts
+/// a source session, converts it, counts the target, and compares the two as
+/// its own independent check that the conversion dropped nothing; a reader that
+/// answers `0` for a category it cannot see makes a session that lost all of
+/// its reasoning compare clean against one that never had any.
+///
+/// Which reader answers what is a property of the track, not of the session:
+///
+/// - The structured track ([`SessionIr`]) counts real [`Body`] variants, so
+///   every one of its counts is a number. Zero there means zero.
+/// - The flat track ([`CanonicalSession`]) is message-level. It has fields for
+///   messages, tool calls and tool results, and nowhere at all to put
+///   reasoning, compaction, sealed context, or any of the rest — those are not
+///   absent from its sessions, they are invisible to it. They are `null`, and
+///   `null` appears nowhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventSummary {
+    pub message: Option<u64>,
+    pub reasoning: Option<u64>,
+    pub tool_call: Option<u64>,
+    pub tool_result: Option<u64>,
+    pub compaction: Option<u64>,
+    pub sealed_context: Option<u64>,
+    pub turn_config: Option<u64>,
+    pub env_snapshot: Option<u64>,
+    pub attachment: Option<u64>,
+    pub rollback: Option<u64>,
+    pub abort: Option<u64>,
+    pub control: Option<u64>,
+    pub unknown: Option<u64>,
+}
+
+impl EventSummary {
+    /// Everything the file holds, superseded history included.
+    ///
+    /// Answers *what does this session contain*. See [`Self::of_live`] for the
+    /// other question, and the type's own docs for why both are reported.
+    pub fn of_ir(ir: &SessionIr) -> Self {
+        Self::of_events(&ir.events)
+    }
+
+    /// Only what the replay fold says is still live.
+    ///
+    /// Answers *what would the agent actually see*. Delegates to
+    /// [`SessionIr::model_visible`], so compaction, rollback, aborts and
+    /// abandoned forks are all applied by the one fold in [`crate::replay`]
+    /// rather than re-derived here — a second opinion about what survives is
+    /// the bug that module exists to remove.
+    pub fn of_live(ir: &SessionIr) -> Self {
+        Self::of_events(ir.model_visible())
+    }
+
+    /// Count the real [`Body`] variants of a sequence of events.
+    fn of_events<'a>(events: impl IntoIterator<Item = &'a crate::ir::Event>) -> Self {
+        let mut counts = Self {
+            message: Some(0),
+            reasoning: Some(0),
+            tool_call: Some(0),
+            tool_result: Some(0),
+            compaction: Some(0),
+            sealed_context: Some(0),
+            turn_config: Some(0),
+            env_snapshot: Some(0),
+            attachment: Some(0),
+            rollback: Some(0),
+            abort: Some(0),
+            control: Some(0),
+            unknown: Some(0),
+        };
+        for event in events {
+            // Every variant is spelled out and there is no wildcard arm. A new
+            // `Body` has to stop this compiling: the alternative is a variant
+            // that quietly counts as nothing at all, which is precisely the
+            // silent zero the whole type exists to prevent.
+            let slot = match &event.body {
+                Body::Message { .. } => &mut counts.message,
+                Body::Reasoning { .. } => &mut counts.reasoning,
+                Body::ToolCall { .. } => &mut counts.tool_call,
+                Body::ToolResult { .. } => &mut counts.tool_result,
+                Body::Compaction { .. } => &mut counts.compaction,
+                Body::SealedContext { .. } => &mut counts.sealed_context,
+                Body::TurnConfig { .. } => &mut counts.turn_config,
+                Body::EnvSnapshot { .. } => &mut counts.env_snapshot,
+                Body::Attachment { .. } => &mut counts.attachment,
+                Body::Rollback { .. } => &mut counts.rollback,
+                Body::Abort { .. } => &mut counts.abort,
+                Body::Control { .. } => &mut counts.control,
+                Body::Unknown { .. } => &mut counts.unknown,
+            };
+            *slot.get_or_insert(0) += 1;
+        }
+        counts
+    }
+
+    /// Count what a flat session can actually account for, and admit the rest.
+    ///
+    /// Serves both `summary` and `live_summary` on this track, and they are
+    /// equal by construction rather than by coincidence: the flat track has no
+    /// replay fold. Whatever the reader parsed is what the pipeline hands the
+    /// target, so "what is in it" and "what survives" have the same answer.
+    /// The thing the flat track cannot see — that the source agent compacted at
+    /// all — is already reported, as `compaction: null` rather than as a `0`
+    /// that would claim the session was never compacted.
+    ///
+    /// [`CanonicalSession`] carries messages, and each message carries its tool
+    /// calls and tool results. Those three are real fields, so they are real
+    /// counts. Nothing else on this track has a field to be counted from:
+    /// reasoning is either flattened into a message's text or dropped on the
+    /// floor depending on which of the nineteen flat readers ran, and
+    /// compaction, sealed context, turn config, environment snapshots,
+    /// attachments, rollbacks, aborts, control records and unrecognised lines
+    /// have no representation at all. Reporting `0` for any of them would be
+    /// this reader stating, on no evidence, that the session contains none.
+    pub fn of_flat(session: &CanonicalSession) -> Self {
+        Self {
+            message: Some(session.messages.len() as u64),
+            reasoning: None,
+            tool_call: Some(
+                session
+                    .messages
+                    .iter()
+                    .map(|message| message.tool_calls.len() as u64)
+                    .sum(),
+            ),
+            tool_result: Some(
+                session
+                    .messages
+                    .iter()
+                    .map(|message| message.tool_results.len() as u64)
+                    .sum(),
+            ),
+            compaction: None,
+            sealed_context: None,
+            turn_config: None,
+            env_snapshot: None,
+            attachment: None,
+            rollback: None,
+            abort: None,
+            control: None,
+            unknown: None,
+        }
+    }
+
+    /// The counts as name/value pairs, in serialization order.
+    ///
+    /// Field-by-field rather than derived from the serialized form, so the
+    /// human rendering keeps the contract-first ordering that a `BTreeMap`
+    /// would sort away. `summary_line_lists_every_json_key` pins this against
+    /// the JSON so a field added to one and not the other fails a test.
+    pub fn counts(&self) -> [(&'static str, Option<u64>); 13] {
+        [
+            ("message", self.message),
+            ("reasoning", self.reasoning),
+            ("tool_call", self.tool_call),
+            ("tool_result", self.tool_result),
+            ("compaction", self.compaction),
+            ("sealed_context", self.sealed_context),
+            ("turn_config", self.turn_config),
+            ("env_snapshot", self.env_snapshot),
+            ("attachment", self.attachment),
+            ("rollback", self.rollback),
+            ("abort", self.abort),
+            ("control", self.control),
+            ("unknown", self.unknown),
+        ]
+    }
+
+    /// One terse line for the human output: `message 42, reasoning 18, …`.
+    ///
+    /// Counts of zero are dropped and unknowns are kept as `?`. A zero tells a
+    /// reader nothing they could act on; a `?` tells them the number does not
+    /// exist, which is the one thing about this report they must not guess at.
+    pub fn describe(&self) -> String {
+        let rendered: Vec<String> = self
+            .counts()
+            .iter()
+            .filter_map(|(name, count)| match count {
+                Some(0) => None,
+                Some(count) => Some(format!("{name} {count}")),
+                None => Some(format!("{name} ?")),
+            })
+            .collect();
+        if rendered.is_empty() {
+            "(empty)".to_string()
+        } else {
+            rendered.join(", ")
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -81,12 +336,35 @@ pub struct InfoResponse {
     pub schema_version: u32,
     pub session_id: String,
     pub provider: String,
+    /// Slug of the reader that actually parsed this session.
+    ///
+    /// Distinct from `provider`, which is whatever the reader recorded on the
+    /// session it produced. The two agree whenever detection was right, and
+    /// when they do not this is the one that says where the numbers came from.
+    /// A caller passing a path to a moved or copied session file — where
+    /// detection is a signature guess rather than a directory lookup — has no
+    /// other way to find out what it was read as.
+    pub detected_format: String,
     pub title: Option<String>,
     /// Provider-native session name (e.g. Claude Code `/rename` title, Amp
     /// thread title). `null` for providers without such a concept.
     pub native_name: Option<String>,
     pub workspace: Option<String>,
     pub messages: usize,
+    /// Everything in the file, by event type — superseded history included.
+    ///
+    /// Answers *what does this session contain*. `null` for a count this reader
+    /// cannot establish, which is not the same answer as `0`; see
+    /// [`EventSummary`].
+    pub summary: EventSummary,
+    /// What the replay fold says is still live, by event type.
+    ///
+    /// Answers *what would the agent actually see*. This is the one to compare
+    /// across a conversion: a target is written from the live context, so
+    /// checking it against the source's `summary` fails every conversion of a
+    /// compacted session. Equal to `summary` on the flat track, which has no
+    /// fold. See [`EventSummary`] for the corpus measurement behind the split.
+    pub live_summary: EventSummary,
     pub started_at: Option<i64>,
     pub ended_at: Option<i64>,
     pub model_name: Option<String>,
@@ -353,8 +631,426 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn schema_version_is_3() {
-        assert_eq!(SCHEMA_VERSION, 3);
+    fn schema_version_is_4() {
+        assert_eq!(SCHEMA_VERSION, 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // EventSummary
+    // -----------------------------------------------------------------------
+
+    use crate::ir::{Block, Branch, Event, Role, SourceRef, Visibility};
+    use crate::model::{CanonicalMessage, MessageRole, ToolCall, ToolResult};
+
+    fn ir_event(id: &str, body: Body) -> Event {
+        Event {
+            id: id.to_string(),
+            parent: None,
+            branch: Branch::Main,
+            turn: None,
+            ts: None,
+            visibility: Visibility::Model,
+            body,
+            capsules: Vec::new(),
+            source: SourceRef {
+                line: 1,
+                sha256: String::new(),
+            },
+        }
+    }
+
+    /// One of every [`Body`] variant, so that the counter is exercised on all
+    /// thirteen rather than on the four anyone thinks about.
+    fn ir_with_one_of_each() -> SessionIr {
+        let mut ir = SessionIr::new("codex", "s1");
+        ir.events = vec![
+            ir_event(
+                "a",
+                Body::Message {
+                    role: Role::User,
+                    blocks: vec![Block::Text {
+                        text: "hello".into(),
+                    }],
+                },
+            ),
+            ir_event(
+                "b",
+                Body::Reasoning {
+                    text: None,
+                    summary: Vec::new(),
+                },
+            ),
+            ir_event(
+                "c",
+                Body::ToolCall {
+                    call_id: "call-1".into(),
+                    name: "shell".into(),
+                    namespace: None,
+                    input: crate::ir::ToolInput::Freeform { text: "ls".into() },
+                },
+            ),
+            ir_event(
+                "d",
+                Body::ToolResult {
+                    call_id: "call-1".into(),
+                    outcome: crate::ir::ToolOutcome::Unknown,
+                    output: Vec::new(),
+                    structured: None,
+                },
+            ),
+            ir_event(
+                "e",
+                Body::Compaction {
+                    context: Vec::new(),
+                    supersedes: Vec::new(),
+                    note: None,
+                    window_from: None,
+                    window_to: None,
+                },
+            ),
+            ir_event(
+                "f",
+                Body::SealedContext {
+                    native_id: None,
+                    meta: serde_json::Value::Null,
+                },
+            ),
+            ir_event(
+                "g",
+                Body::TurnConfig {
+                    model: None,
+                    effort: None,
+                    sandbox: None,
+                    approval: None,
+                    personality: None,
+                    instructions: None,
+                },
+            ),
+            ir_event(
+                "h",
+                Body::EnvSnapshot {
+                    data: serde_json::Value::Null,
+                },
+            ),
+            ir_event(
+                "i",
+                Body::Attachment {
+                    attachment_kind: "file".into(),
+                    data: serde_json::Value::Null,
+                },
+            ),
+            ir_event("j", Body::Rollback { turns: 1 }),
+            ir_event("k", Body::Abort {}),
+            ir_event(
+                "l",
+                Body::Control {
+                    control_kind: "token_count".into(),
+                    data: serde_json::Value::Null,
+                },
+            ),
+            ir_event(
+                "m",
+                Body::Unknown {
+                    native_type: Some("brand_new".into()),
+                    raw: serde_json::Value::Null,
+                },
+            ),
+        ];
+        ir
+    }
+
+    #[test]
+    fn structured_summary_counts_every_body_variant() {
+        let summary = EventSummary::of_ir(&ir_with_one_of_each());
+        for (name, count) in summary.counts() {
+            assert_eq!(
+                count,
+                Some(1),
+                "{name} should have been counted once; a variant the match \
+                 forgot would show up here as 0"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_summary_counts_repeats_and_reports_real_zeroes() {
+        let mut ir = SessionIr::new("codex", "s1");
+        for id in ["a", "b", "c"] {
+            ir.events.push(ir_event(
+                id,
+                Body::Message {
+                    role: Role::Assistant,
+                    blocks: Vec::new(),
+                },
+            ));
+        }
+        let summary = EventSummary::of_ir(&ir);
+        assert_eq!(summary.message, Some(3));
+        // Zero on this track is a fact about the session, not a shrug: the
+        // reader looked at every event and none of them was reasoning.
+        assert_eq!(summary.reasoning, Some(0));
+        assert_eq!(summary.sealed_context, Some(0));
+    }
+
+    #[test]
+    fn structured_summary_totals_every_event() {
+        let ir = ir_with_one_of_each();
+        let summary = EventSummary::of_ir(&ir);
+        let total: u64 = summary
+            .counts()
+            .iter()
+            .map(|(_, count)| count.expect("the structured track knows every count"))
+            .sum();
+        assert_eq!(
+            total as usize,
+            ir.events.len(),
+            "every event lands in exactly one bucket"
+        );
+    }
+
+    fn flat_session(messages: Vec<CanonicalMessage>) -> CanonicalSession {
+        CanonicalSession {
+            session_id: "flat-1".to_string(),
+            provider_slug: "opencode".to_string(),
+            workspace: None,
+            title: None,
+            started_at: None,
+            ended_at: None,
+            messages,
+            metadata: serde_json::Value::Null,
+            source_path: PathBuf::from("/tmp/flat.json"),
+            model_name: None,
+        }
+    }
+
+    fn flat_message(idx: usize, role: MessageRole) -> CanonicalMessage {
+        CanonicalMessage {
+            idx,
+            role,
+            content: "text".to_string(),
+            timestamp: None,
+            author: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    /// The rule the whole field exists for: the flat track says `null`, not `0`,
+    /// for everything it cannot see.
+    ///
+    /// The consumer is a wrapper that counts a source session, converts it,
+    /// counts the target and compares. If a flat reader reported `0` reasoning
+    /// events, a conversion that deleted eight hundred of them would compare
+    /// clean against a source that reported the same `0` — a catastrophic loss
+    /// rendered as agreement. `null` is not a count and cannot be subtracted;
+    /// that is the point.
+    #[test]
+    fn flat_summary_says_null_not_zero_for_what_it_cannot_see() {
+        let mut with_tools = flat_message(1, MessageRole::Assistant);
+        with_tools.tool_calls = vec![ToolCall {
+            id: Some("call-1".into()),
+            name: "shell".into(),
+            arguments: serde_json::Value::Null,
+        }];
+        with_tools.tool_results = vec![ToolResult {
+            call_id: Some("call-1".into()),
+            content: "ok".into(),
+            is_error: false,
+        }];
+        let session = flat_session(vec![flat_message(0, MessageRole::User), with_tools]);
+
+        let summary = EventSummary::of_flat(&session);
+        assert_eq!(summary.message, Some(2));
+        assert_eq!(summary.tool_call, Some(1));
+        assert_eq!(summary.tool_result, Some(1));
+
+        let json = serde_json::to_value(&summary).unwrap();
+        // The three the flat model has fields for are numbers.
+        assert_eq!(json["message"], 2);
+        assert_eq!(json["tool_call"], 1);
+        assert_eq!(json["tool_result"], 1);
+        // Everything else is `null`, present, and never 0.
+        for unknowable in [
+            "reasoning",
+            "compaction",
+            "sealed_context",
+            "turn_config",
+            "env_snapshot",
+            "attachment",
+            "rollback",
+            "abort",
+            "control",
+            "unknown",
+        ] {
+            assert!(
+                json.as_object().unwrap().contains_key(unknowable),
+                "{unknowable} must be present, not omitted: absent and \
+                 unknowable are different answers"
+            );
+            assert!(
+                json[unknowable].is_null(),
+                "{unknowable} must be null on the flat track, not {}: 0 would \
+                 claim the session has none",
+                json[unknowable]
+            );
+        }
+    }
+
+    /// The fold's answer is a subset of the file's, and a strict one here.
+    ///
+    /// A compaction replaces the history: the superseded messages are still in
+    /// `summary` because they are still in the file, and absent from
+    /// `live_summary` because the agent will never see them again. A caller
+    /// that had only `summary` would compare a compacted source against its
+    /// conversion and see events the target was never supposed to contain.
+    #[test]
+    fn live_summary_drops_what_compaction_superseded() {
+        let mut ir = SessionIr::new("codex", "s1");
+        for id in ["old1", "old2", "old3"] {
+            ir.events.push(ir_event(
+                id,
+                Body::Message {
+                    role: Role::User,
+                    blocks: Vec::new(),
+                },
+            ));
+        }
+        ir.events.push(ir_event(
+            "summary",
+            Body::Message {
+                role: Role::Assistant,
+                blocks: Vec::new(),
+            },
+        ));
+        ir.events.push(ir_event(
+            "compact",
+            Body::Compaction {
+                context: vec!["summary".into()],
+                supersedes: vec!["old1".into(), "old2".into(), "old3".into()],
+                note: None,
+                window_from: None,
+                window_to: None,
+            },
+        ));
+
+        let all = EventSummary::of_ir(&ir);
+        let live = EventSummary::of_live(&ir);
+        assert_eq!(all.message, Some(4), "the file still holds all four");
+        assert_eq!(live.message, Some(1), "only the replacement survives");
+        // The marker is an instruction about content, not content.
+        assert_eq!(all.compaction, Some(1));
+        assert_eq!(live.compaction, Some(0));
+        assert_ne!(all, live, "the two fields must be able to disagree");
+    }
+
+    /// Chrome is not live either, and that is a second, independent reason the
+    /// two fields differ — it fires on sessions that were never compacted.
+    #[test]
+    fn live_summary_drops_chrome_even_without_compaction() {
+        let mut ir = SessionIr::new("codex", "s1");
+        ir.events.push(ir_event(
+            "m",
+            Body::Message {
+                role: Role::User,
+                blocks: Vec::new(),
+            },
+        ));
+        let mut chrome = ir_event(
+            "c",
+            Body::Control {
+                control_kind: "token_count".into(),
+                data: serde_json::Value::Null,
+            },
+        );
+        chrome.visibility = Visibility::Telemetry;
+        ir.events.push(chrome);
+
+        let all = EventSummary::of_ir(&ir);
+        let live = EventSummary::of_live(&ir);
+        assert_eq!((all.message, all.control), (Some(1), Some(1)));
+        assert_eq!((live.message, live.control), (Some(1), Some(0)));
+    }
+
+    /// The fold can only remove, so `live` is bounded by `all` on every key.
+    #[test]
+    fn live_summary_never_exceeds_summary() {
+        let ir = ir_with_one_of_each();
+        let all = EventSummary::of_ir(&ir);
+        let live = EventSummary::of_live(&ir);
+        for ((kind, all_count), (_, live_count)) in all.counts().iter().zip(live.counts().iter()) {
+            assert!(
+                live_count <= all_count,
+                "{kind}: live {live_count:?} exceeds all {all_count:?}"
+            );
+        }
+    }
+
+    /// A flat session that genuinely holds no tool traffic still says `0`.
+    ///
+    /// The null rule is about what the *model* cannot represent, not about
+    /// making every flat number vanish — `tool_calls` is a real field, so an
+    /// empty one is a real zero.
+    #[test]
+    fn flat_summary_reports_zero_where_the_model_has_a_field() {
+        let session = flat_session(vec![flat_message(0, MessageRole::User)]);
+        let summary = EventSummary::of_flat(&session);
+        assert_eq!(summary.tool_call, Some(0));
+        assert_eq!(summary.tool_result, Some(0));
+        assert_eq!(summary.reasoning, None);
+    }
+
+    /// The four names an external consumer already parses, spelled exactly.
+    #[test]
+    fn the_four_contract_keys_are_always_present() {
+        for summary in [
+            EventSummary::of_ir(&ir_with_one_of_each()),
+            EventSummary::of_flat(&flat_session(Vec::new())),
+        ] {
+            let json = serde_json::to_value(&summary).unwrap();
+            let object = json.as_object().unwrap();
+            for key in ["message", "reasoning", "tool_call", "tool_result"] {
+                assert!(object.contains_key(key), "{key} is a contract key");
+            }
+        }
+    }
+
+    /// The human line and the JSON cannot drift apart.
+    #[test]
+    fn summary_line_lists_every_json_key() {
+        let summary = EventSummary::of_ir(&ir_with_one_of_each());
+        let json = serde_json::to_value(&summary).unwrap();
+        let mut from_json: Vec<String> = json.as_object().unwrap().keys().cloned().collect();
+        from_json.sort();
+        let mut from_counts: Vec<String> = summary
+            .counts()
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        from_counts.sort();
+        assert_eq!(
+            from_counts, from_json,
+            "a field added to EventSummary must be added to counts() too, or \
+             the human output silently loses it"
+        );
+
+        let described = summary.describe();
+        for (name, _) in summary.counts() {
+            assert!(described.contains(name), "{name} missing from {described}");
+        }
+    }
+
+    #[test]
+    fn summary_line_drops_zeroes_and_keeps_unknowns() {
+        let described = EventSummary::of_flat(&flat_session(Vec::new())).describe();
+        assert!(
+            described.contains("reasoning ?"),
+            "an unknown count must render as ?, not as a number: {described}"
+        );
+        assert!(
+            !described.contains("tool_call 0"),
+            "a real zero carries nothing a reader can act on: {described}"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -365,7 +1061,7 @@ mod tests {
     fn list_envelope_empty_items_serializes() {
         let envelope = ListEnvelope::new(vec![]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert!(json["items"].as_array().unwrap().is_empty());
     }
 
@@ -386,7 +1082,7 @@ mod tests {
             unique_user_messages: 3,
             avg_agent_response_chars: 500.5,
             avg_agent_response_chars_rounded: 501,
-            tool_uses: 7,
+            tool_uses: Some(7),
             path: "/tmp/session.jsonl".to_string(),
             workspace_name: Some("test".to_string()),
             workspace_name_source: Some("session_workspace_path".to_string()),
@@ -394,10 +1090,10 @@ mod tests {
         };
         let envelope = ListEnvelope::new(vec![item]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
         let first = &json["items"][0];
-        assert_eq!(first["schema_version"], 3);
+        assert_eq!(first["schema_version"], 4);
         assert_eq!(first["session_id"], "sid-1");
         assert_eq!(first["provider"], "claude-code");
         assert_eq!(first["native_name"], "Renamed Session");
@@ -416,10 +1112,13 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             session_id: "sid-info".to_string(),
             provider: "codex".to_string(),
+            detected_format: "codex".to_string(),
             title: None,
             native_name: None,
             workspace: None,
             messages: 5,
+            summary: EventSummary::of_ir(&ir_with_one_of_each()),
+            live_summary: EventSummary::of_live(&ir_with_one_of_each()),
             started_at: None,
             ended_at: None,
             model_name: Some("gpt-4".to_string()),
@@ -431,7 +1130,7 @@ mod tests {
             transcript_tail: None,
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["session_id"], "sid-info");
         assert_eq!(json["provider"], "codex");
         assert!(json["title"].is_null());
@@ -445,6 +1144,9 @@ mod tests {
         assert_eq!(json["model_name"], "gpt-4");
         assert!(json["workspace_name"].is_null());
         assert_eq!(json["workspace_name_source"], "none");
+        assert_eq!(json["detected_format"], "codex");
+        assert_eq!(json["summary"]["message"], 1);
+        assert_eq!(json["summary"]["tool_call"], 1);
     }
 
     // -----------------------------------------------------------------------
@@ -575,7 +1277,7 @@ mod tests {
             unique_user_messages: 0,
             avg_agent_response_chars: 0.0,
             avg_agent_response_chars_rounded: 0,
-            tool_uses: 0,
+            tool_uses: None,
             path: "/tmp/x".to_string(),
             workspace_name: None,
             workspace_name_source: Some("none".to_string()),
@@ -609,7 +1311,7 @@ mod tests {
             unique_user_messages: 0,
             avg_agent_response_chars: 0.0,
             avg_agent_response_chars_rounded: 0,
-            tool_uses: 0,
+            tool_uses: None,
             path: "/tmp/x".to_string(),
             workspace_name: Some("my_repo".to_string()),
             workspace_name_source: Some("session_workspace_path".to_string()),
@@ -625,10 +1327,13 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             session_id: "sid".to_string(),
             provider: "test".to_string(),
+            detected_format: "test".to_string(),
             title: None,
             native_name: None,
             workspace: None,
             messages: 0,
+            summary: EventSummary::of_flat(&flat_session(Vec::new())),
+            live_summary: EventSummary::of_flat(&flat_session(Vec::new())),
             started_at: None,
             ended_at: None,
             model_name: None,

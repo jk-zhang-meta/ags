@@ -348,7 +348,7 @@ fn contract_providers_aliases_match_slugs() {
 // ---------------------------------------------------------------------------
 // Contract: `list --json`
 // ---------------------------------------------------------------------------
-// Expected shape: { schema_version: 3, items: [{ schema_version, session_id, provider, ... }] }
+// Expected shape: { schema_version: 4, items: [{ schema_version, session_id, provider, ... }] }
 
 fn assert_list_envelope(parsed: &serde_json::Value) -> &Vec<serde_json::Value> {
     let ctx = "list_envelope";
@@ -356,8 +356,8 @@ fn assert_list_envelope(parsed: &serde_json::Value) -> &Vec<serde_json::Value> {
     assert_uint(&parsed["schema_version"], "schema_version", ctx);
     assert_eq!(
         parsed["schema_version"].as_u64().unwrap(),
-        3,
-        "{ctx}: schema_version should be 3"
+        4,
+        "{ctx}: schema_version should be 4"
     );
     assert_array(&parsed["items"], "items", ctx);
     parsed["items"].as_array().unwrap()
@@ -392,8 +392,8 @@ fn assert_list_item(obj: &serde_json::Value, idx: usize) {
     assert_uint(&obj["schema_version"], "schema_version", &ctx);
     assert_eq!(
         obj["schema_version"].as_u64().unwrap(),
-        3,
-        "{ctx}: per-item schema_version should be 3"
+        4,
+        "{ctx}: per-item schema_version should be 4"
     );
     assert_string(&obj["session_id"], "session_id", &ctx);
     assert_string(&obj["provider"], "provider", &ctx);
@@ -405,6 +405,8 @@ fn assert_list_item(obj: &serde_json::Value, idx: usize) {
     assert_string(&obj["path"], "path", &ctx);
     assert_string_or_null(&obj["workspace_name"], "workspace_name", &ctx);
     assert_string_or_null(&obj["workspace_name_source"], "workspace_name_source", &ctx);
+    // A count or `null` — never a `0` standing in for "no way to count these".
+    assert_number_or_null(&obj["tool_uses"], "tool_uses", &ctx);
 }
 
 #[test]
@@ -530,10 +532,50 @@ fn contract_list_json_messages_is_nonnegative() {
 // ---------------------------------------------------------------------------
 // Contract: `info --json`
 // ---------------------------------------------------------------------------
-// Expected shape: {schema_version, session_id, provider, title, native_name,
-//                  workspace, messages, started_at, ended_at, model_name,
-//                  source_path, metadata, workspace_name, workspace_name_source}
+// Expected shape: {schema_version, session_id, provider, detected_format, title,
+//                  native_name, workspace, messages, summary, started_at,
+//                  ended_at, model_name, source_path, metadata, workspace_name,
+//                  workspace_name_source}
 // (transcript_tail is present only with --peek.)
+
+/// The four `summary` keys an external consumer already parses.
+///
+/// Spelled here rather than derived, because the contract is the spelling.
+const SUMMARY_CONTRACT_KEYS: [&str; 4] = ["message", "reasoning", "tool_call", "tool_result"];
+
+/// Every `summary` key, contract-first then the rest of the `Body` variants.
+const SUMMARY_KEYS: [&str; 13] = [
+    "message",
+    "reasoning",
+    "tool_call",
+    "tool_result",
+    "compaction",
+    "sealed_context",
+    "turn_config",
+    "env_snapshot",
+    "attachment",
+    "rollback",
+    "abort",
+    "control",
+    "unknown",
+];
+
+fn assert_summary_object(obj: &serde_json::Value, ctx: &str) {
+    assert_exact_keys(obj, &SUMMARY_KEYS, ctx);
+    for key in SUMMARY_KEYS {
+        assert!(
+            obj[key].is_null() || obj[key].as_u64().is_some(),
+            "{ctx}: summary.{key} should be a count or null, got {}",
+            obj[key]
+        );
+    }
+    for key in SUMMARY_CONTRACT_KEYS {
+        assert!(
+            obj.as_object().unwrap().contains_key(key),
+            "{ctx}: summary.{key} is a contract key and must always be present"
+        );
+    }
+}
 
 fn assert_info_object(obj: &serde_json::Value) {
     let ctx = "info";
@@ -543,10 +585,13 @@ fn assert_info_object(obj: &serde_json::Value) {
             "schema_version",
             "session_id",
             "provider",
+            "detected_format",
             "title",
             "native_name",
             "workspace",
             "messages",
+            "summary",
+            "live_summary",
             "started_at",
             "ended_at",
             "model_name",
@@ -560,11 +605,27 @@ fn assert_info_object(obj: &serde_json::Value) {
     assert_uint(&obj["schema_version"], "schema_version", ctx);
     assert_eq!(
         obj["schema_version"].as_u64().unwrap(),
-        3,
-        "{ctx}: schema_version should be 3"
+        4,
+        "{ctx}: schema_version should be 4"
     );
     assert_string(&obj["session_id"], "session_id", ctx);
     assert_string(&obj["provider"], "provider", ctx);
+    assert_string(&obj["detected_format"], "detected_format", ctx);
+    assert_summary_object(&obj["summary"], ctx);
+    assert_summary_object(&obj["live_summary"], "info.live_summary");
+    // The fold cannot invent events, so `live_summary` is bounded by `summary`
+    // key for key. A caller diffing the two relies on exactly this.
+    for key in SUMMARY_KEYS {
+        if let (Some(all), Some(live)) = (
+            obj["summary"][key].as_u64(),
+            obj["live_summary"][key].as_u64(),
+        ) {
+            assert!(
+                live <= all,
+                "{ctx}: live_summary.{key} ({live}) exceeds summary.{key} ({all})"
+            );
+        }
+    }
     assert_string_or_null(&obj["title"], "title", ctx);
     assert_string_or_null(&obj["native_name"], "native_name", ctx);
     assert_string_or_null(&obj["workspace"], "workspace", ctx);
@@ -658,6 +719,225 @@ fn contract_info_json_source_path_is_absolute() {
         path.starts_with('/'),
         "source_path should be absolute, got: {path}"
     );
+}
+
+/// `info` takes a session file path where it takes a session ID.
+///
+/// It appeared to already: `Codex::owns_session` joins its argument onto the
+/// Codex sessions directory, and joining an *absolute* path throws the left
+/// side away, so any absolute path resolved as Codex. A Claude Code transcript
+/// was therefore parsed by the Codex reader and reported as
+/// `provider: "codex"` with zero messages. The path form has to resolve by
+/// path.
+#[test]
+fn contract_info_accepts_a_session_file_path() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let by_id: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(
+        &casr_cmd(&tmp)
+            .args(["--json", "info", &session_id])
+            .output()
+            .expect("info by id should run")
+            .stdout,
+    ))
+    .expect("info by id emits JSON");
+    let path = by_id["source_path"].as_str().unwrap().to_string();
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "info", &path])
+        .output()
+        .expect("info by path should run");
+    assert!(
+        output.status.success(),
+        "info by path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let by_path: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .expect("info by path emits JSON");
+
+    assert_info_object(&by_path);
+    assert_eq!(
+        by_path["detected_format"], "claude-code",
+        "a Claude transcript must not be read by the Codex parser: {by_path}"
+    );
+    assert_eq!(by_path["session_id"], by_id["session_id"]);
+    assert_eq!(by_path["messages"], by_id["messages"]);
+    assert_eq!(by_path["summary"], by_id["summary"]);
+}
+
+/// `list --json` says `null`, not `0`, when nothing could count tool uses.
+///
+/// `tool_uses` comes from `CanonicalMessage::tool_calls`, and falls back to a
+/// per-provider scan of the source file when that is empty — because most flat
+/// readers never populate the field, so an empty one does not mean "no tools".
+/// Only four providers have a scan; the rest fell off the end of the match and
+/// reported `0`, which claimed that every session on seventeen providers had
+/// made no tool calls at all.
+///
+/// Amp is one of the seventeen: no scanner, and its reader leaves `tool_calls`
+/// empty, so `0` here would be an answer nothing produced.
+#[test]
+fn contract_list_tool_uses_is_null_when_uncountable() {
+    const AMP_THREAD: &str = "T-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let tmp = TempDir::new().unwrap();
+    let threads = tmp.path().join("amp/threads");
+    fs::create_dir_all(&threads).expect("mkdir");
+    fs::copy(
+        fixtures_dir().join(format!("amp/{AMP_THREAD}.json")),
+        threads.join(format!("{AMP_THREAD}.json")),
+    )
+    .expect("seed amp thread");
+
+    let output = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "list",
+            "--provider",
+            "amp",
+            "--workspace",
+            "/data/projects/fixture-amp",
+        ])
+        .output()
+        .expect("list should run");
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("JSON");
+    let items = parsed["items"].as_array().expect("items");
+    assert!(
+        !items.is_empty(),
+        "the seeded session should be listed: {parsed}"
+    );
+    for item in items {
+        assert!(
+            item["messages"].as_u64().unwrap_or(0) > 0,
+            "the session was really read: {item}"
+        );
+        assert!(
+            item["tool_uses"].is_null(),
+            "nothing can count Amp's tool uses, so any number here is invented: {item}"
+        );
+    }
+
+    // A provider that *can* count still reports a number, so the null above is
+    // the absence of an answer rather than the field having gone away.
+    let gemini_tmp = TempDir::new().unwrap();
+    setup_gemini_fixture(&gemini_tmp, "gmi_simple");
+    let output = casr_cmd(&gemini_tmp)
+        .args(["--json", "list", "--provider", "gemini"])
+        .output()
+        .expect("list should run");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("JSON");
+    for item in parsed["items"].as_array().expect("items") {
+        assert!(
+            item["tool_uses"].as_u64().is_some(),
+            "gemini has a scanner and must answer with a count: {item}"
+        );
+    }
+}
+
+/// `--from` forces the reader, and `detected_format` reports what it forced.
+#[test]
+fn contract_info_from_forces_the_reader() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "info", &session_id, "--from", "cod"])
+        .output()
+        .expect("info --from should run");
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).expect("JSON");
+    assert_info_object(&parsed);
+    assert_eq!(parsed["detected_format"], "codex");
+
+    // An unknown slug is refused up front rather than silently detected.
+    let refused = casr_cmd(&tmp)
+        .args(["--json", "info", &session_id, "--from", "not-an-agent"])
+        .output()
+        .expect("info --from bogus should run");
+    assert!(!refused.status.success(), "an unknown --from must not pass");
+    let error: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&refused.stderr)).expect("error JSON");
+    assert_eq!(error["error_type"], "UnknownProviderAlias");
+}
+
+/// The structured track answers every count; the flat track answers `null`
+/// where it cannot see, and never `0`.
+///
+/// Both halves are asserted in one test because the contract is the
+/// *difference* between them: a caller diffing a source against its conversion
+/// is only safe if `null` and `0` cannot be confused.
+#[test]
+fn contract_info_summary_null_means_unknowable_not_zero() {
+    let tmp = TempDir::new().unwrap();
+
+    let cc_id = setup_cc_fixture(&tmp, "cc_simple");
+    let structured: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(
+        &casr_cmd(&tmp)
+            .args(["--json", "info", &cc_id])
+            .output()
+            .expect("claude-code info should run")
+            .stdout,
+    ))
+    .expect("JSON");
+    let summary = &structured["summary"];
+    for key in SUMMARY_KEYS {
+        assert!(
+            summary[key].as_u64().is_some(),
+            "the structured track knows every count; summary.{key} was {}",
+            summary[key]
+        );
+    }
+    assert_eq!(
+        summary["message"], structured["messages"],
+        "a structured reader that agrees with the flat one should say so: {structured}"
+    );
+    assert!(
+        summary["message"].as_u64().unwrap() > 0,
+        "the fixture has messages: {summary}"
+    );
+
+    let gemini_id = setup_gemini_fixture(&tmp, "gmi_simple");
+    let flat: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(
+        &casr_cmd(&tmp)
+            .args(["--json", "info", &gemini_id])
+            .output()
+            .expect("gemini info should run")
+            .stdout,
+    ))
+    .expect("JSON");
+    let summary = &flat["summary"];
+    assert_eq!(flat["detected_format"], "gemini");
+    // What a `CanonicalSession` holds is countable.
+    for key in ["message", "tool_call", "tool_result"] {
+        assert!(
+            summary[key].as_u64().is_some(),
+            "the flat model has a field for {key}: {summary}"
+        );
+    }
+    // What it does not hold is `null` — present, and never 0.
+    for key in [
+        "reasoning",
+        "compaction",
+        "sealed_context",
+        "turn_config",
+        "env_snapshot",
+        "attachment",
+        "rollback",
+        "abort",
+        "control",
+        "unknown",
+    ] {
+        assert!(
+            summary[key].is_null(),
+            "summary.{key} must be null on the flat track, not {}: 0 would \
+             let a conversion that deleted them compare clean",
+            summary[key]
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
