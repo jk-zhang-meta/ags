@@ -1,21 +1,71 @@
-//! Amp provider — reads/writes threads from Amp's local JSON thread store.
+//! Amp provider — reads/writes the thread store Amp's **editor extension**
+//! keeps on disk.
 //!
-//! Amp stores each conversation "thread" as a single JSON file named by thread ID.
-//! In recent versions the VS Code extension migrates threads from VS Code
-//! `globalStorage` into a centralized data directory.
+//! ## Which Amp this is
 //!
-//! ## Centralized thread storage (preferred)
+//! Amp ships as two products, and only one of them stores threads locally.
+//! Saying "Amp" without saying which is how casr ended up describing a store
+//! it does not read.
 //!
-//! - Linux (default): `~/.local/share/amp/threads/<thread-id>.json`
-//! - Controlled by `XDG_DATA_HOME`, the only variable that moves Amp's data.
-//!   `AMP_HOME` relocates Amp's *install* tree, not this one, so casr does not
-//!   read it; `AMP_DATA_HOME` is real only in Amp's editor plugins.
+//! * The **editor extension** — `sourcegraph.amp` on the VS Code Marketplace,
+//!   installed into VS Code and its forks (Cursor, Windsurf, VSCodium) —
+//!   writes one JSON file per thread into a directory on disk. That store is
+//!   what casr reads and writes, and it is the only Amp transcript that exists
+//!   locally.
+//! * The **CLI** — `@ampcode/cli`; the `@sourcegraph/amp` npm package is now a
+//!   rename stub whose `description` is literally
+//!   `"Renamed to @ampcode/cli"` and whose only dependency is `@ampcode/cli` —
+//!   keeps thread bodies **server-side**. Its data directory holds `daemon/`,
+//!   `ide/`, `oauth/`, `runner/`, `notepad/<id>`, `device-id.json`,
+//!   `history.jsonl`, `session.json` and `secrets.json`: process state,
+//!   credentials, and a `lastThreadId` *pointer*. No transcript. Measured on
+//!   the `@ampcode/cli-linux-x64` 0.0.1785142937-gb7c681 binary, the only
+//!   `"threads"` path it ever joins is `<cache>/amp/logs/threads`, a log
+//!   directory, and it has no thread cache at all.
 //!
-//! ## Legacy VS Code extension storage (fallback during migration)
+//! So a machine that has only the CLI lists nothing here, and that is the
+//! right answer rather than a gap: there is nothing on it to list. The two
+//! products share one data directory, which is why the *directory* proves
+//! nothing on its own — `threads/` inside it is the extension's.
+//!
+//! ## Centralized thread storage (current)
+//!
+//! - `$XDG_DATA_HOME/amp/threads/<thread-id>.json`, else
+//!   `~/.local/share/amp/threads/<thread-id>.json`.
+//! - `XDG_DATA_HOME` is the only variable that moves it, and the extension
+//!   honours it on *every* platform — its resolver is
+//!   `resolve(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "amp")`
+//!   with no `win32`/`darwin` branch (`sourcegraph.amp` 0.0.1772799397,
+//!   `extension/dist/extension.cjs`). The CLI's own copy of that resolver
+//!   *does* branch and ignores `XDG_DATA_HOME` on Windows and macOS; casr
+//!   follows the extension, because the extension is what writes threads.
+//! - `AMP_HOME` relocates Amp's *install* tree (`<AMP_HOME>/bin`, default
+//!   `~/.amp`), never this one, so casr does not read it. `AMP_DATA_HOME` is
+//!   read by nothing casr can find: zero occurrences across the CLI binary and
+//!   six shipped extension builds spanning 2025-04 to 2026-03.
+//!
+//! ## Legacy `globalStorage` storage (still live, not historical trivia)
 //!
 //! - `<HOST_CONFIG>/User/globalStorage/sourcegraph.amp/threads3/<thread-id>.json`
 //! - Where `<HOST_CONFIG>` can be VS Code (`Code`, `Code - Insiders`, `VSCodium`),
 //!   Cursor, or Windsurf.
+//!
+//! This root is kept because the shipped extensions say it was real, and for
+//! some installs still is:
+//!
+//! | extension build | thread store |
+//! | --- | --- |
+//! | 0.0.1746014860 (2025-04-30) | `threads3` only; no `XDG_DATA_HOME` anywhere in the bundle |
+//! | 0.0.1750505632 (2025-06-21) | `threads3` only |
+//! | 0.0.1755058471 (2025-08-13) | centralized store lands behind `useCentralizedStorage`, `threads3` still read |
+//! | 0.0.1760429452 (2025-10-14) | centralized by default, falls back to `threads3` until `isMigrationComplete` |
+//! | 0.0.1767384608 (2026-01-02) | `threads3` and `globalStorage` gone from the bundle |
+//! | 0.0.1772799397 (2026-03-06) | centralized only |
+//!
+//! A grep of the *current* build alone says `threads3` is fictional. It is
+//! not: it was the only store for the first half of the extension's life, and
+//! a user who has not run a build new enough to migrate still has every thread
+//! there and nowhere else.
 //!
 //! The thread JSON format is Amp-internal but resembles Anthropic-style message
 //! blocks: messages have a `role` and an array `content` with blocks like
@@ -45,8 +95,14 @@ const LEGACY_THREADS_DIR: &str = "threads3";
 pub struct Amp;
 
 impl Amp {
-    /// Amp's centralized data directory: `$XDG_DATA_HOME/amp`, else
+    /// Amp's shared data directory: `$XDG_DATA_HOME/amp`, else
     /// `~/.local/share/amp`.
+    ///
+    /// Shared, not the extension's: the CLI puts `daemon/`, `ide/`, `oauth/`,
+    /// `runner/`, `device-id.json`, `history.jsonl`, `session.json` and
+    /// `secrets.json` here too. Only `threads/` under it belongs to the
+    /// extension, which is why nothing outside [`Self::centralized_threads_root`]
+    /// is treated as evidence of a readable store.
     ///
     /// `AMP_HOME` is deliberately not read here. It is Amp's own variable, but
     /// what Amp means by it is the *install* directory — the tree holding
@@ -68,6 +124,20 @@ impl Amp {
         Self::amp_home_dir().map(|h| h.join(CENTRAL_THREADS_DIR))
     }
 
+    /// The pre-migration store: `<globalStorageUri>/threads3`.
+    ///
+    /// Kept, not deleted, and the version table in the module docs is the
+    /// reason. `<globalStorageUri>` is VS Code's per-extension global storage
+    /// directory, `<HOST_CONFIG>/User/globalStorage/sourcegraph.amp`, and the
+    /// extension joined `"threads3"` onto it directly —
+    /// `URI.file(path.join(vscodeContext.globalStorageUri.path, legacySubdir))`
+    /// in 0.0.1760429452, `context.globalStorageUri` + `storagePath` in
+    /// 0.0.1746014860 before centralized storage existed at all.
+    ///
+    /// It reads as dead code only if you grep one build. A user on an
+    /// extension that predates the migration, or whose migration has not run,
+    /// has their threads here and in no other directory; dropping this root
+    /// would show them an empty list and call it "no sessions".
     fn legacy_threads_roots() -> Vec<PathBuf> {
         // Editor config roots that can host VS Code-style `User/globalStorage`.
         // Probe both config_dir and data_dir to cover Linux/Windows vs macOS.
@@ -102,24 +172,47 @@ impl Amp {
             .collect()
     }
 
-    fn looks_like_thread_id(session_id: &str) -> bool {
-        let Some(rest) = session_id.strip_prefix("T-") else {
-            return false;
-        };
-        uuid::Uuid::parse_str(rest).is_ok()
+    /// The file `session_id` names inside `root`, or `None` when it names
+    /// anything other than a plain file directly in that directory.
+    ///
+    /// This is Amp's own key-to-path mapping and nothing more. `get(key)`
+    /// opens `joinPath(<root>, `${key}.json`)` with no validation of `key`,
+    /// because every key Amp passes it came out of `keys()` — one `readdir` of
+    /// that same directory. casr's ids arrive on the command line instead, so
+    /// the mapping needs the one constraint `keys()` supplied implicitly: the
+    /// id has to be a single path component. `..`, a separator, or an absolute
+    /// path is not a key Amp could ever have produced.
+    ///
+    /// What is deliberately *not* here is a shape test. casr used to require
+    /// `T-<uuid>` — Amp's minter (`T-${uuid}`) and its `rz` validator both use
+    /// that shape — and it made resolution stricter than listing:
+    /// [`Provider::is_session_path`] transcribes Amp's `keys()` rule, *any*
+    /// `.json` file directly in a threads root, so `casr list` printed threads
+    /// that `casr info <id>` then refused as unknown. Nothing constrains a
+    /// thread file's name to the minter's shape; a file copied in, restored
+    /// from a backup, or renamed is one Amp opens and casr would not. "Is this
+    /// a path I would list?" and "do I own this id?" are different questions,
+    /// but they are not free to disagree, and this is the direction the
+    /// disagreement had to be resolved: toward what the tool itself accepts.
+    fn thread_path_in(root: &Path, session_id: &str) -> Option<PathBuf> {
+        if session_id.is_empty() {
+            return None;
+        }
+        let file_name = format!("{session_id}.json");
+        let mut components = Path::new(&file_name).components();
+        match (components.next(), components.next()) {
+            (Some(std::path::Component::Normal(name)), None) if name == file_name.as_str() => {
+                Some(root.join(name))
+            }
+            _ => None,
+        }
     }
 
     fn owns_session_in_roots(session_id: &str, roots: &[PathBuf]) -> Option<PathBuf> {
-        if !Self::looks_like_thread_id(session_id) {
-            return None;
-        }
-        for root in roots {
-            let candidate = root.join(format!("{session_id}.json"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
+        roots
+            .iter()
+            .filter_map(|root| Self::thread_path_in(root, session_id))
+            .find(|candidate| candidate.is_file())
     }
 
     fn read_json(path: &Path) -> anyhow::Result<serde_json::Value> {
@@ -411,6 +504,15 @@ impl Amp {
         format!("T-{}", uuid::Uuid::new_v4())
     }
 
+    // Amp threads are `user`, `assistant` and `info`; there is no system slot,
+    // and `info` is where everything else goes.
+    //
+    // Right, and still a loss, so it is declared rather than performed in
+    // silence: `pipeline::folded_role("amp", …)` names it before the write and
+    // the conversion carries an `ir::Loss` for it. Change this match and that
+    // table has to change with it —
+    // `conformance_test::no_writer_folds_a_role_without_declaring_it` drives
+    // this writer and fails if the two disagree, in either direction.
     fn amp_role_for_canonical(role: &MessageRole) -> &'static str {
         match role {
             MessageRole::Assistant => "assistant",
@@ -545,21 +647,46 @@ impl Provider for Amp {
         "amp"
     }
 
+    /// Detection reports the **editor extension**, because that is the only
+    /// Amp whose threads are on this machine.
+    ///
+    /// The evidence says so in words. `installed: false` on a box with a
+    /// working `amp` CLI is the correct answer and an alarming one to read, so
+    /// when the shared data directory is there without a `threads/` in it —
+    /// the exact shape of a CLI-only install — that is reported too, as the
+    /// explanation for the empty listing rather than as evidence of a store.
     fn detect(&self) -> DetectionResult {
         let mut evidence = Vec::new();
         let mut installed = false;
 
-        if let Some(root) = Self::centralized_threads_root()
-            && root.is_dir()
-        {
-            installed = true;
-            evidence.push(format!("{} detected", root.display()));
+        match Self::centralized_threads_root() {
+            Some(root) if root.is_dir() => {
+                installed = true;
+                evidence.push(format!(
+                    "{} detected (Amp editor extension thread store)",
+                    root.display()
+                ));
+            }
+            _ => {
+                if let Some(data) = Self::amp_home_dir()
+                    && data.is_dir()
+                {
+                    evidence.push(format!(
+                        "{} exists but has no {CENTRAL_THREADS_DIR}/: the Amp CLI keeps threads \
+                         server-side, so only the editor extension leaves any to read",
+                        data.display()
+                    ));
+                }
+            }
         }
         let legacy = Self::legacy_threads_roots();
         if !legacy.is_empty() {
             installed = true;
             for r in &legacy {
-                evidence.push(format!("{} detected", r.display()));
+                evidence.push(format!(
+                    "{} detected (pre-0.0.1767384608 extension thread store)",
+                    r.display()
+                ));
             }
         }
 
@@ -791,10 +918,46 @@ impl Provider for Amp {
         })
     }
 
+    /// `amp threads continue <id>` — the thread as the command's argument,
+    /// which is where the CLI looks for it.
+    ///
+    /// The previous form, `amp threads continue --execute "Continue from
+    /// @<id>"`, resumed the wrong thread. `-x, --execute [message]` is a
+    /// *global* option taking an optional value, so the quoted string was
+    /// consumed as the prompt and `continue [threads...]` was left with no
+    /// arguments — the branch that continues the **last** thread for the
+    /// current mode. The id casr had been asked about never reached the
+    /// resolver. `continue`'s own help is explicit about the shape it wants:
+    /// "Each thread can be a thread URL or ID."
+    ///
+    /// One caveat casr cannot engineer away, and so states instead: the CLI
+    /// resolves that id against the Amp server (`amp login` required), while
+    /// the file casr just read or wrote is local to the editor extension. A
+    /// thread the extension has synced resumes; one casr wrote and nothing has
+    /// opened yet does not, because the server has never seen it.
     fn resume_command(&self, session_id: &str) -> String {
-        // Amp doesn't have a stable "resume exact local thread file" CLI contract.
-        // The most portable action is to reference the thread by ID in a new prompt.
-        format!("amp threads continue --execute \"Continue from @{session_id}\"")
+        format!("amp threads continue {session_id}")
+    }
+
+    /// Built from the id rather than recovered by splitting the rendered
+    /// string, because the id is now allowed to contain a space.
+    ///
+    /// A thread is whatever `.json` file sits in a threads root, so
+    /// `my thread.json` is a thread and `my thread` is its id. Rendered and
+    /// re-split, `amp threads continue my thread` becomes two arguments and
+    /// resumes neither. Structurally it stays one.
+    fn launch_spec(&self, session_id: &str) -> Option<crate::launch::LaunchSpec> {
+        Some(
+            crate::launch::LaunchSpec::new(
+                "amp",
+                [
+                    "threads".to_string(),
+                    "continue".to_string(),
+                    session_id.to_string(),
+                ],
+            )
+            .targeting_session(session_id),
+        )
     }
 }
 
@@ -1005,11 +1168,19 @@ mod tests {
         assert_eq!(session.session_id, "thread-stem");
     }
 
+    /// The minter has to keep matching Amp's own `rz` validator: `T-` plus a
+    /// hyphenated 8-4-4-4-12 hex UUID. Nothing *reads* through this shape any
+    /// more — resolution follows Amp's key-to-path mapping instead — but a
+    /// thread casr writes still has to be one the extension recognises.
     #[test]
-    fn writer_generate_thread_id_matches_expected_format() {
+    fn writer_generate_thread_id_matches_amps_validator() {
         let tid = Amp::generate_thread_id();
+        let rest = tid
+            .strip_prefix("T-")
+            .unwrap_or_else(|| panic!("generated thread id should start with T-: {tid}"));
+        assert_eq!(rest.len(), 36, "expected a hyphenated UUID: {tid}");
         assert!(
-            Amp::looks_like_thread_id(&tid),
+            uuid::Uuid::parse_str(rest).is_ok(),
             "generated thread id should be parseable: {tid}"
         );
     }
@@ -1138,22 +1309,71 @@ mod tests {
         assert_eq!(readback.messages[1].tool_results.len(), 1);
     }
 
+    /// The id has to be the command's argument, not text inside `--execute`'s
+    /// prompt: `-x/--execute` takes an optional value, so a quoted prompt
+    /// swallows it and leaves `continue` with no thread to continue.
     #[test]
-    fn resume_command_contains_thread_id() {
+    fn resume_command_passes_thread_id_as_the_argument() {
         let cmd = <Amp as Provider>::resume_command(&Amp, "T-123");
-        assert!(cmd.contains("@T-123"));
+        assert_eq!(cmd, "amp threads continue T-123");
+        assert!(
+            !cmd.contains("--execute"),
+            "--execute consumes the id as a prompt: {cmd}"
+        );
     }
 
+    /// The guard `keys()` used to supply for free: a key is one path
+    /// component, so it can only ever name a file in the root it came from.
     #[test]
-    fn looks_like_thread_id_valid_and_invalid() {
-        assert!(Amp::looks_like_thread_id(
-            "T-550e8400-e29b-41d4-a716-446655440000"
-        ));
-        assert!(!Amp::looks_like_thread_id(
-            "550e8400-e29b-41d4-a716-446655440000"
-        ));
-        assert!(!Amp::looks_like_thread_id("T-not-a-uuid"));
-        assert!(!Amp::looks_like_thread_id("T-"));
+    fn thread_path_in_accepts_only_single_component_ids() {
+        let root = std::path::Path::new("/data/amp/threads");
+
+        for id in [
+            "T-550e8400-e29b-41d4-a716-446655440000",
+            "notes",
+            "..leading-dots",
+            "has space",
+            // `..` and `.` are not traversal here: the suffix lands first, so
+            // these name the plain files `...json` and `.json` — which is also
+            // the key Amp's own `keys()` reports for them, `basename` minus the
+            // last five characters.
+            "..",
+            ".",
+        ] {
+            assert_eq!(
+                Amp::thread_path_in(root, id),
+                Some(root.join(format!("{id}.json"))),
+                "{id} names a file in the root and should map to it"
+            );
+        }
+
+        for id in ["", "sub/thread", "/etc/passwd", "../../escape", "../x"] {
+            assert_eq!(
+                Amp::thread_path_in(root, id),
+                None,
+                "{id:?} is not a key Amp's readdir could have produced"
+            );
+        }
+    }
+
+    /// The divergence this settles: `is_session_path` lists any `.json` file
+    /// directly in a threads root, so resolution has to accept the same set.
+    #[test]
+    fn owns_session_resolves_every_id_that_is_session_path_would_list() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path().join("threads");
+        std::fs::create_dir_all(&root).expect("threads root");
+
+        // A filename the minter would never produce, which Amp opens anyway.
+        let path = root.join("restored-from-backup.json");
+        std::fs::write(&path, "{}").expect("seed thread file");
+
+        assert_eq!(
+            Amp::owns_session_in_roots("restored-from-backup", std::slice::from_ref(&root))
+                .as_deref(),
+            Some(path.as_path()),
+            "a thread casr lists must be a thread casr can resolve"
+        );
     }
 
     #[test]

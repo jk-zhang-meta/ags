@@ -91,7 +91,7 @@ claude --resume <new-session-id>
 | Cursor | `cur` | Yes | Yes | `cursor .` |
 | Cline | `cln` | Yes | Yes | `code .` |
 | Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
-| Amp | `amp` | Yes | Yes | `amp threads continue --execute "Continue from @<session-id>"` |
+| Amp | `amp` | Yes | Yes | `amp threads continue <session-id>` |
 | OpenCode | `opc` | Yes | Yes | `opencode` |
 | ChatGPT | `gpt` | Yes | Yes | `open "https://chatgpt.com/c/<session-id>"` |
 | ClawdBot | `cwb` | Yes | Yes | `clawdbot --resume <session-id>` |
@@ -377,8 +377,14 @@ something else by them:
 - **`AMP_HOME` is not read.** It is Amp's own variable, but it relocates Amp's
   *install* directory (the tree holding `bin/`), which never contains threads.
   `XDG_DATA_HOME` is the only variable that moves Amp's data.
-  `AMP_DATA_HOME` is real only inside Amp's editor plugins, so it is not read
-  either.
+  `AMP_DATA_HOME` is read by nothing casr can find — zero occurrences across the
+  CLI binary and six shipped extension builds — so it is not read either.
+- **The Amp store casr reads is the editor extension's, not the CLI's.** Both
+  products share `<XDG_DATA_HOME>/amp`, but the CLI keeps thread bodies
+  server-side and writes only `daemon/`, `ide/`, `oauth/`, `runner/`,
+  `notepad/`, `device-id.json`, `history.jsonl`, `session.json` and
+  `secrets.json` there. `threads/` is written by `sourcegraph.amp`. On a machine
+  with the CLI and no extension, an empty Amp list is the correct answer.
 - **Aider has no home directory to point at.** It keeps one
   `.aider.chat.history.md` per *repository*, at the git work-tree root, found by
   walking up from wherever you started it (`aider/main.py` uses
