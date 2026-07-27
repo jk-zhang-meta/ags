@@ -661,6 +661,88 @@ fn fixture_opc_simple() {
     assert_session_matches(&session, &patched, "opc_simple");
 }
 
+/// The `opc_simple` fixture above pins the *legacy* OpenCode layout, and it
+/// pins it at `<workspace>/.opencode/opencode.db`. Both of those facts are
+/// historical: current OpenCode names its tables `session`/`message`/`part` and
+/// keeps the file in its XDG data directory, so a reader that only satisfies
+/// `opc_simple` reads nothing a current install has.
+///
+/// This fixture is a real database: it was produced by running the released
+/// `opencode-linux-x64` 1.18.6 binary and letting its own `opencode import`
+/// write the rows, then vacuuming it and rewriting the two absolute paths this
+/// machine had baked into `session.directory` and `project.worktree`. Nothing
+/// about the schema or the JSON payloads is reconstructed.
+///
+/// Note the path: no `.opencode/` component. The layout is detected from the
+/// database, so the file's location must not be what decides it.
+#[test]
+fn fixture_opc_current_schema() {
+    let path = fixtures_dir().join("opencode-current/opencode.db");
+    let session = OpenCode
+        .read_session(&path)
+        .expect("a current-schema OpenCode database should parse");
+
+    assert_eq!(session.session_id, "ses_imported000000000000001");
+    assert_eq!(session.title.as_deref(), Some("Fix OpenCode adapter"));
+    assert_eq!(
+        session.metadata["opencode_schema"], "session/message/part",
+        "the reader should report which layout it actually used"
+    );
+
+    // The current schema records the session's own directory, so the workspace
+    // comes from the row rather than from where the file happens to sit.
+    assert_eq!(
+        session.workspace.as_deref(),
+        Some(Path::new("/workspace/opencode-fixture")),
+        "workspace should come from session.directory, not the db path"
+    );
+
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].role, MessageRole::User);
+    assert_eq!(session.messages[0].content, "Please inspect src/main.rs");
+
+    // Content comes from the `text` part; the `reasoning` and `step-start`
+    // parts in the same message must not leak into it.
+    assert_eq!(session.messages[1].role, MessageRole::Assistant);
+    assert_eq!(session.messages[1].content, "Inspecting now.");
+
+    // `tool` parts carry the call and its result together.
+    let calls = &session.messages[1].tool_calls;
+    assert_eq!(calls.len(), 2, "two tool parts in the assistant message");
+    assert_eq!(calls[0].name, "read");
+    assert_eq!(calls[0].id.as_deref(), Some("call-1"));
+    assert_eq!(calls[0].arguments["filePath"], "src/main.rs");
+    assert_eq!(calls[1].name, "bash");
+
+    let results = &session.messages[1].tool_results;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].content, "Read complete");
+    assert!(!results[0].is_error);
+    assert_eq!(results[1].content, "exit status 1");
+    assert!(results[1].is_error, "an errored tool part is an error result");
+
+    assert_eq!(session.model_name.as_deref(), Some("gpt-5"));
+    assert_eq!(session.metadata["prompt_tokens"], 1234);
+    assert_eq!(session.metadata["completion_tokens"], 567);
+}
+
+/// Both layouts must stay readable, and the legacy one must keep reporting
+/// itself as legacy rather than being quietly read through the new path.
+#[test]
+fn fixture_opc_both_layouts_are_readable() {
+    let legacy = OpenCode
+        .read_session(&fixtures_dir().join("opencode/.opencode/opencode.db"))
+        .expect("legacy layout should still parse");
+    let current = OpenCode
+        .read_session(&fixtures_dir().join("opencode-current/opencode.db"))
+        .expect("current layout should parse");
+
+    assert_eq!(legacy.metadata["opencode_schema"], "sessions/messages/files");
+    assert_eq!(current.metadata["opencode_schema"], "session/message/part");
+    assert!(!legacy.messages.is_empty());
+    assert!(!current.messages.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Edge-case fixtures
 // ---------------------------------------------------------------------------

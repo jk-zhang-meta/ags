@@ -334,6 +334,36 @@ fn a_relative_opencode_db_resolves_against_the_xdg_data_dir() {
     assert_eq!(OpenCode.session_roots(), vec![db]);
 }
 
+/// Discovery must find the database an ordinary OpenCode install actually
+/// writes.
+///
+/// Verified against the released `opencode-linux-x64` 1.18.6 binary: run with a
+/// sandboxed `HOME`, it creates `<XDG_DATA_HOME>/opencode/opencode.db`, and
+/// `opencode db path` reports that same location. Discovery previously searched
+/// only `~/.opencode`, the cwd's ancestors and a config key — so the one
+/// location that is always right was the one place it never looked, and a
+/// working install reported as not installed.
+#[test]
+fn opencode_discovery_finds_the_xdg_data_dir_database() {
+    let _lock = PROVIDER_ENV.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let _path = EnvGuard::unset("OPENCODE_DB_PATH");
+    let _home = EnvGuard::unset("OPENCODE_HOME");
+    let _db_env = EnvGuard::unset("OPENCODE_DB");
+    let _xdg = EnvGuard::set("XDG_DATA_HOME", tmp.path());
+
+    let data_dir = tmp.path().join("opencode");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let db = data_dir.join("opencode.db");
+    std::fs::write(&db, b"SQLite format 3\x00").unwrap();
+
+    assert!(
+        OpenCode.session_roots().contains(&db),
+        "discovery must include <XDG_DATA_HOME>/opencode/opencode.db; found {:?}",
+        OpenCode.session_roots()
+    );
+}
+
 #[test]
 fn an_in_memory_opencode_db_yields_no_path() {
     let _lock = PROVIDER_ENV.lock().unwrap();
