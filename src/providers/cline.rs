@@ -24,7 +24,7 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, WriteOptions, WrittenSession, store_evidence};
 
 /// VS Code Marketplace extension identifier.
 const CLINE_EXTENSION_ID: &str = "saoudrizwan.claude-dev";
@@ -466,6 +466,15 @@ impl Provider for Cline {
             }
         }
 
+        // A storage root exists as soon as the extension is installed; its
+        // `tasks/` subdirectory, which is the only thing `list` walks, appears
+        // with the first task.
+        if installed {
+            for root in &roots {
+                evidence.push(store_evidence(&Self::tasks_root(root)));
+            }
+        }
+
         trace!(provider = "cline", installed, ?evidence, "detection");
         DetectionResult {
             installed,
@@ -479,6 +488,43 @@ impl Provider for Cline {
             .into_iter()
             .map(|root| Self::tasks_root(&root))
             .collect()
+    }
+
+    /// The one file that stands for a task, and only for a task that has one.
+    ///
+    /// Cline's own gate is `api_conversation_history.json` existing —
+    /// `getTaskWithId` in `saoudrizwan.claude-dev@4.0.11` builds the four task
+    /// paths and treats the task as valid only `if (await exists(api))`. The
+    /// two older transcripts stand in when it is absent, matching this
+    /// provider's reader, which refuses `ui_messages.json` as a "non-primary
+    /// Cline task artifact" whenever the API history is there.
+    ///
+    /// Everything else in `tasks/<taskId>/` is a sidecar Cline writes beside
+    /// the transcript, and `list` was handing every one of them to
+    /// `read_session` and reporting the refusal as a skipped session — five
+    /// lines of noise per task, on every run. From the same bundle:
+    /// `context_history.json`, `task_metadata.json`, a per-task
+    /// `settings.json`, `focus_chain_taskid_<id>.md`, the transient
+    /// `conversation_history_<epochMs>.{json,txt}` hook exports, and a legacy
+    /// `checkpoints/` subtree.
+    ///
+    /// The atomic-write leftover is the one that a name list alone would miss:
+    /// every save goes through `writeFile(\`${target}.tmp.${Date.now()}.${rand}.json\`)`
+    /// then `rename`, so an interrupted save leaves
+    /// `api_conversation_history.json.tmp.1769…abc.json` — a `.json` file whose
+    /// name begins with the primary transcript's. Matching the full file name
+    /// exactly, rather than an extension or a prefix, excludes it.
+    fn is_session_path(&self, path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        match name {
+            FILE_API_HISTORY => true,
+            FILE_UI_MESSAGES | FILE_UI_MESSAGES_OLD => path
+                .parent()
+                .is_some_and(|dir| !dir.join(FILE_API_HISTORY).is_file()),
+            _ => false,
+        }
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

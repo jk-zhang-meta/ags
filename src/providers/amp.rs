@@ -519,6 +519,25 @@ impl Provider for Amp {
         roots
     }
 
+    /// Amp's own listing rule, from `keys()` in `sourcegraph.amp`
+    /// v0.0.1772799397: `!entry.isDirectory && name.endsWith(".json")`, with
+    /// the thread id being the basename minus `.json`.
+    ///
+    /// It is transcribed rather than tightened to `^T-<uuid>\.json$` — which
+    /// the mint (`T-${uuid}`) and validator (`rz`) in the same bundle would
+    /// justify — because a listing that is stricter than the tool's own hides
+    /// threads Amp itself would show.
+    ///
+    /// The one thing it has to exclude is the atomic-write leftover: `set()`
+    /// writes `<threadId>.json.amptmp` and renames it into place, so an
+    /// interrupted save leaves that file behind. It does not end in `.json`,
+    /// which is exactly why Amp's rule is written on the suffix.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.ends_with(".json"))
+    }
+
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         let roots = self.session_roots();
         Self::owns_session_in_roots(session_id, &roots)

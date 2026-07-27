@@ -90,7 +90,9 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, parse_timestamp, reindex_messages,
     truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, WriteOptions, WrittenSession, read_dir_reporting, store_evidence,
+};
 
 /// Antigravity CLI provider implementation.
 pub struct Antigravity;
@@ -133,9 +135,9 @@ impl Antigravity {
 
     /// Enumerate `(uuid, db_path)` for every conversation database under the
     /// configured conversations directory.
-    fn list_conversations() -> Vec<(String, PathBuf)> {
+    fn list_conversations() -> SessionListing {
         let Some(conv_dir) = Self::conversations_dir() else {
-            return vec![];
+            return SessionListing::default();
         };
         list_conversations_in(&conv_dir)
     }
@@ -146,13 +148,9 @@ impl Antigravity {
 /// The uuid is the filename stem. Non-`.db` files (and the sibling legacy gmi
 /// `tmp/.../chats/session-*.json` layout, which never lives here) are ignored,
 /// which is what keeps the agy provider disjoint from the Gemini CLI provider.
-fn list_conversations_in(conv_dir: &Path) -> Vec<(String, PathBuf)> {
-    if !conv_dir.is_dir() {
-        return vec![];
-    }
-
-    let mut out: Vec<(String, PathBuf)> = Vec::new();
-    for entry in std::fs::read_dir(conv_dir).into_iter().flatten().flatten() {
+fn list_conversations_in(conv_dir: &Path) -> SessionListing {
+    let mut listing = SessionListing::default();
+    for entry in read_dir_reporting(conv_dir, &mut listing.unreadable) {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -167,9 +165,9 @@ fn list_conversations_in(conv_dir: &Path) -> Vec<(String, PathBuf)> {
         if uuid.is_empty() {
             continue;
         }
-        out.push((uuid.to_string(), path));
+        listing.sessions.push((uuid.to_string(), path));
     }
-    out
+    listing
 }
 
 impl Provider for Antigravity {
@@ -201,6 +199,12 @@ impl Provider for Antigravity {
             installed = true;
         }
 
+        // `list` reads `<cli dir>/conversations`, not the CLI directory that
+        // detection above accepted.
+        if installed && let Some(conversations) = Self::conversations_dir() {
+            evidence.push(store_evidence(&conversations));
+        }
+
         trace!(provider = "antigravity", ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -220,8 +224,15 @@ impl Provider for Antigravity {
         }
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    fn list_sessions(&self) -> Option<SessionListing> {
         Some(Self::list_conversations())
+    }
+
+    /// One `<conversation-uuid>.db` per conversation, directly under the
+    /// conversations directory. The `.db` extension is what keeps this provider
+    /// disjoint from the Gemini CLI's `session-*.json` layout.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("db")
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -240,7 +251,7 @@ impl Provider for Antigravity {
         // Case-insensitive fallback (UUIDs are conventionally lowercase, but be
         // robust to user-typed mixed case).
         let lc = session_id.to_ascii_lowercase();
-        for (uuid, path) in Self::list_conversations() {
+        for (uuid, path) in Self::list_conversations().sessions {
             if uuid.to_ascii_lowercase() == lc {
                 debug!(path = %path.display(), session_id, "found Antigravity conversation (case-insensitive)");
                 return Some(path);
@@ -754,7 +765,7 @@ mod tests {
             ("ad053acc-0ee5-4f9b-b8b6-20506bfd5f56", SAMPLE_TRANSCRIPT),
         ]);
 
-        let convs = list_conversations_in(&cli_dir.join("conversations"));
+        let convs = list_conversations_in(&cli_dir.join("conversations")).sessions;
         let mut ids: Vec<String> = convs.iter().map(|(id, _)| id.clone()).collect();
         ids.sort();
         assert_eq!(
@@ -781,7 +792,7 @@ mod tests {
         std::fs::write(conv_dir.join("notes.txt"), b"ignore me").expect("txt");
         std::fs::write(conv_dir.join("session-x.json"), b"{}").expect("json");
 
-        let convs = list_conversations_in(&conv_dir);
+        let convs = list_conversations_in(&conv_dir).sessions;
         let ids: Vec<String> = convs.into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, vec!["real-uuid".to_string()]);
     }

@@ -83,7 +83,7 @@ fn discovery_lists_and_owns_seeded_session() {
     let _env = EnvGuard::set("GROK_HOME", tmp.path());
     seed_grok_home(tmp.path());
 
-    let listed = Grok.list_sessions().expect("list_sessions");
+    let listed = Grok.list_sessions().expect("list_sessions").sessions;
     assert_eq!(listed.len(), 1, "exactly one seeded session: {listed:?}");
     assert_eq!(listed[0].0, FIXTURE_ID);
 

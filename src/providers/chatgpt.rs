@@ -33,7 +33,9 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+};
 
 /// ChatGPT desktop app provider implementation.
 pub struct ChatGpt;
@@ -61,18 +63,13 @@ impl ChatGpt {
     /// Returns `(path, is_encrypted)` pairs. Only `conversations-{uuid}/` (v1)
     /// are currently readable; `conversations-v2-*` and `conversations-v3-*`
     /// are encrypted and skipped.
-    fn find_conversation_dirs(base: &Path) -> Vec<(PathBuf, bool)> {
+    fn find_conversation_dirs_reporting(
+        base: &Path,
+        unreadable: &mut Vec<UnreadableSource>,
+    ) -> Vec<(PathBuf, bool)> {
         let mut dirs = Vec::new();
 
-        if !base.exists() {
-            return dirs;
-        }
-
-        let Ok(entries) = std::fs::read_dir(base) else {
-            return dirs;
-        };
-
-        for entry in entries.flatten() {
+        for entry in read_dir_reporting(base, unreadable) {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
@@ -89,6 +86,12 @@ impl ChatGpt {
         }
 
         dirs
+    }
+
+    /// `find_conversation_dirs_reporting` for the callers with nowhere to put a
+    /// read failure — `detect`, `session_roots`, `owns_session`, the writer.
+    fn find_conversation_dirs(base: &Path) -> Vec<(PathBuf, bool)> {
+        Self::find_conversation_dirs_reporting(base, &mut Vec::new())
     }
 }
 
@@ -151,6 +154,47 @@ impl Provider for ChatGpt {
             .filter(|(_, encrypted)| !encrypted)
             .map(|(path, _)| path)
             .collect()
+    }
+
+    fn list_sessions(&self) -> Option<SessionListing> {
+        let home = Self::home_dir()?;
+
+        let mut listing = SessionListing::default();
+        for (dir, encrypted) in
+            Self::find_conversation_dirs_reporting(&home, &mut listing.unreadable)
+        {
+            if encrypted {
+                // Not a failure to read, but a refusal to pretend. `detect`
+                // already calls the app installed on the strength of this
+                // directory; without this the user gets "✓ ChatGPT" and an
+                // empty listing with nothing saying which of the two reasons
+                // applies.
+                listing.unreadable.push(UnreadableSource {
+                    path: dir,
+                    error: "encrypted conversation store (v2/v3); casr cannot read it".to_string(),
+                });
+                continue;
+            }
+            for entry in read_dir_reporting(&dir, &mut listing.unreadable) {
+                let path = entry.path();
+                if !self.is_session_path(&path) || !path.is_file() {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                listing.sessions.push((stem.to_string(), path));
+            }
+        }
+
+        Some(listing)
+    }
+
+    /// One `<conversation-id>.json` per conversation, flat in a
+    /// `conversations-<uuid>/` directory — the same shape `owns_session`
+    /// resolves against, at the same depth.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("json")
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

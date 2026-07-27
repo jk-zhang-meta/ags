@@ -53,7 +53,7 @@ use crate::discovery::DetectionResult;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, SessionListing, WriteOptions, WrittenSession};
 
 /// Aider provider implementation.
 pub struct Aider;
@@ -629,28 +629,43 @@ impl Provider for Aider {
         "aider --restore-chat-history".to_string()
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
-        let history_files = Self::find_history_files();
-        if history_files.is_empty() {
-            return Some(Vec::new());
-        }
-
-        let mut results = Vec::new();
-        for history_file in &history_files {
-            let Ok(file) = std::fs::File::open(history_file) else {
-                continue;
+    fn list_sessions(&self) -> Option<SessionListing> {
+        let mut listing = SessionListing::default();
+        for history_file in &Self::find_history_files() {
+            // `find_history_files` only returns paths that exist, so a failure
+            // to open one is a real refusal and not an absent store.
+            let file = match std::fs::File::open(history_file) {
+                Ok(file) => file,
+                Err(error) => {
+                    listing.cannot_read(history_file, &error);
+                    continue;
+                }
             };
             let reader = std::io::BufReader::new(file);
-            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+            for line in std::io::BufRead::lines(reader) {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(error) => {
+                        listing.cannot_read(history_file, &error);
+                        break;
+                    }
+                };
                 if let Some(ts) = parse_session_header(&line) {
                     let id = timestamp_to_session_id(&ts);
                     let virtual_path = Self::virtual_session_path(history_file, &id);
-                    results.push((id, virtual_path));
+                    listing.sessions.push((id, virtual_path));
                 }
             }
         }
 
-        Some(results)
+        Some(listing)
+    }
+
+    /// Aider appends every session to one Markdown file, so a "session path"
+    /// here is the virtual `<history file>#<session id>` this provider mints,
+    /// never a real file of its own.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("md")
     }
 }
 

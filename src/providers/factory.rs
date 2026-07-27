@@ -277,6 +277,33 @@ impl Provider for Factory {
         if root.is_dir() { vec![root] } else { vec![] }
     }
 
+    /// `droid@0.180.0` writes transcripts as `.jsonl` in two places under
+    /// `sessions/` — flat, and inside a per-project directory whose name is the
+    /// slugged absolute cwd and therefore always starts with `-`. Its own scan
+    /// of that root is `entry.isFile() && entry.name.endsWith(".jsonl")` for
+    /// the files and `entry.isDirectory() && entry.name.startsWith("-")` for
+    /// the subdirectories.
+    ///
+    /// Everything else there is a sidecar: `<sessionId>.settings.json` (a
+    /// `.json` file, next to every transcript, which `list` was rendering as a
+    /// session with zero messages), the `.favorites` id list,
+    /// `<sessionId>/attachments/`, and `<sessionId>/local-signals.json`. The
+    /// discovery index is not even in this tree — it is
+    /// `~/.factory/cache/session-discovery-index.json`.
+    ///
+    /// `btw/` is excluded because droid excludes it: a "by the way" side-chat
+    /// fork is stored as `sessions/btw/<sessionId>.jsonl` and the session list
+    /// drops it with `if (!session || session.isBtwFork) return []`.
+    fn is_session_path(&self, path: &Path) -> bool {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return false;
+        }
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            != Some("btw")
+    }
+
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         let root = Self::home_dir();
         if !root.is_dir() {

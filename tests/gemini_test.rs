@@ -140,6 +140,7 @@ fn list_sessions_finds_both_formats() {
     let mut ids: Vec<String> = Gemini
         .list_sessions()
         .expect("gemini lists sessions")
+        .sessions
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -178,7 +179,10 @@ fn list_sessions_collapses_a_migrated_pair_onto_the_jsonl() {
         ],
     );
 
-    let sessions = Gemini.list_sessions().expect("gemini lists sessions");
+    let sessions = Gemini
+        .list_sessions()
+        .expect("gemini lists sessions")
+        .sessions;
     assert_eq!(
         sessions.len(),
         1,

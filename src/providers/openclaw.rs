@@ -97,7 +97,10 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, normalize_role, parse_timestamp,
     reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+    walk_entry_reporting,
+};
 
 /// OpenClaw's default agent id. Sessions are keyed by agent, and an agent id is
 /// mandatory in the path, so casr writes as the agent OpenClaw itself defaults
@@ -340,7 +343,11 @@ fn scan(path: &Path, out: &mut Transcript) -> anyhow::Result<(Vec<Entry>, Option
         }
 
         let Some(id) = value.get("id").and_then(|v| v.as_str()).map(String::from) else {
-            let label = if kind.is_empty() { "(no type field)" } else { kind };
+            let label = if kind.is_empty() {
+                "(no type field)"
+            } else {
+                kind
+            };
             out.count(format!("record without id ({label})"));
             continue;
         };
@@ -350,7 +357,11 @@ fn scan(path: &Path, out: &mut Transcript) -> anyhow::Result<(Vec<Entry>, Option
         if !is_leaf && !canonical {
             // Either the format grew a record type or this is not an OpenClaw
             // transcript. Both are things an operator has to be able to see.
-            let label = if kind.is_empty() { "(no type field)" } else { kind };
+            let label = if kind.is_empty() {
+                "(no type field)"
+            } else {
+                kind
+            };
             warn!(
                 provider = "openclaw",
                 path = %path.display(),
@@ -364,7 +375,10 @@ fn scan(path: &Path, out: &mut Transcript) -> anyhow::Result<(Vec<Entry>, Option
         let side_append = value.get("appendMode").and_then(|v| v.as_str()) == Some("side");
 
         let parent = if is_leaf {
-            value.get("targetId").and_then(|v| v.as_str()).map(String::from)
+            value
+                .get("targetId")
+                .and_then(|v| v.as_str())
+                .map(String::from)
         } else if let Some(raw) = value.get("parentId") {
             raw.as_str().map(String::from)
         } else {
@@ -471,9 +485,10 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
             )
         }
         "custom_message" => {
-            let content = entry.value.get("content").map_or_else(String::new, |c| {
-                flatten_content(c, out)
-            });
+            let content = entry
+                .value
+                .get("content")
+                .map_or_else(String::new, |c| flatten_content(c, out));
             build(MessageRole::User, content, None)
         }
         "message" => {
@@ -498,8 +513,7 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
             match role_str {
                 "assistant" => {
                     let content_val = msg.get("content");
-                    let content = content_val
-                        .map_or_else(String::new, |c| flatten_content(c, out));
+                    let content = content_val.map_or_else(String::new, |c| flatten_content(c, out));
                     let tool_calls = content_val.map(extract_tool_calls).unwrap_or_default();
                     let author = msg
                         .get("model")
@@ -613,7 +627,9 @@ fn read_transcript(path: &Path) -> anyhow::Result<Transcript> {
         .filter(|e| !e.leaf_control && !on_branch.contains(e.id.as_str()))
         .count();
     if abandoned > 0 {
-        *out.unrepresented.entry("abandoned".to_string()).or_insert(0) += abandoned as u64;
+        *out.unrepresented
+            .entry("abandoned".to_string())
+            .or_insert(0) += abandoned as u64;
     }
 
     // State markers are read along the whole branch first: `buildSessionContext`
@@ -734,19 +750,87 @@ impl OpenClaw {
     /// Every agent's sessions directory, so that a session belonging to a
     /// non-default agent (`openclaw sessions --agent work`) is still found.
     /// Only directories that exist are returned.
-    fn session_dirs() -> Vec<PathBuf> {
+    fn session_dirs_reporting(unreadable: &mut Vec<UnreadableSource>) -> Vec<PathBuf> {
         let agents_dir = Self::state_dir().join("agents");
-        let Ok(entries) = std::fs::read_dir(&agents_dir) else {
-            return Vec::new();
-        };
-        let mut dirs: Vec<PathBuf> = entries
-            .flatten()
+        // An `agents/` that exists and cannot be read hides every session on
+        // the machine. `let Ok(entries) = .. else { return Vec::new() }`
+        // reported that as "OpenClaw has no sessions".
+        let mut dirs: Vec<PathBuf> = read_dir_reporting(&agents_dir, unreadable)
+            .into_iter()
             .map(|entry| entry.path().join("sessions"))
             .filter(|path| path.is_dir())
             .collect();
         dirs.sort();
         dirs
     }
+
+    /// `session_dirs_reporting` for the callers with nowhere to put a read
+    /// failure — `detect`, `session_roots`, `owns_session`.
+    fn session_dirs() -> Vec<PathBuf> {
+        Self::session_dirs_reporting(&mut Vec::new())
+    }
+}
+
+/// OpenClaw's own `isPrimarySessionTranscriptFileName`, from
+/// `dist/paths-C2C4lJH6.js` in `openclaw@2026.7.1-2`:
+///
+/// ```js
+/// if (fileName === "sessions.json") return false;
+/// if (!fileName.endsWith(".jsonl")) return false;
+/// if (isTrajectoryRuntimeArtifactName(fileName)) return false;
+/// if (isCompactionCheckpointTranscriptFileName(fileName)) return false;
+/// return !isSessionArchiveArtifactName(fileName);
+/// ```
+///
+/// It is transcribed rather than approximated because OpenClaw writes at least
+/// twelve other things into that one directory — `sessions.json` and its
+/// `.bak.<epochMs>`/`.tmp` neighbours, `<id>.trajectory.jsonl`,
+/// `<id>.checkpoint.<uuid>.jsonl`, `<name>.deleted|reset|bak.<ISO>`,
+/// `<id>.jsonl.lock`, `<id>.jsonl.compact.<uuid>.tmp`,
+/// `<id>.jsonl.bak-<pid>-<ms>`, `<id>.jsonl.corrupt-<ISO>-<hex>.jsonl`, and a
+/// `skills-prompts/sha256/` tree — and three of those end in `.jsonl`.
+///
+/// The last of them, `.corrupt-….jsonl`, is *not* excluded by OpenClaw's rule
+/// either. It is a real transcript OpenClaw set aside after failing to parse
+/// it, so admitting it costs a duplicate row rather than a wrong one; matching
+/// the tool is worth more than diverging to fix its own edge case.
+fn is_primary_transcript_name(name: &str) -> bool {
+    if name == "sessions.json" || !name.ends_with(".jsonl") {
+        return false;
+    }
+    // `<sessionId>.trajectory.jsonl` — the trajectory runtime artifact.
+    if name.ends_with(".trajectory.jsonl") {
+        return false;
+    }
+    // `<sessionId>.checkpoint.<uuid>.jsonl` — a compaction checkpoint.
+    let stem = &name[..name.len() - ".jsonl".len()];
+    if let Some((before, uuid)) = stem.rsplit_once('.')
+        && before.ends_with(".checkpoint")
+        && is_uuid(uuid)
+    {
+        return false;
+    }
+    // `<name>.<deleted|reset|bak>.<ISO stamp>` — an archived transcript. The
+    // suffix follows `.jsonl`, so any name still ending in `.jsonl` at this
+    // point has not been archived; the check is kept explicit because the
+    // archive writer takes the whole path and appends.
+    !matches!(
+        stem.rsplit_once('.').map(|(_, tail)| tail),
+        Some("deleted" | "reset" | "bak")
+    )
+}
+
+/// A canonical lowercase 8-4-4-4-12 UUID, as OpenClaw's own regexes require.
+fn is_uuid(candidate: &str) -> bool {
+    let groups = [8usize, 4, 4, 4, 12];
+    let mut parts = candidate.split('-');
+    for width in groups {
+        match parts.next() {
+            Some(part) if part.len() == width && part.chars().all(|c| c.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
 }
 
 impl Provider for OpenClaw {
@@ -791,6 +875,36 @@ impl Provider for OpenClaw {
 
     fn session_roots(&self) -> Vec<PathBuf> {
         Self::session_dirs()
+    }
+
+    fn list_sessions(&self) -> Option<SessionListing> {
+        let mut listing = SessionListing::default();
+        for root in Self::session_dirs_reporting(&mut listing.unreadable) {
+            for entry in walkdir::WalkDir::new(&root).max_depth(4) {
+                let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
+                    continue;
+                };
+                let path = entry.path();
+                if !entry.file_type().is_file() || !self.is_session_path(path) {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                listing
+                    .sessions
+                    .push((stem.to_string(), path.to_path_buf()));
+            }
+        }
+        Some(listing)
+    }
+
+    /// See [`is_primary_transcript_name`] — OpenClaw's own rule, transcribed
+    /// from the shipped package.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_primary_transcript_name)
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -1099,10 +1213,17 @@ mod tests {
             r#"{"type":"message","id":"b1","parentId":"a2","timestamp":"2026-02-14T09:00:05.000Z","message":{"role":"user","content":"three"}}"#,
         ]);
 
-        let text: Vec<&str> = session.messages.iter().map(|m| m.content.as_str()).collect();
+        let text: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(text, vec!["one", "reply one", "three"]);
         assert!(
-            !session.messages.iter().any(|m| m.content.contains("ABANDONED")),
+            !session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("ABANDONED")),
             "content the user rewound away must not be replayed"
         );
         assert_eq!(session.metadata["unrepresented"], "abandoned 2");
@@ -1117,7 +1238,11 @@ mod tests {
             r#"{"type":"message","id":"x1","parentId":"a1","timestamp":"2026-02-14T09:00:02.000Z","message":{"role":"user","content":"LATER BUT ABANDONED"}}"#,
             r#"{"type":"leaf","id":"L1","parentId":"x1","targetId":"a1","timestamp":"2026-02-14T09:00:03.000Z"}"#,
         ]);
-        let text: Vec<&str> = session.messages.iter().map(|m| m.content.as_str()).collect();
+        let text: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(text, vec!["kept"]);
     }
 
@@ -1130,7 +1255,11 @@ mod tests {
             r#"{"type":"message","id":"m1","timestamp":"2026-02-14T09:00:01.000Z","message":{"role":"user","content":"one"}}"#,
             r#"{"type":"message","id":"m2","timestamp":"2026-02-14T09:00:02.000Z","message":{"role":"user","content":"two"}}"#,
         ]);
-        let text: Vec<&str> = session.messages.iter().map(|m| m.content.as_str()).collect();
+        let text: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(text, vec!["one", "two"]);
         assert!(session.metadata["unrepresented"].is_null());
     }
@@ -1147,12 +1276,22 @@ mod tests {
             r#"{"type":"message","id":"a3","parentId":"c1","timestamp":"2026-02-14T09:00:04.000Z","message":{"role":"user","content":"after"}}"#,
         ]);
 
-        assert!(!session.messages.iter().any(|m| m.content.contains("ANCIENT")));
+        assert!(
+            !session
+                .messages
+                .iter()
+                .any(|m| m.content.contains("ANCIENT"))
+        );
         assert!(
             session.messages[0].content.contains("we discussed things"),
             "the compaction summary is model-visible and must survive"
         );
-        let text: Vec<&str> = session.messages.iter().skip(1).map(|m| m.content.as_str()).collect();
+        let text: Vec<&str> = session
+            .messages
+            .iter()
+            .skip(1)
+            .map(|m| m.content.as_str())
+            .collect();
         assert_eq!(text, vec!["kept", "after"]);
         assert_eq!(session.metadata["unrepresented"], "compacted_away 1");
     }
@@ -1168,7 +1307,10 @@ mod tests {
         let session = read_openclaw(&[
             r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-14T09:00:01.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"weighing it up"},{"type":"text","text":"done"}]}}"#,
         ]);
-        assert_eq!(session.messages[0].content, "[Thinking] weighing it up\ndone");
+        assert_eq!(
+            session.messages[0].content,
+            "[Thinking] weighing it up\ndone"
+        );
     }
 
     /// A `bashExecution` record has no `content` field at all. Reaching for
@@ -1541,7 +1683,10 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
 
         let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(header["version"], 3, "version is the current one, as a number");
+        assert_eq!(
+            header["version"], 3,
+            "version is the current one, as a number"
+        );
 
         let first: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert!(first["parentId"].is_null(), "the first entry is the root");

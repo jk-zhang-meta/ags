@@ -136,6 +136,23 @@ impl Provider for Vibe {
         if root.is_dir() { vec![root] } else { vec![] }
     }
 
+    /// A Vibe session is a *directory*, and `messages.jsonl` is the file that
+    /// makes it one. `mistral-vibe==2.22.0` names each
+    /// `logs/session/session_<YYYYmmdd_HHMMSS>_<shortid>/` and its loader's
+    /// existence test is `if (session_dir / MESSAGES_FILENAME).is_file()`,
+    /// where `MESSAGES_FILENAME = "messages.jsonl"`. This provider's
+    /// `owns_session` and writer already agree on that path; only the listing
+    /// did not.
+    ///
+    /// Named exactly, because the siblings are all things a looser rule admits:
+    /// `meta.json` beside the transcript (rendered as an empty session), the
+    /// `.last_session/<tty>` pointer directory, `attachments/<sha1><ext>`, and
+    /// the `*.json.tmp` / `*.jsonl.tmp` atomic-write temporaries — of which
+    /// only the first kind is ever swept, so `messages.jsonl.tmp` accumulates.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()) == Some("messages.jsonl")
+    }
+
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         let root = Self::home_dir();
         if !root.is_dir() {

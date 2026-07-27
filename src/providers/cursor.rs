@@ -87,7 +87,10 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, flatten_content, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+    store_evidence, walk_entry_reporting,
+};
 
 /// Cursor AI provider implementation.
 pub struct Cursor;
@@ -121,8 +124,9 @@ impl Cursor {
         }
     }
 
-    /// Find all `state.vscdb` files under the Cursor config directory.
-    fn find_db_files() -> Vec<PathBuf> {
+    /// Find all `state.vscdb` files under the Cursor config directory,
+    /// recording any directory it was refused.
+    fn find_db_files_reporting(unreadable: &mut Vec<UnreadableSource>) -> Vec<PathBuf> {
         let Some(config_dir) = Self::config_dir() else {
             return vec![];
         };
@@ -137,20 +141,23 @@ impl Cursor {
 
         // Workspace-specific DBs.
         let ws_storage = config_dir.join("User/workspaceStorage");
-        if ws_storage.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&ws_storage)
-        {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    let candidate = entry.path().join("state.vscdb");
-                    if candidate.is_file() {
-                        dbs.push(candidate);
-                    }
+        for entry in read_dir_reporting(&ws_storage, unreadable) {
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                let candidate = entry.path().join("state.vscdb");
+                if candidate.is_file() {
+                    dbs.push(candidate);
                 }
             }
         }
 
         dbs
+    }
+
+    /// `find_db_files_reporting` for the callers with nowhere to put a read
+    /// failure — `detect`, `session_roots`, `owns_session`. None of those
+    /// answers a question an unreadable `workspaceStorage` changes.
+    fn find_db_files() -> Vec<PathBuf> {
+        Self::find_db_files_reporting(&mut Vec::new())
     }
 
     /// `cursor-agent`'s config root, resolved exactly as the CLI resolves it.
@@ -184,21 +191,20 @@ impl Cursor {
     /// `<id>.jsonl`, and `<parent>/subagents/<id>.jsonl`. In all three the file
     /// stem is the conversation id, so a recursive walk covers them without
     /// having to know which one produced a given file.
-    fn cli_transcripts() -> Vec<(String, PathBuf)> {
+    fn cli_transcripts(unreadable: &mut Vec<UnreadableSource>) -> Vec<(String, PathBuf)> {
         let Some(projects) = Self::cli_data_dir().map(|d| d.join("projects")) else {
             return vec![];
         };
         let mut out = Vec::new();
-        for project in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+        for project in read_dir_reporting(&projects, unreadable) {
             let transcripts = project.path().join("agent-transcripts");
             if !transcripts.is_dir() {
                 continue;
             }
-            for entry in walkdir::WalkDir::new(&transcripts)
-                .max_depth(3)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
+            for entry in walkdir::WalkDir::new(&transcripts).max_depth(3) {
+                let Some(entry) = walk_entry_reporting(entry, unreadable) else {
+                    continue;
+                };
                 let path = entry.path();
                 if !entry.file_type().is_file()
                     || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
@@ -214,17 +220,13 @@ impl Cursor {
     }
 
     /// Every `cursor-agent` chat store, as `(conversation id, store.db path)`.
-    fn cli_chat_stores() -> Vec<(String, PathBuf)> {
+    fn cli_chat_stores(unreadable: &mut Vec<UnreadableSource>) -> Vec<(String, PathBuf)> {
         let Some(chats) = Self::cli_config_dir().map(|d| d.join("chats")) else {
             return vec![];
         };
         let mut out = Vec::new();
-        for bucket in std::fs::read_dir(&chats).into_iter().flatten().flatten() {
-            for chat in std::fs::read_dir(bucket.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
+        for bucket in read_dir_reporting(&chats, unreadable) {
+            for chat in read_dir_reporting(&bucket.path(), unreadable) {
                 let db = chat.path().join("store.db");
                 if !db.is_file() {
                     continue;
@@ -242,7 +244,9 @@ impl Cursor {
     /// Returns `None` rather than an error: this is enrichment, and a chat
     /// store that will not open must not cost the transcript its listing.
     fn cli_chat_metadata(id: &str) -> Option<serde_json::Value> {
-        let (_, db) = Self::cli_chat_stores().into_iter().find(|(k, _)| k == id)?;
+        let (_, db) = Self::cli_chat_stores(&mut Vec::new())
+            .into_iter()
+            .find(|(k, _)| k == id)?;
         let conn = Self::open_db(&db).ok()?;
         let hex: String = conn
             .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
@@ -292,9 +296,40 @@ impl Cursor {
     }
 
     /// List all composer IDs from the cursorDiskKV table.
-    fn list_composer_ids(conn: &Connection) -> Vec<String> {
-        if !Self::table_exists(conn, "cursorDiskKV") {
-            return vec![];
+    /// Every composer id in `conn`, recording a query that failed rather than
+    /// answering it with an empty list.
+    ///
+    /// A database with no `cursorDiskKV` table is not a failure — that is an
+    /// ordinary workspace database that holds no composer data — so only real
+    /// query errors are reported. Without the distinction the listing would
+    /// carry one line per workspace database on every run.
+    fn list_composer_ids_reporting(
+        conn: &Connection,
+        db_path: &Path,
+        unreadable: &mut Vec<UnreadableSource>,
+    ) -> Vec<String> {
+        let mut report = |error: String| {
+            unreadable.push(UnreadableSource {
+                path: db_path.to_path_buf(),
+                error,
+            });
+        };
+
+        // Three outcomes, not two. The table being absent is ordinary — a
+        // workspace database that holds no composer data — and stays quiet.
+        // The *lookup* failing is not: it is what a `state.vscdb` that is
+        // corrupt, truncated, or not a SQLite file at all does, and
+        // `unwrap_or(false)` made that indistinguishable from an empty store.
+        match conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")
+            .and_then(|mut stmt| stmt.exists(rusqlite::params!["cursorDiskKV"]))
+        {
+            Ok(true) => {}
+            Ok(false) => return vec![],
+            Err(e) => {
+                report(format!("could not read the database schema: {e}"));
+                return vec![];
+            }
         }
 
         let mut stmt =
@@ -302,25 +337,40 @@ impl Cursor {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(error = %e, "failed to query composerData keys");
+                    report(format!("composer query failed: {e}"));
                     return vec![];
                 }
             };
 
-        let ids: Vec<String> = stmt
-            .query_map([], |row| {
-                let key: String = row.get(0)?;
-                Ok(key
-                    .strip_prefix("composerData:")
-                    .unwrap_or(&key)
-                    .to_string())
-            })
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .collect();
+        let rows = match stmt.query_map([], |row| {
+            let key: String = row.get(0)?;
+            Ok(key
+                .strip_prefix("composerData:")
+                .unwrap_or(&key)
+                .to_string())
+        }) {
+            Ok(rows) => rows,
+            Err(e) => {
+                report(format!("composer query failed: {e}"));
+                return vec![];
+            }
+        };
 
+        let mut ids = Vec::new();
+        for row in rows {
+            match row {
+                Ok(id) => ids.push(id),
+                Err(e) => report(format!("composer row could not be read: {e}")),
+            }
+        }
         ids
+    }
+
+    /// `list_composer_ids_reporting` for the callers that answer a question a
+    /// failed query does not change — `owns_session` and the readers, for
+    /// which "no such composer here" is already the outcome.
+    fn list_composer_ids(conn: &Connection) -> Vec<String> {
+        Self::list_composer_ids_reporting(conn, Path::new("<unknown>"), &mut Vec::new())
     }
 
     /// Fetch bubble data for a composer using range query optimization.
@@ -728,10 +778,21 @@ impl Provider for Cursor {
             }
         }
 
-        // Check for any state.vscdb files.
-        let dbs = Self::find_db_files();
-        if !dbs.is_empty() {
+        // Always, including zero. "Cursor is installed" and "casr found a
+        // database to read" are different facts, and reporting the count only
+        // when it is non-zero made the interesting case the silent one.
+        if installed {
+            let dbs = Self::find_db_files();
             evidence.push(format!("found {} state.vscdb database(s)", dbs.len()));
+            for dir in [
+                Self::cli_data_dir().map(|d| d.join("projects")),
+                Self::cli_config_dir().map(|d| d.join("chats")),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                evidence.push(store_evidence(&dir));
+            }
         }
 
         trace!(provider = "cursor", ?evidence, installed, "detection");
@@ -759,13 +820,13 @@ impl Provider for Cursor {
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        if let Some((_, path)) = Self::cli_transcripts()
+        if let Some((_, path)) = Self::cli_transcripts(&mut Vec::new())
             .into_iter()
             .find(|(id, _)| id == session_id)
         {
             return Some(path);
         }
-        if let Some((_, path)) = Self::cli_chat_stores()
+        if let Some((_, path)) = Self::cli_chat_stores(&mut Vec::new())
             .into_iter()
             .find(|(id, _)| id == session_id)
         {
@@ -974,19 +1035,28 @@ impl Provider for Cursor {
         "cursor .".to_string()
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
-        let mut results = Vec::new();
+    fn list_sessions(&self) -> Option<SessionListing> {
+        let mut listing = SessionListing::default();
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-        for db_path in &Self::find_db_files() {
-            let Ok(conn) = Self::open_db(db_path) else {
-                continue;
+        for db_path in &Self::find_db_files_reporting(&mut listing.unreadable) {
+            let conn = match Self::open_db(db_path) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    // `find_db_files_reporting` only returns databases that
+                    // exist, so this is a store casr found and could not open.
+                    listing.unreadable.push(UnreadableSource {
+                        path: db_path.clone(),
+                        error: format!("{err:#}"),
+                    });
+                    continue;
+                }
             };
 
-            for id in Self::list_composer_ids(&conn) {
+            for id in Self::list_composer_ids_reporting(&conn, db_path, &mut listing.unreadable) {
                 let virtual_path = Self::virtual_session_path(db_path, &id);
                 if seen.insert(id.clone()) {
-                    results.push((id, virtual_path));
+                    listing.sessions.push((id, virtual_path));
                 }
             }
         }
@@ -994,18 +1064,27 @@ impl Provider for Cursor {
         // `cursor-agent`. Transcripts first so a conversation that has both
         // halves is listed from the half that can actually be read; the chat
         // store then contributes only what the transcript is missing.
-        for (id, path) in Self::cli_transcripts() {
+        for (id, path) in Self::cli_transcripts(&mut listing.unreadable) {
             if seen.insert(id.clone()) {
-                results.push((id, path));
+                listing.sessions.push((id, path));
             }
         }
-        for (id, path) in Self::cli_chat_stores() {
+        for (id, path) in Self::cli_chat_stores(&mut listing.unreadable) {
             if seen.insert(id.clone()) {
-                results.push((id, path));
+                listing.sessions.push((id, path));
             }
         }
 
-        Some(results)
+        Some(listing)
+    }
+
+    /// Three stores, three shapes: the IDE's `state.vscdb`, `cursor-agent`'s
+    /// `agent-transcripts/**/<id>.jsonl`, and its `chats/<bucket>/<id>/store.db`.
+    fn is_session_path(&self, path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("vscdb" | "jsonl" | "db")
+        )
     }
 }
 

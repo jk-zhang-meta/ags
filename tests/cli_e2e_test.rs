@@ -355,7 +355,7 @@ fn cli_list_json_is_valid_array() {
         parsed.is_object(),
         "list --json should be an envelope object"
     );
-    assert_eq!(parsed["schema_version"], 5);
+    assert_eq!(parsed["schema_version"], 6);
     let items = parsed["items"].as_array().expect("items should be array");
     assert!(!items.is_empty());
     let first = &items[0];
@@ -629,9 +629,7 @@ fn cli_list_names_the_session_file_it_could_not_read() {
         .success()
         .stdout(predicate::str::contains("gmi-readable-0001"))
         .stdout(predicate::str::contains("gmi-readable-0002"))
-        .stderr(predicate::str::contains(
-            "1 session file(s) could not be read",
-        ))
+        .stderr(predicate::str::contains("1 path(s) could not be read"))
         .stderr(predicate::str::contains("gemini: 1"))
         .stderr(predicate::str::contains(
             corrupt.to_string_lossy().to_string(),
@@ -676,7 +674,7 @@ fn cli_list_json_carries_the_session_files_it_could_not_read() {
             .is_empty(),
         "a skipped file without a reason is a count nobody can act on"
     );
-    assert_eq!(parsed["schema_version"], 5);
+    assert_eq!(parsed["schema_version"], 6);
 }
 
 /// Every file in the directory fails. The listing is empty and honest about
@@ -704,7 +702,7 @@ fn cli_list_says_so_when_a_whole_directory_will_not_parse() {
         "an empty listing is still an empty listing: {stdout}"
     );
     assert!(
-        stderr.contains("3 session file(s) could not be read"),
+        stderr.contains("3 path(s) could not be read"),
         "\"no sessions\" and \"three sessions I could not read\" must not print \
          the same thing: {stderr}"
     );

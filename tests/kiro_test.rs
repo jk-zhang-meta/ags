@@ -129,7 +129,7 @@ fn discovery_lists_and_owns_seeded_session() {
     let _env = EnvGuard::set("KIRO_HOME", tmp.path());
     seed_kiro_home(tmp.path());
 
-    let listed = Kiro.list_sessions().expect("list_sessions");
+    let listed = Kiro.list_sessions().expect("list_sessions").sessions;
     assert_eq!(listed.len(), 1, "exactly one seeded session");
     assert_eq!(listed[0].0, FIXTURE_ID);
 

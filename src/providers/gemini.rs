@@ -90,7 +90,9 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, WriteOptions, WrittenSession, store_evidence, walk_entry_reporting,
+};
 
 /// Gemini CLI provider implementation.
 pub struct Gemini;
@@ -218,6 +220,12 @@ impl Provider for Gemini {
             installed = true;
         }
 
+        // Chats live under `~/.gemini/tmp/<project-hash>/chats`, not in
+        // `~/.gemini` itself, which is what detection above found.
+        if installed && let Some(tmp) = Self::tmp_dir() {
+            evidence.push(store_evidence(&tmp));
+        }
+
         trace!(provider = "gemini", ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -245,65 +253,66 @@ impl Provider for Gemini {
             .collect()
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    fn list_sessions(&self) -> Option<SessionListing> {
         let tmp = Self::tmp_dir()?;
-        if !tmp.is_dir() {
-            return Some(vec![]);
-        }
 
         // Ordered, so the listing does not reshuffle between runs, but keyed by
         // session id so a migrated session appears once. `max_depth(3)` keeps
         // this to `tmp/<hash>/chats/<file>`; subagent transcripts live one
         // level below that and are not resumable sessions.
-        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+        let mut listing = SessionListing::default();
         let mut seen: HashMap<String, usize> = HashMap::new();
-        for entry in WalkDir::new(&tmp)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let Some(parent) = path.parent() else {
+        for entry in WalkDir::new(&tmp).max_depth(3) {
+            let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
                 continue;
             };
-            if parent.file_name().and_then(|n| n.to_str()) != Some("chats") {
+            let path = entry.path();
+            if !self.is_session_path(path) || !path.is_file() {
                 continue;
             }
 
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !is_session_file_name(name) {
-                continue;
-            }
 
             let session_id = session_id_from_file(path)
                 .unwrap_or_else(|| session_id_from_name(name).to_string());
 
             match seen.get(&session_id) {
                 Some(&index) => {
-                    if supersedes(path, &sessions[index].1) {
+                    if supersedes(path, &listing.sessions[index].1) {
                         debug!(
                             session_id,
-                            superseded = %sessions[index].1.display(),
+                            superseded = %listing.sessions[index].1.display(),
                             live = %path.display(),
                             "migrated Gemini session: preferring the .jsonl"
                         );
-                        sessions[index].1 = path.to_path_buf();
+                        listing.sessions[index].1 = path.to_path_buf();
                     }
                 }
                 None => {
-                    seen.insert(session_id.clone(), sessions.len());
-                    sessions.push((session_id, path.to_path_buf()));
+                    seen.insert(session_id.clone(), listing.sessions.len());
+                    listing.sessions.push((session_id, path.to_path_buf()));
                 }
             }
         }
 
-        Some(sessions)
+        Some(listing)
+    }
+
+    /// A Gemini chat is `tmp/<project-hash>/chats/session-<ts>-<id8>.{json,jsonl}`.
+    /// The `chats/` parent is part of the rule: `tmp/<hash>/` also holds
+    /// `shell_history`, and a subagent transcript one level below `chats/` is
+    /// not a resumable session.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("chats")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_session_file_name)
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

@@ -234,6 +234,7 @@ fn kiro_lists_both_stores_once_each() {
     let mut listed: Vec<String> = Kiro
         .list_sessions()
         .expect("list_sessions")
+        .sessions
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -300,6 +301,7 @@ fn kiro_home_moves_only_the_cli_store() {
     let mut listed: Vec<String> = Kiro
         .list_sessions()
         .expect("list_sessions")
+        .sessions
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -451,6 +453,7 @@ fn cursor_agent_roots_follow_the_cli_env_vars() {
     let listed: Vec<String> = Cursor
         .list_sessions()
         .expect("list_sessions")
+        .sessions
         .into_iter()
         .map(|(id, _)| id)
         .collect();
@@ -464,6 +467,7 @@ fn cursor_agent_roots_follow_the_cli_env_vars() {
     let listed: Vec<String> = Cursor
         .list_sessions()
         .expect("list_sessions")
+        .sessions
         .into_iter()
         .map(|(id, _)| id)
         .collect();

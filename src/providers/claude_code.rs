@@ -26,7 +26,10 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, StructuredWrite, WriteOptions, WrittenSession, read_dir_reporting,
+    store_evidence,
+};
 
 /// Claude Code provider implementation.
 pub struct ClaudeCode;
@@ -108,6 +111,13 @@ impl Provider for ClaudeCode {
             installed = true;
         }
 
+        // Detection above is satisfied by the binary or by `~/.claude`;
+        // neither implies `~/.claude/projects`, which is the only directory
+        // `list` reads.
+        if installed && let Some(projects) = Self::projects_dir() {
+            evidence.push(store_evidence(&projects));
+        }
+
         trace!(provider = "claude-code", ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -123,35 +133,23 @@ impl Provider for ClaudeCode {
         }
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    fn list_sessions(&self) -> Option<SessionListing> {
         let projects_dir = Self::projects_dir()?;
-        if !projects_dir.is_dir() {
-            return Some(vec![]);
-        }
 
-        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
-        let project_entries = match std::fs::read_dir(&projects_dir) {
-            Ok(entries) => entries,
-            Err(_) => return Some(vec![]),
-        };
-
-        for project_entry in project_entries.flatten() {
+        // No `is_dir()` guard. It answers `false` for a directory that exists
+        // and cannot be read *and* for one that is not there, and this method
+        // has to tell those apart — `read_dir_reporting` is where that
+        // distinction lives.
+        let mut listing = SessionListing::default();
+        for project_entry in read_dir_reporting(&projects_dir, &mut listing.unreadable) {
             let project_path = project_entry.path();
             if !project_path.is_dir() {
                 continue;
             }
 
-            let session_entries = match std::fs::read_dir(&project_path) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-
-            for session_entry in session_entries.flatten() {
+            for session_entry in read_dir_reporting(&project_path, &mut listing.unreadable) {
                 let path = session_entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                if !self.is_session_path(&path) || !path.is_file() {
                     continue;
                 }
 
@@ -162,11 +160,23 @@ impl Provider for ClaudeCode {
                 if session_id.trim().is_empty() {
                     continue;
                 }
-                sessions.push((session_id, path));
+                listing.sessions.push((session_id, path));
             }
         }
 
-        Some(sessions)
+        Some(listing)
+    }
+
+    /// Claude Code writes one `<session-id>.jsonl` per session under
+    /// `projects/<project-key>/`, and that directory is not exclusively its
+    /// own: on the corpus machine `projects/` holds 596 files that are not
+    /// transcripts, all of them `.md` notes under a per-project `memory/`
+    /// subdirectory written by tooling layered on top of Claude Code. The
+    /// extension is what keeps them out, and it is the rule this reader has
+    /// always applied — stated here so the walk cannot quietly widen to
+    /// "every file under a session root", which is what it does by default.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("jsonl")
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

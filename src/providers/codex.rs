@@ -32,7 +32,10 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, StructuredWrite, WriteOptions, WrittenSession, store_evidence,
+    walk_entry_reporting,
+};
 
 /// Codex provider implementation.
 pub struct Codex;
@@ -98,6 +101,12 @@ impl Provider for Codex {
             installed = true;
         }
 
+        // `~/.codex` exists as soon as a config is written; `~/.codex/sessions`
+        // only once a session has run, and it is the one `list` reads.
+        if installed && let Some(sessions) = Self::sessions_dir() {
+            evidence.push(store_evidence(&sessions));
+        }
+
         trace!(provider = "codex", ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -113,29 +122,16 @@ impl Provider for Codex {
         }
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    fn list_sessions(&self) -> Option<SessionListing> {
         let sessions_dir = Self::sessions_dir()?;
-        if !sessions_dir.is_dir() {
-            return Some(vec![]);
-        }
 
-        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
-        for entry in WalkDir::new(&sessions_dir)
-            .max_depth(5)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let mut listing = SessionListing::default();
+        for entry in WalkDir::new(&sessions_dir).max_depth(5) {
+            let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
                 continue;
             };
-            if !(name.starts_with("rollout-")
-                && (name.ends_with(".jsonl") || name.ends_with(".json")))
-            {
+            let path = entry.path();
+            if !self.is_session_path(path) || !path.is_file() {
                 continue;
             }
 
@@ -146,10 +142,20 @@ impl Provider for Codex {
             // Prefer authoritative ID from session_meta payload; otherwise
             // retain filename stem for best-effort diagnostics.
             let session_id = session_meta_id(path).unwrap_or_else(|| stem.to_string());
-            sessions.push((session_id, path.to_path_buf()));
+            listing.sessions.push((session_id, path.to_path_buf()));
         }
 
-        Some(sessions)
+        Some(listing)
+    }
+
+    /// Codex names every rollout `rollout-<timestamp>-<uuid>.jsonl` under
+    /// `sessions/YYYY/MM/DD/`. `history.jsonl`, `config.toml`, `auth.json` and
+    /// `log/` sit beside `sessions/`, but the prefix is checked anyway because
+    /// it is the tool's actual rule and the directory is not casr's to promise.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.starts_with("rollout-") && (n.ends_with(".jsonl") || n.ends_with(".json"))
+        })
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -437,8 +443,12 @@ impl Provider for Codex {
         // newline its first appended record lands on casr's last line.
         let mut content = rendered.lines.join("\n");
         content.push('\n');
-        let outcome =
-            crate::pipeline::atomic_write(&target_path, content.as_bytes(), opts.force, self.slug())?;
+        let outcome = crate::pipeline::atomic_write(
+            &target_path,
+            content.as_bytes(),
+            opts.force,
+            self.slug(),
+        )?;
 
         info!(
             target_session_id,

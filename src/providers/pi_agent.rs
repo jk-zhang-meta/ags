@@ -131,6 +131,22 @@ impl Provider for PiAgent {
         }
     }
 
+    /// `@mariozechner/pi-coding-agent@0.73.1` writes transcripts as
+    /// `sessions/--<encoded-cwd>--/<ISO timestamp>_<uuidv7>.jsonl`
+    /// (`dist/core/session-manager.js`), and writes nothing else into that
+    /// directory — every write in `SessionManager` targets `this.sessionFile`.
+    /// Its own settings live one level above `sessions/`, in
+    /// `~/.pi/agent/{settings,auth,models,keybindings}.json`
+    /// (`dist/config.js`), so the extension is the whole rule.
+    ///
+    /// pi's own test is stricter — `.jsonl` plus a first line whose `type` is
+    /// `"session"` — but that means opening every file in the directory to
+    /// decide whether to list it, and the reader is about to open it anyway
+    /// and report a real error if the header is wrong.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+    }
+
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         let home = Self::home_dir();
         let sessions = Self::sessions_dir(&home);

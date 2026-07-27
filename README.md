@@ -605,14 +605,22 @@ The `list` command is optimized for project-local triage first.
   `--workspace X` is a question, and a session nobody can place in X is not an
   answer to it. `list --json` reports `"workspace": null` for these either way.
 - Providers that support `list_sessions()` can bypass expensive filesystem walks.
-- Fallback directory scans are capped by depth and extension filters.
-- A candidate the provider's reader **cannot parse** is not silently dropped.
-  It is missing from the table — one unreadable file must not abort the whole
-  listing — but the run reports how many were skipped, per provider, with up to
-  three paths and the reader's own reason on stderr. `list --json` carries every
-  one of them in `skipped: [{provider, path, error}]`, always present and `[]`
-  on a clean run, because a short listing and a complete one are otherwise the
-  same document.
+- Fallback directory scans are capped by depth, and filtered by the provider's
+  own rule for what its tool writes (`is_session_path()`) rather than by a
+  blanket extension list. ClawdBot's `sessions.json`, Factory's
+  `<sessionId>.settings.json` and Vibe's `meta.json` all sit in a session
+  directory and are not sessions; a listing that shows them as sessions with
+  zero messages is wrong in a way a user cannot see.
+- A candidate the provider's reader **cannot parse**, and a directory the
+  listing **could not read**, are neither of them silently dropped. They are
+  missing from the table — one unreadable file must not abort the whole listing
+  — but the run reports how many were skipped, per provider, with up to three
+  paths and the reason on stderr. `list --json` carries every one of them in
+  `skipped: [{provider, path, error}]`, always present and `[]` on a clean run,
+  because a short listing and a complete one are otherwise the same document.
+  A store directory that simply does not exist yet is not one of these: that is
+  the ordinary state of an installed tool that has not been run, and `casr
+  providers` names the directory and says so instead.
 
 When sorting by date, probe size is capped to avoid slow scans:
 
@@ -645,7 +653,13 @@ To add a provider, implement the `Provider` trait in `src/providers/<provider>.r
 - `read_session()`: native format to canonical model.
 - `write_session()`: canonical model to native format.
 - `resume_command()`: exact command users should run after conversion.
-- `list_sessions()` (optional): optimized multi-session enumeration for DB-backed providers.
+- `list_sessions()` (optional): multi-session enumeration for providers that can
+  do better than a directory walk. Returns a `SessionListing` carrying both the
+  sessions and every place the enumeration was refused; `None` means "this
+  provider does not enumerate itself", never "the enumeration failed".
+- `is_session_path()`: the tool's own rule for which files under
+  `session_roots()` are sessions. Take it from the shipped artifact, not from
+  documentation, and never write it as a list of names to exclude.
 
 Recommended test set for new providers:
 

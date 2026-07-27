@@ -124,7 +124,10 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, parse_timestamp,
     reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+    store_evidence,
+};
 
 /// Provider slug used in canonical metadata.
 const SLUG: &str = "kiro";
@@ -196,20 +199,16 @@ impl Kiro {
     ///
     /// Two levels deep and no deeper: the third level is `tool-outputs/` and
     /// `sub-executions/`, which hold spilled payloads, not sessions.
-    fn ide_sessions() -> Vec<(String, PathBuf)> {
+    fn ide_sessions(unreadable: &mut Vec<UnreadableSource>) -> Vec<(String, PathBuf)> {
         let Some(root) = Self::ide_root() else {
             return vec![];
         };
         let mut out = Vec::new();
-        for bucket in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        for bucket in read_dir_reporting(&root, unreadable) {
             if !bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
-            for session in std::fs::read_dir(bucket.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
+            for session in read_dir_reporting(&bucket.path(), unreadable) {
                 if !session.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
@@ -275,6 +274,20 @@ impl Provider for Kiro {
             }
         }
 
+        // Two stores, and neither is the home directory the loop above
+        // accepted: the CLI writes `<cli home>/sessions/cli` and the IDE
+        // writes `~/.kiro/sessions/<bucket>/<id>/session.json`. An IDE-only
+        // install has the second and not the first, which is exactly the case
+        // that used to read as "installed, no sessions".
+        if installed {
+            if let Some(cli) = Self::sessions_dir() {
+                evidence.push(store_evidence(&cli));
+            }
+            if let Some(ide) = Self::ide_root() {
+                evidence.push(store_evidence(&ide));
+            }
+        }
+
         trace!(provider = SLUG, ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -308,21 +321,34 @@ impl Provider for Kiro {
         // The IDE buckets by a one-way workspace hash, so the bucket holding a
         // given id can only be found by looking in all of them — which is what
         // Kiro's own `deleteSessionAcrossBuckets` does.
-        Self::ide_sessions()
+        // `owns_session` answers "is this id mine"; a directory it could not
+        // read makes the answer `None`, which is what "not mine" already means
+        // here, so the failures are collected and dropped rather than reported
+        // through a return type that has nowhere to put them.
+        Self::ide_sessions(&mut Vec::new())
             .into_iter()
             .find(|(id, _)| id == session_id)
             .map(|(_, path)| path)
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    fn list_sessions(&self) -> Option<SessionListing> {
         let dir = Self::sessions_dir()?;
 
         // Anchor on `.json` metadata files; fall back to `.jsonl` for sessions
         // that never wrote metadata. De-dup so a `<id>.json`/`<id>.jsonl` pair
         // counts once.
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+        let mut listing = SessionListing::default();
 
+        // A missing `sessions/cli` is the right answer for an IDE-only install
+        // and is not reported; a `sessions/cli` that exists and cannot be read
+        // is, and the IDE scan below still runs either way.
+        let paths: Vec<PathBuf> = read_dir_reporting(&dir, &mut listing.unreadable)
+            .into_iter()
+            .map(|e| e.path())
+            .collect();
+
+        let mut sessions: Vec<(String, PathBuf)> = Vec::new();
         let mut push =
             |id: String, path: PathBuf, seen: &mut std::collections::BTreeSet<String>| {
                 if seen.insert(id.clone()) {
@@ -330,11 +356,7 @@ impl Provider for Kiro {
                 }
             };
 
-        // `read_dir` on a missing `sessions/cli` yields nothing, which is the
-        // right answer for an IDE-only install — the IDE scan below still runs.
-        let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
         // Two passes so `.json` wins as the anchor path over a bare `.jsonl`.
-        let paths: Vec<PathBuf> = entries.map(|e| e.path()).collect();
         for path in paths
             .iter()
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json") && p.is_file())
@@ -354,11 +376,29 @@ impl Provider for Kiro {
 
         // The IDE's store. Same `seen` set, so the session id remains the one
         // key: a session cannot be listed twice because two stores describe it.
-        for (id, path) in Self::ide_sessions() {
+        let mut ide_unreadable = Vec::new();
+        for (id, path) in Self::ide_sessions(&mut ide_unreadable) {
             push(id, path, &mut seen);
         }
 
-        Some(sessions)
+        listing.sessions = sessions;
+        listing.unreadable.extend(ide_unreadable);
+        Some(listing)
+    }
+
+    /// Two stores, two rules. The CLI writes a `<id>.json`/`<id>.jsonl`/
+    /// `<id>.history` triplet flat in `sessions/cli`; the IDE writes
+    /// `sessions/<bucket>/<sess_id>/session.json`. `.history` is the raw
+    /// journal of an already-listed session and `tool-outputs/` below the IDE
+    /// anchor holds spilled payloads, so neither is a session of its own.
+    fn is_session_path(&self, path: &Path) -> bool {
+        if Self::is_ide_anchor(path) {
+            return true;
+        }
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("json" | "jsonl")
+        )
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {

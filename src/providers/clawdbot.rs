@@ -56,7 +56,10 @@ use tracing::{debug, info, trace};
 use crate::discovery::DetectionResult;
 use crate::model::{CanonicalSession, MessageRole, truncate_title};
 use crate::providers::pi_session;
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+    walk_entry_reporting,
+};
 
 /// ClawdBot's default agent id (`dist/routing/session-key.js`:
 /// `DEFAULT_AGENT_ID = "main"`). Sessions are keyed by agent and the id is
@@ -104,7 +107,7 @@ impl ClawdBot {
     /// `CLAWDBOT_HOME` names the sessions directory outright, so when it is set
     /// it is the whole answer — the point of that override is that casr looks
     /// nowhere else.
-    fn session_dirs() -> Vec<PathBuf> {
+    fn session_dirs_reporting(unreadable: &mut Vec<UnreadableSource>) -> Vec<PathBuf> {
         if let Some(home) = std::env::var_os("CLAWDBOT_HOME").filter(|value| !value.is_empty()) {
             let home = PathBuf::from(home);
             return if home.is_dir() { vec![home] } else { vec![] };
@@ -113,16 +116,17 @@ impl ClawdBot {
         let state = Self::state_dir();
         let mut dirs: Vec<PathBuf> = Vec::new();
 
-        // Current: one sessions directory per agent.
-        if let Ok(entries) = std::fs::read_dir(state.join("agents")) {
-            let mut agent_dirs: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path().join("sessions"))
-                .filter(|path| path.is_dir())
-                .collect();
-            agent_dirs.sort();
-            dirs.append(&mut agent_dirs);
-        }
+        // Current: one sessions directory per agent. An `agents/` that exists
+        // and cannot be read is reported rather than yielding zero agents: it
+        // hides every session on the machine, and the caller that swallowed it
+        // reported "ClawdBot has no sessions".
+        let mut agent_dirs: Vec<PathBuf> = read_dir_reporting(&state.join("agents"), unreadable)
+            .into_iter()
+            .map(|entry| entry.path().join("sessions"))
+            .filter(|path| path.is_dir())
+            .collect();
+        agent_dirs.sort();
+        dirs.append(&mut agent_dirs);
 
         // Legacy: the pre-migration flat directory.
         let legacy = state.join("sessions");
@@ -131,6 +135,12 @@ impl ClawdBot {
         }
 
         dirs
+    }
+
+    /// `session_dirs_reporting` for the callers with nowhere to put a read
+    /// failure — `detect`, `session_roots`, `owns_session`, the writer.
+    fn session_dirs() -> Vec<PathBuf> {
+        Self::session_dirs_reporting(&mut Vec::new())
     }
 }
 
@@ -176,6 +186,47 @@ impl Provider for ClawdBot {
 
     fn session_roots(&self) -> Vec<PathBuf> {
         Self::session_dirs()
+    }
+
+    fn list_sessions(&self) -> Option<SessionListing> {
+        let mut listing = SessionListing::default();
+        for root in Self::session_dirs_reporting(&mut listing.unreadable) {
+            for entry in walkdir::WalkDir::new(&root).max_depth(4) {
+                let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
+                    continue;
+                };
+                let path = entry.path();
+                if !entry.file_type().is_file() || !self.is_session_path(path) {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                listing
+                    .sessions
+                    .push((stem.to_string(), path.to_path_buf()));
+            }
+        }
+        Some(listing)
+    }
+
+    /// ClawdBot's own rule, from `dist/memory/session-files.js` in
+    /// `clawdbot@2026.1.24-3`: `entry.isFile() && name.endsWith(".jsonl")`.
+    ///
+    /// It has to be a rule and not a glob because the directory is shared. The
+    /// session store writes `sessions.json` (`dist/config/sessions/paths.js`),
+    /// `sessions.json.lock` and `sessions.json.<pid>.<uuid>.tmp`
+    /// (`dist/config/sessions/store.js`) into it, and a `<sessionId>.jsonl.lock`
+    /// beside each transcript (`dist/agents/session-write-lock.js`). `list` was
+    /// rendering `sessions.json` as a session with zero messages, because a
+    /// `.json` file in a session directory was all it asked for.
+    ///
+    /// `.jsonl` alone is sufficient *for this tool*: the lock and temp files
+    /// end in `.lock` and `.tmp`, and no other `.jsonl` is ever written there.
+    /// It admits both transcript shapes, `<sessionId>.jsonl` and the
+    /// `<sessionId>-topic-<topicId>.jsonl` a topic session produces.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.extension().and_then(|e| e.to_str()) == Some("jsonl")
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

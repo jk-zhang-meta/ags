@@ -38,7 +38,18 @@ use crate::store::{Availability, OriginState};
 /// complete one are the same document. The field is always present and `[]`
 /// when nothing was skipped, because an absent key would mean "old build", not
 /// "clean run".
-pub const SCHEMA_VERSION: u32 = 5;
+///
+/// 6 widened what a `skipped` entry can be. Until now `path` was always a
+/// session file, so a caller could read a session id out of its name. It can
+/// now also be a *directory* `list` expected to enumerate and could not —
+/// a store that denies reads, a database whose schema it does not recognise.
+/// The shape is unchanged and `error` still carries the reason, but a consumer
+/// that treated `path` as a file needs to stop, which is why this is a version
+/// and not a silent widening. The cause was that nine providers turned a failed
+/// `read_dir` into an empty listing, so an unreadable store and an empty one
+/// produced the same document — the same defect `skipped` was introduced to
+/// fix, one level up.
+pub const SCHEMA_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // `list --json`
@@ -49,8 +60,8 @@ pub const SCHEMA_VERSION: u32 = 5;
 pub struct ListEnvelope {
     pub schema_version: u32,
     pub items: Vec<ListItem>,
-    /// Session files the listing found and could not read; see
-    /// [`SkippedSession`].
+    /// Every place the listing had to read and could not — session files that
+    /// would not parse, and directories it was refused. See [`SkippedSession`].
     ///
     /// Serialized always, `[]` for a clean run. Omitting it when empty would
     /// make "this build cannot tell you" and "nothing was skipped" the same
@@ -68,7 +79,15 @@ impl ListEnvelope {
     }
 }
 
-/// One candidate `list` could not turn into a row, and the reader's reason.
+/// One place `list` had to read and could not, with the reason.
+///
+/// Two kinds of place, because a listing can fail at two depths. A *file* that
+/// was claimed as a session and would not parse — the original case, and the
+/// reader's own error explains it. And a *directory* the enumeration was
+/// refused, which is the more consequential one: it does not subtract one row,
+/// it subtracts every session underneath it, and it used to subtract them in
+/// silence. `path` is therefore not always a session file, and a consumer must
+/// not treat it as one.
 ///
 /// # Why this is data and not only a warning
 ///
@@ -95,7 +114,8 @@ impl ListEnvelope {
 pub struct SkippedSession {
     /// Slug of the provider whose reader was asked.
     pub provider: String,
-    /// The file that could not be read.
+    /// The place that could not be read — a session file, or a directory the
+    /// enumeration was refused. Not always a file; see the type docs.
     pub path: String,
     /// The reader's error, verbatim and unclassified — the same string `info`
     /// prints for the same file.
@@ -683,8 +703,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn schema_version_is_5() {
-        assert_eq!(SCHEMA_VERSION, 5);
+    fn schema_version_is_6() {
+        assert_eq!(SCHEMA_VERSION, 6);
     }
 
     // -----------------------------------------------------------------------
@@ -1113,7 +1133,7 @@ mod tests {
     fn list_envelope_empty_items_serializes() {
         let envelope = ListEnvelope::new(vec![], vec![]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         assert!(json["items"].as_array().unwrap().is_empty());
         // Present and empty, not absent: "nothing was skipped" is a
         // measurement and has to look different from a build that never made
@@ -1167,10 +1187,10 @@ mod tests {
         };
         let envelope = ListEnvelope::new(vec![item], vec![]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
         let first = &json["items"][0];
-        assert_eq!(first["schema_version"], 5);
+        assert_eq!(first["schema_version"], 6);
         assert_eq!(first["session_id"], "sid-1");
         assert_eq!(first["provider"], "claude-code");
         assert_eq!(first["native_name"], "Renamed Session");
@@ -1207,7 +1227,7 @@ mod tests {
             transcript_tail: None,
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["schema_version"], 5);
+        assert_eq!(json["schema_version"], 6);
         assert_eq!(json["session_id"], "sid-info");
         assert_eq!(json["provider"], "codex");
         assert!(json["title"].is_null());

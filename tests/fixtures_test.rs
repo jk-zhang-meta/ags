@@ -492,7 +492,7 @@ fn fixture_agy_does_not_list_legacy_gmi_sessions() {
     let sessions = Antigravity
         .list_sessions()
         .expect("agy list_sessions returns Some");
-    let ids: Vec<String> = sessions.into_iter().map(|(id, _)| id).collect();
+    let ids: Vec<String> = sessions.sessions.into_iter().map(|(id, _)| id).collect();
 
     assert!(
         ids.contains(&"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string()),
@@ -507,7 +507,11 @@ fn fixture_agy_does_not_list_legacy_gmi_sessions() {
     let gmi_sessions = Gemini
         .list_sessions()
         .expect("gmi list_sessions returns Some");
-    let gmi_ids: Vec<String> = gmi_sessions.into_iter().map(|(id, _)| id).collect();
+    let gmi_ids: Vec<String> = gmi_sessions
+        .sessions
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     assert!(
         gmi_ids.contains(&"gmi-legacy-001".to_string()),
         "gmi should list its own legacy session: {gmi_ids:?}"

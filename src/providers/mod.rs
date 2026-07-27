@@ -32,9 +32,191 @@ use std::path::{Path, PathBuf};
 
 use crate::budget::ContextBudget;
 use crate::discovery::DetectionResult;
-use crate::launch::LaunchSpec;
 use crate::ir::{Fidelity, Loss, SessionIr};
+use crate::launch::LaunchSpec;
 use crate::model::CanonicalSession;
+
+/// A place a listing had to read and could not, with the reason.
+///
+/// # Why an empty listing needs this
+///
+/// Nine provider files reached an empty listing from an I/O *error*, in four
+/// spellings, all silent: `read_dir(..).into_iter().flatten().flatten()`,
+/// `let Ok(entries) = .. else { return .. }`, `Err(_) => return Some(vec![])`,
+/// and a bare `if let Ok(entries) = ..`. A directory owned by another user, a
+/// store path a stray file has taken over, a disk returning `EIO` — every one
+/// of them produced the same answer as a directory that is genuinely empty, and
+/// the user was told "no sessions". `cmd_list`'s own fallback walk made the
+/// tenth, with `filter_map(Result::ok)`.
+///
+/// One of the nine, `Gemini::session_roots`, is deliberately left alone: `list`
+/// never reaches it, because Gemini enumerates itself. Its remaining callers
+/// ask "does this provider own this path", where an empty answer already means
+/// "no" — the same reason `owns_session` keeps its `.ok()?`.
+///
+/// A missing directory is *not* one of these. It is the ordinary state of a
+/// provider that has never run, and reporting it would put a line of noise in
+/// front of every user of every tool they have installed but not used. See
+/// [`read_dir_reporting`], which draws that line once so seventeen providers do
+/// not each draw it differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableSource {
+    /// The directory or file that could not be read.
+    pub path: PathBuf,
+    /// The operating system's reason, verbatim.
+    pub error: String,
+}
+
+/// What a provider's listing found, and what it could not look at.
+///
+/// The pair is the point, and it is the same argument [`Displaced`] makes: a
+/// result that does not say what it could not measure is indistinguishable
+/// from a complete one. `sessions` alone cannot carry "and there may be more
+/// in the directory I was refused" — a short list and a whole list are the same
+/// value.
+///
+/// `unreadable` is empty on the ordinary run. It is not a warning channel for
+/// files that are simply not sessions: a provider that knows a file is not one
+/// of its own excludes it silently, because saying so on every run would bury
+/// the cases that mean something. It is for places the provider *expected* to
+/// read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionListing {
+    /// `(session_id, path)` for every session found.
+    pub sessions: Vec<(String, PathBuf)>,
+    /// Every directory or file the listing could not read, and why.
+    pub unreadable: Vec<UnreadableSource>,
+}
+
+impl SessionListing {
+    /// Record a place this listing could not read.
+    pub fn cannot_read(&mut self, path: &Path, error: &std::io::Error) {
+        self.unreadable.push(UnreadableSource {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        });
+    }
+}
+
+/// Enumerate `dir`, recording the failure instead of returning nothing.
+///
+/// The one place that decides which failures are worth telling the user about:
+///
+/// * [`std::io::ErrorKind::NotFound`] is not a failure. A provider's store
+///   directory does not exist until the tool has run, and every provider casr
+///   detects by binary-in-`PATH` has that state on a fresh install. It yields
+///   an empty list and no entry.
+/// * Everything else is recorded — the `EACCES` of a directory owned by
+///   another user, the `ENOTDIR` of a store path a regular file has taken over,
+///   the `EIO` of a failing mount.
+///
+/// Per-entry errors are recorded too. `entries.flatten()` discards them, and a
+/// directory that lists ten files and errors on the eleventh is exactly as
+/// silent as one that could not be opened at all.
+pub fn read_dir_reporting(
+    dir: &Path,
+    unreadable: &mut Vec<UnreadableSource>,
+) -> Vec<std::fs::DirEntry> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                unreadable.push(UnreadableSource {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                });
+            }
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => out.push(entry),
+            Err(error) => unreadable.push(UnreadableSource {
+                path: dir.to_path_buf(),
+                error: format!("entry in this directory could not be read: {error}"),
+            }),
+        }
+    }
+    out
+}
+
+/// A line of [`Provider::detect`] evidence naming a directory `list` will read
+/// and saying whether it can be read.
+///
+/// # Why detection has to name the store
+///
+/// `detect` answers "is this tool on this machine" and `list` answers "what is
+/// in its store", and most providers answer the first from something that does
+/// not imply the second — a binary in `PATH`, or a *parent* of the store.
+/// `~/.claude` exists on a machine that has never run Claude Code; `~/.codex`
+/// exists as soon as a config is written; `~/.grok/bin/grok` is what the
+/// installer puts there before any session runs.
+///
+/// So the user sees `✓ Claude Code — installed` from one command and no rows
+/// from the other, with nothing in either output saying which of three
+/// different things happened: there are no sessions yet, casr is reading a
+/// directory that does not exist, or casr was refused. Those want three
+/// different responses and were rendered identically.
+///
+/// This is the same shape `opencode` already uses for each database it finds,
+/// and it is evidence rather than a narrowing of `detect` on purpose:
+/// "installed" is a true and useful answer about a tool whose store is empty,
+/// and a `detect` that required the store would report `✗` for a CLI the user
+/// can run right now.
+pub fn store_evidence(store: &Path) -> String {
+    match std::fs::read_dir(store) {
+        Ok(_) => format!("session store: {}", store.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => format!(
+            "no session store at {} yet; `list` has nothing to read",
+            store.display()
+        ),
+        Err(error) => format!(
+            "{}: UNREADABLE — {error}; no sessions can be listed from it",
+            store.display()
+        ),
+    }
+}
+
+/// Keep one entry of a [`walkdir`] walk, or record why the walker stopped
+/// there.
+///
+/// The recursive counterpart of [`read_dir_reporting`], and it draws the same
+/// line for the same reason: a walk whose root does not exist yields one
+/// `NotFound` error, which is the ordinary state of an uninstalled provider
+/// and not worth a line of output. Every other error means a subtree was
+/// skipped — `walkdir` reports it and keeps walking, so the sessions it *did*
+/// reach still make it into the listing.
+///
+/// `filter_map(Result::ok)`, which this replaces, made that subtree vanish.
+pub fn walk_entry_reporting(
+    entry: Result<walkdir::DirEntry, walkdir::Error>,
+    unreadable: &mut Vec<UnreadableSource>,
+) -> Option<walkdir::DirEntry> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            let missing = error
+                .io_error()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound);
+            if !missing {
+                unreadable.push(UnreadableSource {
+                    path: error
+                        .path()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from("<unknown>")),
+                    error: match error.io_error() {
+                        Some(io) => io.to_string(),
+                        None => error.to_string(),
+                    },
+                });
+            }
+            None
+        }
+    }
+}
 
 /// Options controlling how a session is written to disk.
 #[derive(Debug, Clone)]
@@ -171,14 +353,76 @@ pub trait Provider: Send + Sync {
             .map(|spec| spec.targeting_session(session_id))
     }
 
-    /// Enumerate all discoverable sessions for this provider.
+    /// Enumerate all discoverable sessions for this provider, and every place
+    /// it could not read.
     ///
-    /// Returns `Some(vec)` of `(session_id, path)` pairs when the provider
-    /// stores multiple sessions in a single file or database and directory
-    /// walking alone would undercount.  The default returns `None`, which
-    /// tells the caller to fall back to directory walking + `read_session`.
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    /// # The three answers, and what each one means
+    ///
+    /// * **`None` — "I do not enumerate myself."** The caller walks
+    ///   [`Provider::session_roots`] instead and filters with
+    ///   [`Provider::is_session_path`]. It is a statement about this
+    ///   *implementation*, never about the store, and it must not be returned
+    ///   because something went wrong. Five of the seventeen registered
+    ///   providers answer this way; the walk reports their read failures on
+    ///   their behalf, through [`walk_entry_reporting`], so choosing `None`
+    ///   costs no reporting.
+    /// * **`Some` with an empty `sessions` and an empty `unreadable` — "I read
+    ///   everything I meant to and there is nothing here."** This is the
+    ///   ordinary state of an installed tool that has not been run, and it must
+    ///   stay quiet: see [`read_dir_reporting`], which is why a store directory
+    ///   that does not exist is not an error.
+    /// * **`Some` with a non-empty `unreadable` — "these specific places I
+    ///   expected to read, I could not."** Any session inside them is missing
+    ///   from `sessions`. It is *not* all-or-nothing: a provider reports what it
+    ///   reached and what it did not, in the same value, because one refused
+    ///   directory must not delete the sessions found in the others.
+    ///
+    /// # Why the listing carries its own failures
+    ///
+    /// Because nothing downstream can reconstruct them. `cmd_list` sees a
+    /// `Vec` and cannot tell a provider that read its store and found it empty
+    /// from one that was refused at the door, and those are the two facts a
+    /// user staring at `✓ installed` and zero rows is trying to choose
+    /// between. Only the enumeration knows.
+    ///
+    /// Implementors: build the vector with [`read_dir_reporting`] or
+    /// [`walk_entry_reporting`], never with
+    /// `read_dir(..).into_iter().flatten().flatten()`, `let Ok(entries) = ..
+    /// else`, `Err(_) => return Some(vec![])`, or a bare `if let Ok(entries)`.
+    /// Those four spellings are how nine providers came to answer "zero
+    /// sessions" to an `EACCES`.
+    fn list_sessions(&self) -> Option<SessionListing> {
         None
+    }
+
+    /// Whether `path`, found under one of this provider's
+    /// [`Provider::session_roots`], is a file this tool writes sessions to.
+    ///
+    /// Consulted by the fallback walk in `cmd_list` for the providers that
+    /// answer `None` to [`Provider::list_sessions`], and by six of the
+    /// providers that do not, from inside their own enumeration. Without it the
+    /// walk hands every file it finds to `read_session`, which is how
+    /// ClawdBot's `sessions.json`, Factory's `<sessionId>.settings.json` and
+    /// Vibe's `meta.json` each came to be rendered as a session with zero
+    /// messages.
+    ///
+    /// The rule must be the tool's own — the extension it writes, the filename
+    /// it fixes, the layout it uses — and taken from the shipped artifact. A
+    /// list of names *not* to show is the same defect with a different sign: it
+    /// excludes the one file someone remembered and admits the next one the
+    /// tool adds.
+    ///
+    /// The default is the blanket extension set `cmd_list` used to apply to
+    /// everything. It exists only so the three mock providers in the test suite
+    /// need not answer a question they have no store for; every registered
+    /// provider overrides it, which
+    /// `list_truthfulness_test::every_registered_provider_narrows_the_default_session_file_rule`
+    /// checks rather than assumes.
+    fn is_session_path(&self, path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("jsonl" | "json" | "vscdb" | "md" | "db" | "sqlite")
+        )
     }
 
     // -- High-fidelity track ------------------------------------------------

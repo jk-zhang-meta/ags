@@ -68,7 +68,9 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, WriteOptions, WrittenSession, read_dir_reporting, store_evidence,
+};
 
 /// Provider slug used in canonical metadata.
 const SLUG: &str = "grok";
@@ -96,9 +98,9 @@ impl Grok {
 
     /// Enumerate `(session_id, updates.jsonl path)` for every session
     /// directory under the configured sessions root.
-    fn list_all_sessions() -> Vec<(String, PathBuf)> {
+    fn list_all_sessions() -> SessionListing {
         let Some(root) = Self::sessions_root() else {
-            return vec![];
+            return SessionListing::default();
         };
         list_sessions_in(&root)
     }
@@ -110,21 +112,14 @@ impl Grok {
 /// Group-level files (`prompt_history.jsonl`) and root-level files
 /// (`session_search.sqlite`) are ignored because only directories two levels
 /// deep containing an `updates.jsonl` qualify.
-fn list_sessions_in(root: &Path) -> Vec<(String, PathBuf)> {
-    if !root.is_dir() {
-        return vec![];
-    }
-    let mut out: Vec<(String, PathBuf)> = Vec::new();
-    for group in std::fs::read_dir(root).into_iter().flatten().flatten() {
+fn list_sessions_in(root: &Path) -> SessionListing {
+    let mut listing = SessionListing::default();
+    for group in read_dir_reporting(root, &mut listing.unreadable) {
         let group_path = group.path();
         if !group_path.is_dir() {
             continue; // e.g. session_search.sqlite
         }
-        for session in std::fs::read_dir(&group_path)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
+        for session in read_dir_reporting(&group_path, &mut listing.unreadable) {
             let session_dir = session.path();
             if !session_dir.is_dir() {
                 continue; // e.g. prompt_history.jsonl
@@ -139,10 +134,10 @@ fn list_sessions_in(root: &Path) -> Vec<(String, PathBuf)> {
             if id.is_empty() {
                 continue;
             }
-            out.push((id.to_string(), updates));
+            listing.sessions.push((id.to_string(), updates));
         }
     }
-    out
+    listing
 }
 
 /// Decode a percent-encoded cwd group directory name back to a path.
@@ -484,6 +479,12 @@ impl Provider for Grok {
             }
         }
 
+        // The installer creates `~/.grok/bin/grok`; `~/.grok/sessions` is what
+        // `list` reads and it appears only after the first session.
+        if installed && let Some(sessions) = Self::sessions_root() {
+            evidence.push(store_evidence(&sessions));
+        }
+
         trace!(provider = SLUG, ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -499,8 +500,15 @@ impl Provider for Grok {
         if root.is_dir() { vec![root] } else { vec![] }
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
+    fn list_sessions(&self) -> Option<SessionListing> {
         Some(Self::list_all_sessions())
+    }
+
+    /// Every Grok transcript is `<group>/<session-uuid>/updates.jsonl`. The
+    /// filename is fixed, which is what keeps `prompt_history.jsonl` (one level
+    /// up) and `session_search.sqlite` (two levels up) out of the listing.
+    fn is_session_path(&self, path: &Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()) == Some("updates.jsonl")
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -524,7 +532,7 @@ impl Provider for Grok {
 
         // Case-insensitive fallback (UUIDs are conventionally lowercase).
         let lc = session_id.to_ascii_lowercase();
-        for (id, path) in Self::list_all_sessions() {
+        for (id, path) in Self::list_all_sessions().sessions {
             if id.to_ascii_lowercase() == lc {
                 debug!(path = %path.display(), session_id, "found Grok session (case-insensitive)");
                 return Some(path);
@@ -1152,7 +1160,7 @@ mod tests {
         // A session dir without updates.jsonl is skipped.
         std::fs::create_dir_all(group.join("no-updates-session")).unwrap();
 
-        let listed = list_sessions_in(&root);
+        let listed = list_sessions_in(&root).sessions;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].0, SESSION_ID);
         assert!(listed[0].1.ends_with("updates.jsonl"));

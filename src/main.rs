@@ -21,7 +21,7 @@ use casr::discovery::ProviderRegistry;
 use casr::ir::Fidelity;
 use casr::launch::{LaunchSpec, SessionTargeting};
 use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
-use casr::providers::Provider;
+use casr::providers::{Provider, SessionListing, read_dir_reporting, walk_entry_reporting};
 use casr::responses::{
     self, ErrorEnvelope, InfoResponse, ListEnvelope, ListItem, ProviderInfo, ResumeSuccess,
     SkippedSession,
@@ -1524,7 +1524,7 @@ fn cmd_list(
     fn workspace_scoped_listed_sessions(
         provider_slug: &str,
         workspace_filter: Option<&PathBuf>,
-    ) -> Option<Vec<(String, PathBuf)>> {
+    ) -> Option<SessionListing> {
         let ws = workspace_filter?;
         match provider_slug {
             "claude-code" => {
@@ -1534,16 +1534,9 @@ fn cmd_list(
                 let expected_dir = claude_home
                     .join("projects")
                     .join(casr::providers::claude_code::project_dir_key(ws.as_path()));
-                if !expected_dir.is_dir() {
-                    return Some(vec![]);
-                }
 
-                let mut sessions: Vec<(String, PathBuf)> = Vec::new();
-                let entries = match std::fs::read_dir(&expected_dir) {
-                    Ok(entries) => entries,
-                    Err(_) => return Some(vec![]),
-                };
-                for entry in entries.flatten() {
+                let mut listing = SessionListing::default();
+                for entry in read_dir_reporting(&expected_dir, &mut listing.unreadable) {
                     let path = entry.path();
                     if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
                     {
@@ -1552,9 +1545,9 @@ fn cmd_list(
                     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                         continue;
                     };
-                    sessions.push((stem.to_string(), path));
+                    listing.sessions.push((stem.to_string(), path));
                 }
-                Some(sessions)
+                Some(listing)
             }
             "gemini" => {
                 // Reuse the provider's own resolver so this fast path cannot
@@ -1567,23 +1560,29 @@ fn cmd_list(
                     // Fallback to generic provider enumeration when tmp/ has
                     // legacy/non-hash chat roots (fixtures or older layouts).
                     // Otherwise, return empty early to avoid an expensive scan.
-                    let has_legacy_chat_roots =
-                        std::fs::read_dir(&tmp_root).ok().is_some_and(|entries| {
-                            entries.flatten().any(|entry| {
-                                let path = entry.path();
-                                if !path.is_dir() || !path.join("chats").is_dir() {
-                                    return false;
-                                }
-                                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                                    return true;
-                                };
-                                !(name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()))
-                            })
+                    let mut unreadable = Vec::new();
+                    let has_legacy_chat_roots = read_dir_reporting(&tmp_root, &mut unreadable)
+                        .into_iter()
+                        .any(|entry| {
+                            let path = entry.path();
+                            if !path.is_dir() || !path.join("chats").is_dir() {
+                                return false;
+                            }
+                            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                                return true;
+                            };
+                            !(name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()))
                         });
                     return if has_legacy_chat_roots {
+                        // Hand the whole question to the provider, which will
+                        // report its own failures; this scan's are its to find
+                        // again rather than to double-report here.
                         None
                     } else {
-                        Some(vec![])
+                        Some(SessionListing {
+                            sessions: Vec::new(),
+                            unreadable,
+                        })
                     };
                 }
 
@@ -1598,14 +1597,10 @@ fn cmd_list(
                 // files at all. A migrated session is `session-<ts>-<id8>.json`
                 // and `session-<ts>-<id8>.jsonl`, which share that key, so the
                 // pair still collapses to the `.jsonl`.
-                let mut sessions: Vec<(String, PathBuf)> = Vec::new();
+                let mut listing = SessionListing::default();
                 let mut seen: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
-                let entries = match std::fs::read_dir(&chats_dir) {
-                    Ok(entries) => entries,
-                    Err(_) => return Some(vec![]),
-                };
-                for entry in entries.flatten() {
+                for entry in read_dir_reporting(&chats_dir, &mut listing.unreadable) {
                     let path = entry.path();
                     if !path.is_file() {
                         continue;
@@ -1627,22 +1622,24 @@ fn cmd_list(
                         .to_string();
                     match seen.get(&session_id) {
                         Some(&index) => {
-                            let live_is_jsonl =
-                                sessions[index].1.extension().and_then(|e| e.to_str())
-                                    == Some("jsonl");
+                            let live_is_jsonl = listing.sessions[index]
+                                .1
+                                .extension()
+                                .and_then(|e| e.to_str())
+                                == Some("jsonl");
                             if !live_is_jsonl
                                 && path.extension().and_then(|e| e.to_str()) == Some("jsonl")
                             {
-                                sessions[index].1 = path;
+                                listing.sessions[index].1 = path;
                             }
                         }
                         None => {
-                            seen.insert(session_id.clone(), sessions.len());
-                            sessions.push((session_id, path));
+                            seen.insert(session_id.clone(), listing.sessions.len());
+                            listing.sessions.push((session_id, path));
                         }
                     }
                 }
-                Some(sessions)
+                Some(listing)
             }
             _ => None,
         }
@@ -1730,8 +1727,20 @@ fn cmd_list(
         // in a single file/DB (avoids undercounting).
         let scoped_listed =
             workspace_scoped_listed_sessions(provider.slug(), workspace_filter.as_ref());
-        if let Some(listed) = scoped_listed.or_else(|| provider.list_sessions()) {
-            let mut listed = listed;
+        if let Some(listing) = scoped_listed.or_else(|| provider.list_sessions()) {
+            // The places this provider could not look, before anything is
+            // truncated. They are not sessions and must not be subject to the
+            // probe limit: a listing capped at 20 rows that silently drops the
+            // one directory it was refused is the defect wearing a cap.
+            for source in listing.unreadable {
+                skipped.push(SkippedSession {
+                    provider: provider.slug().to_string(),
+                    path: source.path.display().to_string(),
+                    error: source.error,
+                });
+            }
+
+            let mut listed = listing.sessions;
             let probe_limit = probe_limit_for_sort(limit, sort, workspace_filter.is_some());
             if listed.len() > probe_limit {
                 listed.sort_by_key(|(_, path)| std::cmp::Reverse(file_mtime_millis(path)));
@@ -1766,26 +1775,25 @@ fn cmd_list(
         let mut candidate_paths: Vec<PathBuf> = Vec::new();
 
         for root in provider.session_roots() {
-            let walker = walkdir::WalkDir::new(&root)
-                .max_depth(4)
-                .into_iter()
-                .filter_map(Result::ok);
-
-            for entry in walker {
+            let mut unreadable = Vec::new();
+            for entry in walkdir::WalkDir::new(&root).max_depth(4) {
+                // A subtree the walker was refused used to leave by the same
+                // door as a file that is not a session — `filter_map(Result::ok)`
+                // — so a provider whose store had become unreadable reported
+                // "no sessions" instead of saying so.
+                let Some(entry) = walk_entry_reporting(entry, &mut unreadable) else {
+                    continue;
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
                 let path = entry.path();
-                let ext = path.extension().and_then(|e| e.to_str());
-                if !matches!(
-                    ext,
-                    Some("jsonl")
-                        | Some("json")
-                        | Some("vscdb")
-                        | Some("md")
-                        | Some("db")
-                        | Some("sqlite")
-                ) {
+                // The provider's own rule for what it writes, not "every file
+                // with a plausible extension". The latter is how ClawdBot's
+                // `sessions.json`, Factory's `<sessionId>.settings.json` and
+                // Vibe's `meta.json` were rendered as sessions with zero
+                // messages.
+                if !provider.is_session_path(path) {
                     continue;
                 }
 
@@ -1796,6 +1804,13 @@ fn cmd_list(
                 }
 
                 candidate_paths.push(path.to_path_buf());
+            }
+            for source in unreadable {
+                skipped.push(SkippedSession {
+                    provider: provider.slug().to_string(),
+                    path: source.path.display().to_string(),
+                    error: source.error,
+                });
             }
         }
 
@@ -1910,7 +1925,8 @@ fn cmd_list(
             .map(|(provider, count)| format!("{provider}: {count}"))
             .collect();
         eprintln!(
-            "{} {} session file(s) could not be read and are missing from this listing ({}).",
+            "{} {} path(s) could not be read; any sessions in them are missing from this \
+             listing ({}).",
             "⚠".yellow(),
             skipped.len(),
             counts.join(", ")

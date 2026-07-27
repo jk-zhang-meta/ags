@@ -646,7 +646,10 @@ fn list_sessions_returns_all_sessions_from_db() {
         .write_session(&second, &WriteOptions { force: false })
         .expect("second write");
 
-    let listed = OpenCode.list_sessions().expect("should return Some");
+    let listed = OpenCode
+        .list_sessions()
+        .expect("should return Some")
+        .sessions;
     let ids: Vec<&str> = listed.iter().map(|(id, _)| id.as_str()).collect();
     assert!(
         ids.contains(&first_written.session_id.as_str()),
@@ -663,7 +666,10 @@ fn list_sessions_empty_db_returns_empty_vec() {
     let sb = Sandbox::new();
     make_current_db(&sb.data_dir_db());
 
-    let listed = OpenCode.list_sessions().expect("should return Some");
+    let listed = OpenCode
+        .list_sessions()
+        .expect("should return Some")
+        .sessions;
     assert!(listed.is_empty(), "empty DB should have no sessions");
 }
 

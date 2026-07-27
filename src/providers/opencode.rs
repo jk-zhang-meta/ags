@@ -23,7 +23,7 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession};
 
 /// OpenCode provider implementation.
 pub struct OpenCode;
@@ -1000,19 +1000,22 @@ impl Provider for OpenCode {
         "opencode".to_string()
     }
 
-    fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
-        let db_files = Self::find_db_files();
-        if db_files.is_empty() {
-            return Some(Vec::new());
-        }
-
-        let mut results = Vec::new();
-        for db_path in &db_files {
+    fn list_sessions(&self) -> Option<SessionListing> {
+        let mut listing = SessionListing::default();
+        // Every database accounts for itself. `find_db_files` returns only
+        // databases that exist, so each of these failures is a store casr found
+        // and could not read — the case `warn!` alone left out of `list`.
+        for db_path in &Self::find_db_files() {
             let conn = match Self::open_db(db_path) {
                 Ok(conn) => conn,
                 Err(err) => {
-                    warn!(db = %db_path.display(), error = %format!("{err:#}"),
+                    let error = format!("{err:#}");
+                    warn!(db = %db_path.display(), error = %error,
                           "OpenCode database could not be opened; its sessions are not listed");
+                    listing.unreadable.push(UnreadableSource {
+                        path: db_path.clone(),
+                        error,
+                    });
                     continue;
                 }
             };
@@ -1020,6 +1023,12 @@ impl Provider for OpenCode {
                 warn!(db = %db_path.display(),
                       "OpenCode database has an unrecognised schema (neither \
                        session/message/part nor sessions/messages); its sessions are not listed");
+                listing.unreadable.push(UnreadableSource {
+                    path: db_path.clone(),
+                    error: "unrecognised schema (neither session/message/part nor \
+                            sessions/messages)"
+                        .to_string(),
+                });
                 continue;
             };
 
@@ -1028,23 +1037,54 @@ impl Provider for OpenCode {
                 schema.session_table(),
                 schema.created_column()
             );
-            let Ok(mut stmt) = conn.prepare(&query) else {
-                warn!(db = %db_path.display(), schema = schema.label(),
-                      "OpenCode session query failed; its sessions are not listed");
-                continue;
+            let mut stmt = match conn.prepare(&query) {
+                Ok(stmt) => stmt,
+                Err(err) => {
+                    warn!(db = %db_path.display(), schema = schema.label(),
+                          "OpenCode session query failed; its sessions are not listed");
+                    listing.unreadable.push(UnreadableSource {
+                        path: db_path.clone(),
+                        error: format!("session query failed: {err}"),
+                    });
+                    continue;
+                }
             };
 
-            let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
-                continue;
+            let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    listing.unreadable.push(UnreadableSource {
+                        path: db_path.clone(),
+                        error: format!("session query failed: {err}"),
+                    });
+                    continue;
+                }
             };
 
-            for row in rows.flatten() {
-                let virtual_path = Self::virtual_session_path(db_path, &row);
-                results.push((row, virtual_path));
+            for row in rows {
+                match row {
+                    Ok(id) => {
+                        let virtual_path = Self::virtual_session_path(db_path, &id);
+                        listing.sessions.push((id, virtual_path));
+                    }
+                    Err(err) => listing.unreadable.push(UnreadableSource {
+                        path: db_path.clone(),
+                        error: format!("session row could not be read: {err}"),
+                    }),
+                }
             }
         }
 
-        Some(results)
+        Some(listing)
+    }
+
+    /// One SQLite database holds every session, so a session "path" is the
+    /// virtual `<db>#<session id>` this provider mints.
+    fn is_session_path(&self, path: &Path) -> bool {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("db" | "sqlite")
+        )
     }
 }
 
