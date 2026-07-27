@@ -511,12 +511,14 @@ fn cross(
         return;
     };
 
-    // `UNLIMITED`, and not the CLI's defaults, because this battery verifies the
-    // *conversion* and not the budget policy. Same-agent conservation is only
-    // meaningful when nothing is allowed to be trimmed: under the CLI defaults a
-    // long session would legitimately lose its oldest turns, and the check could
-    // no longer tell that from a writer dropping them by mistake. The budget has
-    // its own tests, including that `UNLIMITED` writes byte-identical output.
+    // `UNLIMITED`, explicitly, because this battery verifies the *conversion* and
+    // not the budget policy. Same-agent conservation is only meaningful when
+    // nothing is allowed to be trimmed: under any binding cap a long session
+    // would legitimately lose its oldest turns, and the check could no longer
+    // tell that from a writer dropping them by mistake. It is also what a plain
+    // `resume` now passes — the caps are opt-in — so this is the ordinary path
+    // and not a special case. The budget has its own tests, including that
+    // `UNLIMITED` writes byte-identical output.
     let written = match target.write_session_ir(ir, &WriteOptions { force: false }, &ContextBudget::UNLIMITED) {
         Ok(Some(written)) => written,
         Ok(None) => {

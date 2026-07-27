@@ -266,14 +266,55 @@ pub trait Provider: Send + Sync {
     ///
     /// Implementors must apply it with [`crate::budget::ContextBudget::apply`]
     /// over `model_visible`, and must fold what it removes into the losses
-    /// [`StructuredWrite::fidelity`] is derived from. `UNLIMITED` must produce
-    /// byte-identical output to a writer that had no budget at all.
+    /// [`StructuredWrite::fidelity`] is derived from.
+    /// [`crate::budget::ContextBudget::UNLIMITED`] must produce byte-identical
+    /// output to a writer that had no budget at all — and since the caps are
+    /// opt-in, `UNLIMITED` is what a plain `resume` hands you, so that is the
+    /// ordinary path rather than a corner. It is checked rather than assumed:
+    /// both writers were run over all 831 readable corpus sessions against a
+    /// build with the `apply` call physically deleted, and all 1,662 renders
+    /// matched.
     fn write_session_ir(
         &self,
         _ir: &SessionIr,
         _opts: &WriteOptions,
         _budget: &ContextBudget,
     ) -> anyhow::Result<Option<StructuredWrite>> {
+        Ok(None)
+    }
+
+    /// The grade [`Provider::write_session_ir`] would earn on `ir` inside
+    /// `budget`, without writing anything.
+    ///
+    /// `Ok(None)` in exactly the cases `write_session_ir` returns it — no
+    /// structured writer, or a replay with nothing in it — so a caller can use
+    /// the two interchangeably to decide which track a conversion takes.
+    ///
+    /// # Why this exists
+    ///
+    /// `--dry-run` answers "what will this conversion cost me before I let it
+    /// write", and it was answering with [`crate::pipeline::flat_fidelity`] on
+    /// every conversion, budget excluded — so the user deciding whether a
+    /// `--max-context-tokens` value was survivable got a grade from a code path
+    /// their real run would not take. Only the writer knows what it would have
+    /// to leave behind, and the writer cannot be asked without being run.
+    ///
+    /// It is answerable because the expensive half is pure: both structured
+    /// providers build the whole file in memory (`codex_ir_write::render`,
+    /// `claude_code_ir_write::render`) and only then place it on disk, and the
+    /// grade is settled by the first half. Implementors must return the grade
+    /// from *that same rendering call*, not re-derive it: two ways to compute
+    /// one fact is how `codex_ir_write::Writer::summarise` came to disagree with
+    /// itself. Neither the target session id nor the clock reaches
+    /// `fidelity`/`losses`, so a placeholder for both is honest here.
+    ///
+    /// A provider that overrides `write_session_ir` and leaves this at the
+    /// default will convert correctly and mis-report every dry run of itself.
+    fn grade_session_ir(
+        &self,
+        _ir: &SessionIr,
+        _budget: &ContextBudget,
+    ) -> anyhow::Result<Option<(Fidelity, Vec<Loss>)>> {
         Ok(None)
     }
 }

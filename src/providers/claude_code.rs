@@ -604,6 +604,24 @@ impl Provider for ClaudeCode {
             losses: rendered.losses,
         }))
     }
+
+    /// The first half of `write_session_ir`, stopped before the file is placed.
+    ///
+    /// Neither the session id nor the timestamp reaches `fidelity` or `losses`
+    /// — they only fill envelope fields — so the placeholders below cost the
+    /// answer nothing, and nothing here touches the filesystem.
+    fn grade_session_ir(
+        &self,
+        ir: &SessionIr,
+        budget: &crate::budget::ContextBudget,
+    ) -> anyhow::Result<Option<(crate::ir::Fidelity, Vec<crate::ir::Loss>)>> {
+        let Some(rendered) =
+            super::claude_code_ir_write::render(ir, "dry-run", chrono::Utc::now(), budget)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((rendered.fidelity, rendered.losses)))
+    }
 }
 
 // ---------------------------------------------------------------------------

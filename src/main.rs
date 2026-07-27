@@ -16,6 +16,7 @@ use rayon::prelude::*;
 use rich_rust::prelude::{Cell, Column, Console, JustifyMethod, Row, Style, Table};
 use tracing_subscriber::EnvFilter;
 
+use casr::budget::ContextBudget;
 use casr::discovery::ProviderRegistry;
 use casr::ir::Fidelity;
 use casr::launch::{LaunchSpec, SessionTargeting};
@@ -86,25 +87,36 @@ enum Command {
         #[arg(long)]
         enrich: bool,
 
-        /// Cap the transferred history at roughly this many tokens (0 = unlimited).
-        /// Applies to cross-provider conversions on both tracks; the oldest
-        /// turns are dropped first and the most recent history is kept. The
-        /// flat track also pins the original task message; the structured track
-        /// keeps a plain suffix and reports everything it dropped as a loss.
-        #[arg(long, default_value = "200000")]
-        max_context_tokens: usize,
+        /// Cap the transferred history at roughly this many tokens (0 = no cap).
+        /// Off unless you pass it: with neither --max-context-tokens nor
+        /// --max-tool-output the whole session crosses untrimmed. Applies to
+        /// cross-provider conversions on both tracks; the oldest turns are
+        /// dropped first and the most recent history is kept. The flat track
+        /// also pins the original task message; the structured track keeps a
+        /// plain suffix and reports everything it dropped as a loss.
+        #[arg(long)]
+        max_context_tokens: Option<usize>,
 
         /// Truncate each tool result/observation to this many characters
-        /// (0 = unlimited). Tool output is usually the bulk of a long session,
-        /// so this often removes the need to drop any turn at all.
-        #[arg(long, default_value = "4000")]
-        max_tool_output: usize,
-
-        /// Keep the source agent's reasoning traces (dropped by default for
-        /// cross-agent handoffs, since the target can't use another agent's
-        /// hidden reasoning). Not an exemption from --max-context-tokens:
-        /// reasoning that belongs to a turn the cap removes goes with the turn.
+        /// (0 = no cap). Off unless you pass it. Tool output is usually the bulk
+        /// of a long session, so this often removes the need to drop any turn at
+        /// all.
         #[arg(long)]
+        max_tool_output: Option<usize>,
+
+        /// Drop the source agent's reasoning traces. Off unless you pass it,
+        /// and never implied by the two caps above: a limit on tool output is
+        /// not a request to delete reasoning. Worth passing for a cross-agent
+        /// handoff, where the target cannot replay another agent's hidden
+        /// reasoning anyway and it is the cheapest thing to give up.
+        #[arg(long)]
+        drop_reasoning: bool,
+
+        /// Accepted, and does nothing: keeping reasoning is the default. It used
+        /// to be the opt-in half of an inverted pair, so existing command lines
+        /// still work and still get what they asked for. To drop reasoning, say
+        /// so with --drop-reasoning.
+        #[arg(long, conflicts_with = "drop_reasoning")]
         keep_reasoning: bool,
 
         /// Start the target agent on the converted session instead of printing
@@ -342,7 +354,11 @@ fn main() -> ExitCode {
             enrich,
             max_context_tokens,
             max_tool_output,
-            keep_reasoning,
+            drop_reasoning,
+            // Accepted for compatibility and deliberately unread: it names the
+            // default, and `conflicts_with` has already refused the one command
+            // line where reading it could change an answer.
+            keep_reasoning: _,
             launch,
             launch_dry_run,
             launch_anyway,
@@ -357,7 +373,7 @@ fn main() -> ExitCode {
             enrich,
             max_context_tokens,
             max_tool_output,
-            keep_reasoning,
+            drop_reasoning,
             no_store,
             cli.json,
             LaunchRequest {
@@ -562,9 +578,9 @@ fn cmd_resume(
     force: bool,
     source: Option<String>,
     enrich: bool,
-    max_context_tokens: usize,
-    max_tool_output: usize,
-    keep_reasoning: bool,
+    max_context_tokens: Option<usize>,
+    max_tool_output: Option<usize>,
+    drop_reasoning: bool,
     no_store: bool,
     json_mode: bool,
     launch: LaunchRequest,
@@ -585,9 +601,9 @@ fn cmd_resume(
         verbose: false,
         enrich,
         source_hint: source,
-        max_context_tokens,
-        max_tool_output,
-        keep_reasoning,
+        // Absent flags mean an absent budget. A converter graded on fidelity
+        // does not trim a session nobody asked it to trim.
+        budget: ContextBudget::requested(max_context_tokens, max_tool_output, drop_reasoning),
     };
 
     let result = pipeline.convert(target, &session_id, opts)?;

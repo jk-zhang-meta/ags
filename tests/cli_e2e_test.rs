@@ -2051,24 +2051,23 @@ fn cli_resume_structured_track_honours_the_context_budget() {
     assert_eq!(lines, 1, "only the newest turn was in budget");
 }
 
-/// The same conversion with the budget switched off, as the contrast.
+/// The same conversion with no budget flags at all, as the contrast.
+///
+/// Naming no flag is the whole test. The caps shipped as defaults —
+/// `--max-context-tokens 200000 --max-tool-output 4000`, with reasoning dropped
+/// unless `--keep-reasoning` was passed — so a plain `resume` trimmed every
+/// conversion it ran. Over the local corpus that removed something from 815 of
+/// 832 sessions and deleted conversation outright from 147 of them, graded
+/// `HistoryIncomplete`, which is the grade `--launch` refuses on. A converter
+/// whose product is fidelity does not trim a session nobody asked it to trim,
+/// so this asserts the untouched command carries the whole replay.
 #[test]
 fn cli_resume_structured_track_without_flags_carries_everything() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_complex");
 
     let output = casr_cmd(&tmp)
-        .args([
-            "--json",
-            "resume",
-            "cod",
-            &session_id,
-            "--max-context-tokens",
-            "0",
-            "--max-tool-output",
-            "0",
-            "--keep-reasoning",
-        ])
+        .args(["--json", "resume", "cod", &session_id])
         .output()
         .expect("resume should run");
 
@@ -2093,6 +2092,166 @@ fn cli_resume_structured_track_without_flags_carries_everything() {
         .filter(|line| line.contains("response_item"))
         .count();
     assert!(lines > 1, "the whole replay crossed, {lines} events");
+}
+
+/// The flat track's half of the same promise, both ways round.
+///
+/// The nineteen providers with no structured writer are budgeted in the pipeline
+/// rather than in a writer, from the same [`ContextBudget`] — so "off unless
+/// asked" has to hold on that path too, and asking still has to work. Measured
+/// over the local corpus the shipped `--max-tool-output 4000` default elided
+/// 11,206 tool observations across 747 of 833 sessions on this track alone,
+/// which is what makes the first half of this test worth having.
+#[test]
+fn cli_resume_flat_track_budget_is_opt_in() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_complex");
+
+    let plain = casr_cmd(&tmp)
+        .args(["--json", "resume", "gmi", &session_id, "--no-store"])
+        .output()
+        .expect("resume should run");
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    let plain: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&plain.stdout))
+        .expect("resume --json should emit valid JSON");
+    assert_eq!(
+        plain["warnings"]
+            .as_array()
+            .expect("warnings array")
+            .iter()
+            .filter(|warning| {
+                let warning = warning.as_str().unwrap_or_default();
+                warning.contains("Truncated") || warning.contains("Context budget")
+            })
+            .count(),
+        0,
+        "no flag was given, so nothing may be trimmed: {}",
+        plain["warnings"]
+    );
+
+    let asked = casr_cmd(&tmp)
+        .args([
+            "--json",
+            "resume",
+            "gmi",
+            &session_id,
+            "--no-store",
+            "--force",
+            "--max-tool-output",
+            "20",
+        ])
+        .output()
+        .expect("resume should run");
+    assert!(
+        asked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&asked.stderr)
+    );
+    let asked: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&asked.stdout))
+        .expect("resume --json should emit valid JSON");
+    let losses = asked["losses"].as_array().expect("losses array");
+    assert!(
+        losses.iter().any(|loss| {
+            loss["kind"] == "tool_protocol"
+                && loss["events"].as_u64().unwrap_or(0) > 0
+                && loss["grade"] == "conversation_only"
+        }),
+        "and when it is given, the trim is still counted as a loss: {asked}"
+    );
+}
+
+/// Reasoning survives unless someone writes down that it should not.
+///
+/// The caps were made opt-in first, and reasoning was left riding along on them
+/// — so `--max-tool-output`, a command line about oversized tool output, still
+/// deleted every reasoning event in the session. Over the local corpus that was
+/// 35,303 events and 88.6 MB of sealed capsules, removed because a flag was
+/// *absent*, which is the same defect one flag over. The inverted sense had to
+/// go with it: an absent `--keep-reasoning` cannot mean "delete".
+///
+/// `--keep-reasoning` stays accepted so that an existing casr command line does
+/// not start erroring, and it now names the default. Passing both is a genuine
+/// contradiction and is refused rather than resolved by picking one.
+#[test]
+fn cli_resume_reasoning_is_kept_unless_dropping_is_asked_for() {
+    /// The reasoning losses a conversion reported, by their note.
+    fn reasoning_notes(args: &[&str]) -> Vec<String> {
+        let tmp = TempDir::new().unwrap();
+        let session_id = setup_codex_fixture(&tmp, "codex_reasoning", "jsonl");
+        let mut argv: Vec<String> = vec!["--json".into(), "resume".into(), "cc".into(), session_id];
+        argv.extend(args.iter().map(|a| (*a).to_string()));
+        let output = casr_cmd(&tmp)
+            .args(&argv)
+            .output()
+            .expect("resume should run");
+        assert!(
+            output.status.success(),
+            "{argv:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+                .expect("resume --json should emit valid JSON");
+        parsed["losses"]
+            .as_array()
+            .expect("losses array")
+            .iter()
+            .filter(|loss| loss["kind"] == "reasoning")
+            .map(|loss| loss["note"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    assert!(
+        reasoning_notes(&[]).is_empty(),
+        "nothing was asked for, so nothing is dropped"
+    );
+    assert!(
+        reasoning_notes(&["--max-tool-output", "20"]).is_empty(),
+        "a cap on tool output is not a request to delete reasoning"
+    );
+    assert!(
+        reasoning_notes(&["--max-context-tokens", "100000"]).is_empty(),
+        "nor is a token cap this session fits inside"
+    );
+    assert!(
+        reasoning_notes(&["--keep-reasoning"]).is_empty(),
+        "the compatibility flag asks for the default and still gets it"
+    );
+
+    let dropped = reasoning_notes(&["--drop-reasoning"]);
+    assert_eq!(dropped.len(), 1, "asking removes it: {dropped:?}");
+    assert!(
+        dropped[0].contains("--drop-reasoning"),
+        "and the note names the request rather than advising a flag that would do \
+         nothing: {dropped:?}"
+    );
+
+    // Contradictory, so refused — clap's own usage error, exit code 2.
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_codex_fixture(&tmp, "codex_reasoning", "jsonl");
+    let both = casr_cmd(&tmp)
+        .args([
+            "resume",
+            "cc",
+            &session_id,
+            "--keep-reasoning",
+            "--drop-reasoning",
+        ])
+        .output()
+        .expect("resume should run");
+    assert!(
+        !both.status.success(),
+        "keeping and dropping reasoning at once is not a request that can be honoured"
+    );
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("--drop-reasoning"),
+        "and the refusal has to name the pair: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------

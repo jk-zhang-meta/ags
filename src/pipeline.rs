@@ -89,46 +89,32 @@ pub struct ConvertOptions {
     pub verbose: bool,
     pub enrich: bool,
     pub source_hint: Option<String>,
-    /// Cap the transferred history at roughly this many tokens (0 = unlimited).
-    /// Applied only to cross-provider conversions; mirrors the source agent's
-    /// live context rather than its full archive.
-    pub max_context_tokens: usize,
-    /// Truncate each tool result/observation to this many characters (0 = unlimited).
-    pub max_tool_output: usize,
-    /// Keep source-agent reasoning traces (dropped by default for cross-agent
-    /// handoffs since the target agent cannot use another agent's hidden reasoning).
-    pub keep_reasoning: bool,
-}
-
-impl ConvertOptions {
-    /// The three context-budget flags, as the structured track takes them.
+    /// How much of the session the caller allowed across, applied only to
+    /// cross-provider conversions.
     ///
-    /// The flat track reads the fields directly (see [`apply_context_budget`]);
-    /// the structured track needs them as one value because they travel through
-    /// [`Provider::write_session_ir`] into the writers. One conversion in one
-    /// place, so the two tracks cannot drift into disagreeing about what
-    /// "`--max-tool-output 0`" means.
-    pub fn budget(&self) -> crate::budget::ContextBudget {
-        crate::budget::ContextBudget {
-            max_context_tokens: self.max_context_tokens,
-            max_tool_output: self.max_tool_output,
-            keep_reasoning: self.keep_reasoning,
-        }
-    }
+    /// One value rather than the three flags it is made of, because both tracks
+    /// consume it — the flat track reads its fields in [`apply_context_budget`],
+    /// the structured track hands it whole to [`Provider::write_session_ir`] —
+    /// and two copies of the same three numbers is how the tracks would drift
+    /// into disagreeing about what "`--max-tool-output 0`" means.
+    ///
+    /// [`crate::budget::ContextBudget::UNLIMITED`] is the default and is what a
+    /// caller who named no flag gets: nothing is trimmed and no loss is
+    /// reported. See [`crate::budget::ContextBudget::requested`].
+    pub budget: crate::budget::ContextBudget,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
-        // No-op budgeting by default; the CLI layer supplies the smart caps.
         ConvertOptions {
             dry_run: false,
             force: false,
             verbose: false,
             enrich: false,
             source_hint: None,
-            max_context_tokens: 0,
-            max_tool_output: 0,
-            keep_reasoning: true,
+            // Trimming is something the caller asks for. A conversion nobody
+            // constrained carries the whole session.
+            budget: crate::budget::ContextBudget::UNLIMITED,
         }
     }
 }
@@ -564,35 +550,13 @@ but resume may fail until the CLI is installed.",
             ));
         }
 
-        // 6. Dry-run short-circuit.
-        if opts.dry_run {
-            info!("dry run — skipping write and verify");
-            // Nothing was written, so there is no writer to ask for a grade.
-            // What a dry run can honestly report is what the flat projection
-            // would earn, which is also the only track available until a
-            // structured writer exists for the target.
-            let source_ir = read_source_ir(resolved.provider, &resolved.path);
-            if let Err(detail) = &source_ir {
-                all_warnings.push(detail.clone());
-            }
-            let (fidelity, losses) = flat_fidelity(
-                source_ir.as_ref().map(Option::as_ref).map_err(String::as_str),
-                target_provider.slug(),
-            );
-            return Ok(ConversionResult {
-                source_provider: resolved.provider.slug().to_string(),
-                target_provider: target_provider.slug().to_string(),
-                canonical_session: canonical,
-                written: None,
-                warnings: all_warnings,
-                fidelity,
-                losses,
-                verified_fidelity: None,
-                source: selection,
-            });
-        }
-
-        // 7. Same-provider short-circuit.
+        // 6. Same-provider short-circuit.
+        //
+        // Ahead of the dry-run branches rather than behind them, which is where
+        // it used to be: a dry run of a same-provider conversion reported
+        // whatever the flat projection would have earned, for a conversion that
+        // never happens. Predicting the wrong path is the defect the dry run
+        // below was rewritten to fix, and this is the first place it occurred.
         if !opts.enrich && resolved.provider.slug() == target_provider.slug() {
             info!("source and target provider are the same — skipping write and verify");
             all_warnings.push(
@@ -663,7 +627,7 @@ but resume may fail until the CLI is installed.",
         // can keep the promise. A lower grade for an enriched conversion is a
         // true statement; the alternative was a higher one that was false.
         let write_opts = WriteOptions { force: opts.force };
-        let budget = opts.budget();
+        let budget = opts.budget;
         let source_ir = read_source_ir(resolved.provider, &resolved.path);
         if let Err(detail) = &source_ir {
             all_warnings.push(detail.clone());
@@ -678,93 +642,146 @@ but resume may fail until the CLI is installed.",
         if !opts.enrich
             && target_provider.supports_structured_write()
             && let Ok(Some(ir)) = source_ir.as_ref()
-            && let Some(StructuredWrite {
+        {
+            // 7a1a. A dry run stops here, on the track it just selected.
+            //
+            // Inside the same `if` as the real write, and gated on the same
+            // three conditions, because the answer a dry run owes the user is
+            // "what will *this* conversion cost" — a prediction computed from a
+            // second, parallel decision is a prediction of a different
+            // conversion. [`Provider::grade_session_ir`] declines for exactly
+            // the reason `write_session_ir` does, so the fall-through below
+            // matches too.
+            if opts.dry_run {
+                if let Some((fidelity, losses)) = target_provider.grade_session_ir(ir, &budget)? {
+                    info!(?fidelity, "dry run graded on the structured track");
+                    return Ok(ConversionResult {
+                        source_provider: resolved.provider.slug().to_string(),
+                        target_provider: target_provider.slug().to_string(),
+                        canonical_session: canonical,
+                        written: None,
+                        warnings: all_warnings,
+                        fidelity,
+                        losses,
+                        // Nothing was written, so nothing could be read back.
+                        // The one thing a dry run cannot promise, and it says so
+                        // by leaving this `None` rather than by guessing.
+                        verified_fidelity: None,
+                        source: selection,
+                    });
+                }
+            } else if let Some(StructuredWrite {
                 written,
                 fidelity,
                 losses,
-            }) =
-                target_provider.write_session_ir(ir, &write_opts, &budget)?
-        {
-            info!(
-                target_session_id = written.session_id,
-                ?fidelity,
-                "session written on the structured track"
-            );
-            all_warnings.extend(written.warnings.iter().cloned());
+            }) = target_provider.write_session_ir(ir, &write_opts, &budget)?
+            {
+                info!(
+                    target_session_id = written.session_id,
+                    ?fidelity,
+                    "session written on the structured track"
+                );
+                all_warnings.extend(written.warnings.iter().cloned());
 
-            // 7a1b. Structural read-back verification.
-            //
-            // The flat verifier cannot be reused here: it compares the target's
-            // `read_session` against `canonical`, and `canonical` is not what
-            // was written — a structured write that legitimately preserved more
-            // than the projection would fail it. So the file is read back
-            // through `read_session_ir` and compared IR to IR by
-            // [`crate::compare`], whose whole point is that it can tell a
-            // predicted vendor-boundary drop from a hole.
-            let verified_fidelity;
-            match verify_structured_write(target_provider, ir, &budget, &written, fidelity) {
-                Ok((notes, observed)) => {
-                    all_warnings.extend(notes);
-                    verified_fidelity = observed;
-                }
-                Err(detail) => {
-                    warn!(detail, "structured read-back verification failed");
-                    let rollback_detail =
-                        match rollback_written_session(target_provider.slug(), &written) {
-                            Ok(()) => "rollback succeeded".to_string(),
-                            Err(rollback_error) => format!("rollback failed: {rollback_error}"),
-                        };
-                    return Err(CasrError::VerifyFailed {
-                        provider: target_provider.slug().to_string(),
-                        written_paths: written.paths.clone(),
-                        detail: format!("{detail}; {rollback_detail}"),
+                // 7a1b. Structural read-back verification.
+                //
+                // The flat verifier cannot be reused here: it compares the target's
+                // `read_session` against `canonical`, and `canonical` is not what
+                // was written — a structured write that legitimately preserved more
+                // than the projection would fail it. So the file is read back
+                // through `read_session_ir` and compared IR to IR by
+                // [`crate::compare`], whose whole point is that it can tell a
+                // predicted vendor-boundary drop from a hole.
+                let verified_fidelity;
+                match verify_structured_write(target_provider, ir, &budget, &written, fidelity) {
+                    Ok((notes, observed)) => {
+                        all_warnings.extend(notes);
+                        verified_fidelity = observed;
                     }
-                    .into());
+                    Err(detail) => {
+                        warn!(detail, "structured read-back verification failed");
+                        let rollback_detail =
+                            match rollback_written_session(target_provider.slug(), &written) {
+                                Ok(()) => "rollback succeeded".to_string(),
+                                Err(rollback_error) => format!("rollback failed: {rollback_error}"),
+                            };
+                        return Err(CasrError::VerifyFailed {
+                            provider: target_provider.slug().to_string(),
+                            written_paths: written.paths.clone(),
+                            detail: format!("{detail}; {rollback_detail}"),
+                        }
+                        .into());
+                    }
                 }
+
+                // 7a1c. Tell the store what we just wrote.
+                //
+                // After verification, never before it: a record of a conversion is a
+                // measurement of an event that happened, and a write that was rolled
+                // back did not happen.
+                self.record_write(
+                    selection.as_ref(),
+                    target_provider,
+                    &written,
+                    fidelity,
+                    &losses,
+                    &mut all_warnings,
+                );
+
+                return Ok(ConversionResult {
+                    source_provider: resolved.provider.slug().to_string(),
+                    target_provider: target_provider.slug().to_string(),
+                    canonical_session: canonical,
+                    written: Some(written),
+                    warnings: all_warnings,
+                    fidelity,
+                    losses,
+                    verified_fidelity,
+                    source: selection,
+                });
             }
-
-            // 7a1c. Tell the store what we just wrote.
-            //
-            // After verification, never before it: a record of a conversion is a
-            // measurement of an event that happened, and a write that was rolled
-            // back did not happen.
-            self.record_write(
-                selection.as_ref(),
-                target_provider,
-                &written,
-                fidelity,
-                &losses,
-                &mut all_warnings,
-            );
-
-            return Ok(ConversionResult {
-                source_provider: resolved.provider.slug().to_string(),
-                target_provider: target_provider.slug().to_string(),
-                canonical_session: canonical,
-                written: Some(written),
-                warnings: all_warnings,
-                fidelity,
-                losses,
-                verified_fidelity,
-                source: selection,
-            });
         }
 
         // 7a2. Context budget (cross-provider only — same-provider short-circuited above).
         //
         // The Codex reader already collapses the on-disk archive to the live
         // context (honoring compaction). This step keeps that context inside a
-        // target-friendly budget: drop the source agent's hidden reasoning,
-        // truncate oversized tool observations, then drop the oldest turns if
+        // target-friendly budget: drop the source agent's hidden reasoning if
+        // asked, truncate oversized tool observations, then drop the oldest turns if
         // still over the token cap — preserving the original task message and
         // the most recent history, and never severing tool_use/tool_result pairs.
-        let (budget_warnings, budget_losses) = apply_context_budget(
-            &mut canonical,
-            opts.max_context_tokens,
-            opts.max_tool_output,
-            opts.keep_reasoning,
-        );
+        //
+        // The same `budget` the structured branch above hands its writer, so the
+        // two tracks cannot answer "was a budget asked for?" differently. When
+        // none was, it is `UNLIMITED` and this step removes nothing.
+        let (budget_warnings, budget_losses) = apply_context_budget(&mut canonical, &budget);
         all_warnings.extend(budget_warnings);
+
+        // The projection's own grade, then everything the budget removed on top
+        // of it. Settled here rather than after the write because nothing below
+        // this line can change it — which is what lets a dry run return the same
+        // two values without writing anything.
+        let (fidelity, losses) = flat_grade(&source_ir, target_provider.slug(), budget_losses);
+
+        // 7a3. A dry run stops here, on the flat track.
+        //
+        // Below this point is only placement: normalization shapes `canonical`
+        // for a writer that will not run, and the write and its read-back cannot
+        // happen at all. The grade above is the one the real conversion reports.
+        if opts.dry_run {
+            info!(?fidelity, "dry run graded on the flat track");
+            return Ok(ConversionResult {
+                source_provider: resolved.provider.slug().to_string(),
+                target_provider: target_provider.slug().to_string(),
+                canonical_session: canonical,
+                written: None,
+                warnings: all_warnings,
+                fidelity,
+                losses,
+                verified_fidelity: None,
+                source: selection,
+            });
+        }
 
         // 7b. Normalize tool-only messages with empty content.
         //
@@ -874,19 +891,6 @@ but resume may fail until the CLI is installed.",
                     .into());
                 }
             }
-        }
-
-        // The projection's own grade, then everything the budget removed on top
-        // of it. Folded rather than accumulated separately: a `Fidelity` is the
-        // worst of its losses, and a budget that deleted turns has to be able to
-        // make the grade worse than the projection alone would.
-        let (mut fidelity, mut losses) = flat_fidelity(
-            source_ir.as_ref().map(Option::as_ref).map_err(String::as_str),
-            target_provider.slug(),
-        );
-        for loss in budget_losses {
-            fidelity = fidelity.worse_of(loss.grade);
-            losses.push(loss);
         }
 
         self.record_write(
@@ -1336,6 +1340,36 @@ fn verify_structured_write(
 /// parse. Graded at the worst it could be, with the counts left at zero and the
 /// note saying plainly that nothing was measured — the grade is a floor on how
 /// bad this might be, not a finding.
+/// The whole flat-track grade: the projection's own, plus the budget's.
+///
+/// Folded rather than accumulated separately: a [`Fidelity`] is the worst of its
+/// losses, and a budget that deleted turns has to be able to make the grade
+/// worse than the projection alone would.
+///
+/// Extracted so that the flat dry run and the flat write cannot report different
+/// numbers. They used to: the dry run returned before the budget ran and graded
+/// with [`flat_fidelity`] alone, so `--dry-run --max-context-tokens N` promised
+/// a grade the same command without `--dry-run` would not produce, to precisely
+/// the user asking whether that `N` was survivable.
+fn flat_grade(
+    source_ir: &Result<Option<SessionIr>, String>,
+    target_slug: &str,
+    budget_losses: Vec<Loss>,
+) -> (Fidelity, Vec<Loss>) {
+    let (mut fidelity, mut losses) = flat_fidelity(
+        source_ir
+            .as_ref()
+            .map(Option::as_ref)
+            .map_err(String::as_str),
+        target_slug,
+    );
+    for loss in budget_losses {
+        fidelity = fidelity.worse_of(loss.grade);
+        losses.push(loss);
+    }
+    (fidelity, losses)
+}
+
 fn flat_fidelity(
     ir: Result<Option<&SessionIr>, &str>,
     target_slug: &str,
@@ -1542,13 +1576,20 @@ fn repair_tool_pairing(
 
 /// Fit a (cross-provider) session into a target-friendly context budget while
 /// preserving its meaning. Steps, in order:
-/// 1. Drop the source agent's hidden reasoning traces (another agent can't use them).
+/// 1. Drop the source agent's hidden reasoning traces, if `--drop-reasoning`
+///    asked. Never implied by either cap.
 /// 2. Truncate oversized tool observations.
 /// 3. Drop the oldest turns (excluding the first task message) if still over budget.
 /// 4. Repair orphaned tool_use/tool_result pairs that result from the dropping.
 ///
 /// Returns human-readable notes about what was elided — never silent — and the
 /// [`Loss`] values behind them.
+///
+/// [`crate::budget::ContextBudget::UNLIMITED`] — what a caller who named no flag
+/// gets — leaves every one of steps 1-3 switched off, so nothing is removed,
+/// nothing is truncated, and both returned lists come back empty. Step 4 still
+/// runs and is a no-op by construction: with nothing dropped, every id it can
+/// see either still pairs or was already in `already_unpaired`.
 ///
 /// # Why the losses exist as well as the notes
 ///
@@ -1567,10 +1608,13 @@ fn repair_tool_pairing(
 /// model was shown, so it grades [`Fidelity::HistoryIncomplete`].
 fn apply_context_budget(
     canonical: &mut CanonicalSession,
-    max_tokens: usize,
-    max_tool_output: usize,
-    keep_reasoning: bool,
+    budget: &crate::budget::ContextBudget,
 ) -> (Vec<String>, Vec<Loss>) {
+    let crate::budget::ContextBudget {
+        max_context_tokens: max_tokens,
+        max_tool_output,
+        keep_reasoning,
+    } = *budget;
     let mut warnings = Vec::new();
     let mut losses = Vec::new();
 
@@ -1591,9 +1635,11 @@ fn apply_context_budget(
         });
         let dropped = before - canonical.messages.len();
         if dropped > 0 {
-            let note = format!(
-                "Dropped {dropped} source reasoning trace(s); pass --keep-reasoning to retain."
-            );
+            // Reached only when `--drop-reasoning` was passed — step 1 does not
+            // run otherwise — so the note names the request rather than
+            // advising a flag whose effect the caller is already getting.
+            let note =
+                format!("Dropped {dropped} source reasoning trace(s), as --drop-reasoning asked.");
             warnings.push(note.clone());
             losses.push(Loss {
                 kind: LossKind::Reasoning,
@@ -2155,6 +2201,7 @@ fn preserve_original(target: &Path) -> std::io::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budget::ContextBudget;
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -2499,7 +2546,14 @@ mod tests {
         let task = budget_msg(MessageRole::User, "task");
         let mut s = budget_session(vec![task, call, tool, reasoning]);
 
-        let (warns, _) = apply_context_budget(&mut s, 0, 4000, false);
+        let (warns, _) = apply_context_budget(
+            &mut s,
+            &ContextBudget {
+                max_context_tokens: 0,
+                max_tool_output: 4_000,
+                keep_reasoning: false,
+            },
+        );
 
         // Reasoning was dropped.
         assert!(
@@ -2548,7 +2602,13 @@ mod tests {
         let before = msgs.len();
         let mut s = budget_session(msgs);
 
-        let (warns, _) = apply_context_budget(&mut s, 2000, 0, true);
+        let (warns, _) = apply_context_budget(
+            &mut s,
+            &ContextBudget {
+                max_context_tokens: 2_000,
+                ..ContextBudget::UNLIMITED
+            },
+        );
 
         assert!(s.messages.len() < before, "older turns should be dropped");
         assert_eq!(
@@ -2584,7 +2644,7 @@ mod tests {
         // turn, on every conversion, with no warning and no `Loss`.
         let mut s = budget_session(vec![budget_msg(MessageRole::User, "hi"), call]);
 
-        let (warnings, losses) = apply_context_budget(&mut s, 0, 0, true);
+        let (warnings, losses) = apply_context_budget(&mut s, &ContextBudget::UNLIMITED);
 
         assert_eq!(
             s.messages.len(),
@@ -2625,7 +2685,13 @@ mod tests {
 
         // Small enough to drop the expensive call, large enough to keep the
         // cheap result that answered it.
-        let (_warnings, losses) = apply_context_budget(&mut s, 300, 0, true);
+        let (_warnings, losses) = apply_context_budget(
+            &mut s,
+            &ContextBudget {
+                max_context_tokens: 300,
+                ..ContextBudget::UNLIMITED
+            },
+        );
 
         assert!(
             losses.iter().any(|loss| loss.kind == LossKind::Conversation
@@ -2636,6 +2702,83 @@ mod tests {
             losses.iter().any(|loss| loss.kind == LossKind::ToolProtocol
                 && loss.grade == Fidelity::HistoryIncomplete),
             "and severing its result from it is a second one: {losses:?}"
+        );
+    }
+
+    /// A budget nobody asked for removes nothing — on a session that a budget
+    /// somebody asked for would visibly cut.
+    ///
+    /// The caps shipped as clap defaults: `--max-context-tokens 200000
+    /// --max-tool-output 4000`, with reasoning dropped unless `--keep-reasoning`
+    /// was passed. So every conversion carried a budget, and on the local corpus
+    /// that was not theoretical — 747 of 833 sessions were trimmed on this
+    /// track, ten of them losing 12,202 whole messages, which grades
+    /// [`Fidelity::HistoryIncomplete`] and makes `--launch` refuse. The fixture
+    /// below is that shape, and the two halves of this test are the two things
+    /// the change has to keep true at once: absence removes nothing, and asking
+    /// still works and is still counted.
+    #[test]
+    fn an_unrequested_budget_removes_nothing() {
+        use crate::model::ToolResult;
+
+        let mut oversized = budget_msg(MessageRole::Tool, "");
+        oversized.tool_results.push(ToolResult {
+            call_id: None,
+            content: "y".repeat(50_000),
+            is_error: false,
+        });
+        let mut reasoning = budget_msg(MessageRole::Assistant, "secret thoughts");
+        reasoning.author = Some("reasoning".into());
+
+        let mut messages = vec![budget_msg(MessageRole::User, "the original task")];
+        for _ in 0..40 {
+            messages.push(budget_msg(MessageRole::Assistant, &"word ".repeat(5_000)));
+        }
+        messages.push(oversized);
+        messages.push(reasoning);
+        messages.push(budget_msg(MessageRole::User, "and now this"));
+
+        assert!(
+            ConvertOptions::default().budget.is_unlimited(),
+            "a conversion nobody constrained carries the whole session"
+        );
+
+        let mut untouched = budget_session(messages.clone());
+        let (warnings, losses) =
+            apply_context_budget(&mut untouched, &ConvertOptions::default().budget);
+        // Renumbering is not removal, and it happens to every conversion.
+        let mut expected = messages.clone();
+        reindex_messages(&mut expected);
+        assert_eq!(
+            untouched.messages, expected,
+            "an absent budget may not drop, truncate or reorder a single message"
+        );
+        assert!(warnings.is_empty(), "and reports nothing: {warnings:?}");
+        assert!(losses.is_empty(), "and loses nothing: {losses:?}");
+
+        let mut asked = budget_session(messages);
+        let (warnings, losses) = apply_context_budget(
+            &mut asked,
+            &ContextBudget {
+                max_context_tokens: 200_000,
+                max_tool_output: 4_000,
+                keep_reasoning: false,
+            },
+        );
+        assert!(
+            asked.messages.len() < untouched.messages.len(),
+            "the same caps, asked for, still cut this session"
+        );
+        assert!(!warnings.is_empty(), "and still say so");
+        assert!(
+            losses.iter().any(|loss| loss.kind == LossKind::Conversation
+                && loss.grade == Fidelity::HistoryIncomplete),
+            "and a dropped turn still grades the conversion down: {losses:?}"
+        );
+        assert!(
+            losses.iter().any(|loss| loss.kind == LossKind::Reasoning
+                && loss.grade == Fidelity::ContextNoReasoning),
+            "and dropped reasoning is still counted: {losses:?}"
         );
     }
 }

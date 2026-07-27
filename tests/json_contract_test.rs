@@ -1198,13 +1198,92 @@ fn contract_resume_json_dry_run_cc_to_codex() {
     assert!(parsed["target_session_id"].is_null());
     assert!(parsed["written_paths"].is_null());
     assert!(parsed["resume_command"].is_null());
-    // The flat projection keeps roles and tool-call structure but not the
-    // protocol around them, and this session has nothing sealed to lose.
-    assert_eq!(parsed["fidelity"], "conversation_only");
+    // The grade of the conversion this dry run describes, which for a
+    // Claude Code → Codex pair is the structured writer's. It used to read
+    // `conversation_only` — the flat projection's grade, from a track the real
+    // run does not take. `contract_resume_json_dry_run_matches_the_real_run`
+    // pins the two together; this pins the value.
+    assert_eq!(parsed["fidelity"], "context_complete");
     // No launch was asked for. Null, not false: "not applicable" and "will not
     // resume the converted session" are different answers.
     assert!(parsed["launch_command"].is_null());
     assert!(parsed["launch_targets_session"].is_null());
+}
+
+/// A dry run has to predict the run it is a dry run of.
+///
+/// The point of `--dry-run` is to answer "what will this cost me before I let it
+/// write", so the two numbers a decision is made on — the grade and the losses
+/// behind it — must be the ones the same command line produces without the flag.
+/// They were not: the dry run returned before track selection *and* before the
+/// budget, so it answered with the flat projection's grade on every conversion,
+/// including the ones the real run hands to a structured writer and the ones a
+/// `--max-context-tokens` would gut.
+///
+/// Run across three shapes because the old branch was wrong in a different way
+/// in each: a structured pair, a flat target with a binding budget, and a
+/// same-provider conversion that is not a conversion at all.
+///
+/// `verified_fidelity` is deliberately not compared. A dry run writes nothing,
+/// so there is nothing to read back, and reporting a verification that never ran
+/// would be the same class of lie in the other direction.
+#[test]
+fn contract_resume_json_dry_run_matches_the_real_run() {
+    let grades = |args: &[&str], fixture: &str| -> (serde_json::Value, serde_json::Value) {
+        let mut out = Vec::new();
+        for dry in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let session_id = setup_cc_fixture(&tmp, fixture);
+            let mut argv: Vec<String> = vec!["--json".into(), "resume".into()];
+            argv.extend(args.iter().map(|a| (*a).to_string()));
+            argv.push(session_id);
+            if dry {
+                argv.push("--dry-run".into());
+            }
+            let output = casr_cmd(&tmp)
+                .args(&argv)
+                .output()
+                .expect("resume should run");
+            assert!(
+                output.status.success(),
+                "{argv:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+                    .expect("resume --json should emit valid JSON");
+            out.push(serde_json::json!({
+                "fidelity": parsed["fidelity"],
+                "losses": parsed["losses"],
+            }));
+        }
+        (out.remove(0), out.remove(0))
+    };
+
+    // Structured track: the writer's grade, not the projection's.
+    let (dry, real) = grades(&["cod"], "cc_simple");
+    assert_eq!(dry, real, "cc → codex, no flags");
+
+    // Flat track, with a budget small enough to delete something. This is the
+    // command line the fix is for: someone deciding whether the cap is
+    // survivable, before letting it write.
+    let (dry, real) = grades(
+        &["gmi", "--max-tool-output", "20", "--drop-reasoning"],
+        "cc_complex",
+    );
+    assert_eq!(dry, real, "cc → gemini under a binding budget");
+    assert!(
+        dry["losses"]
+            .as_array()
+            .is_some_and(|losses| !losses.is_empty()),
+        "this budget has to remove something for the comparison to test anything: {dry}"
+    );
+
+    // Same provider: nothing is converted and nothing is rewritten, and a dry
+    // run of that used to report the flat projection's grade instead.
+    let (dry, real) = grades(&["cc"], "cc_simple");
+    assert_eq!(dry, real, "cc → cc");
+    assert_eq!(dry["fidelity"], "byte_identical");
 }
 
 #[test]

@@ -2060,7 +2060,10 @@ fn the_flat_budget_grades_the_turns_it_deleted() {
             "tgt",
             "sid-budget",
             ConvertOptions {
-                max_context_tokens: 300,
+                budget: ContextBudget {
+                    max_context_tokens: 300,
+                    ..ContextBudget::UNLIMITED
+                },
                 ..ConvertOptions::default()
             },
         )
@@ -2178,7 +2181,10 @@ fn pairing_repair_reports_the_pairs_the_budget_broke() {
             "tgt",
             "sid-severed",
             ConvertOptions {
-                max_context_tokens: 300,
+                budget: ContextBudget {
+                    max_context_tokens: 300,
+                    ..ContextBudget::UNLIMITED
+                },
                 ..ConvertOptions::default()
             },
         )

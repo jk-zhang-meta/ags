@@ -398,6 +398,9 @@ impl Provider for Codex {
     /// what goes *in* the file. `Ok(None)` when the replay is empty, so the
     /// caller falls back to the flat projection rather than registering a
     /// thread that resumes into nothing.
+    ///
+    /// The grade half of this is [`Provider::grade_session_ir`], which stops
+    /// after the render below; a dry run takes that and nothing else.
     fn write_session_ir(
         &self,
         ir: &SessionIr,
@@ -479,6 +482,25 @@ impl Provider for Codex {
             fidelity: rendered.fidelity,
             losses: rendered.losses,
         }))
+    }
+
+    /// The first half of `write_session_ir`, stopped before the file is placed.
+    ///
+    /// Neither the session id nor the timestamp reaches `fidelity` or `losses`
+    /// — they only fill envelope fields — so the placeholders below cost the
+    /// answer nothing, and nothing here touches the filesystem or the thread
+    /// index.
+    fn grade_session_ir(
+        &self,
+        ir: &SessionIr,
+        budget: &crate::budget::ContextBudget,
+    ) -> anyhow::Result<Option<(crate::ir::Fidelity, Vec<crate::ir::Loss>)>> {
+        let Some(rendered) =
+            super::codex_ir_write::render(ir, "dry-run", chrono::Utc::now(), budget)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((rendered.fidelity, rendered.losses)))
     }
 }
 

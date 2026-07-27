@@ -134,15 +134,28 @@ The trait already makes this opt-in: `read_session_ir` and `write_session_ir`
 default to `Ok(None)`, so a provider joins the high-fidelity track by
 overriding them and no provider is ever rewritten to accommodate another.
 
-Override **four** methods, not two. `supports_structured_read` and
+Override **five** methods, not two. `supports_structured_read` and
 `supports_structured_write` are capability probes the pipeline asks *instead of*
 calling the method — a capability should not cost a session parse to discover —
 so a provider that implements a reader and leaves the probe at `false` is a
 provider the pipeline never asks. It will convert, silently, on the flat track.
+
+The fifth is `grade_session_ir`: the grade `write_session_ir` would earn, with
+nothing placed on disk. `--dry-run` calls it in the same branch, on the same
+three conditions, as the real write — so a dry run predicts the conversion the
+user is about to run rather than a flat one they will not. Implement it by
+returning the `fidelity` and `losses` of the *same* `render` call your writer
+uses and stopping there; deriving the grade a second way is how two sources of
+truth for one fact start covering for each other's gaps. Leave it at its default
+and your provider will convert correctly and mis-report every dry run of itself.
 A writer must also honour the `ContextBudget` it is handed, apply it over
 `model_visible` with `ContextBudget::apply`, and fold what it removes into the
 losses its grade is derived from; `ContextBudget::UNLIMITED` must produce
-byte-identical output.
+byte-identical output. `UNLIMITED` is the common case, not the exception: the
+caps are opt-in, so it is what every `resume` that named no budget flag hands
+you. That identity is measured rather than asserted — the two structured writers
+were run over all 831 readable corpus sessions against a build with the
+`ContextBudget::apply` call physically deleted, and all 1,662 renders matched.
 
 **The conformance suite comes with that override, and there is no list to add
 yourself to.** `src/conformance.rs` takes

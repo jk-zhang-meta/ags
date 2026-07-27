@@ -49,7 +49,9 @@ pub struct ContextBudget {
     pub max_context_tokens: usize,
     /// Cap on one tool observation, in characters. `0` means unlimited.
     pub max_tool_output: usize,
-    /// Keep reasoning that the target could actually replay.
+    /// Keep the source agent's reasoning. `true` unless `--drop-reasoning` was
+    /// passed, and never inferred from the caps: a cap on tool output is not a
+    /// request to delete reasoning.
     pub keep_reasoning: bool,
 }
 
@@ -72,6 +74,48 @@ impl ContextBudget {
         *self == Self::UNLIMITED
     }
 
+    /// The budget the caller asked for, one flag at a time.
+    ///
+    /// Every argument is a request to remove something, and every argument's
+    /// "not given" form removes nothing — so a caller who named no flag gets
+    /// [`ContextBudget::UNLIMITED`] by arithmetic rather than by a special case.
+    /// `None` and `Some(0)` are deliberately the same answer: both mean "no cap
+    /// on this dimension", and neither costs the session anything.
+    ///
+    /// # Why absence has to mean nothing at all
+    ///
+    /// The two caps shipped as `--max-context-tokens 200000` and
+    /// `--max-tool-output 4000` *defaults*, so every conversion carried a budget
+    /// nobody had asked for. Measured over the local corpus that was not
+    /// theoretical: 815 of 832 sessions lost something on the structured track,
+    /// 43,914 model-visible events were deleted outright, and 147 sessions had
+    /// conversation itself removed by the token cap — which grades
+    /// [`Fidelity::HistoryIncomplete`] and makes `--launch` refuse to start. A
+    /// converter whose product is fidelity may not trim by default.
+    ///
+    /// # Why reasoning is a request and not a rider
+    ///
+    /// `drop_reasoning` is its own trigger, and it is phrased as the *removal*
+    /// rather than as its opposite, because both alternatives leak. Making it a
+    /// rider on the caps — "the budget spends reasoning first" — meant
+    /// `--max-tool-output 4000`, a command line about oversized tool output,
+    /// silently deleted all 34,935 reasoning events and 88.6 MB the corpus
+    /// holds. Keeping the old inverted `--keep-reasoning` sense meant an absent
+    /// flag removed content, which is the whole defect this constructor exists
+    /// to end. So reasoning is kept unless someone writes down that they want it
+    /// gone, and writing that down is by itself enough to switch the budget on.
+    pub fn requested(
+        max_context_tokens: Option<usize>,
+        max_tool_output: Option<usize>,
+        drop_reasoning: bool,
+    ) -> ContextBudget {
+        ContextBudget {
+            max_context_tokens: max_context_tokens.unwrap_or(0),
+            max_tool_output: max_tool_output.unwrap_or(0),
+            keep_reasoning: !drop_reasoning,
+        }
+    }
+
     /// Fit `visible` into this budget, reporting everything removed.
     ///
     /// `visible` is [`SessionIr::model_visible`]'s output, oldest first, and the
@@ -91,25 +135,23 @@ impl ContextBudget {
     /// 4. **Pairing repair**, because step 3 can cut between a tool call and its
     ///    result.
     ///
-    /// # Precedence: `--keep-reasoning` against the cap
+    /// # Precedence: kept reasoning against the cap
     ///
     /// The cap wins. `max_context_tokens` describes something physical — a
     /// context window the resumed session has to fit inside — while
-    /// `keep_reasoning` is a preference about *what to sacrifice first*. So
-    /// `keep_reasoning` is not an exemption from the cap: it says only that
-    /// reasoning must not be sacrificed *ahead of* conversation. Reasoning that
-    /// belongs to a turn the cap removes goes with that turn, and is reported
-    /// as a reasoning loss when it does.
+    /// `keep_reasoning` says only that reasoning must not be sacrificed *ahead
+    /// of* conversation. It is not an exemption from the cap: reasoning that
+    /// belongs to a turn the cap removes goes with that turn, and is reported as
+    /// a reasoning loss when it does.
     ///
-    /// This is the interaction that matters, because the two flags pull in
-    /// opposite directions on purpose. Reasoning capsules are the largest and
-    /// least human-legible part of a session, which is why the cross-agent
-    /// default drops them — but they are also exactly what makes a same-vendor
-    /// resume high-fidelity, and a same-vendor writer keeps them. Letting
-    /// `keep_reasoning` veto the cap would let a flag produce a session the
-    /// target cannot load; letting the cap ignore `keep_reasoning` would throw
-    /// away the one thing the user asked to protect while cheaper material
-    /// survived.
+    /// This is the interaction that matters, because the two pull in opposite
+    /// directions on purpose. Reasoning capsules are the largest and least
+    /// human-legible part of a session, which is why `--drop-reasoning` exists
+    /// at all — but they are also exactly what makes a same-vendor resume
+    /// high-fidelity, which is why it has to be asked for. Letting
+    /// `keep_reasoning` veto the cap would let it produce a session the target
+    /// cannot load; letting the cap ignore it would throw away the one thing
+    /// left standing while cheaper material survived.
     ///
     /// # Oldest end first
     ///
@@ -176,7 +218,7 @@ impl ContextBudget {
 
         Budgeted {
             events: retained,
-            losses: dropped.losses(truncated, self.max_tool_output),
+            losses: dropped.losses(truncated, self.max_tool_output, self.keep_reasoning),
         }
     }
 
@@ -437,7 +479,13 @@ impl Dropped {
         }
     }
 
-    fn losses(&self, truncated: Tally, max_tool_output: usize) -> Vec<Loss> {
+    /// `keep_reasoning` only picks the wording of the reasoning note, and it has
+    /// to: the same tally is fed by two different events. With
+    /// `--drop-reasoning` the removal is what the caller asked for; without it
+    /// the reasoning that vanished went down with a turn the token cap took, and
+    /// telling that user to pass a flag they are already getting the effect of
+    /// would be advice that does nothing.
+    fn losses(&self, truncated: Tally, max_tool_output: usize, keep_reasoning: bool) -> Vec<Loss> {
         let mut losses = Vec::new();
         let mut push = |kind, tally: Tally, grade, note| {
             if tally.events > 0 {
@@ -488,11 +536,21 @@ impl Dropped {
             LossKind::Reasoning,
             self.reasoning,
             Fidelity::ContextNoReasoning,
-            format!(
-                "The context budget dropped {} reasoning event(s) totalling {} sealed bytes. Pass \
-                 --keep-reasoning to spend the budget on them instead of on older turns.",
-                self.reasoning.events, self.reasoning.bytes,
-            ),
+            if keep_reasoning {
+                format!(
+                    "The context budget dropped {} reasoning event(s) totalling {} sealed bytes \
+                     along with the turns they belonged to. Reasoning is kept unless \
+                     --drop-reasoning is passed, but it cannot outlive the turn the token cap \
+                     removed; raise --max-context-tokens to keep both.",
+                    self.reasoning.events, self.reasoning.bytes,
+                )
+            } else {
+                format!(
+                    "The context budget dropped {} reasoning event(s) totalling {} sealed bytes, \
+                     as --drop-reasoning asked.",
+                    self.reasoning.events, self.reasoning.bytes,
+                )
+            },
         );
         push(
             LossKind::Metadata,
@@ -612,6 +670,51 @@ mod tests {
 
     fn ids(out: &Budgeted<'_>) -> Vec<String> {
         out.events.iter().map(|event| event.id.clone()).collect()
+    }
+
+    /// Every flag is a request to remove something, and no flag removes
+    /// anything.
+    #[test]
+    fn only_a_named_flag_removes_anything() {
+        assert_eq!(
+            ContextBudget::requested(None, None, false),
+            ContextBudget::UNLIMITED,
+            "nothing was asked for, so nothing is removed"
+        );
+        assert_eq!(
+            ContextBudget::requested(Some(0), Some(0), false),
+            ContextBudget::UNLIMITED,
+            "`0` is 'no cap on this dimension', which is the same answer as not saying so — and \
+             now costs nothing either, because it no longer drags reasoning down with it"
+        );
+
+        // The trap this constructor was rewritten to close: a command line
+        // about oversized tool output must not delete the session's reasoning.
+        let tool_output_only = ContextBudget::requested(None, Some(4_000), false);
+        assert!(
+            tool_output_only.keep_reasoning,
+            "--max-tool-output is not a request to drop reasoning: {tool_output_only:?}"
+        );
+        assert!(ContextBudget::requested(Some(200_000), None, false).keep_reasoning);
+
+        assert_eq!(
+            ContextBudget::requested(None, None, true),
+            ContextBudget {
+                max_context_tokens: 0,
+                max_tool_output: 0,
+                keep_reasoning: false,
+            },
+            "--drop-reasoning is a request on its own and switches the budget on by itself"
+        );
+        assert!(!ContextBudget::requested(None, None, true).is_unlimited());
+        assert_eq!(
+            ContextBudget::requested(Some(1_000), Some(200), true),
+            ContextBudget {
+                max_context_tokens: 1_000,
+                max_tool_output: 200,
+                keep_reasoning: false,
+            }
+        );
     }
 
     #[test]

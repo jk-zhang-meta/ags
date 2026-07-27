@@ -231,6 +231,35 @@ casr cc resume <session-id> --force
 casr cc resume <session-id> --json
 ```
 
+**Context budget (opt-in).** By default nothing is trimmed: the whole session
+crosses, and anything the conversion cannot carry is reported as a loss and
+graded. Pass a cap only when you want one, and whatever it removes is still
+counted against the fidelity grade:
+
+```bash
+--max-context-tokens <n>  # Cap the transferred history (0 = no cap). Oldest turns go first.
+--max-tool-output <n>     # Elide the middle of each tool observation (0 = no cap).
+--drop-reasoning          # Drop the source agent's reasoning traces.
+```
+
+Each flag removes only what it names. `--max-tool-output` will not delete
+reasoning, and `--drop-reasoning` will not drop turns. Reasoning is worth
+dropping on a cross-agent handoff — the target cannot replay another agent's
+hidden reasoning — but that is a decision, not a side effect of asking for
+something else.
+
+`--drop-reasoning` is not an exemption from `--max-context-tokens` in reverse
+either: reasoning that belongs to a turn the token cap removes goes with that
+turn, and is reported as a reasoning loss when it does.
+
+`--keep-reasoning` is still accepted and now names the default, so an existing
+`casr` command line keeps working and keeps getting what it asked for. Passing
+it together with `--drop-reasoning` is refused.
+
+`--dry-run` grades the conversion it describes: the same track, the same budget,
+the same losses the real run would report. The one thing it cannot report is
+`verified_fidelity`, because nothing was written to read back.
+
 ### `casr list`
 
 List sessions across installed providers.
