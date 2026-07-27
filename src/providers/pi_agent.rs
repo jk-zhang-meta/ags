@@ -1,7 +1,8 @@
 //! Pi-Agent provider — reads/writes JSONL sessions with typed entries and content blocks.
 //!
 //! Session files: `~/.pi/agent/sessions/<safe-path>/<timestamp>_<uuid>.jsonl`
-//! Override root: `PI_AGENT_HOME` env var
+//! Override root: `PI_AGENT_HOME` env var (casr's own), `PI_CODING_AGENT_DIR`
+//! and `PI_CODING_AGENT_SESSION_DIR` (`pi`'s own)
 //!
 //! ## JSONL format
 //!
@@ -57,14 +58,15 @@ impl PiAgent {
     /// 3. `~/.pi/agent`.
     ///
     /// An empty value counts as unset, matching `pi`'s own truthiness check.
-    /// `pi` also honours `PI_CODING_AGENT_SESSION_DIR`, which names the sessions
-    /// directory directly; casr has no slot for it because it derives the
-    /// sessions directory from this one.
+    ///
+    /// `PI_CODING_AGENT_SESSION_DIR` is *not* consulted here, because it names
+    /// a different level — see [`Self::env_sessions_dir`].
     fn home_dir() -> PathBuf {
-        for key in ["PI_AGENT_HOME", "PI_CODING_AGENT_DIR"] {
-            if let Some(home) = std::env::var_os(key).filter(|value| !value.is_empty()) {
-                return PathBuf::from(home);
-            }
+        if let Some(home) = std::env::var_os("PI_AGENT_HOME").filter(|value| !value.is_empty()) {
+            return PathBuf::from(home);
+        }
+        if let Some(dir) = Self::pi_env_path("PI_CODING_AGENT_DIR") {
+            return dir;
         }
         dirs::home_dir()
             .unwrap_or_default()
@@ -72,23 +74,116 @@ impl PiAgent {
             .join("agent")
     }
 
+    /// A directory path read out of the environment the way `pi` reads it.
+    ///
+    /// Empty counts as unset, because `pi` gates on `if (envDir)`
+    /// (`dist/config.js:360`) and `envSessionDir ? … : undefined`
+    /// (`dist/main.js:386`), and a leading `~` is expanded, because every one of
+    /// those values then goes through `expandTildePath`
+    /// (`dist/config.js:342-348`): `~` alone becomes the home directory and
+    /// `~/rest` becomes `<home>/rest`. Nothing else is touched — `~user` is not
+    /// a form `pi` expands, so it is not one casr may expand either.
+    fn pi_env_path(key: &str) -> Option<PathBuf> {
+        let raw = std::env::var_os(key).filter(|value| !value.is_empty())?;
+        let Some(text) = raw.to_str() else {
+            return Some(PathBuf::from(raw));
+        };
+        if text == "~" {
+            return Some(dirs::home_dir().unwrap_or_default());
+        }
+        match text.strip_prefix("~/") {
+            Some(rest) => Some(dirs::home_dir().unwrap_or_default().join(rest)),
+            None => Some(PathBuf::from(text)),
+        }
+    }
+
+    /// `PI_CODING_AGENT_SESSION_DIR` — the sessions directory `pi` is actually
+    /// using, when it is not the default one.
+    ///
+    /// This is a real variable, not a name casr made up: `pi` builds it from its
+    /// own app name (`ENV_SESSION_DIR = "${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR"`,
+    /// `dist/config.js:341`, and `APP_NAME` is `"pi"` for the published package)
+    /// and reads it at startup:
+    ///
+    /// ```js
+    /// const envSessionDir = process.env[ENV_SESSION_DIR];
+    /// const sessionDir = parsed.sessionDir ??
+    ///     (envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
+    ///     startupSettingsManager.getSessionDir();
+    /// ```
+    ///
+    /// — `dist/main.js:384-387`, `@mariozechner/pi-coding-agent@0.73.1`. That
+    /// `sessionDir` is then the `??` alternative to `getDefaultSessionDir(cwd)`
+    /// in `SessionManager.create` / `.continueRecent` / `.forkFrom` / `.list`,
+    /// and `getDefaultSessionDir` is `join(agentDir, "sessions", "--<cwd>--")`
+    /// (`dist/core/session-manager.js:211-219`). So it names the **leaf**
+    /// directory the `.jsonl` files sit in, not the `sessions/` tree above them,
+    /// and `pi` creates it if it is missing (`session-manager.js:445-447`).
+    ///
+    /// Ignoring it was not a safe default. With it set, `pi` writes every
+    /// session somewhere casr never looked, so casr reported that the user had
+    /// no `pi` sessions at all.
+    ///
+    /// `PI_AGENT_HOME` suppresses it for the same reason `PI_AGENT_HOME` exists:
+    /// it is casr's own knob for aiming casr at a tree, and an aiming knob that
+    /// an ambient `pi` variable can drag elsewhere does not aim.
+    fn env_sessions_dir() -> Option<PathBuf> {
+        if std::env::var_os("PI_AGENT_HOME").is_some_and(|value| !value.is_empty()) {
+            return None;
+        }
+        Self::pi_env_path("PI_CODING_AGENT_SESSION_DIR")
+    }
+
+    /// The directory a *new* session goes in — `pi`'s `sessionDir`, which is
+    /// where the writer puts its file and where `pi --session` is pointed.
+    fn leaf_sessions_dir() -> PathBuf {
+        Self::env_sessions_dir().unwrap_or_else(|| Self::home_dir().join("sessions"))
+    }
+
+    /// Every directory `pi` *lists* sessions out of, paired with how deep its
+    /// own lister reaches into that directory.
+    ///
+    /// `pi` has two listers and they disagree, so the depth is per-root:
+    ///
+    /// * `SessionManager.listAll()` (`dist/core/session-manager.js:1065-1081`)
+    ///   scans `getSessionsDir()` — `join(getAgentDir(), "sessions")`, which
+    ///   deliberately does *not* consult the session-dir override — as
+    ///   `readdir().filter(isDirectory)` then `readdir(dir).filter(f =>
+    ///   f.endsWith(".jsonl"))`. Two levels.
+    /// * `SessionManager.list(cwd, sessionDir)` (:1055-1059) reads one directory
+    ///   flat: `listSessionsFromDir` (:391-402) is `readdir(dir).filter(f =>
+    ///   f.endsWith(".jsonl"))` with no recursion at all. One level.
+    ///
+    /// Depth **1** under `sessions/` is admitted as well, and that half is not
+    /// `pi`'s rule — it is casr's own writer's, which puts a converted session
+    /// at `sessions/<id>.jsonl`. Transcribing only `listAll`'s two-level rule
+    /// would make every session casr has ever written unlistable by casr, which
+    /// is the same trap `vibe.rs` documents for the `session_` prefix. Both
+    /// shapes are therefore listed, and the walk is bounded either way.
+    ///
+    /// When the override points *inside* `sessions/`, the two roots would
+    /// overlap and `cmd_list` does not de-duplicate across roots — the same file
+    /// would be listed twice. So that case widens the one walk instead of adding
+    /// a second.
+    fn listing_roots() -> Vec<(PathBuf, usize)> {
+        let sessions = Self::home_dir().join("sessions");
+        let Some(leaf) = Self::env_sessions_dir() else {
+            return vec![(sessions, 2)];
+        };
+        match leaf.strip_prefix(&sessions) {
+            Ok(rest) => {
+                let depth = rest.components().count() + 1;
+                vec![(sessions, depth.max(2))]
+            }
+            Err(_) => vec![(sessions, 2), (leaf, 1)],
+        }
+    }
+
     /// Where a session with this id lives — the path the writer produces and
     /// the path `pi --session` is pointed at, resolved once so the two cannot
     /// disagree.
     fn session_path(session_id: &str) -> PathBuf {
-        Self::home_dir()
-            .join("sessions")
-            .join(format!("{session_id}.jsonl"))
-    }
-
-    /// Sessions directory under the home dir.
-    fn sessions_dir(home: &Path) -> PathBuf {
-        let sessions = home.join("sessions");
-        if sessions.exists() {
-            sessions
-        } else {
-            home.to_path_buf()
-        }
+        Self::leaf_sessions_dir().join(format!("{session_id}.jsonl"))
     }
 }
 
@@ -105,14 +200,20 @@ impl Provider for PiAgent {
         "pi"
     }
 
+    /// Installed if any directory `pi` lists sessions out of exists.
+    ///
+    /// The override root counts, and has to: `detect` is what
+    /// `Registry::resolve_auto` consults before it will ask a provider anything
+    /// at all, so with `PI_CODING_AGENT_SESSION_DIR` set and no
+    /// `<agent-dir>/sessions` on disk, checking only the latter reported `pi` as
+    /// not installed and made every session it had unreachable by id.
     fn detect(&self) -> DetectionResult {
-        let home = Self::home_dir();
-        let installed = home.join("sessions").is_dir();
-        let evidence = if installed {
-            vec![format!("sessions directory found: {}", home.display())]
-        } else {
-            vec![]
-        };
+        let roots = self.session_roots();
+        let evidence = roots
+            .iter()
+            .map(|root| format!("sessions directory found: {}", root.display()))
+            .collect::<Vec<_>>();
+        let installed = !roots.is_empty();
         trace!(provider = "pi-agent", ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -122,13 +223,11 @@ impl Provider for PiAgent {
     }
 
     fn session_roots(&self) -> Vec<PathBuf> {
-        let home = Self::home_dir();
-        let sessions = home.join("sessions");
-        if sessions.is_dir() {
-            vec![sessions]
-        } else {
-            vec![]
-        }
+        Self::listing_roots()
+            .into_iter()
+            .map(|(root, _depth)| root)
+            .filter(|root| root.is_dir())
+            .collect()
     }
 
     /// `@mariozechner/pi-coding-agent@0.73.1` writes transcripts as
@@ -143,42 +242,95 @@ impl Provider for PiAgent {
     /// `"session"` — but that means opening every file in the directory to
     /// decide whether to list it, and the reader is about to open it anyway
     /// and report a real error if the header is wrong.
+    ///
+    /// The extension is not the whole rule, though, because the root is no
+    /// longer always `<agent-dir>/sessions`: `PI_CODING_AGENT_SESSION_DIR` can
+    /// name any directory on the machine, and `cmd_list` walks a root four
+    /// levels deep. Where the file sits is checked against the depth `pi`'s own
+    /// lister reaches into that particular root — see [`Self::listing_roots`].
     fn is_session_path(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return false;
+        }
+        Self::listing_roots().iter().any(|(root, max_depth)| {
+            path.strip_prefix(root)
+                .is_ok_and(|rest| rest.components().count() <= *max_depth)
+        })
     }
 
+    /// # Why this is not [`Self::is_session_path`] with a walk around it
+    ///
+    /// It searches one directory more than the listing does, and the extra one
+    /// is `<agent-dir>` itself — but only its immediate `*.jsonl` children.
+    ///
+    /// That is a layout `pi` really wrote. Version 0.30.0 saved sessions to
+    /// `~/.pi/agent/` instead of `~/.pi/agent/sessions/<encoded-cwd>/`
+    /// (pi-mono issue #320), and `migrateSessionsFromAgentRoot`
+    /// (`dist/migrations.js:75-116`) still runs on every startup to move them:
+    /// `readdirSync(agentDir).filter(f => f.endsWith(".jsonl"))`, flat, then
+    /// `renameSync` into the directory the header's `cwd` implies. Until `pi`
+    /// next starts, those files are real sessions sitting there.
+    ///
+    /// Neither of `pi`'s listers shows them, so casr must not list them either —
+    /// they would appear twice the moment the migration ran, once from each
+    /// location. But a user who has one and names it by id should get it, which
+    /// is the same split `codex.rs` makes for the legacy whole-file `.json`
+    /// rollout form. Listing and ownership are different questions here and this
+    /// is the one place they get different answers.
+    ///
+    /// The filename is matched on `.jsonl` and the stem alone. The underscore
+    /// this used to require is real in every name `pi` generates
+    /// (`${fileTimestamp}_${sessionId}.jsonl`, `session-manager.js:502`), but
+    /// `pi` never *tests* for it, and `/attach` copies a file into the sessions
+    /// directory under whatever basename it already had
+    /// (`agent-session-runtime.js:258`). Requiring it made casr list files it
+    /// then refused to resolve.
+    ///
+    /// # What was there before
+    ///
+    /// `sessions_dir` fell back to the whole of `<agent-dir>` whenever
+    /// `sessions/` was absent, and walked it with no depth bound at all. Since
+    /// `--source pi` reaches `owns_session` without going through `detect`,
+    /// `casr info <id> --source pi` resolved `<agent-dir>/logs/deep/deeper/
+    /// buried_transcript.jsonl` and `<agent-dir>/cache/tool_output.jsonl` and
+    /// rendered each as a session. Neither the fallback nor the walk was
+    /// answering a question about `pi`: `pi` reads sessions out of the two
+    /// directories [`Self::listing_roots`] names and out of the agent root's own
+    /// `*.jsonl` children, and out of nothing else. `<agent-dir>` also holds
+    /// `auth.json`.
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let home = Self::home_dir();
-        let sessions = Self::sessions_dir(&home);
-        if !sessions.is_dir() {
-            return None;
-        }
-        // Walk to find a JSONL file whose stem matches the session_id.
-        for entry in walkdir::WalkDir::new(&sessions)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
+        let mut roots = Self::listing_roots();
+        roots.push((Self::home_dir(), 1));
+
+        for (root, max_depth) in roots {
+            if !root.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_str().unwrap_or("");
-            // Pi-Agent files must be JSONL with an underscore.
-            if !name.ends_with(".jsonl") || !name.contains('_') {
-                continue;
-            }
-            if entry
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s == session_id)
+            for entry in walkdir::WalkDir::new(&root)
+                .max_depth(max_depth)
+                .into_iter()
+                .filter_map(Result::ok)
             {
-                debug!(
-                    provider = "pi-agent",
-                    path = %entry.path().display(),
-                    session_id,
-                    "owns session"
-                );
-                return Some(entry.path().to_path_buf());
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == session_id)
+                {
+                    debug!(
+                        provider = "pi-agent",
+                        path = %path.display(),
+                        session_id,
+                        "owns session"
+                    );
+                    return Some(path.to_path_buf());
+                }
             }
         }
         None
@@ -259,9 +411,11 @@ impl Provider for PiAgent {
             format!("{}_{}", now.format("%Y-%m-%dT%H-%M-%S"), session.session_id)
         };
 
-        let home = Self::home_dir();
-        let sessions_dir = home.join("sessions");
-        let target_path = sessions_dir.join(format!("{session_id}.jsonl"));
+        // The same path `resume_command` and `launch_spec` will name, and — when
+        // `PI_CODING_AGENT_SESSION_DIR` is set — the directory `pi` itself is
+        // reading, so a converted session lands where `pi` will find it rather
+        // than in the default tree `pi` has been configured away from.
+        let target_path = Self::session_path(&session_id);
 
         debug!(
             session_id,
