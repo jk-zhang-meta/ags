@@ -602,12 +602,43 @@ impl ToolInput {
     }
 
     /// Parse a provider's argument field, keeping the original when it was text.
+    ///
+    /// # The non-string branch is load-bearing — do not tighten this
+    ///
+    /// Accepting a non-string looks like sloppiness, and it is the reason one
+    /// writer bug stayed invisible: a Codex rollout whose
+    /// `function_call.arguments` was an object round-tripped through here
+    /// perfectly, and the real `codex` CLI dropped every tool call in the file.
+    /// The tempting repair is to make this strict. It is the wrong repair.
+    ///
+    /// Of the 47,314 argument fields this is fed across the local corpus, 20,327
+    /// are objects rather than strings: every one of Claude Code's 19,859
+    /// `tool_use.input`s, plus Codex's own `tool_search_call.arguments` (340)
+    /// and `web_search_call.action` (128). Only Codex's
+    /// `function_call.arguments` is a string, and it is a string every time.
+    ///
+    /// So "arguments are text" is a rule about one record type in one format,
+    /// not a rule about arguments. It is enforced where the record type is still
+    /// known and the wire shape still exists — on the serialised payload, by
+    /// [`crate::providers::codex_ir_write::wire_contract_violation`] — and not
+    /// here, where tightening it would fail to read 43% of the corpus.
     pub fn from_json_field(raw: &serde_json::Value) -> Self {
         match raw.as_str() {
-            Some(text) => ToolInput::Json {
-                value: serde_json::from_str(text).unwrap_or(serde_json::Value::Null),
-                original: Some(text.to_string()),
-            },
+            Some(text) => {
+                let value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
+                // `original` exists to preserve text that re-serialising cannot
+                // reproduce — odd key order, whitespace, or arguments that are
+                // not JSON at all. Text that *is* the canonical serialisation
+                // of `value` carries nothing `value` does not, and recording it
+                // anyway makes two identical calls compare unequal: a target
+                // format with no way to express "no original text" — Codex
+                // writes `function_call.arguments` as a string and has no other
+                // shape for it — would then read back as a shape change and
+                // grade a lossless conversion `ConversationOnly`.
+                let original = (serde_json::to_string(&value).ok().as_deref() != Some(text))
+                    .then(|| text.to_string());
+                ToolInput::Json { value, original }
+            }
             None => ToolInput::Json {
                 value: raw.clone(),
                 original: None,
@@ -755,10 +786,12 @@ impl CapsuleKind {
     /// from [`Origin::provider`].
     pub fn vendor(self) -> &'static str {
         match self {
-            CapsuleKind::AnthropicThinkingSignature
-            | CapsuleKind::AnthropicRedactedThinking => "anthropic",
-            CapsuleKind::OpenaiReasoningEncryptedContent
-            | CapsuleKind::OpenaiCompactedContext => "openai",
+            CapsuleKind::AnthropicThinkingSignature | CapsuleKind::AnthropicRedactedThinking => {
+                "anthropic"
+            }
+            CapsuleKind::OpenaiReasoningEncryptedContent | CapsuleKind::OpenaiCompactedContext => {
+                "openai"
+            }
         }
     }
 }
@@ -803,7 +836,11 @@ impl Capsule {
     /// gating on that string would throw away reasoning that is plainly
     /// OpenAI's, for no reason but a label.
     pub fn fits(&self, target_vendor: &str) -> CapsuleFit {
-        if self.kind.vendor().eq_ignore_ascii_case(target_vendor.trim()) {
+        if self
+            .kind
+            .vendor()
+            .eq_ignore_ascii_case(target_vendor.trim())
+        {
             CapsuleFit::SameVendor
         } else {
             CapsuleFit::ForeignVendor
@@ -862,7 +899,10 @@ pub struct CaptureReport {
 impl CaptureReport {
     /// Record one emitted event.
     pub fn record(&mut self, event: &Event) {
-        *self.by_kind.entry(event.body.kind().to_string()).or_insert(0) += 1;
+        *self
+            .by_kind
+            .entry(event.body.kind().to_string())
+            .or_insert(0) += 1;
         if matches!(event.body, Body::Unknown { .. }) {
             self.unknown += 1;
         }

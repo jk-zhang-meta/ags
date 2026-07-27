@@ -58,8 +58,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::ir::{
-    Block, Body, Branch, Capsule, CapsuleBinding, CapsuleKind, Event, SessionIr, SourceRef,
-    Role, ToolInput, ToolOutcome, Visibility,
+    Block, Body, Branch, Capsule, CapsuleBinding, CapsuleKind, Event, Role, SessionIr, SourceRef,
+    ToolInput, ToolOutcome, Visibility,
 };
 use crate::model::parse_timestamp;
 
@@ -341,17 +341,38 @@ impl Builder {
 
             "function_call" | "custom_tool_call" => {
                 // `function_call` puts JSON in `arguments`; `custom_tool_call`
-                // puts an opaque string in `input`. Both arrive as strings on
-                // the wire, so the distinction lives in the type rather than
-                // in a guess about the payload's shape.
+                // puts an opaque string in `input`. Both are strings in every
+                // rollout Codex itself wrote, so the distinction lives in the
+                // type rather than in a guess about the payload's shape.
+                //
+                // This reader is nonetheless deliberately lenient about
+                // `arguments`, and that leniency is *not* the missing half of
+                // the invariant — it is load-bearing. Every value that reaches
+                // [`ToolInput::from_json_field`] in the local corpus:
+                //
+                // | fed by                             | shape  |      n |
+                // |------------------------------------|--------|--------|
+                // | Codex `function_call.arguments`    | string | 26,987 |
+                // | Claude Code `tool_use.input`       | object | 19,859 |
+                // | Codex `tool_search_call.arguments` | object |    340 |
+                // | Codex `web_search_call.action`     | object |    128 |
+                //
+                // 20,327 of 47,314 arrive as objects, including every Claude
+                // Code tool call and two of Codex's own record types. A strict
+                // parser would fail to read 43% of the corpus to protect one
+                // writer. The rule is per record type, so it cannot live in the
+                // shared parser. It is enforced instead on the way out, against
+                // the serialised payload, by
+                // [`crate::providers::codex_ir_write::wire_contract_violation`]
+                // — which exists because a writer that emitted the object form
+                // here read back perfectly and still produced a file the real
+                // `codex` CLI stripped every tool call out of.
                 let input = if kind == "custom_tool_call" {
                     ToolInput::Freeform {
                         text: string_field(&payload, "input").unwrap_or_default(),
                     }
                 } else {
-                    ToolInput::from_json_field(
-                        payload.get("arguments").unwrap_or(&Value::Null),
-                    )
+                    ToolInput::from_json_field(payload.get("arguments").unwrap_or(&Value::Null))
                 };
                 let body = Body::ToolCall {
                     call_id: string_field(&payload, "call_id").unwrap_or_default(),
@@ -713,7 +734,10 @@ fn blocks_from_content(content: Option<&Value>) -> Vec<Block> {
 /// in the corpus — which are sealed material, not text. They belong in
 /// [`Event::capsules`] beside reasoning, not in the block list and certainly
 /// not on the floor, which is where the previous `filter_map` put them.
-fn content_parts(content: Option<&Value>, bound: Option<&CapsuleBinding>) -> (Vec<Block>, Vec<Capsule>) {
+fn content_parts(
+    content: Option<&Value>,
+    bound: Option<&CapsuleBinding>,
+) -> (Vec<Block>, Vec<Capsule>) {
     let Some(content) = content else {
         return (Vec::new(), Vec::new());
     };
@@ -803,7 +827,10 @@ mod tests {
     fn reads_header_into_origin_and_workspace() {
         let file = rollout(&[META]);
         let ir = read(file.path()).expect("parse");
-        assert_eq!(ir.origin.native_session_id, "019f9906-b8f7-7cb2-85d5-386512c066d4");
+        assert_eq!(
+            ir.origin.native_session_id,
+            "019f9906-b8f7-7cb2-85d5-386512c066d4"
+        );
         assert_eq!(ir.origin.agent_version.as_deref(), Some("0.145.0"));
         assert_eq!(ir.origin.provider.as_deref(), Some("openai"));
         assert_eq!(ir.workspace.cwd.as_deref(), Some(Path::new("/work")));
@@ -832,7 +859,10 @@ mod tests {
         );
         assert_eq!(reasoning.capsules[0].bound.provider, "openai");
         assert_eq!(reasoning.capsules[0].fits("openai"), CapsuleFit::SameVendor);
-        assert_eq!(reasoning.capsules[0].fits("anthropic"), CapsuleFit::ForeignVendor);
+        assert_eq!(
+            reasoning.capsules[0].fits("anthropic"),
+            CapsuleFit::ForeignVendor
+        );
         assert_eq!(ir.capture.capsules, 1);
     }
 
@@ -1005,8 +1035,18 @@ mod tests {
             META,
             r#"{"timestamp":"2026-07-25T10:00:12.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}"#,
         ]);
-        let first: Vec<String> = read(file.path()).unwrap().events.iter().map(|e| e.id.clone()).collect();
-        let second: Vec<String> = read(file.path()).unwrap().events.iter().map(|e| e.id.clone()).collect();
+        let first: Vec<String> = read(file.path())
+            .unwrap()
+            .events
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        let second: Vec<String> = read(file.path())
+            .unwrap()
+            .events
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
         assert_eq!(first, second);
     }
 }
