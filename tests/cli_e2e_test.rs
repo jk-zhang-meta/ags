@@ -155,6 +155,22 @@ fn setup_gemini_fixture(tmp: &TempDir, fixture_name: &str) -> String {
     session_id
 }
 
+/// Set up a Vibe session fixture in the temp dir.
+///
+/// Vibe is the plainest case of a provider whose reader cannot determine a
+/// workspace: nothing in `messages.jsonl` records one, and the directory it
+/// lives in is named after the session, not the project. Its layout is
+/// `<VIBE_HOME>/logs/session/<session-id>/messages.jsonl`.
+#[allow(dead_code)]
+fn setup_vibe_fixture(tmp: &TempDir, session_id: &str) -> String {
+    let content =
+        fs::read_to_string(fixtures_dir().join("vibe/messages.jsonl")).expect("read vibe fixture");
+    let session_dir = tmp.path().join("vibe/logs/session").join(session_id);
+    fs::create_dir_all(&session_dir).expect("create Vibe session dir");
+    fs::write(session_dir.join("messages.jsonl"), content).expect("write Vibe fixture");
+    session_id.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Basic CLI tests
 // ---------------------------------------------------------------------------
@@ -416,6 +432,138 @@ fn cli_list_workspace_filter_filters_sessions() {
             .iter()
             .any(|s| s["session_id"].as_str() == Some(&webapp_id)),
         "expected webapp session to be filtered out"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// List: sessions whose workspace no source can determine
+//
+// Four providers never record a workspace (vibe, chatgpt, clawdbot,
+// antigravity) and thirteen more record one only when the session file happens
+// to carry a `cwd`. `list` always has a workspace filter — `--workspace` if
+// given, the working directory otherwise — so how the filter treats a session
+// it cannot place decides whether those sessions are listable at all.
+// ---------------------------------------------------------------------------
+
+/// Without `--workspace` the user asked for a list, not a workspace question.
+/// A session no source can place is unclassified, not disqualified, and must
+/// still be listed.
+#[test]
+fn cli_list_without_workspace_filter_includes_workspace_less_provider() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_vibe_fixture(&tmp, "vibe-unplaced-0001");
+
+    let output = casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["--json", "list", "--provider", "vibe"])
+        .output()
+        .expect("list should run");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let items = parsed["items"].as_array().expect("items should be array");
+    assert!(
+        items
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(session_id.as_str())),
+        "a session whose workspace cannot be determined must still appear in an \
+         unfiltered list; got {items:?}"
+    );
+    assert_eq!(
+        items[0]["workspace"],
+        serde_json::Value::Null,
+        "the unknown workspace must be reported as null, not invented"
+    );
+}
+
+/// The unfiltered listing says so, rather than letting the "Project-scoped
+/// sessions" heading assert a placement nobody measured.
+#[test]
+fn cli_list_without_workspace_filter_says_which_sessions_are_unplaced() {
+    let tmp = TempDir::new().unwrap();
+    setup_vibe_fixture(&tmp, "vibe-unplaced-0002");
+
+    casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["list", "--provider", "vibe"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("record no workspace"));
+}
+
+/// `--workspace X` asks which sessions belong to X. "Cannot tell" is not an
+/// answer to that, so the session stays out — but the exclusion is announced,
+/// because a filter that silently deletes what it could not classify is
+/// indistinguishable from the provider having no sessions.
+#[test]
+fn cli_list_explicit_workspace_filter_hides_unplaceable_sessions_and_says_so() {
+    let tmp = TempDir::new().unwrap();
+    let vibe_id = setup_vibe_fixture(&tmp, "vibe-unplaced-0003");
+
+    let assert = casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args([
+            "--json",
+            "list",
+            "--provider",
+            "vibe",
+            "--workspace",
+            "/data/projects/myapp",
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("hidden by --workspace"))
+        .stderr(predicate::str::contains("vibe"));
+
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(
+        !parsed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(vibe_id.as_str())),
+        "an explicit --workspace must not claim an unplaceable session belongs to it"
+    );
+}
+
+/// The other half of the contract: `--workspace` still means what it says for
+/// the providers that do report one, and is not weakened by admitting the
+/// unplaceable ones elsewhere.
+#[test]
+fn cli_list_explicit_workspace_filter_still_selects_among_reporting_providers() {
+    let tmp = TempDir::new().unwrap();
+    let myapp_id = setup_cc_fixture(&tmp, "cc_simple"); // /data/projects/myapp
+    let webapp_id = setup_cc_fixture(&tmp, "cc_complex"); // /data/projects/webapp
+    setup_vibe_fixture(&tmp, "vibe-unplaced-0004");
+
+    let output = casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["--json", "list", "--workspace", "/data/projects/myapp"])
+        .output()
+        .expect("list should run");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let items = parsed["items"].as_array().unwrap();
+
+    assert!(
+        items
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(myapp_id.as_str())),
+        "the session recorded in the filtered workspace must be kept"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|s| s["session_id"].as_str() == Some(webapp_id.as_str())),
+        "a session recorded in a different workspace must still be filtered out"
+    );
+    assert!(
+        !items.iter().any(|s| s["provider"].as_str() == Some("vibe")),
+        "an unplaceable session must not leak into an explicitly filtered list"
     );
 }
 

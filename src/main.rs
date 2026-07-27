@@ -1451,22 +1451,51 @@ fn cmd_list(
         }
     }
 
-    fn workspace_hint_matches(
+    /// What a provider's on-disk layout says about the workspace a session
+    /// belongs to.
+    ///
+    /// Three answers, not two, because "this layout encodes no workspace" is a
+    /// different fact from "this layout encodes a different workspace". The
+    /// `bool` this replaced returned `true` for both, so `true` meant "matches"
+    /// for the two providers whose directory names are derived from a
+    /// workspace path and "no opinion" for the other fifteen — and the only
+    /// thing that could tell those two readings apart was a hardcoded list of
+    /// the two slugs, consulted by the caller. Naming the third answer deletes
+    /// the list: every provider without a workspace-derived layout reports
+    /// [`WorkspaceHint::Unknown`] by falling off the end of the match, which is
+    /// exactly what it means.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WorkspaceHint {
+        /// The layout places this session in the filtered workspace.
+        Matches,
+        /// The layout places this session in some other workspace.
+        Differs,
+        /// The layout says nothing about which workspace this session is from.
+        Unknown,
+    }
+
+    fn workspace_path_hint(
         provider_slug: &str,
         path: &Path,
         workspace_filter: Option<&PathBuf>,
-    ) -> bool {
+    ) -> WorkspaceHint {
         let Some(ws) = workspace_filter else {
-            return true;
+            return WorkspaceHint::Unknown;
         };
 
         match provider_slug {
             "claude-code" => {
                 let expected = casr::providers::claude_code::project_dir_key(ws.as_path());
-                path.parent()
+                match path
+                    .parent()
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str())
-                    == Some(expected.as_str())
+                {
+                    Some(key) if key == expected => WorkspaceHint::Matches,
+                    Some(_) => WorkspaceHint::Differs,
+                    // No parent directory to read a project key from.
+                    None => WorkspaceHint::Unknown,
+                }
             }
             "gemini" => {
                 let expected_hash = casr::providers::gemini::project_hash(ws.as_path());
@@ -1476,22 +1505,19 @@ fn cmd_list(
                     .and_then(|p| p.file_name())
                     .and_then(|n| n.to_str());
                 match observed_hash {
-                    Some(hash) if hash == expected_hash => true,
+                    Some(hash) if hash == expected_hash => WorkspaceHint::Matches,
                     Some(hash)
                         if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) =>
                     {
-                        false
+                        WorkspaceHint::Differs
                     }
-                    // Keep fixture/legacy layouts permissive.
-                    _ => true,
+                    // Fixture/legacy layouts do not hash the workspace, so the
+                    // directory name is not evidence either way.
+                    Some(_) | None => WorkspaceHint::Unknown,
                 }
             }
-            _ => true,
+            _ => WorkspaceHint::Unknown,
         }
-    }
-
-    fn provider_has_workspace_path_hint(provider_slug: &str) -> bool {
-        matches!(provider_slug, "claude-code" | "gemini")
     }
 
     fn workspace_scoped_listed_sessions(
@@ -1673,7 +1699,10 @@ fn cmd_list(
                 listed
                     .into_iter()
                     .filter_map(|(_session_id, path)| {
-                        if !workspace_hint_matches(&provider_slug, &path, workspace_filter.as_ref())
+                        // Only a positive mismatch skips the parse. `Unknown`
+                        // is not evidence, so it must not act like one.
+                        if workspace_path_hint(&provider_slug, &path, workspace_filter.as_ref())
+                            == WorkspaceHint::Differs
                         {
                             return None;
                         }
@@ -1685,7 +1714,8 @@ fn cmd_list(
                 listed
                     .into_par_iter()
                     .filter_map(|(_session_id, path)| {
-                        if !workspace_hint_matches(&provider_slug, &path, workspace_filter.as_ref())
+                        if workspace_path_hint(&provider_slug, &path, workspace_filter.as_ref())
+                            == WorkspaceHint::Differs
                         {
                             return None;
                         }
@@ -1724,7 +1754,9 @@ fn cmd_list(
                     continue;
                 }
 
-                if !workspace_hint_matches(provider.slug(), path, workspace_filter.as_ref()) {
+                if workspace_path_hint(provider.slug(), path, workspace_filter.as_ref())
+                    == WorkspaceHint::Differs
+                {
                     continue;
                 }
 
@@ -1759,12 +1791,57 @@ fn cmd_list(
         sessions.extend(parsed);
     }
 
+    // Sessions no source could place in *any* workspace, counted per provider.
+    //
+    // Two independent sources can place a session: the workspace its reader
+    // recorded, and the provider's on-disk layout. Either saying "this one is
+    // in the filtered workspace" keeps it; either saying "this one is
+    // elsewhere", with nothing contradicting it, drops it. When both come back
+    // `Unknown` the session is *unclassified*, which is not the same as
+    // disqualified, and the previous filter collapsed the two: it kept a
+    // session only if it had a recorded workspace or its provider appeared in
+    // a two-name allowlist. Since the filter falls back to the working
+    // directory when `--workspace` is absent, that made every session with no
+    // recorded workspace unlistable everywhere — permanently for the four
+    // providers that never record one, and per-session for the thirteen whose
+    // source file may not carry a `cwd`.
+    //
+    // What an unclassified session should do depends on whether the user
+    // actually asked a workspace question. With an explicit `--workspace X`
+    // they did, and "we cannot tell whether this is in X" is not an answer to
+    // it, so the session stays out — but the exclusion is now reported instead
+    // of silent. Without the flag they asked for a list; the working directory
+    // is a default scope, not a claim, and answering it by deleting everything
+    // unmeasurable is the silent-default failure this codebase reports `null`
+    // to avoid everywhere else.
+    let mut unclassified: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
     if let Some(filter) = workspace_filter.as_ref() {
         sessions.retain(|s| {
-            s.workspace.as_ref().is_some_and(|w| w.starts_with(filter))
-                || (provider_has_workspace_path_hint(&s.provider)
-                    && workspace_hint_matches(&s.provider, &s.path, Some(filter)))
+            let recorded = s.workspace.as_ref().map(|w| w.starts_with(filter));
+            let hint = workspace_path_hint(&s.provider, &s.path, Some(filter));
+            match (recorded, hint) {
+                (_, WorkspaceHint::Matches) | (Some(true), _) => true,
+                (Some(false), _) | (_, WorkspaceHint::Differs) => false,
+                (None, WorkspaceHint::Unknown) => {
+                    *unclassified.entry(s.provider.clone()).or_default() += 1;
+                    !workspace_filter_explicit
+                }
+            }
         });
+    }
+
+    // Say so. A filter that removes what it could not classify, without
+    // mentioning it, is indistinguishable from a provider having no sessions.
+    if workspace_filter_explicit && !unclassified.is_empty() {
+        let total: usize = unclassified.values().sum();
+        let providers: Vec<&str> = unclassified.keys().map(String::as_str).collect();
+        eprintln!(
+            "{} {total} session(s) hidden by --workspace: their workspace could not be \
+             determined ({}). Run without --workspace to include them.",
+            "⚠".yellow(),
+            providers.join(", ")
+        );
     }
 
     let mut sessions_by_provider: std::collections::BTreeMap<String, Vec<SessionSummary>> =
@@ -1832,6 +1909,21 @@ fn cmd_list(
             "[bold cyan]Project-scoped sessions[/] for [bold]{workspace_scope}[/]"
         ));
         console.print(&format!("[dim]Scope:[/] [bold]{workspace_scope_label}[/]"));
+        // "Project-scoped" is a claim, and it is not true of every row here:
+        // some readers cannot tell which workspace a session came from, and
+        // those are shown rather than dropped. Say which ones, so the heading
+        // is not read as a measurement nobody made.
+        let unplaced_shown: usize = sessions_by_provider
+            .values()
+            .flatten()
+            .filter(|s| s.workspace.is_none())
+            .count();
+        if unplaced_shown > 0 {
+            console.print(&format!(
+                "[dim]Includes[/] [bold]{unplaced_shown}[/] [dim]session(s) that record no \
+                 workspace — shown because nothing places them outside this project.[/]"
+            ));
+        }
         console.print(&format!(
             "[dim]Showing up to[/] [bold]{limit}[/] [dim]most recent sessions per provider[/]"
         ));

@@ -570,6 +570,15 @@ The `list` command is optimized for project-local triage first.
 - Default scope is the current working directory project.
 - `--workspace` can override scope explicitly.
 - Provider-specific path hints are used for fast filtering (`claude-code`, `gemini`).
+  A hint answers *matches*, *differs*, or *unknown*; only *differs* excludes a
+  session, because "this layout encodes no workspace" is not evidence.
+- Sessions no source can place in any workspace — the four providers that never
+  record one (`vibe`, `chatgpt`, `clawdbot`, `antigravity`), plus any session of
+  the others whose file carries no `cwd` — are **listed** under the default
+  scope and **hidden with a warning on stderr** under an explicit `--workspace`.
+  The default scope is a convenience, not a question the user asked;
+  `--workspace X` is a question, and a session nobody can place in X is not an
+  answer to it. `list --json` reports `"workspace": null` for these either way.
 - Providers that support `list_sessions()` can bypass expensive filesystem walks.
 - Fallback directory scans are capped by depth and extension filters.
 
