@@ -1030,8 +1030,10 @@ fn fixture_kiro_ide_session() {
     );
 
     // Extra: reasoning is attributed as reasoning, not as prose from a model.
+    // Index 2: `session_start` is the opening user turn and `user` the mid-turn
+    // one, so the first assistant message is third.
     assert_eq!(
-        session.messages[1].author.as_deref(),
+        session.messages[2].author.as_deref(),
         Some("reasoning"),
         "operationType Reasoning marks the message as reasoning"
     );

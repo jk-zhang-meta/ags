@@ -1,38 +1,67 @@
-//! Kiro provider — reads/writes both stores Kiro keeps under `~/.kiro`.
+//! Kiro provider — reads/writes both session layouts Kiro keeps under `~/.kiro`.
 //!
-//! Kiro ships as two products that share one home directory, and they do not
-//! share a session layout. `detect()` fires on `~/.kiro` existing, which either
-//! product creates, so reading only one of them renders as "installed, 0
-//! sessions" for every user of the other — indistinguishable from having none.
+//! Kiro ships as two products that share one home directory, and they keep two
+//! session *layouts* between them. `detect()` fires on `~/.kiro` existing,
+//! which either product creates, so reading only one layout renders as
+//! "installed, 0 sessions" for every user of the other — indistinguishable
+//! from having none.
 //!
 //! ```text
-//! <cliRoot>/sessions/cli/<uuid>.{json,jsonl,history}          ← Kiro CLI
-//! <ideRoot>/sessions/<workspaceHash>/sess_<uuid>/…            ← Kiro IDE
+//! <root>/sessions/cli/<uuid>.{json,jsonl,history}   ← flat: kiro-cli's classic/v2 store
+//! <root>/sessions/<workspaceHash>/<id>/…            ← bucketed: the shared "KAS" store
 //! ```
+//!
+//! # Two layouts, not two products
+//!
+//! The bucketed layout is *not* the IDE's private store. `kiro-cli` 2.14.2
+//! reads **and writes** it too, under its own root. Measured against the
+//! shipped `kiro-cli-chat` 2.14.2 binary (`BUILD_VERSION=2.14.2`), whose
+//! internal wire surface `chat _ ensure-session` is what `--resume-id` is
+//! implemented in terms of:
+//!
+//! ```text
+//! $ KIRO_HOME=…/khome3 kiro-cli-chat chat _ ensure-session \
+//!       --source-format v2 --source-session-id <uuid> --target-format kas --cwd /tmp/wsX
+//! {"kind":"ensureSession","data":{"sessionId":"cli_<uuid>_uHORXqEL"}}
+//! $ find "$KIRO_HOME/sessions"
+//!   …/khome3/sessions/c25a05601239adfe/cli_<uuid>_uHORXqEL/session.json
+//!   …/khome3/sessions/c25a05601239adfe/cli_<uuid>_uHORXqEL/messages.jsonl
+//! $ printf '/tmp/wsX' | sha256sum | cut -c1-16   →  c25a05601239adfe
+//! ```
+//!
+//! That is the same bucket rule, the same two filenames and the same root the
+//! IDE uses. In the binary it is `chat_cli_v2::agent::kas::persist::
+//! write_kas_session_dir` rooted at `chat_cli_v2::agent::kas::shared::
+//! default_kas_sessions_root`, which is `kiro_home_dir_from_process_env()`
+//! joined with `"sessions"`. So a bucketed session says nothing about which
+//! product wrote it, and neither does its id: `kiro-cli` mints `sess_<uuid>`
+//! natively ("V2 uses a UUID; KAS uses the `sess_<uuid>` form" — its own
+//! `--source-session-id` help) and `cli_<uuid>` when converting or importing.
 //!
 //! # The two roots are not the same variable
 //!
-//! They are usually the same directory, and they are not the same rule:
+//! Both layouts hang off `<root>/sessions`, and each product resolves `<root>`
+//! by its own rule:
 //!
-//! * `<cliRoot>` is `$KIRO_HOME` when that is set and non-empty, else
-//!   `~/.kiro`. This is `kiro-cli`'s own resolver — see [`Kiro::cli_home_dir`],
-//!   which quotes it — and `KIRO_HOME` *replaces* the root rather than being a
-//!   parent to append `.kiro` to.
-//! * `<ideRoot>` is always `~/.kiro`. The Kiro IDE has no relocation variable
-//!   at all: `KIRO_HOME` occurs zero times in the entire shipped package. See
+//! * `kiro-cli` uses `$KIRO_HOME` when that is set and non-empty, else
+//!   `~/.kiro` — see [`Kiro::cli_home_dir`], which quotes it. `KIRO_HOME`
+//!   *replaces* the root rather than being a parent to append `.kiro` to.
+//! * The Kiro IDE is always `~/.kiro`. It has no relocation variable at all:
+//!   `KIRO_HOME` occurs zero times in the entire shipped package. See
 //!   [`Kiro::ide_home_dir`].
 //!
-//! So `KIRO_HOME=/tmp/x` moves the CLI's sessions and leaves the IDE's where
-//! they were, and casr has to follow each store to where its own product
-//! actually writes. Applying `KIRO_HOME` to both would send the IDE scan to a
-//! directory Kiro IDE never writes to — the same defect class as not reading
-//! the store at all.
+//! So `KIRO_HOME=/tmp/x` moves kiro-cli's sessions — *both* its layouts — and
+//! leaves the IDE's where they were. casr therefore scans the bucketed layout
+//! under **both** roots ([`Kiro::kas_roots`]) and the flat layout under the
+//! CLI's root. Pinning the bucketed scan to `~/.kiro` alone, on the theory
+//! that bucketed means IDE, silently drops every kiro-cli session written
+//! while `KIRO_HOME` was set.
 //!
 //! One real CLI variable is deliberately not read: `KIRO_TEST_SESSIONS_DIR`,
 //! which replaces `sessions/cli` outright. It is part of the CLI's `KIRO_TEST_*`
 //! harness family, not a user-facing relocation knob.
 //!
-//! # Kiro CLI (`kiro-cli`)
+//! # The flat layout (`kiro-cli`'s classic/v2 store)
 //!
 //! AWS/Amazon's agentic coding CLI, backed by Amazon Bedrock. Each session is
 //! up to three sibling files keyed by the session UUID:
@@ -43,15 +72,15 @@
 //! <cliRoot>/sessions/cli/<id>.history   ← plain-text slash-command history (optional)
 //! ```
 //!
-//! # Kiro IDE (the desktop app)
+//! # The bucketed layout (the shared "KAS" store)
 //!
-//! A different store, written by the bundled `kiro.kiro-agent` extension. A
-//! session is a *directory* under a per-workspace bucket:
+//! Written by the IDE's bundled `kiro.kiro-agent` extension and by `kiro-cli`
+//! alike. A session is a *directory* under a per-workspace bucket:
 //!
 //! ```text
-//! ~/.kiro/sessions/<bucket>/sess_<uuid>/session.json      ← metadata
-//! ~/.kiro/sessions/<bucket>/sess_<uuid>/messages.jsonl    ← one JSON event per line
-//! ~/.kiro/sessions/<bucket>/sess_<uuid>/tool-outputs/…    ← spilled tool output
+//! <root>/sessions/<bucket>/<id>/session.json      ← metadata
+//! <root>/sessions/<bucket>/<id>/messages.jsonl    ← one JSON event per line
+//! <root>/sessions/<bucket>/<id>/tool-outputs/…    ← spilled tool output
 //! ```
 //!
 //! `<bucket>` is `_global` when the session has no workspace, else the first 16
@@ -64,18 +93,46 @@
 //! lastModifiedAt, modelId?, parentSessionId?, …}`. Each `messages.jsonl` line
 //! is `{"id", "timestamp", "payload"}` where `payload.type` selects one of
 //! twenty-three shapes; the four that carry conversation are `user`,
-//! `assistant`, `tool_call` and `tool_result`. The rest are session lifecycle
-//! events (`turn_start`, `tombstone`, `usage_summary`, …) and are not messages.
+//! `assistant`, `tool_call` and `tool_result`. `session_start` carries a fifth
+//! — see below. The rest are session lifecycle events (`turn_start`,
+//! `tombstone`, `usage_summary`, …) and are not messages.
+//!
+//! ## `session_start` is the opening user turn
+//!
+//! It looks like a lifecycle marker and is not one. In the shipped
+//! extension.js the payload is built from the session's *first* prompt —
+//! `content` is the prompt's text entries joined — and written exactly once,
+//! only on the first turn:
+//!
+//! ```js
+//! c36 = { type: "session_start", agentType: t16, content: a36, …,
+//!         forcedRole: s27.forcedRole, messageId: s27.messageId };
+//! // Se17: return t16 ? i30 ? Z22(n29) ? { write: false } : { write: true, artifact: V19(…) } …
+//! ```
+//!
+//! No `user` payload is written for that turn, and Kiro's own model-context
+//! rebuild replays it as a human message before anything else:
+//!
+//! ```js
+//! for (const h52 of s27) if (h52.payload.type === "session_start") {
+//!   n29.push(ke19(h52.payload)); break;   // ke19: pt3.fromHuman(messageId).withText(content)
+//! }
+//! ```
+//!
+//! Discarding it therefore loses the prompt that started the session. (Kiro's
+//! *other* projection — the one that builds UI items — does return `[]` for
+//! `session_start`, alongside `system`/`agent_note`/`error`; that one is not
+//! the conversation.)
 //!
 //! ## Why the two scans cannot collide
 //!
-//! With `KIRO_HOME` unset the two roots coincide, so the scans share a parent.
-//! The IDE scan looks for `<sessions>/<dir>/<dir>/session.json`. `sessions/cli`
-//! *is* a bucket-shaped directory, but its children are files, not directories,
-//! so it yields nothing — and a bucket name is 16 hex characters or `_global`,
-//! never `cli`. The id spaces are disjoint too: CLI ids are bare UUIDs, IDE ids
-//! are `sess_`-prefixed. `list_sessions` still de-duplicates on the session id,
-//! which is the only key both stores agree on.
+//! The two layouts share a parent, always: `<root>/sessions` holds both
+//! `cli/` and the buckets. The bucketed scan looks for
+//! `<sessions>/<dir>/<dir>/session.json`. `sessions/cli` *is* a bucket-shaped
+//! directory, but its children are files, not directories, so it yields
+//! nothing — and a bucket name is 16 hex characters or `_global`, never `cli`.
+//! `list_sessions` de-duplicates on the session id, which is the only key both
+//! layouts agree on, and which also collapses the two roots when they coincide.
 //!
 //! ## `.json` (metadata)
 //!
@@ -110,8 +167,11 @@
 //!
 //! ## Resume
 //!
+//! One flag, two very different contracts — see [`Kiro::resume_command`].
+//!
 //! ```bash
-//! kiro-cli --resume-id <session-id>
+//! kiro-cli --resume-id <uuid>                          # flat layout, from anywhere
+//! cd <workspace> && kiro-cli --v3 --resume-id <id>     # bucketed layout
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -120,6 +180,7 @@ use anyhow::Context;
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, parse_timestamp,
     reindex_messages, truncate_title,
@@ -185,49 +246,96 @@ impl Kiro {
         dirs::home_dir().map(|h| h.join(".kiro"))
     }
 
-    /// Directory holding the CLI session triplets.
+    /// Directory holding the flat CLI session triplets.
     fn sessions_dir() -> Option<PathBuf> {
         Self::cli_home_dir().map(|h| h.join("sessions").join("cli"))
     }
 
-    /// Root the Kiro IDE buckets its session directories under.
-    fn ide_root() -> Option<PathBuf> {
-        Self::ide_home_dir().map(|h| h.join("sessions"))
+    /// Every `<root>/sessions` the bucketed layout can live under.
+    ///
+    /// Both, because both products write it and they resolve `<root>`
+    /// differently: `kiro-cli` honours `KIRO_HOME`, the IDE does not. With
+    /// `KIRO_HOME` unset the two coincide and this collapses to one entry, so
+    /// the scan below never sees the same directory twice.
+    fn kas_roots() -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for home in [Self::cli_home_dir(), Self::ide_home_dir()] {
+            if let Some(root) = home.map(|h| h.join("sessions"))
+                && !roots.contains(&root)
+            {
+                roots.push(root);
+            }
+        }
+        roots
     }
 
-    /// Every `<bucket>/<sess_id>/session.json` the IDE has written.
+    /// Every `<bucket>/<id>/session.json` in the bucketed layout, under every
+    /// root it can live under.
     ///
     /// Two levels deep and no deeper: the third level is `tool-outputs/` and
     /// `sub-executions/`, which hold spilled payloads, not sessions.
-    fn ide_sessions(unreadable: &mut Vec<UnreadableSource>) -> Vec<(String, PathBuf)> {
-        let Some(root) = Self::ide_root() else {
-            return vec![];
-        };
+    fn kas_sessions(unreadable: &mut Vec<UnreadableSource>) -> Vec<(String, PathBuf)> {
         let mut out = Vec::new();
-        for bucket in read_dir_reporting(&root, unreadable) {
-            if !bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            for session in read_dir_reporting(&bucket.path(), unreadable) {
-                if !session.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        for root in Self::kas_roots() {
+            for bucket in read_dir_reporting(&root, unreadable) {
+                if !bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                let meta = session.path().join("session.json");
-                if !meta.is_file() {
-                    continue;
+                for session in read_dir_reporting(&bucket.path(), unreadable) {
+                    if !session.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let meta = session.path().join("session.json");
+                    if !meta.is_file() {
+                        continue;
+                    }
+                    let Some(id) = session.file_name().to_str().map(ToString::to_string) else {
+                        continue;
+                    };
+                    out.push((id, meta));
                 }
-                let Some(id) = session.file_name().to_str().map(ToString::to_string) else {
-                    continue;
-                };
-                out.push((id, meta));
             }
         }
         out
     }
 
-    /// True when `path` is a Kiro IDE session anchor rather than a CLI one.
-    fn is_ide_anchor(path: &Path) -> bool {
+    /// True when `path` anchors a bucketed session rather than a flat one.
+    fn is_kas_anchor(path: &Path) -> bool {
         path.file_name().and_then(|n| n.to_str()) == Some("session.json")
+    }
+
+    /// Which resume contract a given id falls under.
+    ///
+    /// Decided by looking the id up rather than by its prefix. The prefix used
+    /// to be read as "`sess_` means IDE", and that is not a fact about the id:
+    /// `kiro-cli` mints `sess_` ids for its own bucketed sessions and `cli_`
+    /// ids for converted ones. Where the session actually sits on disk is the
+    /// thing that decides how it is resumed, so that is what gets asked.
+    fn resume_form(session_id: &str) -> ResumeForm {
+        let Some(anchor) = Self::kas_sessions(&mut Vec::new())
+            .into_iter()
+            .find(|(id, _)| id == session_id)
+            .map(|(_, path)| path)
+        else {
+            return ResumeForm::Flat;
+        };
+        // The bucket directory is a one-way hash, so `workspacePaths` is the
+        // only source for the directory `--resume-id` has to be run from.
+        let workspace = std::fs::read_to_string(&anchor)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|meta| {
+                meta.get("workspacePaths")?
+                    .as_array()?
+                    .first()?
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from)
+            });
+        match workspace {
+            Some(dir) => ResumeForm::Bucketed(dir),
+            None => ResumeForm::Unreachable,
+        }
     }
 
     /// Sibling path for a session file with a different extension.
@@ -274,17 +382,17 @@ impl Provider for Kiro {
             }
         }
 
-        // Two stores, and neither is the home directory the loop above
-        // accepted: the CLI writes `<cli home>/sessions/cli` and the IDE
-        // writes `~/.kiro/sessions/<bucket>/<id>/session.json`. An IDE-only
-        // install has the second and not the first, which is exactly the case
-        // that used to read as "installed, no sessions".
+        // Two layouts, and neither is the home directory the loop above
+        // accepted: the flat one is `<cli home>/sessions/cli`, the bucketed one
+        // is `<root>/sessions/<bucket>/<id>/session.json` under either root. An
+        // IDE-only install has the second and not the first, which is exactly
+        // the case that used to read as "installed, no sessions".
         if installed {
             if let Some(cli) = Self::sessions_dir() {
                 evidence.push(store_evidence(&cli));
             }
-            if let Some(ide) = Self::ide_root() {
-                evidence.push(store_evidence(&ide));
+            for root in Self::kas_roots() {
+                evidence.push(store_evidence(&root));
             }
         }
 
@@ -297,12 +405,19 @@ impl Provider for Kiro {
     }
 
     fn session_roots(&self) -> Vec<PathBuf> {
-        // `sessions/` rather than `sessions/cli/`: it is the parent of both
-        // stores, and every caller uses these roots with `starts_with`.
-        match Self::ide_root() {
-            Some(dir) if dir.is_dir() => vec![dir],
-            _ => vec![],
-        }
+        // `sessions/` rather than `sessions/cli/`, because it is the parent of
+        // both layouts and callers match explicitly-passed paths against these
+        // roots with `starts_with`.
+        //
+        // Every root, not just the IDE's: `ide_root()` alone ignores
+        // `KIRO_HOME` by design, so with it set the whole CLI store — flat
+        // *and* bucketed — sat under no returned root, and
+        // `casr info $KIRO_HOME/sessions/cli/<id>.json` fell through to the
+        // best-effort parser and was read as some other agent's format.
+        Self::kas_roots()
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect()
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
@@ -318,14 +433,14 @@ impl Provider for Kiro {
                 return Some(jsonl);
             }
         }
-        // The IDE buckets by a one-way workspace hash, so the bucket holding a
-        // given id can only be found by looking in all of them — which is what
-        // Kiro's own `deleteSessionAcrossBuckets` does.
+        // The bucketed layout keys on a one-way workspace hash, so the bucket
+        // holding a given id can only be found by looking in all of them —
+        // which is what Kiro's own `deleteSessionAcrossBuckets` does.
         // `owns_session` answers "is this id mine"; a directory it could not
         // read makes the answer `None`, which is what "not mine" already means
         // here, so the failures are collected and dropped rather than reported
         // through a return type that has nowhere to put them.
-        Self::ide_sessions(&mut Vec::new())
+        Self::kas_sessions(&mut Vec::new())
             .into_iter()
             .find(|(id, _)| id == session_id)
             .map(|(_, path)| path)
@@ -374,25 +489,26 @@ impl Provider for Kiro {
             }
         }
 
-        // The IDE's store. Same `seen` set, so the session id remains the one
-        // key: a session cannot be listed twice because two stores describe it.
-        let mut ide_unreadable = Vec::new();
-        for (id, path) in Self::ide_sessions(&mut ide_unreadable) {
+        // The bucketed layout, under every root. Same `seen` set, so the
+        // session id remains the one key: a session cannot be listed twice
+        // because two layouts — or two coinciding roots — describe it.
+        let mut kas_unreadable = Vec::new();
+        for (id, path) in Self::kas_sessions(&mut kas_unreadable) {
             push(id, path, &mut seen);
         }
 
         listing.sessions = sessions;
-        listing.unreadable.extend(ide_unreadable);
+        listing.unreadable.extend(kas_unreadable);
         Some(listing)
     }
 
-    /// Two stores, two rules. The CLI writes a `<id>.json`/`<id>.jsonl`/
-    /// `<id>.history` triplet flat in `sessions/cli`; the IDE writes
-    /// `sessions/<bucket>/<sess_id>/session.json`. `.history` is the raw
-    /// journal of an already-listed session and `tool-outputs/` below the IDE
-    /// anchor holds spilled payloads, so neither is a session of its own.
+    /// Two layouts, two rules. The flat one is a `<id>.json`/`<id>.jsonl`/
+    /// `<id>.history` triplet in `sessions/cli`; the bucketed one is
+    /// `sessions/<bucket>/<id>/session.json`. `.history` is the raw journal of
+    /// an already-listed session and `tool-outputs/` below the bucketed anchor
+    /// holds spilled payloads, so neither is a session of its own.
     fn is_session_path(&self, path: &Path) -> bool {
-        if Self::is_ide_anchor(path) {
+        if Self::is_kas_anchor(path) {
             return true;
         }
         matches!(
@@ -402,7 +518,7 @@ impl Provider for Kiro {
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
-        if Self::is_ide_anchor(path) {
+        if Self::is_kas_anchor(path) {
             return read_ide_session(path);
         }
         debug!(path = %path.display(), "reading Kiro session");
@@ -675,9 +791,99 @@ impl Provider for Kiro {
         })
     }
 
+    /// One flag, two contracts — and the bucketed one has two extra
+    /// preconditions casr used to omit.
+    ///
+    /// `kiro-cli --resume-id <id>` is implemented by handing the id to the
+    /// internal wire subcommand `chat _ ensure-session`, verbatim from the
+    /// shipped TUI bundle:
+    ///
+    /// ```js
+    /// let Q = await md({ sourceFormat: "auto", sourceSessionId: zn.resumeId,
+    ///                    targetFormat: Lc(), cwd: process.cwd() });
+    /// // md: ["chat","_","ensure-session","--source-format",…,"--cwd",…]
+    /// ```
+    ///
+    /// So the resolution is scoped by `process.cwd()` and by the agent engine,
+    /// and both matter. Measured against `kiro-cli-chat` 2.14.2, on one
+    /// bucketed session in `…/ws-demo`:
+    ///
+    /// ```text
+    /// --cwd …/ws-demo --target-format kas → {"kind":"ensureSession","data":{"sessionId":"sess_9c1f…"}}
+    /// --cwd …/ws-imp  --target-format kas → {"kind":"error","data":{…,"code":"SESSION_NOT_FOUND"}}
+    /// --cwd …/ws-demo --target-format v2  → {"kind":"error","data":{"message":"ensure-session: KAS source -> V2 target not supported"}}
+    /// ```
+    ///
+    /// `--target-format` follows the engine, and the engine defaults to v2
+    /// (`--agent-engine <ENGINE>  … "v1", "v2" (default), or "v3"`), so a
+    /// bucketed session needs `--v3` *and* the workspace as the working
+    /// directory. A flat session needs neither: the same probe resolves a
+    /// `sessions/cli` uuid from `/tmp` and from an unrelated workspace alike.
+    ///
+    /// The Kiro IDE contributes nothing here. It has no CLI-invocable resume
+    /// for a session that already exists on disk: its only deep link is
+    /// `kiro://kiro.resume-session/<base64 presigned-URL>`, which downloads and
+    /// unpacks a *remote* zip into a folder the user picks, and its only local
+    /// affordance is the palette command `kiroAgent.openChatSession`. So when a
+    /// bucketed session has no workspace to `cd` into — `workspacePaths: []`,
+    /// which Kiro buckets under the literal `_global` and which no `process.cwd()`
+    /// can ever hash to — there is no command that resumes it, and casr says so
+    /// by naming no session at all rather than printing one that cannot work.
     fn resume_command(&self, session_id: &str) -> String {
-        format!("kiro-cli --resume-id {session_id}")
+        match Self::resume_form(session_id) {
+            ResumeForm::Flat => format!("kiro-cli --resume-id {session_id}"),
+            ResumeForm::Bucketed(workspace) => {
+                // Quoted, because a workspace path with a space in it is
+                // ordinary and `cd /Users/a b` is not a `cd` into `/Users/a b`.
+                let dir = workspace.display().to_string();
+                let cd = shlex::try_join(["cd", &dir]).unwrap_or_else(|_| format!("cd {dir}"));
+                format!("{cd} && kiro-cli --v3 --resume-id {session_id}")
+            }
+            ResumeForm::Unreachable => "kiro".to_string(),
+        }
     }
+
+    /// Built directly rather than recovered from [`Self::resume_command`].
+    ///
+    /// The trait default splits the rendered string into a program and
+    /// arguments, which for the bucketed form would launch `cd`. The working
+    /// directory is a first-class field of a [`LaunchSpec`] precisely because
+    /// it is load-bearing here, so it is set rather than rendered.
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        Some(match Self::resume_form(session_id) {
+            ResumeForm::Flat => LaunchSpec::new(
+                "kiro-cli",
+                ["--resume-id".to_string(), session_id.to_string()],
+            )
+            .targeting_session(session_id),
+            ResumeForm::Bucketed(workspace) => LaunchSpec::new(
+                "kiro-cli",
+                [
+                    "--v3".to_string(),
+                    "--resume-id".to_string(),
+                    session_id.to_string(),
+                ],
+            )
+            .in_dir(workspace)
+            .targeting_session(session_id),
+            // Deliberately not `targeting_session`: `kiro` opens the IDE and
+            // names nothing, which is what the caller has to be told.
+            ResumeForm::Unreachable => LaunchSpec::new("kiro", Vec::new()),
+        })
+    }
+}
+
+/// How — or whether — a given session id can be resumed from a shell.
+///
+/// See [`Kiro::resume_command`] for the measurements behind each arm.
+enum ResumeForm {
+    /// A flat `sessions/cli/<uuid>` session: `--resume-id` finds it from
+    /// anywhere. Also the form every session casr *writes* takes.
+    Flat,
+    /// A bucketed session with a workspace: reachable only from that directory.
+    Bucketed(PathBuf),
+    /// A bucketed session bucketed under `_global`: no shell command resumes it.
+    Unreachable,
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +1121,19 @@ fn parse_ide_message(
             MessageRole::System,
             text("message"),
             None,
+            Vec::new(),
+            Vec::new(),
+        ),
+        // Not a lifecycle marker: `session_start.content` is the prompt that
+        // opened the session, and it is the *only* copy of it — Kiro writes it
+        // once, on the first turn, and writes no `user` payload for that turn.
+        // Its own model-context rebuild replays it as a human message before
+        // anything else. Dropping it dropped the first thing the user said.
+        // See the module docs for the two shipped functions.
+        "session_start" => (
+            MessageRole::User,
+            text("content"),
+            Some("user".to_string()),
             Vec::new(),
             Vec::new(),
         ),

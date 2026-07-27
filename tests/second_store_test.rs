@@ -116,6 +116,62 @@ fn seed_kiro_cli(root: &Path) -> String {
     id.to_string()
 }
 
+/// A `kiro-cli`-written session in the bucketed layout, under `<root>` —
+/// which for kiro-cli is `$KIRO_HOME`.
+///
+/// Byte-shaped after the real thing rather than after the IDE fixture: this is
+/// what `kiro-cli-chat` 2.14.2 wrote when asked to make a flat session loadable
+/// under its KAS engine, `session.json` field order and all. The `cli_<uuid>_…`
+/// id is its own, and is the reason an id prefix cannot be read as a product.
+/// Returns the session id.
+fn seed_kiro_cli_bucketed(root: &Path) -> String {
+    let id = "cli_0a5376f2-7e2f-4981-bcbc-67195586604a_uHORXqEL";
+    let dir = root.join("sessions").join(KIRO_BUCKET).join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schemaVersion": "1.0.0",
+            "id": id,
+            "title": "Research the opencode repo",
+            "agentMode": "default",
+            "workspacePaths": [WORKSPACE],
+            "createdAt": "2026-06-07T14:14:27.290365+00:00",
+            "lastModifiedAt": "2026-07-27T13:54:01.685124967+00:00",
+            "dataModelVersion": 1,
+            "createdReason": "human"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    // The converter emits no `source` on the user payload; the IDE does. Both
+    // are valid — `source` is optional — and neither identifies the writer.
+    let messages = [
+        serde_json::json!({
+            "id": "93cdb28f-d3b8-4b0a-81a9-b7ff12cb5d5a",
+            "timestamp": "2026-06-07T14:14:27+00:00",
+            "payload": {"type": "user", "content": "Research the opencode repo."}
+        }),
+        serde_json::json!({
+            "id": "1f0c4a52-6d3b-4a97-9d21-0b7c8e5f3a44",
+            "timestamp": "2026-06-07T14:14:36+00:00",
+            "payload": {"type": "assistant", "content": "Reading its provider abstraction now.",
+                        "operationType": "Say"}
+        }),
+    ];
+    std::fs::write(
+        dir.join("messages.jsonl"),
+        messages
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    id.to_string()
+}
+
 /// `<root>/projects/<slug>/agent-transcripts/<id>/<id>.jsonl` and
 /// `<root>/chats/<md5(cwd)>/<id>/store.db`, for both the conversation that has
 /// both halves and the one that has only a chat store.
@@ -210,7 +266,9 @@ fn kiro_ide_sessions_are_listed() {
         "the IDE session must be listed; before the fix this was empty while \
          `casr providers` still reported Kiro installed"
     );
-    assert_eq!(envelope["items"][0]["messages"], 8);
+    // Nine, not eight: `session_start` carries the prompt that opened the
+    // session and is the only copy of it, so it is a message.
+    assert_eq!(envelope["items"][0]["messages"], 9);
     assert_eq!(envelope["items"][0]["workspace"], WORKSPACE);
     assert!(
         envelope["skipped"].as_array().unwrap().is_empty(),
@@ -258,7 +316,7 @@ fn kiro_lists_both_stores_once_each() {
     );
 }
 
-/// `KIRO_HOME` moves the CLI store and *only* the CLI store.
+/// `KIRO_HOME` moves everything `kiro-cli` writes, and nothing the IDE writes.
 ///
 /// This is not a style preference, it is what the two products do. `kiro-cli`
 /// resolves its root with (verbatim from the shipped `kiro-cli-chat` 2.14.2
@@ -268,11 +326,29 @@ fn kiro_lists_both_stores_once_each() {
 /// variable — `KIRO_HOME` occurs zero times in the whole shipped desktop
 /// package — so its store stays at `~/.kiro/sessions` no matter what.
 ///
-/// Applying `KIRO_HOME` to both scans would look right on a default install,
-/// where the roots coincide, and silently read the wrong directory for every
-/// user who sets it. The decoy below is the half that must NOT be read.
+/// What `KIRO_HOME` moves is *both* of kiro-cli's layouts, not just the flat
+/// one. An earlier revision of this test seeded a bucketed session under
+/// `$KIRO_HOME/sessions` as a "decoy" and asserted it must not be listed, on
+/// the theory that bucketed means IDE. It does not. Driving the shipped binary
+/// in a sandboxed `HOME`, with no network and no login:
+///
+/// ```text
+/// $ KIRO_HOME=$X kiro-cli-chat chat _ ensure-session --source-format v2 \
+///       --source-session-id 0a5376f2-… --target-format kas --cwd /tmp/wsX
+/// {"kind":"ensureSession","data":{"sessionId":"cli_0a5376f2-…_uHORXqEL"}}
+/// $ ls $X/sessions/c25a05601239adfe/cli_0a5376f2-…_uHORXqEL
+/// messages.jsonl  session.json
+/// $ printf '/tmp/wsX' | sha256sum | cut -c1-16   →  c25a05601239adfe
+/// ```
+///
+/// The decoy was a real kiro-cli session, and refusing to list it was data
+/// loss. So it is seeded here as what it is and asserted to be listed. What
+/// still distinguishes the two stores is the *layout* — flat triplet versus
+/// bucketed directory — never the root and never the id prefix: kiro-cli mints
+/// `sess_` ids natively and `cli_` ids for conversions, and the IDE mints
+/// `sess_` too.
 #[test]
-fn kiro_home_moves_only_the_cli_store() {
+fn kiro_home_moves_both_of_the_cli_layouts() {
     let _lock = ENV.lock().unwrap();
     let home = tempfile::tempdir().unwrap();
     let kiro_home = tempfile::tempdir().unwrap();
@@ -282,21 +358,7 @@ fn kiro_home_moves_only_the_cli_store() {
     // Where each product would really write with these variables set.
     let cli_id = seed_kiro_cli(kiro_home.path());
     seed_kiro_ide(&home.path().join(".kiro"));
-
-    // A decoy IDE session under $KIRO_HOME, where Kiro IDE never writes. If
-    // the IDE scan honoured KIRO_HOME it would find this one and miss the real
-    // one above.
-    let decoy = kiro_home
-        .path()
-        .join("sessions")
-        .join(KIRO_BUCKET)
-        .join("sess_dddddddd-dddd-4ddd-8ddd-dddddddddddd");
-    std::fs::create_dir_all(&decoy).unwrap();
-    std::fs::copy(
-        fixtures_dir().join("kiro/ide_session_global.json"),
-        decoy.join("session.json"),
-    )
-    .unwrap();
+    let cli_kas_id = seed_kiro_cli_bucketed(kiro_home.path());
 
     let mut listed: Vec<String> = Kiro
         .list_sessions()
@@ -306,11 +368,12 @@ fn kiro_home_moves_only_the_cli_store() {
         .map(|(id, _)| id)
         .collect();
     listed.sort();
+    let mut want = vec![cli_id, cli_kas_id, KIRO_IDE_ID.to_string()];
+    want.sort();
     assert_eq!(
-        listed,
-        vec![cli_id, KIRO_IDE_ID.to_string()],
-        "the CLI store follows KIRO_HOME and the IDE store does not; the decoy \
-         under $KIRO_HOME/sessions must not be read"
+        listed, want,
+        "both of kiro-cli's layouts follow KIRO_HOME and the IDE's does not; \
+         pinning the bucketed scan to ~/.kiro drops the middle one entirely"
     );
 
     // Both roots are reported, because with KIRO_HOME set they are two
@@ -322,6 +385,143 @@ fn kiro_home_moves_only_the_cli_store() {
         evidence.contains(&kiro_home.path().display().to_string())
             && evidence.contains(&home.path().join(".kiro").display().to_string()),
         "detection should name both roots, got: {evidence}"
+    );
+}
+
+/// The gap the listing tests above could not see: a path handed to casr
+/// directly is matched against `session_roots()`, and `session_roots()` was
+/// `~/.kiro/sessions` alone.
+///
+/// With `KIRO_HOME` set that root contains none of kiro-cli's sessions, so
+/// `casr info $KIRO_HOME/sessions/cli/<id>.json` matched no provider root at
+/// all and fell through to the best-effort parser — reporting some other
+/// agent's format for a file casr can read perfectly well.
+#[test]
+fn kiro_session_roots_cover_every_root_a_session_can_live_under() {
+    let _lock = ENV.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let kiro_home = tempfile::tempdir().unwrap();
+    let _h = EnvGuard::set("HOME", home.path());
+    let _k = EnvGuard::set("KIRO_HOME", kiro_home.path());
+
+    let cli_id = seed_kiro_cli(kiro_home.path());
+    seed_kiro_ide(&home.path().join(".kiro"));
+
+    let roots = Kiro.session_roots();
+    for store in [
+        kiro_home.path().join("sessions"),
+        home.path().join(".kiro").join("sessions"),
+    ] {
+        assert!(
+            roots.contains(&store),
+            "{} is a root Kiro sessions live under, but session_roots() is {roots:?}",
+            store.display()
+        );
+    }
+
+    // The property every caller actually uses these roots for.
+    let cli_session = kiro_home
+        .path()
+        .join("sessions")
+        .join("cli")
+        .join(format!("{cli_id}.json"));
+    assert!(
+        roots.iter().any(|r| cli_session.starts_with(r)),
+        "a CLI session passed by path must fall under a returned root: {}",
+        cli_session.display()
+    );
+}
+
+/// The user-visible end of the same path, through the binary.
+///
+/// A contract check rather than a regression test for the root fix: with the
+/// roots reverted this still passes, because discovery's file-signature
+/// inference recognises a real `kiro-cli` metadata file on its own. That
+/// fallback is a safety net and not the contract — it is a guess that happens
+/// to be right here — so what is pinned is that casr resolves the file without
+/// needing it. `kiro_session_roots_cover_every_root_a_session_can_live_under`
+/// above is the one that fails on the unfixed source.
+#[test]
+fn kiro_session_passed_by_path_is_read_as_kiro() {
+    let home = tempfile::tempdir().unwrap();
+    let kiro_home = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let cli_id = "cccc1111-2222-4333-8444-555555555555";
+    let cli = kiro_home.path().join("sessions").join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    std::fs::write(
+        cli.join(format!("{cli_id}.json")),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "session_id": cli_id,
+            "cwd": WORKSPACE,
+            "created_at": "2026-06-07T14:14:27.290365Z",
+            "updated_at": "2026-06-07T14:14:36.404077Z",
+            "title": "Two turns"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let journal = [
+        serde_json::json!({"version": "v1", "kind": "Prompt", "data": {
+            "message_id": "93cdb28f-d3b8-4b0a-81a9-b7ff12cb5d5a",
+            "content": [{"kind": "text", "data": "Add a /health endpoint."}]}}),
+        serde_json::json!({"version": "v1", "kind": "AssistantMessage", "data": {
+            "message_id": "7199a1ef-0b07-4efc-a793-42d5ce193a5a",
+            "content": [{"kind": "text", "data": "Added it to server.py."}]}}),
+    ];
+    std::fs::write(
+        cli.join(format!("{cli_id}.jsonl")),
+        journal
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let path = cli.join(format!("{cli_id}.json"));
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
+        .args(["info", &path.display().to_string(), "--json"])
+        .env("HOME", home.path())
+        .env("KIRO_HOME", kiro_home.path())
+        .env("XDG_DATA_HOME", store.path())
+        .output()
+        .expect("run casr info");
+    assert!(
+        output.status.success(),
+        "casr info failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("info --json emits an envelope");
+    assert_eq!(
+        envelope["provider"], "kiro",
+        "the file is under $KIRO_HOME/sessions/cli, which is a Kiro root; \
+         picking a parser by guessing is what happens when no root matches"
+    );
+    assert_eq!(
+        envelope["messages"], 2,
+        "both turns, which is what reading it as Kiro gets you"
+    );
+
+    // And it got there by matching a root, not by winning a bake-off. When no
+    // root matches, discovery probes every registered provider and keeps the
+    // most plausible parse — which is how a Kiro session comes back as some
+    // other agent's. The probe is silent under `--json`, so it is observed
+    // without it: the losing providers complain on stderr as they are asked.
+    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
+        .args(["info", &path.display().to_string()])
+        .env("HOME", home.path())
+        .env("KIRO_HOME", kiro_home.path())
+        .env("XDG_DATA_HOME", store.path())
+        .output()
+        .expect("run casr info");
+    let stderr = String::from_utf8_lossy(&plain.stderr);
+    assert!(
+        !stderr.contains("pi-agent") && !stderr.contains("clawdbot"),
+        "other providers were asked to parse a file that sits under a Kiro \
+         root, which means no root matched it: {stderr}"
     );
 }
 
