@@ -479,6 +479,13 @@ cross_agent_session_resumer/
 - A variable carrying a real tool's name must mean what that tool means by it.
   `AMP_HOME` is therefore not read at all: it relocates Amp's install tree, not
   its data. Never add a variable a tool does not actually honour.
+- The same rule applies *per store* when one provider reads two. `KIRO_HOME` is
+  `kiro-cli`'s variable and relocates only the CLI store; the Kiro IDE has no
+  relocation variable and always uses `~/.kiro`. `Kiro::cli_home_dir` and
+  `Kiro::ide_home_dir` are separate for that reason, and each quotes the shipped
+  code it mirrors. Applying one store's variable to the other store's scan is
+  the same defect as not reading that store at all: casr ends up looking at a
+  path the tool never writes to.
 
 ### CLI Surface
 

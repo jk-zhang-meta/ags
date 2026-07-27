@@ -26,6 +26,55 @@
 //!
 //! Cursor has no CLI `--resume <id>` flag. The resume command opens the
 //! workspace directory in Cursor (`cursor <workspace-path>`).
+//!
+//! # The second store: `cursor-agent`
+//!
+//! `cursor-agent` (the `agent` CLI) is a separate product with a separate root
+//! — `~/.cursor`, not `~/.config/Cursor` — and none of its sessions are in
+//! `state.vscdb`. It keeps each conversation in two places:
+//!
+//! ```text
+//! <configDir>/chats/<md5(cwd)>/<id>/store.db                       ← agent state
+//! <dataDir>/projects/<slug>/agent-transcripts/<id>/<id>.jsonl      ← transcript
+//! ```
+//!
+//! `<configDir>` is `$CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
+//! `~/.cursor`; `<dataDir>` is `$CURSOR_DATA_DIR`, else `~/.cursor`. Both
+//! resolvers are the CLI's own, so a user who moved either directory is still
+//! read correctly. `<slug>` is the absolute workspace path with every
+//! non-alphanumeric run collapsed to `-`, sometimes truncated with a sha256
+//! suffix; the reader globs `projects/*` instead of recomputing it, so which of
+//! the two namers ran does not matter.
+//!
+//! ## `store.db`
+//!
+//! ```sql
+//! CREATE TABLE blobs (id TEXT PRIMARY KEY, data BLOB);
+//! CREATE TABLE meta  (key TEXT PRIMARY KEY, value TEXT);
+//! ```
+//!
+//! `meta['0']` is the hex of UTF-8 JSON holding `{agentId, name, createdAt,
+//! mode, lastUsedModel, latestRootBlobId, …}` — that much is read. The
+//! conversation itself is a content-addressed graph of protobuf blobs rooted at
+//! `latestRootBlobId`, which this reader cannot decode.
+//!
+//! ## `<id>.jsonl`
+//!
+//! One JSON object per line. Conversation lines are
+//! `{"role": …, "message": {"content": [{"type":"text","text":…} |
+//! {"type":"tool_use","name":…,"input":…}]}}`; `{"type":"metadata"}` and
+//! `{"type":"turn_ended"}` lines carry no message. There are no timestamps and
+//! no workspace path in the file — see [`Cursor::read_cli_transcript`].
+//!
+//! ## De-duplication
+//!
+//! The conversation id is the key, and it is the only key the two halves share:
+//! `cursor-agent` uses the same string for the chat directory name and for the
+//! transcript filename. A conversation with both halves is listed once, from
+//! its transcript, enriched with its `store.db` metadata. A chat with no
+//! transcript — created but never prompted, or written by a build that did not
+//! write one — cannot be rendered, so it is listed as a candidate and reported
+//! through `list`'s `skipped` channel rather than dropped.
 
 use std::path::{Path, PathBuf};
 
@@ -35,7 +84,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
 use crate::model::{
-    CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
+    CanonicalMessage, CanonicalSession, MessageRole, ToolCall, flatten_content, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
 };
 use crate::providers::{Provider, WriteOptions, WrittenSession};
@@ -102,6 +151,105 @@ impl Cursor {
         }
 
         dbs
+    }
+
+    /// `cursor-agent`'s config root, resolved exactly as the CLI resolves it.
+    fn cli_config_dir() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("CURSOR_CONFIG_DIR")
+            && !dir.trim().is_empty()
+        {
+            return Some(PathBuf::from(dir));
+        }
+        if let Ok(dir) = std::env::var("XDG_CONFIG_HOME")
+            && !dir.trim().is_empty()
+        {
+            return Some(PathBuf::from(dir).join("cursor"));
+        }
+        dirs::home_dir().map(|h| h.join(".cursor"))
+    }
+
+    /// `cursor-agent`'s data root. Note it does *not* consult `XDG_DATA_HOME`.
+    fn cli_data_dir() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("CURSOR_DATA_DIR")
+            && !dir.trim().is_empty()
+        {
+            return Some(PathBuf::from(dir));
+        }
+        dirs::home_dir().map(|h| h.join(".cursor"))
+    }
+
+    /// Every `cursor-agent` transcript, as `(conversation id, path)`.
+    ///
+    /// Three filename layouts exist — `<id>/<id>.jsonl`, the legacy flat
+    /// `<id>.jsonl`, and `<parent>/subagents/<id>.jsonl`. In all three the file
+    /// stem is the conversation id, so a recursive walk covers them without
+    /// having to know which one produced a given file.
+    fn cli_transcripts() -> Vec<(String, PathBuf)> {
+        let Some(projects) = Self::cli_data_dir().map(|d| d.join("projects")) else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        for project in std::fs::read_dir(&projects).into_iter().flatten().flatten() {
+            let transcripts = project.path().join("agent-transcripts");
+            if !transcripts.is_dir() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&transcripts)
+                .max_depth(3)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                let path = entry.path();
+                if !entry.file_type().is_file()
+                    || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+                {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push((stem.to_string(), path.to_path_buf()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every `cursor-agent` chat store, as `(conversation id, store.db path)`.
+    fn cli_chat_stores() -> Vec<(String, PathBuf)> {
+        let Some(chats) = Self::cli_config_dir().map(|d| d.join("chats")) else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        for bucket in std::fs::read_dir(&chats).into_iter().flatten().flatten() {
+            for chat in std::fs::read_dir(bucket.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let db = chat.path().join("store.db");
+                if !db.is_file() {
+                    continue;
+                }
+                if let Some(id) = chat.file_name().to_str() {
+                    out.push((id.to_string(), db));
+                }
+            }
+        }
+        out
+    }
+
+    /// The `meta['0']` JSON from a chat's `store.db`, if one exists for `id`.
+    ///
+    /// Returns `None` rather than an error: this is enrichment, and a chat
+    /// store that will not open must not cost the transcript its listing.
+    fn cli_chat_metadata(id: &str) -> Option<serde_json::Value> {
+        let (_, db) = Self::cli_chat_stores().into_iter().find(|(k, _)| k == id)?;
+        let conn = Self::open_db(&db).ok()?;
+        let hex: String = conn
+            .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
+                row.get(0)
+            })
+            .ok()?;
+        serde_json::from_slice(&decode_hex(&hex)?).ok()
     }
 
     /// Build a virtual per-session path backed by a `state.vscdb` file.
@@ -221,6 +369,132 @@ impl Cursor {
         }
 
         bubbles
+    }
+
+    /// Read one `cursor-agent` transcript.
+    ///
+    /// The file carries roles, text, thinking and tool calls, and nothing else:
+    /// no per-message timestamps, no model, and no workspace path. The chat's
+    /// `store.db` supplies the title, creation time and model when it is still
+    /// there; the workspace is supplied by nothing. Both directory names that
+    /// could name it — the `projects/<slug>` slug and the `chats/<md5>` bucket
+    /// — are one-way, so the workspace stays `None` instead of being guessed
+    /// from a lossy slug.
+    fn read_cli_transcript(path: &Path) -> anyhow::Result<CanonicalSession> {
+        debug!(path = %path.display(), "reading cursor-agent transcript");
+
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        let mut messages: Vec<CanonicalMessage> = Vec::new();
+        let mut overview: Option<String> = None;
+        for (lineno, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let record: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    // The writer appends, so an interrupted run leaves a
+                    // partial last line; the turns before it are intact.
+                    trace!(line = lineno, error = %e, "skipping unparseable transcript line");
+                    continue;
+                }
+            };
+            // `{"type":"metadata"}` / `{"type":"turn_ended"}` lines are not
+            // messages. The overview is the CLI's own summary of the
+            // conversation, so it is kept as the title candidate.
+            if let Some(kind) = record.get("type").and_then(|v| v.as_str()) {
+                if kind == "metadata" {
+                    overview = record
+                        .pointer("/metadata/overview")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
+                }
+                continue;
+            }
+            if let Some(msg) = parse_transcript_line(&record) {
+                messages.push(msg);
+            }
+        }
+
+        reindex_messages(&mut messages);
+
+        let chat_meta = Self::cli_chat_metadata(&session_id);
+        let meta_str = |key: &str| {
+            chat_meta
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(ToString::to_string)
+        };
+
+        let title = meta_str("name")
+            .or(overview)
+            .map(|t| truncate_title(&t, 100))
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| truncate_title(&m.content, 100))
+            });
+        let started_at = chat_meta
+            .as_ref()
+            .and_then(|m| m.get("createdAt"))
+            .and_then(parse_timestamp);
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "source".into(),
+            serde_json::Value::String("cursor".to_string()),
+        );
+        metadata.insert(
+            "cursor_store".into(),
+            serde_json::Value::String("cursor-agent".to_string()),
+        );
+        if let Some(chat) = chat_meta.clone() {
+            metadata.insert("cursor_agent_chat".into(), chat);
+        }
+        // A subagent transcript lives at `<parent>/subagents/<id>.jsonl`, so
+        // the path is the only record of whose subagent it was. It is a real
+        // session and stays listed as one, but the lineage is right there and
+        // dropping it would lose something the store actually said.
+        if let Some(parent) = subagent_parent_id(path) {
+            metadata.insert(
+                "cursor_agent_parent_id".into(),
+                serde_json::Value::String(parent),
+            );
+        }
+
+        debug!(
+            session_id,
+            messages = messages.len(),
+            "cursor-agent transcript parsed"
+        );
+
+        Ok(CanonicalSession {
+            session_id,
+            provider_slug: "cursor".to_string(),
+            // Not determinable from either store; see the doc comment.
+            workspace: None,
+            title,
+            started_at,
+            // The transcript has no timestamps at all, and inventing the file's
+            // mtime here would make it indistinguishable from a recorded one.
+            ended_at: None,
+            messages,
+            metadata: serde_json::Value::Object(metadata),
+            source_path: path.to_path_buf(),
+            model_name: meta_str("lastUsedModel"),
+        })
     }
 
     /// Read a single session from a composerData entry.
@@ -424,9 +698,11 @@ impl Provider for Cursor {
         let mut installed = false;
 
         // Check for binary in PATH.
-        if which::which("cursor").is_ok() {
-            evidence.push("cursor binary found in PATH".to_string());
-            installed = true;
+        for bin in ["cursor", "cursor-agent"] {
+            if which::which(bin).is_ok() {
+                evidence.push(format!("{bin} binary found in PATH"));
+                installed = true;
+            }
         }
 
         // Check for config directory.
@@ -435,6 +711,21 @@ impl Provider for Cursor {
         {
             evidence.push(format!("{} exists", config.display()));
             installed = true;
+        }
+
+        // `cursor-agent` has its own root, and installing it is the one thing
+        // that creates it. Reporting it keeps detection matched to the two
+        // stores this provider reads.
+        for dir in [Self::cli_config_dir(), Self::cli_data_dir()] {
+            if let Some(dir) = dir
+                && dir.is_dir()
+                && !evidence
+                    .iter()
+                    .any(|e| e.starts_with(&dir.display().to_string()))
+            {
+                evidence.push(format!("{} exists", dir.display()));
+                installed = true;
+            }
         }
 
         // Check for any state.vscdb files.
@@ -452,10 +743,34 @@ impl Provider for Cursor {
     }
 
     fn session_roots(&self) -> Vec<PathBuf> {
-        Self::find_db_files()
+        let mut roots = Self::find_db_files();
+        for dir in [
+            Self::cli_data_dir().map(|d| d.join("projects")),
+            Self::cli_config_dir().map(|d| d.join("chats")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if dir.is_dir() && !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+        roots
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
+        if let Some((_, path)) = Self::cli_transcripts()
+            .into_iter()
+            .find(|(id, _)| id == session_id)
+        {
+            return Some(path);
+        }
+        if let Some((_, path)) = Self::cli_chat_stores()
+            .into_iter()
+            .find(|(id, _)| id == session_id)
+        {
+            return Some(path);
+        }
         for db_path in Self::find_db_files() {
             if let Ok(conn) = Self::open_db(&db_path) {
                 let ids = Self::list_composer_ids(&conn);
@@ -476,6 +791,26 @@ impl Provider for Cursor {
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading Cursor session");
+
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            return Self::read_cli_transcript(path);
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("store.db") {
+            // Deliberately an error, not an empty session: this chat has real
+            // turns and this reader cannot see them. `list` carries it in
+            // `skipped` so the count the user reads is honest, where a
+            // zero-message row would silently claim the conversation is empty.
+            let id = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
+            anyhow::bail!(
+                "cursor-agent chat {id}: its turns live in this store's `blobs` table as \
+                 protobuf, which casr cannot decode, and no transcript for it exists under \
+                 `projects/*/agent-transcripts/`"
+            );
+        }
 
         // The path may be a DB file directly, or a DB file with an appended composer ID.
         // Check if the path itself is a real file (SQLite DB).
@@ -640,20 +975,33 @@ impl Provider for Cursor {
     }
 
     fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
-        let db_files = Self::find_db_files();
-        if db_files.is_empty() {
-            return Some(Vec::new());
-        }
-
         let mut results = Vec::new();
-        for db_path in &db_files {
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for db_path in &Self::find_db_files() {
             let Ok(conn) = Self::open_db(db_path) else {
                 continue;
             };
 
             for id in Self::list_composer_ids(&conn) {
                 let virtual_path = Self::virtual_session_path(db_path, &id);
-                results.push((id, virtual_path));
+                if seen.insert(id.clone()) {
+                    results.push((id, virtual_path));
+                }
+            }
+        }
+
+        // `cursor-agent`. Transcripts first so a conversation that has both
+        // halves is listed from the half that can actually be read; the chat
+        // store then contributes only what the transcript is missing.
+        for (id, path) in Self::cli_transcripts() {
+            if seen.insert(id.clone()) {
+                results.push((id, path));
+            }
+        }
+        for (id, path) in Self::cli_chat_stores() {
+            if seen.insert(id.clone()) {
+                results.push((id, path));
             }
         }
 
@@ -664,6 +1012,95 @@ impl Provider for Cursor {
 // ---------------------------------------------------------------------------
 // Bubble parsing helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// cursor-agent transcript helpers
+// ---------------------------------------------------------------------------
+
+/// Decode a lowercase-or-upper hex string. `None` on any non-hex input.
+///
+/// Six lines beats a dependency for the one place a hex string is read.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    s.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
+}
+
+/// The parent conversation id of a subagent transcript, from its path.
+///
+/// `agent-transcripts/<parentId>/subagents/<id>.jsonl` is the only layout that
+/// records one; the two primary layouts return `None`.
+fn subagent_parent_id(path: &Path) -> Option<String> {
+    let subagents = path.parent()?;
+    if subagents.file_name()? != "subagents" {
+        return None;
+    }
+    subagents
+        .parent()?
+        .file_name()?
+        .to_str()
+        .map(ToString::to_string)
+}
+
+/// Parse one conversation line of a `cursor-agent` transcript.
+///
+/// `{"role": …, "message": {"content": [ … ]}}`. Returns `None` when the line
+/// has no content blocks the canonical message can carry.
+fn parse_transcript_line(record: &serde_json::Value) -> Option<CanonicalMessage> {
+    let role_str = record.get("role").and_then(|v| v.as_str())?;
+    let blocks = record.pointer("/message/content")?.as_array()?;
+
+    let mut text_chunks: Vec<String> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+
+    for block in blocks {
+        match block.get("type").and_then(|v| v.as_str()) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str())
+                    && !t.trim().is_empty()
+                {
+                    text_chunks.push(t.to_string());
+                }
+            }
+            Some("tool_use") => tool_calls.push(ToolCall {
+                // The transcript records no tool-call id — the writer drops it
+                // when it flattens the blob graph — so there is none to report.
+                id: None,
+                name: block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                arguments: block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }),
+            _ => {}
+        }
+    }
+
+    if text_chunks.is_empty() && tool_calls.is_empty() {
+        return None;
+    }
+
+    Some(CanonicalMessage {
+        idx: 0,
+        role: normalize_role(role_str),
+        content: text_chunks.join("\n\n"),
+        // Not recorded anywhere in the file.
+        timestamp: None,
+        author: None,
+        tool_calls,
+        tool_results: Vec::new(),
+        extra: record.clone(),
+    })
+}
 
 /// Extract text content from a bubble, trying multiple fields.
 ///
@@ -806,9 +1243,50 @@ fn extract_workspace_from_bubbles(
 
 /// Extract workspace from composerData itself (fallback).
 fn extract_workspace_from_composer(composer: &serde_json::Value) -> Option<PathBuf> {
-    composer
-        .get("workspacePath")
-        .or_else(|| composer.get("projectPath"))
+    workspace_from_identifier(composer.get("workspaceIdentifier")).or_else(|| {
+        composer
+            .get("workspacePath")
+            .or_else(|| composer.get("projectPath"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    })
+}
+
+/// Read a workspace path out of `composerData.workspaceIdentifier`.
+///
+/// Cursor stamps every composer it creates with VS Code's `IWorkspaceIdentifier`
+/// — `{id, uri}` for a single folder, `{id, configPath}` for a multi-root
+/// `.code-workspace`, and a bare `{id}` for an empty window. The `id` is the
+/// `workspaceStorage` hash and names no path, so only the URI forms answer.
+///
+/// The URI is a serialized VS Code `URI`: `{"$mid":1, "fsPath":…, "path":…,
+/// "scheme":"file", "external":"file:///…"}`. `fsPath` is preferred because it
+/// is already native and already decoded; `external` is the fallback for a
+/// remote workspace, where `fsPath` is a path on the *remote*. An empty-window
+/// composer returns `None` — there is no folder to name.
+fn workspace_from_identifier(identifier: Option<&serde_json::Value>) -> Option<PathBuf> {
+    let uri = identifier?
+        .get("uri")
+        .or_else(|| identifier?.get("configPath"))?;
+
+    // A plain string URI, in case a future writer stops using `URI.toJSON`.
+    if let Some(s) = uri.as_str() {
+        return parse_workspace_uri(s).or_else(|| Some(PathBuf::from(s)));
+    }
+
+    if uri.get("scheme").and_then(|v| v.as_str()) == Some("file")
+        && let Some(fs_path) = uri.get("fsPath").and_then(|v| v.as_str())
+        && !fs_path.is_empty()
+    {
+        return Some(PathBuf::from(fs_path));
+    }
+    if let Some(external) = uri.get("external").and_then(|v| v.as_str())
+        && let Some(path) = parse_workspace_uri(external)
+    {
+        return Some(path);
+    }
+    uri.get("path")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)

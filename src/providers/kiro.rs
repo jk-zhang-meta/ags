@@ -1,17 +1,81 @@
-//! Kiro CLI provider — reads/writes Kiro's per-session file triplet under
-//! `$KIRO_HOME/sessions/cli/`.
+//! Kiro provider — reads/writes both stores Kiro keeps under `~/.kiro`.
 //!
-//! Kiro is AWS/Amazon's agentic coding CLI (`kiro-cli`), backed by Amazon
-//! Bedrock. Each session is stored as up to three sibling files keyed by the
-//! session UUID:
+//! Kiro ships as two products that share one home directory, and they do not
+//! share a session layout. `detect()` fires on `~/.kiro` existing, which either
+//! product creates, so reading only one of them renders as "installed, 0
+//! sessions" for every user of the other — indistinguishable from having none.
 //!
 //! ```text
-//! $KIRO_HOME/sessions/cli/<id>.json      ← session metadata + nested session_state
-//! $KIRO_HOME/sessions/cli/<id>.jsonl     ← append-only conversation journal
-//! $KIRO_HOME/sessions/cli/<id>.history   ← plain-text slash-command history (optional)
+//! <cliRoot>/sessions/cli/<uuid>.{json,jsonl,history}          ← Kiro CLI
+//! <ideRoot>/sessions/<workspaceHash>/sess_<uuid>/…            ← Kiro IDE
 //! ```
 //!
-//! `$KIRO_HOME` overrides the default `~/.kiro`.
+//! # The two roots are not the same variable
+//!
+//! They are usually the same directory, and they are not the same rule:
+//!
+//! * `<cliRoot>` is `$KIRO_HOME` when that is set and non-empty, else
+//!   `~/.kiro`. This is `kiro-cli`'s own resolver — see [`Kiro::cli_home_dir`],
+//!   which quotes it — and `KIRO_HOME` *replaces* the root rather than being a
+//!   parent to append `.kiro` to.
+//! * `<ideRoot>` is always `~/.kiro`. The Kiro IDE has no relocation variable
+//!   at all: `KIRO_HOME` occurs zero times in the entire shipped package. See
+//!   [`Kiro::ide_home_dir`].
+//!
+//! So `KIRO_HOME=/tmp/x` moves the CLI's sessions and leaves the IDE's where
+//! they were, and casr has to follow each store to where its own product
+//! actually writes. Applying `KIRO_HOME` to both would send the IDE scan to a
+//! directory Kiro IDE never writes to — the same defect class as not reading
+//! the store at all.
+//!
+//! One real CLI variable is deliberately not read: `KIRO_TEST_SESSIONS_DIR`,
+//! which replaces `sessions/cli` outright. It is part of the CLI's `KIRO_TEST_*`
+//! harness family, not a user-facing relocation knob.
+//!
+//! # Kiro CLI (`kiro-cli`)
+//!
+//! AWS/Amazon's agentic coding CLI, backed by Amazon Bedrock. Each session is
+//! up to three sibling files keyed by the session UUID:
+//!
+//! ```text
+//! <cliRoot>/sessions/cli/<id>.json      ← session metadata + nested session_state
+//! <cliRoot>/sessions/cli/<id>.jsonl     ← append-only conversation journal
+//! <cliRoot>/sessions/cli/<id>.history   ← plain-text slash-command history (optional)
+//! ```
+//!
+//! # Kiro IDE (the desktop app)
+//!
+//! A different store, written by the bundled `kiro.kiro-agent` extension. A
+//! session is a *directory* under a per-workspace bucket:
+//!
+//! ```text
+//! ~/.kiro/sessions/<bucket>/sess_<uuid>/session.json      ← metadata
+//! ~/.kiro/sessions/<bucket>/sess_<uuid>/messages.jsonl    ← one JSON event per line
+//! ~/.kiro/sessions/<bucket>/sess_<uuid>/tool-outputs/…    ← spilled tool output
+//! ```
+//!
+//! `<bucket>` is `_global` when the session has no workspace, else the first 16
+//! hex characters of `sha256` over the session's absolute workspace paths,
+//! normalised, sorted and joined by NUL. It is a one-way hash, so the bucket
+//! name is *not* a workspace: the workspace comes from `session.json`'s
+//! `workspacePaths`, and is `None` when that array is empty.
+//!
+//! `session.json` carries `{id, title, agentMode, workspacePaths, createdAt,
+//! lastModifiedAt, modelId?, parentSessionId?, …}`. Each `messages.jsonl` line
+//! is `{"id", "timestamp", "payload"}` where `payload.type` selects one of
+//! twenty-three shapes; the four that carry conversation are `user`,
+//! `assistant`, `tool_call` and `tool_result`. The rest are session lifecycle
+//! events (`turn_start`, `tombstone`, `usage_summary`, …) and are not messages.
+//!
+//! ## Why the two scans cannot collide
+//!
+//! With `KIRO_HOME` unset the two roots coincide, so the scans share a parent.
+//! The IDE scan looks for `<sessions>/<dir>/<dir>/session.json`. `sessions/cli`
+//! *is* a bucket-shaped directory, but its children are files, not directories,
+//! so it yields nothing — and a bucket name is 16 hex characters or `_global`,
+//! never `cli`. The id spaces are disjoint too: CLI ids are bare UUIDs, IDE ids
+//! are `sess_`-prefixed. `list_sessions` still de-duplicates on the session id,
+//! which is the only key both stores agree on.
 //!
 //! ## `.json` (metadata)
 //!
@@ -69,9 +133,23 @@ const SLUG: &str = "kiro";
 pub struct Kiro;
 
 impl Kiro {
-    /// Root directory for Kiro data. Respects the `KIRO_HOME` env override,
-    /// otherwise defaults to `~/.kiro`.
-    fn home_dir() -> Option<PathBuf> {
+    /// Root directory for Kiro **CLI** data.
+    ///
+    /// This is `kiro-cli`'s own resolver, not a casr convention. From the
+    /// bundled TUI in the shipped `kiro-cli-chat` 2.14.2 binary, verbatim:
+    ///
+    /// ```js
+    /// function XTe(){
+    ///   let e=process.env.KIRO_HOME;
+    ///   if(e&&e.length>0)return e;
+    ///   let n=process.env.HOME||process.env.USERPROFILE||WTe();
+    ///   return yte(n,".kiro")
+    /// }
+    /// ```
+    ///
+    /// Note `KIRO_HOME` replaces the whole root — `.kiro` is *not* appended to
+    /// it — which is why this returns it unjoined.
+    fn cli_home_dir() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("KIRO_HOME") {
             let trimmed = home.trim();
             if !trimmed.is_empty() {
@@ -81,9 +159,76 @@ impl Kiro {
         dirs::home_dir().map(|h| h.join(".kiro"))
     }
 
+    /// Root directory for Kiro **IDE** data.
+    ///
+    /// Deliberately does not consult `KIRO_HOME`, because the IDE does not.
+    /// `KIRO_HOME` appears zero times in the whole shipped Kiro IDE 1.0.212
+    /// package, and all six places the extension builds this path use
+    /// `os.homedir()` — e.g. `getDefaultSessionsPath()` in
+    /// `src/extension/agent-chat/api/methods/open-file-diff.ts`:
+    ///
+    /// ```js
+    /// return nodePath4.join(os18.homedir(), ".kiro", "sessions");
+    /// ```
+    ///
+    /// The agent's own `sessionsPath` constructor option would override it, but
+    /// nothing in the package ever supplies one (`sessionsPath:` occurs zero
+    /// times), so the default always wins.
+    ///
+    /// Honouring `KIRO_HOME` here would point casr at a directory Kiro IDE
+    /// never writes to, which is the same defect — reading a path the tool does
+    /// not use — that adding this store was meant to fix.
+    fn ide_home_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".kiro"))
+    }
+
     /// Directory holding the CLI session triplets.
     fn sessions_dir() -> Option<PathBuf> {
-        Self::home_dir().map(|h| h.join("sessions").join("cli"))
+        Self::cli_home_dir().map(|h| h.join("sessions").join("cli"))
+    }
+
+    /// Root the Kiro IDE buckets its session directories under.
+    fn ide_root() -> Option<PathBuf> {
+        Self::ide_home_dir().map(|h| h.join("sessions"))
+    }
+
+    /// Every `<bucket>/<sess_id>/session.json` the IDE has written.
+    ///
+    /// Two levels deep and no deeper: the third level is `tool-outputs/` and
+    /// `sub-executions/`, which hold spilled payloads, not sessions.
+    fn ide_sessions() -> Vec<(String, PathBuf)> {
+        let Some(root) = Self::ide_root() else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        for bucket in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            if !bucket.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            for session in std::fs::read_dir(bucket.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                if !session.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let meta = session.path().join("session.json");
+                if !meta.is_file() {
+                    continue;
+                }
+                let Some(id) = session.file_name().to_str().map(ToString::to_string) else {
+                    continue;
+                };
+                out.push((id, meta));
+            }
+        }
+        out
+    }
+
+    /// True when `path` is a Kiro IDE session anchor rather than a CLI one.
+    fn is_ide_anchor(path: &Path) -> bool {
+        path.file_name().and_then(|n| n.to_str()) == Some("session.json")
     }
 
     /// Sibling path for a session file with a different extension.
@@ -117,11 +262,17 @@ impl Provider for Kiro {
             }
         }
 
-        if let Some(home) = Self::home_dir()
-            && home.is_dir()
-        {
-            evidence.push(format!("{} exists", home.display()));
-            installed = true;
+        // Both roots, because they are not always the same directory: with
+        // `KIRO_HOME` set they are two, and a user with only the IDE installed
+        // has only the second one.
+        for home in [Self::cli_home_dir(), Self::ide_home_dir()] {
+            if let Some(home) = home
+                && home.is_dir()
+                && !evidence.contains(&format!("{} exists", home.display()))
+            {
+                evidence.push(format!("{} exists", home.display()));
+                installed = true;
+            }
         }
 
         trace!(provider = SLUG, ?evidence, installed, "detection");
@@ -133,29 +284,38 @@ impl Provider for Kiro {
     }
 
     fn session_roots(&self) -> Vec<PathBuf> {
-        match Self::sessions_dir() {
+        // `sessions/` rather than `sessions/cli/`: it is the parent of both
+        // stores, and every caller uses these roots with `starts_with`.
+        match Self::ide_root() {
             Some(dir) if dir.is_dir() => vec![dir],
             _ => vec![],
         }
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let dir = Self::sessions_dir()?;
-        // The metadata `.json` file is the canonical session anchor.
-        let candidate = dir.join(format!("{session_id}.json"));
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Some(dir) = Self::sessions_dir() {
+            // The metadata `.json` file is the canonical CLI session anchor.
+            let candidate = dir.join(format!("{session_id}.json"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            // Tolerate sessions that only ever produced a `.jsonl` journal.
+            let jsonl = dir.join(format!("{session_id}.jsonl"));
+            if jsonl.is_file() {
+                return Some(jsonl);
+            }
         }
-        // Tolerate sessions that only ever produced a `.jsonl` journal.
-        let jsonl = dir.join(format!("{session_id}.jsonl"));
-        jsonl.is_file().then_some(jsonl)
+        // The IDE buckets by a one-way workspace hash, so the bucket holding a
+        // given id can only be found by looking in all of them — which is what
+        // Kiro's own `deleteSessionAcrossBuckets` does.
+        Self::ide_sessions()
+            .into_iter()
+            .find(|(id, _)| id == session_id)
+            .map(|(_, path)| path)
     }
 
     fn list_sessions(&self) -> Option<Vec<(String, PathBuf)>> {
         let dir = Self::sessions_dir()?;
-        if !dir.is_dir() {
-            return Some(vec![]);
-        }
 
         // Anchor on `.json` metadata files; fall back to `.jsonl` for sessions
         // that never wrote metadata. De-dup so a `<id>.json`/`<id>.jsonl` pair
@@ -170,6 +330,8 @@ impl Provider for Kiro {
                 }
             };
 
+        // `read_dir` on a missing `sessions/cli` yields nothing, which is the
+        // right answer for an IDE-only install — the IDE scan below still runs.
         let entries = std::fs::read_dir(&dir).into_iter().flatten().flatten();
         // Two passes so `.json` wins as the anchor path over a bare `.jsonl`.
         let paths: Vec<PathBuf> = entries.map(|e| e.path()).collect();
@@ -190,10 +352,19 @@ impl Provider for Kiro {
             }
         }
 
+        // The IDE's store. Same `seen` set, so the session id remains the one
+        // key: a session cannot be listed twice because two stores describe it.
+        for (id, path) in Self::ide_sessions() {
+            push(id, path, &mut seen);
+        }
+
         Some(sessions)
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
+        if Self::is_ide_anchor(path) {
+            return read_ide_session(path);
+        }
         debug!(path = %path.display(), "reading Kiro session");
 
         // The given `path` may be either the `.json` metadata or the `.jsonl`
@@ -472,6 +643,262 @@ impl Provider for Kiro {
 // ---------------------------------------------------------------------------
 // Reader helpers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Kiro IDE reader
+// ---------------------------------------------------------------------------
+
+/// Read one `sess_<uuid>/session.json` + its `messages.jsonl` sibling.
+fn read_ide_session(meta_path: &Path) -> anyhow::Result<CanonicalSession> {
+    debug!(path = %meta_path.display(), "reading Kiro IDE session");
+
+    let text = std::fs::read_to_string(meta_path)
+        .with_context(|| format!("failed to read {}", meta_path.display()))?;
+    let meta: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("failed to parse JSON {}", meta_path.display()))?;
+
+    let dir = meta_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", meta_path.display()))?;
+
+    let session_id = meta
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| {
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // The bucket directory is a one-way hash, so `workspacePaths` is the only
+    // source. An empty array is Kiro's own "_global" case: no workspace, which
+    // is reported as such rather than guessed at.
+    let workspace = meta
+        .get("workspacePaths")
+        .and_then(|v| v.as_array())
+        .and_then(|paths| paths.first())
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from);
+
+    let started_at = meta.get("createdAt").and_then(parse_timestamp);
+    let mut ended_at = meta.get("lastModifiedAt").and_then(parse_timestamp);
+
+    let mut messages: Vec<CanonicalMessage> = Vec::new();
+    let jsonl_path = dir.join("messages.jsonl");
+    if jsonl_path.is_file() {
+        let text = std::fs::read_to_string(&jsonl_path)
+            .with_context(|| format!("failed to read {}", jsonl_path.display()))?;
+        for (lineno, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let record: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A crashed IDE leaves a half-written trailing line; the
+                    // rest of the transcript is still good.
+                    trace!(line = lineno, error = %e, "skipping unparseable Kiro IDE message");
+                    continue;
+                }
+            };
+            if let Some(msg) = parse_ide_message(&record, &mut ended_at) {
+                messages.push(msg);
+            }
+        }
+    }
+
+    reindex_messages(&mut messages);
+
+    let title = meta
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| truncate_title(s, 100))
+        .or_else(|| {
+            messages
+                .iter()
+                .find(|m| m.role == MessageRole::User)
+                .map(|m| truncate_title(&m.content, 100))
+        });
+
+    let model_name = meta
+        .get("modelId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(String::from);
+
+    // Preserve everything the canonical fields cannot carry, so an IDE session
+    // that leaves and comes back does not lose its mode or its lineage.
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("source".into(), serde_json::Value::String(SLUG.to_string()));
+    metadata.insert(
+        "kiro_store".into(),
+        serde_json::Value::String("ide".to_string()),
+    );
+    for key in [
+        "agentMode",
+        "parentSessionId",
+        "parentExecutionId",
+        "createdReason",
+        "executionTarget",
+        "repositories",
+        "schemaVersion",
+        "dataModelVersion",
+        "workspacePaths",
+    ] {
+        if let Some(v) = meta.get(key)
+            && !v.is_null()
+        {
+            metadata.insert(key.into(), v.clone());
+        }
+    }
+
+    debug!(
+        session_id,
+        messages = messages.len(),
+        "Kiro IDE session parsed"
+    );
+
+    Ok(CanonicalSession {
+        session_id,
+        provider_slug: SLUG.to_string(),
+        workspace,
+        title,
+        started_at,
+        ended_at,
+        messages,
+        metadata: serde_json::Value::Object(metadata),
+        source_path: meta_path.to_path_buf(),
+        model_name,
+    })
+}
+
+/// Parse one `{"id","timestamp","payload"}` line of `messages.jsonl`.
+///
+/// Returns `None` for the lifecycle events (`turn_start`, `tombstone`,
+/// `usage_summary`, …) that share the file with the conversation but are not
+/// messages.
+fn parse_ide_message(
+    record: &serde_json::Value,
+    ended_at: &mut Option<i64>,
+) -> Option<CanonicalMessage> {
+    let payload = record.get("payload")?;
+    let kind = payload.get("type").and_then(|v| v.as_str())?;
+
+    let timestamp = record.get("timestamp").and_then(parse_timestamp);
+    if let Some(t) = timestamp {
+        *ended_at = Some(ended_at.map_or(t, |e: i64| e.max(t)));
+    }
+
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let (role, content, author, tool_calls, tool_results) = match kind {
+        "user" => (
+            MessageRole::User,
+            text("content"),
+            Some("user".to_string()),
+            Vec::new(),
+            Vec::new(),
+        ),
+        "assistant" => (
+            MessageRole::Assistant,
+            text("content"),
+            // `operationType: "Reasoning"` is how the IDE marks thinking; the
+            // rest of this codebase spells that author `"reasoning"`.
+            match payload.get("operationType").and_then(|v| v.as_str()) {
+                Some("Reasoning") => Some("reasoning".to_string()),
+                _ => payload
+                    .get("reasoningModelId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+            },
+            Vec::new(),
+            Vec::new(),
+        ),
+        "tool_call" => (
+            MessageRole::Assistant,
+            String::new(),
+            None,
+            vec![ToolCall {
+                id: payload
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                name: payload
+                    .get("toolName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                arguments: payload
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }],
+            Vec::new(),
+        ),
+        "tool_result" => (
+            MessageRole::Tool,
+            String::new(),
+            None,
+            Vec::new(),
+            vec![ToolResult {
+                call_id: payload
+                    .get("toolCallId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
+                content: text("content"),
+                is_error: payload
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .map(|ok| !ok)
+                    .unwrap_or(false),
+            }],
+        ),
+        "system" | "agent_note" => (
+            MessageRole::System,
+            text("content"),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+        "error" => (
+            MessageRole::System,
+            text("message"),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+        // Lifecycle events, not conversation.
+        _ => return None,
+    };
+
+    if content.trim().is_empty() && tool_calls.is_empty() && tool_results.is_empty() {
+        return None;
+    }
+
+    Some(CanonicalMessage {
+        idx: 0,
+        role,
+        content,
+        timestamp,
+        author,
+        tool_calls,
+        tool_results,
+        // The whole record, so a round-trip keeps the fields the canonical
+        // message has nowhere to put (status, executionId, snapshot ids, …).
+        extra: record.clone(),
+    })
+}
 
 /// Extract the session id from a `<id>.{json,jsonl,history}` path's file stem.
 fn session_id_from_path(path: &Path) -> Option<String> {

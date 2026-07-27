@@ -1,0 +1,16 @@
+{
+  "fixture_id": "kiro_ide_session",
+  "provider_slug": "kiro",
+  "session_id": "sess_9c1f4c2e-6b0a-4f71-8a55-2f0d7b3ac914",
+  "workspace": "/home/u/demo-project",
+  "title": "Add a /health endpoint",
+  "message_count": 8,
+  "roles": ["User", "Assistant", "Assistant", "Assistant", "Tool", "Assistant", "Tool", "Assistant"],
+  "started_at_present": true,
+  "ended_at_present": true,
+  "model_name": "claude-sonnet-4-5",
+  "has_tool_calls": true,
+  "has_tool_results": true,
+  "known_lossy_fields": ["payload.status", "payload.executionId", "payload.preSnapshotId", "payload.reasoningSignature"],
+  "notes": "Kiro IDE session.json + messages.jsonl. The four lifecycle payloads (session_start, turn_start, usage_summary, turn_end) are not messages and must not appear in the count. Workspace comes from workspacePaths[0]; the bucket directory is a one-way sha256 prefix and names nothing."
+}

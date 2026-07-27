@@ -1,0 +1,16 @@
+{
+  "fixture_id": "kiro_ide_session_global",
+  "provider_slug": "kiro",
+  "session_id": "sess_3d7e5a10-11c2-4c8e-9b64-5a1e0f2d8c37",
+  "workspace": null,
+  "title": "What is a monad?",
+  "message_count": 2,
+  "roles": ["User", "Assistant"],
+  "started_at_present": true,
+  "ended_at_present": true,
+  "model_name": null,
+  "has_tool_calls": false,
+  "has_tool_results": false,
+  "known_lossy_fields": [],
+  "notes": "workspacePaths is empty, so Kiro files this under the literal _global bucket. There is no workspace to recover and none is invented: workspace reads None."
+}

@@ -19,6 +19,7 @@ use casr::providers::cursor::Cursor;
 use casr::providers::factory::Factory;
 use casr::providers::gemini::Gemini;
 use casr::providers::grok::Grok;
+use casr::providers::kiro::Kiro;
 use casr::providers::openclaw::OpenClaw;
 use casr::providers::opencode::OpenCode;
 use casr::providers::pi_agent::PiAgent;
@@ -917,11 +918,172 @@ fn manifest_all_fixtures_have_expected_files() {
             fixture_path.display()
         );
 
-        let expected_path = fixtures_dir().join(entry["expected"].as_str().unwrap());
-        assert!(
-            expected_path.exists(),
-            "Expected file missing for {fixture_id}: {}",
-            expected_path.display()
-        );
+        // Most fixtures have a golden. One does not, and cannot: a
+        // `cursor-agent` chat store's correct outcome is a *read failure* that
+        // reaches `list`'s `skipped` list, and there is no canonical session to
+        // write down. An entry may therefore omit `expected` only by saying so,
+        // which keeps "no golden" a decision someone made rather than one
+        // someone forgot.
+        match (entry.get("expected"), entry.get("no_expected_because")) {
+            (Some(expected), _) => {
+                let expected_path = fixtures_dir().join(expected.as_str().unwrap());
+                assert!(
+                    expected_path.exists(),
+                    "Expected file missing for {fixture_id}: {}",
+                    expected_path.display()
+                );
+            }
+            (None, Some(reason)) => assert!(
+                reason.as_str().is_some_and(|r| !r.trim().is_empty()),
+                "{fixture_id} omits `expected` but its `no_expected_because` is empty"
+            ),
+            (None, None) => panic!(
+                "{fixture_id} has no `expected` golden and no `no_expected_because` saying why"
+            ),
+        }
+
+        // Provenance is not optional for a fixture that claims to be evidence
+        // about a tool. `synthetic` and `edge` fixtures are openly written for
+        // casr and claim nothing; `real` and `schema-derived` both assert that
+        // the bytes came from somewhere outside this repository, and an
+        // assertion like that has to say where — otherwise the next reader
+        // cannot tell a capture from a guess, which is how a provider ends up
+        // with fixtures that encode casr's expectations instead of the tool's
+        // behaviour.
+        if matches!(
+            entry["category"].as_str(),
+            Some("real") | Some("schema-derived")
+        ) {
+            assert!(
+                entry
+                    .get("provenance")
+                    .and_then(|p| p.as_str())
+                    .is_some_and(|p| !p.trim().is_empty()),
+                "{fixture_id} is category {} but records no provenance",
+                entry["category"]
+            );
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Second stores: Kiro IDE and cursor-agent
+//
+// Each of these tools keeps two session stores under one home directory, and
+// `detect()` fires on the home directory. Reading only one of them therefore
+// renders as "installed, 0 sessions", which a user cannot tell apart from
+// having none. These fixtures are the store that was not being read.
+// ---------------------------------------------------------------------------
+
+/// Lay a Kiro IDE session out the way `SessionPersistence.saveSession` does:
+/// `<root>/<bucket>/<sess_id>/{session.json,messages.jsonl}`.
+fn seed_kiro_ide_session(root: &Path, bucket: &str, meta: &str, messages: &str) -> PathBuf {
+    let meta_json = std::fs::read_to_string(fixtures_dir().join("kiro").join(meta)).unwrap();
+    let id: String = serde_json::from_str::<serde_json::Value>(&meta_json).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let dir = root.join(bucket).join(&id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.json"), &meta_json).unwrap();
+    std::fs::copy(
+        fixtures_dir().join("kiro").join(messages),
+        dir.join("messages.jsonl"),
+    )
+    .unwrap();
+    dir.join("session.json")
+}
+
+#[test]
+fn fixture_kiro_ide_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `b550143462be8201` is not a guess: it is what Kiro's own
+    // `workspace-hash-Dq3QXXpU.js` returns for `["/home/u/demo-project"]`.
+    let anchor = seed_kiro_ide_session(
+        tmp.path(),
+        "b550143462be8201",
+        "ide_session.json",
+        "ide_messages.jsonl",
+    );
+
+    let session = Kiro
+        .read_session(&anchor)
+        .expect("kiro_ide_session should parse");
+    let expected = load_expected("kiro_ide_session");
+    assert_session_matches(&session, &expected, "kiro_ide_session");
+
+    // Extra: the failing tool result keeps its failure. `success: false` is the
+    // only place the outcome is recorded — the payload has no status string.
+    let failed: Vec<bool> = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_results.iter().map(|r| r.is_error))
+        .collect();
+    assert_eq!(
+        failed,
+        vec![false, true],
+        "the pytest tool result reported success:false and must read as an error"
+    );
+
+    // Extra: reasoning is attributed as reasoning, not as prose from a model.
+    assert_eq!(
+        session.messages[1].author.as_deref(),
+        Some("reasoning"),
+        "operationType Reasoning marks the message as reasoning"
+    );
+}
+
+#[test]
+fn fixture_kiro_ide_session_global_has_no_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let anchor = seed_kiro_ide_session(
+        tmp.path(),
+        "_global",
+        "ide_session_global.json",
+        "ide_messages_global.jsonl",
+    );
+
+    let session = Kiro
+        .read_session(&anchor)
+        .expect("kiro_ide_session_global should parse");
+    let expected = load_expected("kiro_ide_session_global");
+    assert_session_matches(&session, &expected, "kiro_ide_session_global");
+}
+
+#[test]
+fn fixture_cursor_agent_transcript() {
+    // The conversation id is the filename, in every one of the three layouts
+    // `agent-transcript/dist/paths.js` can produce, so the reader takes it from
+    // the stem and the fixture has to be placed under its own id.
+    let id = "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d";
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(format!("{id}.jsonl"));
+    std::fs::copy(
+        fixtures_dir().join("cursor/cursor_agent_transcript.jsonl"),
+        &path,
+    )
+    .unwrap();
+
+    let session = Cursor
+        .read_session(&path)
+        .expect("cursor_agent_transcript should parse");
+    let expected = load_expected("cursor_agent_transcript");
+    assert_session_matches(&session, &expected, "cursor_agent_transcript");
+
+    // Extra: the `metadata` and `turn_ended` lines are not messages. Counting
+    // them would inflate every cursor-agent session by two.
+    assert_eq!(session.messages.len(), 4);
+
+    // Extra: the transcript records no tool-call id, so none is invented.
+    let call = session
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .next()
+        .expect("the assistant turn carries a tool_use block");
+    assert_eq!(call.name, "read_file");
+    assert!(
+        call.id.is_none(),
+        "the transcript has no tool-call id to report"
+    );
 }

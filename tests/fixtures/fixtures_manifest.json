@@ -259,6 +259,44 @@
       "expected": "expected/edge_single_sided_cc.json",
       "category": "edge",
       "intent": "User-only messages, no assistant. Validation should flag as error."
+    },
+    "kiro_ide_session": {
+      "provider": "kiro",
+      "format": "json+jsonl",
+      "path": "kiro/ide_session.json",
+      "companion": "kiro/ide_messages.jsonl",
+      "category": "schema-derived",
+      "expected": "expected/kiro_ide_session.json",
+      "intent": "Kiro IDE session (the store the Kiro CLI reader never looked at): metadata plus a twelve-line messages.jsonl covering user, assistant Say, assistant Reasoning, two tool_call/tool_result pairs (one failing), and the four lifecycle events (session_start, turn_start, usage_summary, turn_end) a reader must NOT count as messages.",
+      "provenance": "Not a capture — Kiro IDE needs a GUI and an AWS login, so no session could be recorded on this machine, and this is stated rather than dressed up. Every field is transcribed from the zod schemas recovered verbatim from the shipped Kiro IDE 1.0.212 linux-x64 build (kiro-ide-1.0.212-stable-linux-x64.tar.gz), file Kiro/resources/app/extensions/kiro.kiro-agent/dist/extension.js: `SessionMetadataSchema` and `PersistedMessageSchema = z.object({id: z.string(), timestamp: z.string(), payload: MessagePayloadSchema})`, whose 23-arm discriminated union names every `payload.type` used here. The on-disk layout the test places these at (`$KIRO_HOME/sessions/<bucket>/sess_<uuid>/{session.json,messages.jsonl}`) is from `SessionPersistence.getSessionPath`/`saveSession` in the same file, and the bucket name `b550143462be8201` was produced by running Kiro's own `workspace-hash-Dq3QXXpU.js` functions (copied out verbatim) under node against `[\"/home/u/demo-project\"]`, not by re-implementing the hash."
+    },
+    "kiro_ide_session_global": {
+      "provider": "kiro",
+      "format": "json+jsonl",
+      "path": "kiro/ide_session_global.json",
+      "companion": "kiro/ide_messages_global.jsonl",
+      "category": "schema-derived",
+      "expected": "expected/kiro_ide_session_global.json",
+      "intent": "Kiro IDE session with `workspacePaths: []`. Kiro buckets these under the literal `_global`, and the bucket name is a sha256 prefix that names no path, so the session's workspace is genuinely unknowable and must read as None rather than as an inverted directory name.",
+      "provenance": "Same class and same source file as `kiro_ide_session`. The `_global` bucket literal is `a20 = \"_global\"` in workspace-hash-Dq3QXXpU.js, returned by `p27` when the path array is empty; confirmed by running that function under node."
+    },
+    "cursor_agent_transcript": {
+      "provider": "cursor",
+      "format": "jsonl",
+      "path": "cursor/cursor_agent_transcript.jsonl",
+      "category": "schema-derived",
+      "expected": "expected/cursor_agent_transcript.json",
+      "intent": "cursor-agent CLI transcript (the store the Cursor state.vscdb reader never looked at): a metadata/overview line, user, assistant with a text block and a tool_use block, a tool-role line, and a turn_ended line. The metadata and turn_ended lines must not be counted as messages.",
+      "provenance": "Not a capture — cursor-agent refuses to run a turn without a Cursor account, so no real conversation could be recorded on this machine. The line shape is transcribed from the writer itself in the shipped cursor-agent 2026.07.23-e383d2b linux-x64 package (downloads.cursor.com/lab/2026.07.23-e383d2b/linux/x64/agent-cli-package.tar.gz), module `../agent-transcript/dist/index.js` in 7923.index.js: the emitter is `{role: t.role, message: {content: r}}` with `r` entries `{type:'text',text}` and `{type:'tool_use',name,input}`, plus the `{type:'metadata',metadata:{overview}}` prefix line and the `{type:'turn_ended',...}` suffix line. The path the test places it at (`<dataDir>/projects/<slug>/agent-transcripts/<id>/<id>.jsonl`) is `sk()` in `../agent-transcript/dist/paths.js` joined with `Xq()` from `../cursor-config/dist/index.js`; the slug `home-u-demo-project` was produced by running cursor-agent's own `r_` from `../utils/dist/workspace-paths.js` under node. An empirical run of the shipped binary under a sandboxed HOME created `~/.cursor/projects/<slug>` for its own cwd, confirming the root."
+    },
+    "cursor_agent_chat_store": {
+      "provider": "cursor",
+      "format": "sqlite",
+      "path": "cursor/cursor_agent_chat_store.db",
+      "category": "schema-derived",
+      "intent": "cursor-agent CLI chat store — the half of the CLI's session that is NOT the transcript. Supplies the title, creation time and model the transcript does not carry, and, when no transcript exists for its id, is the unreadable candidate that must reach `list`'s `skipped` list instead of being dropped.",
+      "provenance": "Built by sqlite3 from the DDL executed verbatim by cursor-agent 2026.07.23-e383d2b, `../cursor-sdk-local-runtime/dist/run-store/sqlite-blob-store.js` `initializeDriver`: `CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB); CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);` with `PRAGMA user_version = 1`. The `meta['0']` row is hex of UTF-8 JSON because that is what the shipped codec does — `L.serialize` is `TextEncoder.encode(JSON.stringify({...metadata, latestRootBlobId: hex}))` and it is stored through `nj = (e) => Buffer.from(e).toString('hex')` (`../agent-kv/dist/index.js`); its field names are the keys of that class's own zod schema. The `blobs` row is a stub: the real blob graph is protobuf this reader does not decode, which is the fact the skipped-path test asserts.",
+      "no_expected_because": "There is no canonical session to expect. This fixture's correct outcome is a read failure that reaches `list`'s `skipped` list, which is asserted in tests/cursor_agent_test.rs rather than in an expected/ golden."
     }
   }
 }

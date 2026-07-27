@@ -1,0 +1,2 @@
+{"id":"01J9L1","timestamp":"2026-07-21T11:30:02.000Z","payload":{"type":"user","content":"What is a monad?","source":"chat"}}
+{"id":"01J9L2","timestamp":"2026-07-21T11:31:05.000Z","payload":{"type":"assistant","content":"A monoid in the category of endofunctors, and also a way to sequence effects.","operationType":"Say"}}

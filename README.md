@@ -351,7 +351,8 @@ same one.
 | ClawdBot | `CLAWDBOT_HOME` | `CLAWDBOT_STATE_DIR` → `$CLAWDBOT_STATE_DIR/sessions` |
 | Aider | `AIDER_HOME` | `AIDER_CHAT_HISTORY_FILE` (a file, not a directory) |
 | Grok | — | `GROK_HOME` → used as `~/.grok` |
-| Kiro | — | `KIRO_HOME` → used as `~/.kiro` |
+| Kiro (CLI store) | — | `KIRO_HOME` → used as `~/.kiro` |
+| Kiro (IDE store) | — | none exists — the IDE always uses `~/.kiro`, see below |
 | Amp | — | `XDG_DATA_HOME` → `$XDG_DATA_HOME/amp` |
 | Vibe | — | `VIBE_HOME` → `$VIBE_HOME/logs/session` |
 | OpenClaw | — | `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw` |
@@ -360,6 +361,19 @@ same one.
 A few names look like they should work but do not, because the real tool means
 something else by them:
 
+- **`KIRO_HOME` moves only half of Kiro.** Kiro ships two products under one
+  `~/.kiro`, and only one of them has a relocation variable. `kiro-cli` reads
+  `KIRO_HOME` and, when it is set and non-empty, uses it as the whole root
+  (`.kiro` is *not* appended), so its sessions move to
+  `$KIRO_HOME/sessions/cli/`. The Kiro **IDE** has no such variable at all —
+  `KIRO_HOME` does not appear anywhere in the shipped desktop package, and every
+  place the bundled agent extension builds its store path uses `os.homedir()`.
+  So with `KIRO_HOME` set, casr reads CLI sessions from there and IDE sessions
+  from `~/.kiro/sessions/` — each store from where its own product actually
+  writes. Moving `HOME` moves both, because both ultimately resolve the home
+  directory. One further real variable is **not** read:
+  `KIRO_TEST_SESSIONS_DIR` replaces `sessions/cli` outright in `kiro-cli`, but
+  it belongs to that binary's `KIRO_TEST_*` test harness rather than to users.
 - **`AMP_HOME` is not read.** It is Amp's own variable, but it relocates Amp's
   *install* directory (the tree holding `bin/`), which never contains threads.
   `XDG_DATA_HOME` is the only variable that moves Amp's data.

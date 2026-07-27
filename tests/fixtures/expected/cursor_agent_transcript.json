@@ -1,0 +1,16 @@
+{
+  "fixture_id": "cursor_agent_transcript",
+  "provider_slug": "cursor",
+  "session_id": "7a1b2c3d-4e5f-4a6b-8c9d-0e1f2a3b4c5d",
+  "workspace": null,
+  "title": "Explains what src/main.rs does and reads it to confirm.",
+  "message_count": 4,
+  "roles": ["User", "Assistant", "Tool", "Assistant"],
+  "started_at_present": false,
+  "ended_at_present": false,
+  "model_name": null,
+  "has_tool_calls": true,
+  "has_tool_results": false,
+  "known_lossy_fields": ["tool_call.id", "message.timestamp"],
+  "notes": "Read standalone, with no sibling chat store. The transcript records no timestamps, no model and no workspace, so all three read as absent rather than as an mtime or an inverted directory slug; the title falls back to the writer's own overview line. With the chat store present (see cursor_agent_chat_store) the title, started_at and model_name come from its meta row instead."
+}
