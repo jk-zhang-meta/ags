@@ -595,14 +595,39 @@ impl Provider for Amp {
     /// justify — because a listing that is stricter than the tool's own hides
     /// threads Amp itself would show.
     ///
-    /// The one thing it has to exclude is the atomic-write leftover: `set()`
-    /// writes `<threadId>.json.amptmp` and renames it into place, so an
+    /// The one thing the suffix has to exclude is the atomic-write leftover:
+    /// `set()` writes `<threadId>.json.amptmp` and renames it into place, so an
     /// interrupted save leaves that file behind. It does not end in `.json`,
     /// which is exactly why Amp's rule is written on the suffix.
+    ///
+    /// `!B.isDirectory` is the other half, and it is the half that was missing.
+    /// Amp does one `readdir` of the threads root and *drops* every directory
+    /// entry rather than descending into it, so a thread is a `.json` file
+    /// directly in a threads root and nowhere else. That has to be enforced
+    /// here because the walk feeding this predicate is recursive (`main.rs`,
+    /// `max_depth(4)`); without it a file the user attached to a thread
+    /// (`threads/attachments/*.json`), a thread the user deleted
+    /// (`threads/.trash/T-….json`) and a spilled payload
+    /// (`threads/blobs/ab/cd/blob.json`) were all rendered as threads — the
+    /// trashed one putting a thread the user threw away back in front of them.
+    ///
+    /// The root is resolved rather than assumed, so the rule follows whichever
+    /// root the store is actually in: the centralized `$XDG_DATA_HOME/amp/threads`
+    /// and every legacy `globalStorage/sourcegraph.amp/threads3` are all
+    /// depth-one roots in their own right, which is why the test is membership
+    /// in `session_roots()` and not a fixed number of path components.
     fn is_session_path(&self, path: &Path) -> bool {
-        path.file_name()
+        if !path
+            .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|name| name.ends_with(".json"))
+        {
+            return false;
+        }
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        self.session_roots().iter().any(|root| root == parent)
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

@@ -969,7 +969,32 @@ impl Provider for OpenClaw {
     fn list_sessions(&self) -> Option<SessionListing> {
         let mut listing = SessionListing::default();
         for root in Self::session_dirs_reporting(&mut listing.unreadable) {
-            for entry in walkdir::WalkDir::new(&root).max_depth(4) {
+            // One level, because that is how far OpenClaw looks. Every scanner
+            // pointed at an agent's `sessions/` directory reads exactly one
+            // level and guards on `isFile()` —
+            // `doctor-state-integrity-D-B71ywJ.js:1484`,
+            // `doctor-session-transcripts-CuHKQasv.js:243`,
+            // `security-cli-BgOxd0Kk.js:307`,
+            // `session-write-lock-BZ_4P1vk.js:428`, `store-BJJhlPrk.js:859`
+            // and `:3224`, `engine-qmd-zad3_Bbe.js:147`,
+            // `cli.runtime-BQudgd-S.js:308`,
+            // `session-cost-usage-B0dBxiXW.js:226` — and the package contains
+            // no `readdir(..., { recursive: true })` at all. `paths-C2C4lJH6.js`
+            // states the rule outright when resolving a transcript path:
+            // `const relativeSegments = parts.slice(sessionsIndex + 1); if
+            // (relativeSegments.length !== 1) return;`.
+            //
+            // The one subdirectory OpenClaw creates there is
+            // `sessions/skills-prompts/sha256/<2 hex>/<64 hex>.txt`
+            // (`store-BJJhlPrk.js: readSessionPromptBlobFiles`) — a prompt blob
+            // store, not sessions.
+            //
+            // The fix belongs here and not in `is_session_path`, which already
+            // transcribes `isPrimarySessionTranscriptFileName` exactly. Under
+            // `max_depth(4)` that predicate was being asked what a file was
+            // named but never where it was, so an archived or hand-copied
+            // `.jsonl` anywhere under the root was rendered as a session.
+            for entry in walkdir::WalkDir::new(&root).max_depth(1) {
                 let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
                     continue;
                 };

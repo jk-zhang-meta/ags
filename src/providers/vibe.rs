@@ -149,8 +149,39 @@ impl Provider for Vibe {
     /// `.last_session/<tty>` pointer directory, `attachments/<sha1><ext>`, and
     /// the `*.json.tmp` / `*.jsonl.tmp` atomic-write temporaries — of which
     /// only the first kind is ever swept, so `messages.jsonl.tmp` accumulates.
+    ///
+    /// # Where the directory has to be
+    ///
+    /// One level under `logs/session/`, because that is all Vibe looks at:
+    /// `SessionLoader.list_sessions` is
+    ///
+    /// ```python
+    /// pattern = f"{config.session_prefix}_*"
+    /// session_dirs = list(save_dir.glob(pattern))
+    /// ```
+    ///
+    /// — `glob`, not `rglob`, and no `**` in the pattern. The walk feeding this
+    /// predicate is recursive (`main.rs`, `max_depth(4)`), so the depth rule has
+    /// to be here.
+    ///
+    /// What it excludes is not a hypothetical. `vibe/core/tools/builtins/task.py`
+    /// gives every subagent its own session logger rooted *inside* the parent
+    /// session — `save_dir=str(ctx.session_dir / "agents")` — so
+    /// `session_<stamp>/agents/<agent>_<stamp>/messages.jsonl` is a real
+    /// transcript Vibe writes and never lists. casr was listing it as a peer of
+    /// the session that spawned it.
+    ///
+    /// Only the depth half of Vibe's rule is transcribed. The prefix half
+    /// (`session_*`, and the `meta.json` the loader also requires) is
+    /// deliberately left out: casr's own writer names a session `casr-<stamp>`
+    /// and writes no `meta.json`, so enforcing either would make a session casr
+    /// itself wrote unlistable.
     fn is_session_path(&self, path: &Path) -> bool {
-        path.file_name().and_then(|n| n.to_str()) == Some("messages.jsonl")
+        if path.file_name().and_then(|n| n.to_str()) != Some("messages.jsonl") {
+            return false;
+        }
+        let root = Self::home_dir();
+        path.parent().and_then(Path::parent) == Some(root.as_path())
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

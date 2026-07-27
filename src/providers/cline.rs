@@ -572,17 +572,66 @@ impl Provider for Cline {
     /// `api_conversation_history.json.tmp.1769…abc.json` — a `.json` file whose
     /// name begins with the primary transcript's. Matching the full file name
     /// exactly, rather than an extension or a prefix, excludes it.
+    ///
+    /// # Where the file has to be
+    ///
+    /// A name alone is not enough, because the walk feeding this predicate is
+    /// recursive (`main.rs`, `max_depth(4)`) and the same name can appear
+    /// deeper. Cline enumerates tasks from one `readdir` of `tasks/`:
+    ///
+    /// ```js
+    /// (await readdir(t, { withFileTypes: true }))
+    ///     .filter(n => n.isDirectory())
+    ///     .map(n => n.name)
+    ///     .filter(n => /^\d+$/.test(n))
+    /// ```
+    ///
+    /// so a task is `tasks/<digits>/`, exactly one level down — the id being
+    /// the `Date.now()` that created it. casr's own writer agrees:
+    /// `generate_task_id` returns `Utc::now().timestamp_millis().to_string()`,
+    /// so tightening the predicate cannot orphan a session casr wrote.
+    ///
+    /// Both halves were leaking, and in different directions. A transcript
+    /// copied a level deeper — `tasks/<id>/checkpoints/…`, `tasks/backups/a/…`
+    /// — is refused by this provider's *reader*
+    /// ([`Self::task_dir_from_api_path`] requires the grandparent to be
+    /// `tasks/`), so every one of them was reported as a session that could not
+    /// be read: a warning channel meant for real failures, describing files
+    /// that were never sessions. A transcript at the right depth under a
+    /// non-numeric directory — `tasks/backups/api_conversation_history.json` —
+    /// the reader *accepts*, so it became a row with the task id `backups`.
+    ///
+    /// The root is resolved rather than assumed, so the rule follows whichever
+    /// storage root the file is in: `session_roots()` is one `tasks/` per
+    /// storage root, and each is the anchor for the tasks it holds.
     fn is_session_path(&self, path: &Path) -> bool {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
-        match name {
+        let is_transcript = match name {
             FILE_API_HISTORY => true,
             FILE_UI_MESSAGES | FILE_UI_MESSAGES_OLD => path
                 .parent()
                 .is_some_and(|dir| !dir.join(FILE_API_HISTORY).is_file()),
             _ => false,
+        };
+        if !is_transcript {
+            return false;
         }
+
+        let Some(task_dir) = path.parent() else {
+            return false;
+        };
+        if !task_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return false;
+        }
+        task_dir
+            .parent()
+            .is_some_and(|tasks| self.session_roots().iter().any(|root| root == tasks))
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

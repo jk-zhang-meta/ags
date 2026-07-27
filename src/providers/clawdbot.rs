@@ -191,7 +191,22 @@ impl Provider for ClawdBot {
     fn list_sessions(&self) -> Option<SessionListing> {
         let mut listing = SessionListing::default();
         for root in Self::session_dirs_reporting(&mut listing.unreadable) {
-            for entry in walkdir::WalkDir::new(&root).max_depth(4) {
+            // One level, because that is how far ClawdBot looks.
+            // `listSessionFilesForAgent` (`dist/memory/session-files.js`) is a
+            // single `fs.readdir(dir, { withFileTypes: true })` with no
+            // `recursive`, filtered by `entry.isFile()`. Nothing in the shipped
+            // package creates a subdirectory under an agent's `sessions/`
+            // either: the only `mkdir`s that reach it — `mkdir(sessionsDir)` in
+            // `session-write-lock.js` and `mkdir(path.dirname(sessionFile))` in
+            // `config/sessions/transcript.js` — *are* that directory.
+            //
+            // The fix belongs here and not in `is_session_path`, which already
+            // transcribes ClawdBot's file-name rule exactly. `max_depth(4)` was
+            // walking into anything a user had put beside the transcripts —
+            // `sessions/attachments/`, `sessions/archive/`, `sessions/a/b/c/` —
+            // and every `.jsonl` under it passed a predicate that was never
+            // asked where the file was.
+            for entry in walkdir::WalkDir::new(&root).max_depth(1) {
                 let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
                     continue;
                 };
