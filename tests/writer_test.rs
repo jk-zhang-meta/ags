@@ -1542,22 +1542,51 @@ fn writer_clawdbot_output_valid_jsonl() {
 
     let content = std::fs::read_to_string(&written.paths[0]).unwrap();
     let lines: Vec<&str> = content.lines().collect();
-    assert_eq!(lines.len(), 4, "ClawdBot should write one line per message");
-    for (i, line) in lines.iter().enumerate() {
+    // ClawdBot has no session format of its own: it writes the
+    // `@mariozechner/pi-coding-agent` `SessionManager` envelope, which is a
+    // session header followed by one wrapped entry per message. A top-level
+    // `role`/`content` line is a shape nothing in that ecosystem has ever
+    // written or been able to read.
+    assert_eq!(
+        lines.len(),
+        5,
+        "ClawdBot should write a session header plus one entry per message"
+    );
+
+    let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(
+        header["type"], "session",
+        "first line is the session header"
+    );
+    assert_eq!(header["id"], "src-simple");
+    assert_eq!(header["cwd"], "/data/projects/myapp");
+
+    let mut expected_parent = serde_json::Value::Null;
+    for (i, line) in lines[1..].iter().enumerate() {
         let entry: serde_json::Value = match serde_json::from_str(line) {
             Ok(entry) => entry,
             Err(e) => {
                 panic!("ClawdBot line {i} not valid JSON: {e}\nContent: {line}");
             }
         };
+        assert_eq!(entry["type"], "message", "ClawdBot entry {i}: type");
         assert!(
-            entry["role"].is_string(),
-            "ClawdBot line {i}: should have role"
+            entry["id"].is_string(),
+            "ClawdBot entry {i}: needs an entry id"
+        );
+        assert_eq!(
+            entry["parentId"], expected_parent,
+            "ClawdBot entry {i}: entries chain through parentId"
         );
         assert!(
-            entry["content"].is_string(),
-            "ClawdBot line {i}: should have content"
+            entry["message"]["role"].is_string(),
+            "ClawdBot entry {i}: role lives on the wrapped message"
         );
+        assert!(
+            !entry["message"]["content"].is_null(),
+            "ClawdBot entry {i}: should have content"
+        );
+        expected_parent = entry["id"].clone();
     }
 }
 

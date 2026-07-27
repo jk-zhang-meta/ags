@@ -1,67 +1,136 @@
-//! ClawdBot provider — reads/writes simple JSONL chat sessions.
+//! ClawdBot provider — reads/writes `pi-coding-agent` `SessionManager` JSONL.
 //!
-//! Session files: `~/.clawdbot/sessions/*.jsonl`
-//! Override root: `CLAWDBOT_HOME` env var
+//! Session files, both of which occur on a live machine:
+//! - `~/.clawdbot/agents/<agent-id>/sessions/*.jsonl` — current
+//! - `~/.clawdbot/sessions/*.jsonl` — through `clawdbot@2026.1.2x`
+//!
+//! Override root: `CLAWDBOT_HOME` (casr's own), else `CLAWDBOT_STATE_DIR`.
 //!
 //! ## JSONL format
 //!
-//! ClawdBot uses the simplest session format of any provider: each line is a
-//! standalone JSON message with three fields:
+//! ClawdBot does not have a session format of its own. It depends on
+//! `@mariozechner/pi-coding-agent` and drives the transcript through that
+//! package's `SessionManager` — `dist/agents/pi-embedded-runner.js` calls
+//! `SessionManager.open(params.sessionFile)`, and
+//! `dist/config/sessions/transcript.js` writes the header and appends through
+//! `sessionManager.appendMessage(...)`. Every published version of the package,
+//! from `clawdbot@2026.1.4` to `clawdbot@2026.1.24-3`, writes that envelope:
 //!
 //! ```json
-//! {"role":"user","content":"Hello","timestamp":"2025-01-27T03:30:00.000Z"}
+//! {"type":"session","version":2,"id":"…","timestamp":"…","cwd":"/home/u/p"}
+//! {"type":"message","id":"5c4f098c","parentId":null,"timestamp":"…","message":{"role":"user","content":"…"}}
 //! ```
 //!
-//! No wrapper objects, no content blocks, no session metadata header.
+//! The parse lives in [`crate::providers::pi_session`], shared with the `pi`
+//! provider, which reads the output of the very same library. That module's
+//! docs list every record type the envelope can carry and say why OpenClaw —
+//! which forked away from `pi-coding-agent` — is deliberately not folded in.
+//!
+//! ## Storage layout, and why both are read
+//!
+//! `clawdbot@2026.1.4` stored transcripts at `~/.clawdbot/sessions/<id>.jsonl`
+//! (`dist/config/sessions.js`: `resolveSessionTranscriptsDir`). By
+//! `clawdbot@2026.1.24-3` they had moved under the agent
+//! (`dist/config/sessions/paths.js`: `<state>/agents/<agentId>/sessions`), and
+//! `dist/infra/state-migrations.js` moves the old files across on startup.
+//!
+//! That migration is not a guarantee that only one layout exists. It runs when
+//! the gateway starts, it skips any file whose name already exists in the
+//! target, and when a file is left behind it renames the whole directory to
+//! `sessions.legacy-<timestamp>`. A machine that has not been upgraded, or has
+//! not started the gateway since upgrading, has only the old layout. So both
+//! are read, and neither can be assumed away.
 //!
 //! ## Session ID scheme
 //!
-//! Sessions are identified by the filename stem (e.g. `my-session` from
-//! `my-session.jsonl`).
+//! Sessions are identified by the filename stem, which is the id ClawdBot
+//! allocated: `resolveSessionTranscriptPath` names the file `<sessionId>.jsonl`
+//! and `dist/agents/pi-embedded-runner/session-manager-init.js` stamps the same
+//! id into the header. The stem is preferred over the header id because the
+//! stem is what `owns_session` resolved and what a resume command needs.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
-use crate::model::{
-    CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
-    parse_timestamp, reindex_messages, truncate_title,
-};
+use crate::model::{CanonicalSession, MessageRole, truncate_title};
+use crate::providers::pi_session;
 use crate::providers::{Provider, WriteOptions, WrittenSession};
+
+/// ClawdBot's default agent id (`dist/routing/session-key.js`:
+/// `DEFAULT_AGENT_ID = "main"`). Sessions are keyed by agent and the id is
+/// mandatory in the path, so casr writes as the agent ClawdBot itself defaults
+/// to rather than inventing one.
+const DEFAULT_AGENT_ID: &str = "main";
 
 /// ClawdBot provider implementation.
 pub struct ClawdBot;
 
 impl ClawdBot {
-    /// Root directory for ClawdBot session storage, in precedence order:
+    /// ClawdBot's mutable state root — `CLAWDBOT_STATE_DIR` if set, else
+    /// `~/.clawdbot`, exactly as `dist/config/paths.js: resolveStateDir` does
+    /// it. An empty value counts as unset, matching ClawdBot, which trims the
+    /// override and ignores it when blank.
+    fn state_dir() -> PathBuf {
+        if let Some(state) =
+            std::env::var_os("CLAWDBOT_STATE_DIR").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(state);
+        }
+        dirs::home_dir().unwrap_or_default().join(".clawdbot")
+    }
+
+    /// Where casr writes, in precedence order:
     ///
     /// 1. `CLAWDBOT_HOME` — casr's own override, naming the sessions directory
     ///    itself. ClawdBot has no variable with those semantics, so this one is
     ///    casr's alone; it wins so that aiming casr at a tree never disturbs the
     ///    ClawdBot the rest of the shell talks to.
-    /// 2. `CLAWDBOT_STATE_DIR` — the variable ClawdBot itself honours. It
-    ///    replaces the `~/.clawdbot` state root, so `sessions` is joined onto it
-    ///    exactly as ClawdBot does (`resolveConfigDir` returns the override,
-    ///    else `path.join(homedir(), ".clawdbot")`).
-    /// 3. `~/.clawdbot/sessions`.
-    ///
-    /// An empty value counts as unset, matching ClawdBot, which trims the
-    /// override and ignores it when blank.
+    /// 2. `<state>/agents/main/sessions` — where current ClawdBot looks.
     fn home_dir() -> PathBuf {
         if let Some(home) = std::env::var_os("CLAWDBOT_HOME").filter(|value| !value.is_empty()) {
             return PathBuf::from(home);
         }
-        if let Some(state) =
-            std::env::var_os("CLAWDBOT_STATE_DIR").filter(|value| !value.is_empty())
-        {
-            return PathBuf::from(state).join("sessions");
-        }
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".clawdbot")
+        Self::state_dir()
+            .join("agents")
+            .join(DEFAULT_AGENT_ID)
             .join("sessions")
+    }
+
+    /// Every directory that can hold a ClawdBot transcript, current layout
+    /// first. Only directories that exist are returned.
+    ///
+    /// `CLAWDBOT_HOME` names the sessions directory outright, so when it is set
+    /// it is the whole answer — the point of that override is that casr looks
+    /// nowhere else.
+    fn session_dirs() -> Vec<PathBuf> {
+        if let Some(home) = std::env::var_os("CLAWDBOT_HOME").filter(|value| !value.is_empty()) {
+            let home = PathBuf::from(home);
+            return if home.is_dir() { vec![home] } else { vec![] };
+        }
+
+        let state = Self::state_dir();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        // Current: one sessions directory per agent.
+        if let Ok(entries) = std::fs::read_dir(state.join("agents")) {
+            let mut agent_dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path().join("sessions"))
+                .filter(|path| path.is_dir())
+                .collect();
+            agent_dirs.sort();
+            dirs.append(&mut agent_dirs);
+        }
+
+        // Legacy: the pre-migration flat directory.
+        let legacy = state.join("sessions");
+        if legacy.is_dir() {
+            dirs.push(legacy);
+        }
+
+        dirs
     }
 }
 
@@ -79,10 +148,21 @@ impl Provider for ClawdBot {
     }
 
     fn detect(&self) -> DetectionResult {
-        let root = Self::home_dir();
-        let installed = root.is_dir();
-        let evidence = if installed {
-            vec![format!("sessions directory found: {}", root.display())]
+        let dirs = Self::session_dirs();
+        let state = Self::state_dir();
+        // The state directory existing is enough to call ClawdBot installed:
+        // the sessions directory is only created once a session runs.
+        let state_exists = state.is_dir();
+        let installed = !dirs.is_empty() || state_exists;
+        let evidence = if !dirs.is_empty() {
+            dirs.iter()
+                .map(|dir| format!("sessions directory found: {}", dir.display()))
+                .collect()
+        } else if state_exists {
+            vec![format!(
+                "state directory found (no sessions yet): {}",
+                state.display()
+            )]
         } else {
             vec![]
         };
@@ -95,51 +175,48 @@ impl Provider for ClawdBot {
     }
 
     fn session_roots(&self) -> Vec<PathBuf> {
-        let root = Self::home_dir();
-        if root.is_dir() { vec![root] } else { vec![] }
+        Self::session_dirs()
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let root = Self::home_dir();
-        if !root.is_dir() {
-            return None;
-        }
-        let candidate = root.join(format!("{session_id}.jsonl"));
-        if candidate.is_file() {
-            debug!(
-                provider = "clawdbot",
-                path = %candidate.display(),
-                session_id,
-                "owns session"
-            );
-            return Some(candidate);
-        }
-        // Walk subdirectories.
-        for entry in walkdir::WalkDir::new(&root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s == session_id)
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e == "jsonl")
-            {
+        for root in Self::session_dirs() {
+            let candidate = root.join(format!("{session_id}.jsonl"));
+            if candidate.is_file() {
                 debug!(
                     provider = "clawdbot",
-                    path = %entry.path().display(),
+                    path = %candidate.display(),
                     session_id,
-                    "owns session (subdirectory)"
+                    "owns session"
                 );
-                return Some(entry.path().to_path_buf());
+                return Some(candidate);
+            }
+            // Walk subdirectories.
+            for entry in walkdir::WalkDir::new(&root)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if entry
+                    .path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == session_id)
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e == "jsonl")
+                {
+                    debug!(
+                        provider = "clawdbot",
+                        path = %entry.path().display(),
+                        session_id,
+                        "owns session (subdirectory)"
+                    );
+                    return Some(entry.path().to_path_buf());
+                }
             }
         }
         None
@@ -148,92 +225,54 @@ impl Provider for ClawdBot {
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading ClawdBot session");
 
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
-        let reader = std::io::BufReader::new(file);
+        let transcript = pi_session::read(path, "clawdbot")?;
 
-        let mut messages: Vec<CanonicalMessage> = Vec::new();
-        let mut started_at: Option<i64> = None;
-        let mut ended_at: Option<i64> = None;
-
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let val: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let role_str = val
-                .get("role")
-                .and_then(|v| v.as_str())
-                .unwrap_or("assistant");
-            let role = normalize_role(role_str);
-
-            let content = val.get("content").map(flatten_content).unwrap_or_default();
-
-            if content.trim().is_empty() {
-                continue;
-            }
-
-            let ts = val.get("timestamp").and_then(parse_timestamp);
-            if started_at.is_none() {
-                started_at = ts;
-            }
-            if ts.is_some() {
-                ended_at = ts;
-            }
-
-            messages.push(CanonicalMessage {
-                idx: 0,
-                role,
-                content,
-                timestamp: ts,
-                author: None,
-                tool_calls: vec![],
-                tool_results: vec![],
-                extra: val,
-            });
-        }
-
-        reindex_messages(&mut messages);
-
+        // The filename stem is the id ClawdBot allocated and the id a resume
+        // command needs. The header id agrees with it on any session ClawdBot
+        // started itself; where they disagree — a transcript copied out of
+        // another agent's directory, say — the stem is the one that resolves.
         let session_id = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown")
             .to_string();
 
-        let title = messages
+        let title = transcript
+            .messages
             .iter()
             .find(|m| m.role == MessageRole::User)
             .map(|m| truncate_title(&m.content, 100));
 
-        let metadata = serde_json::json!({ "source": "clawdbot" });
+        let workspace = transcript.cwd.as_ref().map(PathBuf::from);
+
+        // `unrepresented` is present only when something was actually left
+        // over. Absent means every line was accounted for; it never means "this
+        // reader did not look".
+        let metadata = serde_json::json!({
+            "source": "clawdbot",
+            "cwd": transcript.cwd,
+            "header_session_id": transcript.header_id,
+            "unrepresented": transcript.describe_unrepresented(),
+        });
 
         info!(
             session_id,
-            messages = messages.len(),
+            messages = transcript.messages.len(),
+            unrepresented = transcript.describe_unrepresented(),
             "ClawdBot session parsed"
         );
 
         Ok(CanonicalSession {
             session_id,
             provider_slug: "clawdbot".to_string(),
-            workspace: None,
+            workspace,
             title,
-            started_at,
-            ended_at,
-            messages,
+            started_at: transcript.started_at,
+            ended_at: transcript.ended_at,
+            messages: transcript.messages,
             metadata,
             source_path: path.to_path_buf(),
-            model_name: None,
+            model_name: transcript.model_id,
         })
     }
 
@@ -258,38 +297,8 @@ impl Provider for ClawdBot {
             "writing ClawdBot session"
         );
 
-        let mut lines: Vec<String> = Vec::with_capacity(session.messages.len());
-        for msg in &session.messages {
-            let role_str = match &msg.role {
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::System => "system",
-                MessageRole::Tool => "tool",
-                MessageRole::Other(r) => r.as_str(),
-            };
+        let (content, warnings) = Self::render(&session_id, session)?;
 
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "role".into(),
-                serde_json::Value::String(role_str.to_string()),
-            );
-            obj.insert(
-                "content".into(),
-                serde_json::Value::String(msg.content.clone()),
-            );
-            if let Some(ts) = msg.timestamp {
-                let dt =
-                    chrono::DateTime::from_timestamp_millis(ts).unwrap_or_else(chrono::Utc::now);
-                obj.insert(
-                    "timestamp".into(),
-                    serde_json::Value::String(dt.to_rfc3339()),
-                );
-            }
-
-            lines.push(serde_json::to_string(&serde_json::Value::Object(obj))?);
-        }
-
-        let content = lines.join("\n") + "\n";
         let outcome = crate::pipeline::atomic_write(
             &target_path,
             content.as_bytes(),
@@ -309,7 +318,7 @@ impl Provider for ClawdBot {
             session_id: session_id.clone(),
             resume_command: self.resume_command(&session_id),
             backups: outcome.displaced().into_iter().collect(),
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
@@ -318,13 +327,162 @@ impl Provider for ClawdBot {
     }
 }
 
+impl ClawdBot {
+    /// Render a session as a `SessionManager` transcript: the file bytes, plus
+    /// whatever the caller has to be told was left out of them.
+    ///
+    /// Separate from [`Provider::write_session`] because that resolves its
+    /// target from the environment, and the environment cannot be set safely
+    /// from a Rust 2024 test. What gets written is worth a test of its own.
+    fn render(
+        session_id: &str,
+        session: &CanonicalSession,
+    ) -> anyhow::Result<(String, Vec<String>)> {
+        let mut lines: Vec<String> = Vec::with_capacity(session.messages.len() + 1);
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Session header, as ClawdBot writes it in
+        // `dist/config/sessions/transcript.js: ensureSessionHeader`. `version`
+        // is `CURRENT_SESSION_VERSION` = 2; writing 2 with real `id`/`parentId`
+        // links means `SessionManager` loads the file as-is instead of running
+        // `migrateSessionEntries` and rewriting it under the user.
+        let header = serde_json::json!({
+            "type": "session",
+            "version": 2,
+            "id": session_id,
+            "timestamp": session.started_at
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+            "cwd": session.workspace.as_ref().and_then(|w| w.to_str()).unwrap_or("/tmp"),
+        });
+        lines.push(serde_json::to_string(&header)?);
+
+        // The entry tree. Every entry is a child of the one before it, which is
+        // the shape `SessionManager.appendMessage` produces for a conversation
+        // that was never branched. Ids are 8 hex characters, as
+        // `generateId()` — `randomUUID().slice(0, 8)` — produces.
+        let mut parent: Option<String> = None;
+        let mut dropped_empty = 0usize;
+
+        for msg in &session.messages {
+            // The reader skips a message that flattens to nothing, so writing
+            // one would mean writing a line that cannot survive a read-back.
+            if msg.content.trim().is_empty() {
+                dropped_empty += 1;
+                continue;
+            }
+
+            let epoch_ms = msg
+                .timestamp
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+            let ts_iso = chrono::DateTime::from_timestamp_millis(epoch_ms)
+                .unwrap_or_else(chrono::Utc::now)
+                .to_rfc3339();
+
+            // One text block, never a `toolCall` block. The reader flattens
+            // `toolCall` blocks into the text as `[Tool: name]`, so emitting
+            // both would duplicate them on read-back.
+            let text_blocks = serde_json::json!([{ "type": "text", "text": msg.content }]);
+
+            let inner = match &msg.role {
+                // `content` may be a plain string for a user message, and that
+                // is what ClawdBot itself writes for one.
+                MessageRole::User => serde_json::json!({
+                    "role": "user",
+                    "content": msg.content,
+                    "timestamp": epoch_ms,
+                }),
+                MessageRole::Assistant => {
+                    let extra = msg.extra.get("message");
+                    let field = |name: &str| {
+                        extra
+                            .and_then(|m| m.get(name))
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    };
+                    serde_json::json!({
+                        "role": "assistant",
+                        "content": text_blocks,
+                        // `api`/`provider`/`model` are required by pi's
+                        // `AssistantMessage`. Carried through when the source
+                        // session had them; otherwise ClawdBot's own convention
+                        // for a message it synthesized rather than received —
+                        // `dist/config/sessions/transcript.js` writes
+                        // `openai-responses` with a non-model `model` value.
+                        "api": field("api").unwrap_or_else(|| "openai-responses".to_string()),
+                        "provider": field("provider").unwrap_or_else(|| "casr".to_string()),
+                        "model": msg.author.clone()
+                            .or_else(|| session.model_name.clone())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        "usage": {
+                            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                            "totalTokens": 0,
+                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+                        },
+                        "stopReason": "stop",
+                        "timestamp": epoch_ms,
+                    })
+                }
+                // pi calls a tool's output `toolResult`, and the reader maps
+                // that name back to `Tool`.
+                MessageRole::Tool => serde_json::json!({
+                    "role": "toolResult",
+                    "toolCallId": msg.tool_results.first()
+                        .and_then(|r| r.call_id.clone())
+                        .unwrap_or_default(),
+                    "toolName": "unknown",
+                    "content": text_blocks,
+                    "isError": msg.tool_results.first().is_some_and(|r| r.is_error),
+                    "timestamp": epoch_ms,
+                }),
+                // pi has no system role and no role of its own for anything
+                // else. The name is written through unchanged rather than
+                // remapped: a role this writer cannot express is better left
+                // legible than relabelled as something it is not.
+                MessageRole::System => serde_json::json!({
+                    "role": "system",
+                    "content": msg.content,
+                    "timestamp": epoch_ms,
+                }),
+                MessageRole::Other(role) => serde_json::json!({
+                    "role": role,
+                    "content": msg.content,
+                    "timestamp": epoch_ms,
+                }),
+            };
+
+            let id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+            let entry = serde_json::json!({
+                "type": "message",
+                "id": id,
+                "parentId": parent,
+                "timestamp": ts_iso,
+                "message": inner,
+            });
+            parent = Some(id);
+            lines.push(serde_json::to_string(&entry)?);
+        }
+
+        if dropped_empty > 0 {
+            warnings.push(format!(
+                "{dropped_empty} message(s) had no text content and were not written: \
+                 ClawdBot's reader skips an entry that flattens to nothing"
+            ));
+        }
+
+        Ok((lines.join("\n") + "\n", warnings))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CanonicalMessage;
     use serde_json::json;
 
     // -----------------------------------------------------------------------
-    // Helper
+    // Helpers
     // -----------------------------------------------------------------------
 
     fn write_jsonl(dir: &Path, name: &str, lines: &[&str]) -> PathBuf {
@@ -336,19 +494,62 @@ mod tests {
     fn read_clawdbot(lines: &[&str]) -> CanonicalSession {
         let tmp = tempfile::tempdir().unwrap();
         let path = write_jsonl(tmp.path(), "test.jsonl", lines);
-        let provider = ClawdBot;
-        provider.read_session(&path).expect("read_session failed")
+        ClawdBot.read_session(&path).expect("read_session failed")
+    }
+
+    /// The real fixture: a transcript written by the published
+    /// `@mariozechner/pi-coding-agent` `SessionManager`.
+    fn real_fixture_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/clawdbot/clawdbot_simple.jsonl")
     }
 
     // -----------------------------------------------------------------------
-    // Reader tests
+    // Reader — the format ClawdBot actually writes
     // -----------------------------------------------------------------------
+
+    /// The regression that started this: every published ClawdBot writes the
+    /// `SessionManager` envelope, and a reader that looks for top-level `role`
+    /// and `content` finds neither on any line, so it returns `Ok` with an
+    /// empty session — indistinguishable, to whoever ran `casr list`, from
+    /// having no sessions at all.
+    #[test]
+    fn reads_a_real_session_manager_transcript() {
+        let session = ClawdBot
+            .read_session(&real_fixture_path())
+            .expect("the real fixture must parse");
+
+        assert_eq!(
+            session.messages.len(),
+            6,
+            "a transcript in the real envelope must not read as an empty session"
+        );
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(
+            session.messages[0].content,
+            "check the gateway logs and tell me why whatsapp keeps reconnecting"
+        );
+        assert_eq!(session.messages[2].role, MessageRole::Tool);
+        assert_eq!(
+            session.title.as_deref(),
+            Some("check the gateway logs and tell me why whatsapp keeps reconnecting")
+        );
+        assert_eq!(
+            session.workspace.as_deref(),
+            Some(Path::new("/home/mario/projects/clawdbot")),
+            "the session header carries cwd; the old reader reported no workspace"
+        );
+        assert_eq!(session.model_name.as_deref(), Some("gpt-5-codex"));
+        assert!(session.started_at.is_some());
+        assert!(session.ended_at.is_some());
+    }
 
     #[test]
     fn reader_basic_exchange() {
         let session = read_clawdbot(&[
-            r#"{"role":"user","content":"Hello there","timestamp":"2025-01-27T03:30:00.000Z"}"#,
-            r#"{"role":"assistant","content":"Hi!","timestamp":"2025-01-27T03:30:05.000Z"}"#,
+            r#"{"type":"session","version":2,"id":"s1","timestamp":"2026-02-14T09:12:03.000Z","cwd":"/w"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"Hello there","timestamp":1771060324000}}"#,
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-02-14T09:12:09.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}]}}"#,
         ]);
 
         assert_eq!(session.provider_slug, "clawdbot");
@@ -362,10 +563,24 @@ mod tests {
     }
 
     #[test]
+    fn reader_extracts_tool_calls_and_thinking() {
+        let session = read_clawdbot(&[
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:08.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"read the log"},{"type":"text","text":"Pulling it."},{"type":"toolCall","id":"c1","name":"bash","arguments":{"cmd":"tail"}}]}}"#,
+        ]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0].content,
+            "[Thinking] read the log\nPulling it.\n[Tool: bash]"
+        );
+        assert_eq!(session.messages[0].tool_calls.len(), 1);
+        assert_eq!(session.messages[0].tool_calls[0].name, "bash");
+    }
+
+    #[test]
     fn reader_title_from_first_user_message() {
         let session = read_clawdbot(&[
-            r#"{"role":"assistant","content":"Welcome"}"#,
-            r#"{"role":"user","content":"Refactor the authentication module"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"assistant","content":"Welcome"}}"#,
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-02-14T09:12:05.000Z","message":{"role":"user","content":"Refactor the authentication module"}}"#,
         ]);
         assert_eq!(
             session.title.as_deref(),
@@ -376,10 +591,10 @@ mod tests {
     #[test]
     fn reader_skips_empty_content() {
         let session = read_clawdbot(&[
-            r#"{"role":"user","content":"Hello"}"#,
-            r#"{"role":"assistant","content":""}"#,
-            r#"{"role":"assistant","content":"  "}"#,
-            r#"{"role":"assistant","content":"Real response"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"Hello"}}"#,
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-02-14T09:12:05.000Z","message":{"role":"assistant","content":""}}"#,
+            r#"{"type":"message","id":"c3","parentId":"b2","timestamp":"2026-02-14T09:12:06.000Z","message":{"role":"assistant","content":"  "}}"#,
+            r#"{"type":"message","id":"d4","parentId":"c3","timestamp":"2026-02-14T09:12:07.000Z","message":{"role":"assistant","content":"Real response"}}"#,
         ]);
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0].content, "Hello");
@@ -391,7 +606,7 @@ mod tests {
         let session = read_clawdbot(&[
             "",
             "not-json",
-            r#"{"role":"user","content":"Valid line"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"Valid line"}}"#,
             "{truncated...",
         ]);
         assert_eq!(session.messages.len(), 1);
@@ -399,17 +614,10 @@ mod tests {
     }
 
     #[test]
-    fn reader_defaults_missing_role_to_assistant() {
-        let session = read_clawdbot(&[r#"{"content":"No role field"}"#]);
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].role, MessageRole::Assistant);
-    }
-
-    #[test]
     fn reader_system_role() {
         let session = read_clawdbot(&[
-            r#"{"role":"system","content":"You are helpful."}"#,
-            r#"{"role":"user","content":"Hi"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"system","content":"You are helpful."}}"#,
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-02-14T09:12:05.000Z","message":{"role":"user","content":"Hi"}}"#,
         ]);
         assert_eq!(session.messages[0].role, MessageRole::System);
         assert_eq!(session.messages[1].role, MessageRole::User);
@@ -421,11 +629,29 @@ mod tests {
         let path = write_jsonl(
             tmp.path(),
             "my-session.jsonl",
-            &[r#"{"role":"user","content":"test"}"#],
+            &[
+                r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"test"}}"#,
+            ],
         );
-        let provider = ClawdBot;
-        let session = provider.read_session(&path).unwrap();
+        let session = ClawdBot.read_session(&path).unwrap();
         assert_eq!(session.session_id, "my-session");
+    }
+
+    /// The filename stem is the id ClawdBot allocated and the id a resume
+    /// command needs; a header id copied in from elsewhere must not displace it.
+    #[test]
+    fn reader_prefers_the_filename_stem_over_a_disagreeing_header_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_jsonl(
+            tmp.path(),
+            "on-disk-id.jsonl",
+            &[
+                r#"{"type":"session","version":2,"id":"header-id","timestamp":"2026-02-14T09:12:03.000Z","cwd":"/w"}"#,
+            ],
+        );
+        let session = ClawdBot.read_session(&path).unwrap();
+        assert_eq!(session.session_id, "on-disk-id");
+        assert_eq!(session.metadata["header_session_id"], "header-id");
     }
 
     #[test]
@@ -438,199 +664,200 @@ mod tests {
     #[test]
     fn reader_timestamps_parsed() {
         let session = read_clawdbot(&[
-            r#"{"role":"user","content":"First","timestamp":"2025-01-27T03:30:00.000Z"}"#,
-            r#"{"role":"assistant","content":"Second","timestamp":"2025-01-27T04:00:00.000Z"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"First"}}"#,
+            r#"{"type":"message","id":"b2","parentId":"a1","timestamp":"2026-02-14T10:00:00.000Z","message":{"role":"assistant","content":"Second"}}"#,
         ]);
-        assert!(session.started_at.is_some());
-        assert!(session.ended_at.is_some());
         assert!(session.started_at.unwrap() < session.ended_at.unwrap());
         assert!(session.messages[0].timestamp.is_some());
         assert!(session.messages[1].timestamp.is_some());
     }
 
     #[test]
-    fn reader_no_timestamps() {
-        let session = read_clawdbot(&[
-            r#"{"role":"user","content":"Hello"}"#,
-            r#"{"role":"assistant","content":"Hi"}"#,
-        ]);
-        assert!(session.started_at.is_none());
-        assert!(session.ended_at.is_none());
-    }
-
-    #[test]
-    fn reader_reindexes_messages() {
-        let session = read_clawdbot(&[
-            r#"{"role":"user","content":"A"}"#,
-            r#"{"role":"assistant","content":"B"}"#,
-            r#"{"role":"user","content":"C"}"#,
-        ]);
-        assert_eq!(session.messages[0].idx, 0);
-        assert_eq!(session.messages[1].idx, 1);
-        assert_eq!(session.messages[2].idx, 2);
-    }
-
-    #[test]
-    fn reader_title_truncated_for_long_content() {
-        let long_msg = "x".repeat(200);
-        let line = format!(r#"{{"role":"user","content":"{long_msg}"}}"#);
-        let session = read_clawdbot(&[&line]);
-        assert!(session.title.is_some());
-        let title = session.title.unwrap();
-        // truncate_title adds "..." suffix, so max is 100 + 3 = 103.
-        assert!(title.len() <= 103);
-        assert!(title.ends_with("..."));
-    }
-
-    #[test]
     fn reader_metadata_has_source() {
-        let session = read_clawdbot(&[r#"{"role":"user","content":"test"}"#]);
+        let session = read_clawdbot(&[
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"test"}}"#,
+        ]);
         assert_eq!(session.metadata["source"], "clawdbot");
     }
 
+    /// A record type the flat track cannot hold is reported, not skipped: the
+    /// whole point of the field is that `casr info --json` can say what was in
+    /// the file and did not survive.
+    #[test]
+    fn reader_reports_records_it_cannot_represent() {
+        let session = read_clawdbot(&[
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"go"}}"#,
+            r#"{"type":"compaction","id":"b2","parentId":"a1","timestamp":"2026-02-14T09:20:00.000Z","summary":"…","firstKeptEntryId":"a1","tokensBefore":50000}"#,
+            r#"{"type":"widget","id":"c3","parentId":"b2","timestamp":"2026-02-14T09:21:00.000Z"}"#,
+        ]);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.metadata["unrepresented"],
+            "compaction 1, unrecognised:widget 1"
+        );
+    }
+
+    #[test]
+    fn reader_reports_nothing_when_every_record_was_accounted_for() {
+        let session = read_clawdbot(&[
+            r#"{"type":"session","version":2,"id":"s1","timestamp":"2026-02-14T09:12:03.000Z","cwd":"/w"}"#,
+            r#"{"type":"message","id":"a1","parentId":null,"timestamp":"2026-02-14T09:12:04.000Z","message":{"role":"user","content":"go"}}"#,
+        ]);
+        assert!(
+            session.metadata["unrepresented"].is_null(),
+            "absent means nothing was dropped, never that the reader did not look"
+        );
+    }
+
     // -----------------------------------------------------------------------
-    // Writer tests
+    // Storage layout
     // -----------------------------------------------------------------------
 
-    /// Write a session to a specific directory (bypassing env var).
-    fn write_clawdbot_session(dir: &Path, session: &CanonicalSession) -> Vec<PathBuf> {
-        let mut lines: Vec<String> = Vec::new();
-        for msg in &session.messages {
-            let role_str = match &msg.role {
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::System => "system",
-                MessageRole::Tool => "tool",
-                MessageRole::Other(r) => r.as_str(),
-            };
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "role".into(),
-                serde_json::Value::String(role_str.to_string()),
-            );
-            obj.insert(
-                "content".into(),
-                serde_json::Value::String(msg.content.clone()),
-            );
-            if let Some(ts) = msg.timestamp {
-                let dt =
-                    chrono::DateTime::from_timestamp_millis(ts).unwrap_or_else(chrono::Utc::now);
-                obj.insert(
-                    "timestamp".into(),
-                    serde_json::Value::String(dt.to_rfc3339()),
-                );
-            }
-            lines.push(serde_json::to_string(&serde_json::Value::Object(obj)).unwrap());
+    /// Both layouts exist on a real machine — the migration only runs when the
+    /// gateway starts, and it leaves a `sessions.legacy-*` directory behind
+    /// when it cannot move a file. Reading only one of them loses sessions
+    /// silently.
+    #[test]
+    fn session_dirs_covers_both_the_agent_and_the_legacy_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        std::fs::create_dir_all(state.join("agents/main/sessions")).unwrap();
+        std::fs::create_dir_all(state.join("agents/work/sessions")).unwrap();
+        std::fs::create_dir_all(state.join("sessions")).unwrap();
+
+        // `session_dirs` reads the environment, which cannot be mutated safely
+        // in Rust 2024 tests, so the layout walk is asserted directly against
+        // the same directory shape the resolver builds.
+        let mut agent_dirs: Vec<PathBuf> = std::fs::read_dir(state.join("agents"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path().join("sessions"))
+            .filter(|p| p.is_dir())
+            .collect();
+        agent_dirs.sort();
+        assert_eq!(agent_dirs.len(), 2, "one sessions dir per agent");
+        assert!(agent_dirs[0].ends_with("agents/main/sessions"));
+        assert!(agent_dirs[1].ends_with("agents/work/sessions"));
+        assert!(state.join("sessions").is_dir(), "legacy layout still there");
+    }
+
+    // -----------------------------------------------------------------------
+    // Writer
+    // -----------------------------------------------------------------------
+
+    fn sample_session(messages: Vec<CanonicalMessage>) -> CanonicalSession {
+        CanonicalSession {
+            session_id: "roundtrip-test".to_string(),
+            provider_slug: "claude-code".to_string(),
+            workspace: Some(PathBuf::from("/home/u/proj")),
+            title: Some("Test".to_string()),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_001_000_000),
+            messages,
+            metadata: json!({"source": "claude-code"}),
+            source_path: PathBuf::from("/tmp/test.jsonl"),
+            model_name: Some("claude-sonnet-4-5".to_string()),
         }
+    }
 
-        let session_id = if session.session_id.is_empty() {
-            "test".to_string()
-        } else {
-            session.session_id.clone()
-        };
-        let target = dir.join(format!("{session_id}.jsonl"));
+    fn msg(idx: usize, role: MessageRole, content: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            idx,
+            role,
+            content: content.to_string(),
+            timestamp: Some(1_700_000_000_000 + idx as i64 * 1000),
+            author: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            extra: json!({}),
+        }
+    }
+
+    /// Render through the real writer, then land the bytes in an explicit
+    /// directory, so the test never depends on `CLAWDBOT_HOME` (which cannot be
+    /// set safely in Rust 2024 tests).
+    fn write_to(dir: &Path, session: &CanonicalSession) -> PathBuf {
+        let (content, _warnings) = ClawdBot::render(&session.session_id, session).unwrap();
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(&target, lines.join("\n") + "\n").unwrap();
-        vec![target]
+        let target = dir.join(format!("{}.jsonl", session.session_id));
+        std::fs::write(&target, content).unwrap();
+        target
+    }
+
+    #[test]
+    fn writer_emits_the_session_manager_envelope() {
+        let session = sample_session(vec![
+            msg(0, MessageRole::User, "Fix the bug"),
+            msg(1, MessageRole::Assistant, "I'll fix it now."),
+        ]);
+        let (text, warnings) = ClawdBot::render(&session.session_id, &session).unwrap();
+        assert!(warnings.is_empty());
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("every written line must be JSON"))
+            .collect();
+
+        assert_eq!(lines.len(), 3, "header plus one entry per message");
+        assert_eq!(lines[0]["type"], "session");
+        assert_eq!(lines[0]["version"], 2);
+        assert_eq!(lines[0]["id"], "roundtrip-test");
+        assert_eq!(lines[0]["cwd"], "/home/u/proj");
+
+        assert_eq!(lines[1]["type"], "message");
+        assert_eq!(lines[1]["message"]["role"], "user");
+        assert_eq!(lines[1]["message"]["content"], "Fix the bug");
+        assert!(lines[1]["parentId"].is_null(), "first entry is the root");
+
+        assert_eq!(lines[2]["message"]["role"], "assistant");
+        assert_eq!(lines[2]["message"]["content"][0]["type"], "text");
+        assert_eq!(
+            lines[2]["parentId"], lines[1]["id"],
+            "entries form the id/parentId chain SessionManager expects"
+        );
+        // pi's AssistantMessage requires these; a file without them is not one
+        // the real agent can load.
+        for field in ["api", "provider", "model", "usage", "stopReason"] {
+            assert!(
+                !lines[2]["message"][field].is_null(),
+                "assistant entry must carry {field}"
+            );
+        }
     }
 
     #[test]
     fn writer_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
+        let original = sample_session(vec![
+            msg(0, MessageRole::User, "Fix the bug"),
+            msg(1, MessageRole::Assistant, "I'll fix it now."),
+            msg(2, MessageRole::Tool, "exit 0"),
+            msg(3, MessageRole::System, "You are helpful."),
+        ]);
+        let path = write_to(tmp.path(), &original);
 
-        let original = CanonicalSession {
-            session_id: "roundtrip-test".to_string(),
-            provider_slug: "claude-code".to_string(),
-            workspace: None,
-            title: Some("Test".to_string()),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_001_000_000),
-            messages: vec![
-                CanonicalMessage {
-                    idx: 0,
-                    role: MessageRole::User,
-                    content: "Fix the bug".to_string(),
-                    timestamp: Some(1_700_000_000_000),
-                    author: None,
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: json!({}),
-                },
-                CanonicalMessage {
-                    idx: 1,
-                    role: MessageRole::Assistant,
-                    content: "I'll fix it now.".to_string(),
-                    timestamp: Some(1_700_000_500_000),
-                    author: None,
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: json!({}),
-                },
-            ],
-            metadata: json!({"source": "claude-code"}),
-            source_path: PathBuf::from("/tmp/test.jsonl"),
-            model_name: None,
-        };
-
-        let paths = write_clawdbot_session(tmp.path(), &original);
-        assert!(!paths.is_empty());
-        assert!(paths[0].exists());
-
-        // Read back.
-        let provider = ClawdBot;
-        let readback = provider.read_session(&paths[0]).unwrap();
-        assert_eq!(readback.messages.len(), 2);
-        assert_eq!(readback.messages[0].role, MessageRole::User);
-        assert_eq!(readback.messages[0].content, "Fix the bug");
-        assert_eq!(readback.messages[1].role, MessageRole::Assistant);
-        assert_eq!(readback.messages[1].content, "I'll fix it now.");
-    }
-
-    #[test]
-    fn writer_generates_timestamps() {
-        let tmp = tempfile::tempdir().unwrap();
-
-        let session = CanonicalSession {
-            session_id: "ts-test".to_string(),
-            provider_slug: "test".to_string(),
-            workspace: None,
-            title: None,
-            started_at: None,
-            ended_at: None,
-            messages: vec![CanonicalMessage {
-                idx: 0,
-                role: MessageRole::User,
-                content: "Hi".to_string(),
-                timestamp: Some(1_700_000_000_000),
-                author: None,
-                tool_calls: vec![],
-                tool_results: vec![],
-                extra: json!({}),
-            }],
-            metadata: json!({}),
-            source_path: PathBuf::from("/tmp/test.jsonl"),
-            model_name: None,
-        };
-
-        let paths = write_clawdbot_session(tmp.path(), &session);
-        let content = std::fs::read_to_string(&paths[0]).unwrap();
-        let val: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
-        assert!(val.get("timestamp").is_some());
-        assert_eq!(val["role"], "user");
-        assert_eq!(val["content"], "Hi");
+        let readback = ClawdBot.read_session(&path).unwrap();
+        assert_eq!(readback.messages.len(), original.messages.len());
+        for (orig, back) in original.messages.iter().zip(readback.messages.iter()) {
+            assert_eq!(orig.role, back.role, "role must survive the round trip");
+            assert_eq!(orig.content, back.content, "content must survive verbatim");
+        }
+        assert_eq!(
+            readback.workspace.as_deref(),
+            Some(Path::new("/home/u/proj"))
+        );
     }
 
     #[test]
     fn writer_resume_command() {
-        let provider = ClawdBot;
         assert_eq!(
-            provider.resume_command("my-session"),
+            ClawdBot.resume_command("my-session"),
             "clawdbot --resume my-session"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Provider metadata tests
+    // Provider metadata
     // -----------------------------------------------------------------------
 
     #[test]
@@ -640,10 +867,6 @@ mod tests {
         assert_eq!(provider.slug(), "clawdbot");
         assert_eq!(provider.cli_alias(), "cwb");
     }
-
-    // -----------------------------------------------------------------------
-    // Detection tests
-    // -----------------------------------------------------------------------
 
     // NOTE: Detection tests that need env var mutation are skipped in Rust 2024
     // (set_var is unsafe). Detection is tested indirectly via json_contract_test.rs

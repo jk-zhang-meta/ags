@@ -22,22 +22,24 @@
 //! - `{"type":"thinking","thinking":"..."}` — chain-of-thought
 //! - `{"type":"image",...}` — images (skipped)
 //!
+//! The parse itself lives in [`crate::providers::pi_session`], because `pi` is
+//! not the only reader of this format here: ClawdBot embeds the same
+//! `@mariozechner/pi-coding-agent` `SessionManager` and writes the same
+//! envelope. That module lists every record type the format can carry.
+//!
 //! ## Session ID scheme
 //!
 //! Sessions are identified by the filename stem (e.g. `2025-12-01T10-00-00_uuid1`).
 //! Files must contain an underscore to be recognized as session files.
 
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
 use crate::launch::LaunchSpec;
-use crate::model::{
-    CanonicalMessage, CanonicalSession, MessageRole, ToolCall, normalize_role, parse_timestamp,
-    reindex_messages, truncate_title,
-};
+use crate::model::{CanonicalSession, MessageRole, truncate_title};
+use crate::providers::pi_session;
 use crate::providers::{Provider, WriteOptions, WrittenSession};
 
 /// Pi-Agent provider implementation.
@@ -87,70 +89,6 @@ impl PiAgent {
         } else {
             home.to_path_buf()
         }
-    }
-
-    /// Flatten Pi-Agent message content to a string.
-    ///
-    /// Handles plain string content and arrays of typed blocks:
-    /// text, thinking, toolCall (image is skipped).
-    fn flatten_content(content: &serde_json::Value) -> String {
-        if let Some(s) = content.as_str() {
-            return s.to_string();
-        }
-        if let Some(arr) = content.as_array() {
-            let parts: Vec<String> = arr
-                .iter()
-                .filter_map(|block| {
-                    let block_type = block.get("type").and_then(|t| t.as_str());
-                    match block_type {
-                        Some("text") => {
-                            block.get("text").and_then(|t| t.as_str()).map(String::from)
-                        }
-                        Some("thinking") => block
-                            .get("thinking")
-                            .and_then(|t| t.as_str())
-                            .map(|t| format!("[Thinking] {t}")),
-                        Some("toolCall") => {
-                            let name = block
-                                .get("name")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown");
-                            Some(format!("[Tool: {name}]"))
-                        }
-                        Some("image") => None,
-                        _ => None,
-                    }
-                })
-                .collect();
-            return parts.join("\n");
-        }
-        String::new()
-    }
-
-    /// Extract tool calls from a content block array.
-    fn extract_tool_calls(content: &serde_json::Value) -> Vec<ToolCall> {
-        let Some(arr) = content.as_array() else {
-            return vec![];
-        };
-        arr.iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(|t| t.as_str()) != Some("toolCall") {
-                    return None;
-                }
-                Some(ToolCall {
-                    id: block.get("id").and_then(|v| v.as_str()).map(String::from),
-                    name: block
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    arguments: block
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                })
-            })
-            .collect()
     }
 }
 
@@ -233,151 +171,39 @@ impl Provider for PiAgent {
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading Pi-Agent session");
 
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
-        let reader = std::io::BufReader::new(file);
-
-        let mut messages: Vec<CanonicalMessage> = Vec::new();
-        let mut started_at: Option<i64> = None;
-        let mut ended_at: Option<i64> = None;
-        let mut session_cwd: Option<String> = None;
-        let mut session_id_from_header: Option<String> = None;
-        let mut model_id: Option<String> = None;
-        let mut provider_name: Option<String> = None;
-
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let val: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let entry_type = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-            match entry_type {
-                "session" => {
-                    session_id_from_header =
-                        val.get("id").and_then(|v| v.as_str()).map(String::from);
-                    session_cwd = val.get("cwd").and_then(|v| v.as_str()).map(String::from);
-                    provider_name = val
-                        .get("provider")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    model_id = val
-                        .get("modelId")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    if let Some(ts) = val.get("timestamp").and_then(parse_timestamp) {
-                        started_at = Some(ts);
-                    }
-                }
-                "message" => {
-                    let msg = match val.get("message") {
-                        Some(m) => m,
-                        None => continue,
-                    };
-
-                    let role_str = msg
-                        .get("role")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    // Normalize: toolResult → tool.
-                    let normalized = match role_str {
-                        "toolResult" => "tool",
-                        other => other,
-                    };
-                    let role = normalize_role(normalized);
-
-                    let content_val = msg.get("content");
-                    let content = content_val.map(Self::flatten_content).unwrap_or_default();
-
-                    if content.trim().is_empty() {
-                        continue;
-                    }
-
-                    let tool_calls = content_val
-                        .map(Self::extract_tool_calls)
-                        .unwrap_or_default();
-
-                    let ts = val.get("timestamp").and_then(parse_timestamp);
-
-                    if started_at.is_none() {
-                        started_at = ts;
-                    }
-                    if ts.is_some() {
-                        ended_at = ts;
-                    }
-
-                    // Author: message.model first, then tracked model_id for assistants.
-                    let author = if role == MessageRole::Assistant {
-                        msg.get("model")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .or_else(|| model_id.clone())
-                    } else {
-                        None
-                    };
-
-                    messages.push(CanonicalMessage {
-                        idx: 0,
-                        role,
-                        content,
-                        timestamp: ts,
-                        author,
-                        tool_calls,
-                        tool_results: vec![],
-                        extra: val,
-                    });
-                }
-                "model_change" => {
-                    provider_name = val
-                        .get("provider")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    model_id = val
-                        .get("modelId")
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                }
-                // Skip thinking_level_change and unknown types.
-                _ => continue,
-            }
-        }
-
-        reindex_messages(&mut messages);
+        // The line loop lives in `pi_session` because `pi` is not the only
+        // reader of this format here — ClawdBot embeds the same
+        // `@mariozechner/pi-coding-agent` `SessionManager` and writes the same
+        // envelope. What stays here is what is `pi`'s alone: the session-id
+        // policy and the metadata blob.
+        let transcript = pi_session::read(path, "pi-agent")?;
 
         // Session ID: prefer header id, then filename stem.
-        let session_id = session_id_from_header.unwrap_or_else(|| {
+        let session_id = transcript.header_id.clone().unwrap_or_else(|| {
             path.file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
                 .to_string()
         });
 
-        let title = messages
+        let title = transcript
+            .messages
             .iter()
             .find(|m| m.role == MessageRole::User)
             .map(|m| truncate_title(&m.content, 100));
 
-        let workspace = session_cwd.as_ref().map(PathBuf::from);
+        let workspace = transcript.cwd.as_ref().map(PathBuf::from);
 
         let metadata = serde_json::json!({
             "source": "pi_agent",
             "session_id": session_id,
-            "provider": provider_name,
-            "model_id": model_id,
+            "provider": transcript.provider,
+            "model_id": transcript.model_id,
         });
 
         info!(
             session_id,
-            messages = messages.len(),
+            messages = transcript.messages.len(),
             "Pi-Agent session parsed"
         );
 
@@ -386,12 +212,12 @@ impl Provider for PiAgent {
             provider_slug: "pi-agent".to_string(),
             workspace,
             title,
-            started_at,
-            ended_at,
-            messages,
+            started_at: transcript.started_at,
+            ended_at: transcript.ended_at,
+            messages: transcript.messages,
             metadata,
             source_path: path.to_path_buf(),
-            model_name: model_id,
+            model_name: transcript.model_id,
         })
     }
 
@@ -639,6 +465,7 @@ impl Provider for PiAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{CanonicalMessage, ToolCall};
     use serde_json::json;
 
     // -----------------------------------------------------------------------

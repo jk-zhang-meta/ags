@@ -25,6 +25,7 @@ pub mod kiro;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi_agent;
+pub mod pi_session;
 pub mod vibe;
 
 use std::path::{Path, PathBuf};

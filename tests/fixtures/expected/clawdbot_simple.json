@@ -2,15 +2,15 @@
   "fixture_id": "clawdbot_simple",
   "provider_slug": "clawdbot",
   "session_id": "clawdbot_simple",
-  "workspace": null,
-  "title": "Can you help me understand how async works in Rust?",
-  "message_count": 4,
-  "roles": ["User", "Assistant", "User", "Assistant"],
+  "workspace": "/home/mario/projects/clawdbot",
+  "title": "check the gateway logs and tell me why whatsapp keeps reconnecting",
+  "message_count": 6,
+  "roles": ["User", "Assistant", "Tool", "Assistant", "User", "Assistant"],
   "started_at_present": true,
   "ended_at_present": true,
-  "model_name": null,
-  "has_tool_calls": false,
+  "model_name": "gpt-5-codex",
+  "has_tool_calls": true,
   "has_tool_results": false,
-  "known_lossy_fields": ["workspace"],
-  "notes": "Basic 4-message ClawdBot JSONL conversation with RFC3339 timestamps. No workspace or model fields in format."
+  "known_lossy_fields": ["tool_results", "usage", "stopReason", "entry tree (id/parentId)"],
+  "notes": "Real @mariozechner/pi-coding-agent SessionManager transcript — the envelope every published clawdbot writes. Header, message entries, and a model_change. The assistant turn carries thinking/text/toolCall blocks; a tool's output is its own toolResult message, which the flat track records as role Tool with no tool_results, because pi keeps the output on that message rather than on the caller's."
 }
