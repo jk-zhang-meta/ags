@@ -1,6 +1,8 @@
 //! Factory (factory.ai) provider — reads/writes JSONL sessions with metadata headers.
 //!
-//! Session files: `~/.factory/sessions/{workspace-slug}/{uuid}.jsonl`
+//! Session files: `~/.factory/sessions/{workspace-slug}/{uuid}.jsonl`, or
+//! `~/.factory/sessions/{uuid}.jsonl` for a session started with no project
+//! cwd. Those two levels are the whole store; droid never recurses past them.
 //! Settings file: `~/.factory/sessions/{workspace-slug}/{uuid}.settings.json`
 //! Override root: `FACTORY_HOME` env var
 //!
@@ -277,31 +279,65 @@ impl Provider for Factory {
         if root.is_dir() { vec![root] } else { vec![] }
     }
 
-    /// `droid@0.180.0` writes transcripts as `.jsonl` in two places under
-    /// `sessions/` — flat, and inside a per-project directory whose name is the
-    /// slugged absolute cwd and therefore always starts with `-`. Its own scan
-    /// of that root is `entry.isFile() && entry.name.endsWith(".jsonl")` for
-    /// the files and `entry.isDirectory() && entry.name.startsWith("-")` for
-    /// the subdirectories.
+    /// `droid@0.180.0` enumerates transcripts from exactly two directory
+    /// levels and never recurses. Its scan set is `[this.sessionsDir,
+    /// ...this.state.projectDirectories]`, where the project directories are
     ///
-    /// Everything else there is a sidecar: `<sessionId>.settings.json` (a
-    /// `.json` file, next to every transcript, which `list` was rendering as a
-    /// session with zero messages), the `.favorites` id list,
-    /// `<sessionId>/attachments/`, and `<sessionId>/local-signals.json`. The
-    /// discovery index is not even in this tree — it is
-    /// `~/.factory/cache/session-discovery-index.json`.
+    /// ```js
+    /// getAllProjectDirectories() {
+    ///     return readdirSync(this.sessionsDir, { withFileTypes: true })
+    ///         .filter($ => $.isDirectory() && $.name.startsWith("-"))
+    ///         .map($ => join(this.sessionsDir, $.name));
+    /// }
+    /// ```
     ///
-    /// `btw/` is excluded because droid excludes it: a "by the way" side-chat
-    /// fork is stored as `sessions/btw/<sessionId>.jsonl` and the session list
-    /// drops it with `if (!session || session.isBtwFork) return []`.
+    /// and the scan over that set is `if (!E.isFile()) continue;` followed by
+    /// `E.name.endsWith(".jsonl")`. So a transcript is a session only when it
+    /// sits directly in `sessions/` — a session started with no project cwd,
+    /// which droid lists via `if (E.directoryPath === this.sessionsDir) return
+    /// true` — or directly in a project directory, whose name is the slugged
+    /// absolute cwd and therefore always starts with `-`.
+    ///
+    /// That depth rule has to be enforced here because the walk feeding this
+    /// predicate is recursive (`main.rs`, `max_depth(4)`). Without it
+    /// `sessions/<slug>/attachments/*.jsonl` — a transcript a user attached to
+    /// a session, not a session — and any `.jsonl` under a directory droid
+    /// never opens are both rendered as sessions.
+    ///
+    /// The remaining neighbours are sidecars excluded by extension:
+    /// `<sessionId>.settings.json` (a `.json` file next to every transcript,
+    /// which `list` was rendering as a session with zero messages), the
+    /// `.favorites` id list, and `<sessionId>/local-signals.json`. The
+    /// discovery index is not even in this tree — droid builds it at
+    /// `join(dirname(sessionsDir), "cache", "session-discovery-index.json")`,
+    /// i.e. `~/.factory/cache/session-discovery-index.json`.
+    ///
+    /// `btw/` needs no special case and no longer has one: a "by the way"
+    /// side-chat fork lives in `sessions/btw/`, which does not start with `-`,
+    /// so droid's scan never reaches it and neither does this rule. droid keeps
+    /// btw forks out of its listing twice over — `if (!B || B.isBtwFork)
+    /// return []` and `.filter(E => !E.isBtwFork)` — while still resolving one
+    /// by id, because `findSessionFile` probes
+    /// `join(getBtwSessionsDirectory(), `${id}.jsonl`)` after the cwd project
+    /// and the root. casr matches on both counts: this predicate is consulted
+    /// only when listing (`main.rs`), and `owns_session` walks the whole tree
+    /// by filename and so still resolves a btw session by id.
     fn is_session_path(&self, path: &Path) -> bool {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             return false;
         }
-        path.parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            != Some("btw")
+        let root = Self::home_dir();
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        if parent == root {
+            return true;
+        }
+        parent.parent() == Some(root.as_path())
+            && parent
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with('-'))
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {

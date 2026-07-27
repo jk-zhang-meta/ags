@@ -1,17 +1,42 @@
 //! ChatGPT desktop app provider — reads/writes JSON sessions.
 //!
-//! ChatGPT stores conversations in:
-//! - macOS: `~/Library/Application Support/com.openai.chat/conversations-{uuid}/`
-//!
 //! Session files are individual JSON files per conversation with a tree-based
 //! `mapping` structure (node IDs → messages with parent pointers).
 //!
-//! ## Storage versions
+//! ## Which store this is
 //!
-//! - v1 (legacy): Plain JSON files in `conversations-{uuid}/` (unencrypted)
-//! - v2/v3: Encrypted files in `conversations-v2-{uuid}/` or `conversations-v3-{uuid}/`
+//! `home_dir` resolves to `~/Library/Application
+//! Support/com.openai.chat` on macOS and to nothing at all on every other
+//! platform, so off macOS this provider reads only what `CHATGPT_HOME` is
+//! explicitly pointed at. There is no Windows or Linux path here to be wrong
+//! about, and `CHATGPT_HOME` is casr's own override — the desktop app honours
+//! no such variable.
 //!
-//! casr currently only supports unencrypted v1 conversations.
+//! ## Storage generations
+//!
+//! Verified against `ChatGPT.app` (`ChatGPT.dmg`, 78,575,566 bytes, sha256
+//! `49b33cad…`). Its `ChatGPT.framework` binary carries the directory-name
+//! components as standalone NUL-terminated literals beside
+//! `cleanUpLegacyDirectoryIfNeeded(for:accountID:appGroupID:)`:
+//!
+//! - `conversations-v3-` — current. A *prefix*, joined to the account id at
+//!   runtime, so the directory is `conversations-v3-<accountID>`.
+//! - `conversations_v2_` and `conversations_v2_cache` — the previous
+//!   generation, underscore-separated rather than hyphen-separated.
+//!
+//! Both generations are encrypted, so `list` reports them as refused rather
+//! than pretending the store is empty. Swift interpolates these at runtime, so
+//! no complete directory path exists in the binary as a literal and the exact
+//! concatenation below the prefix is *not* established.
+//!
+//! The plain `conversations-<id>/<id>.json` tree this module reads has no
+//! counterpart in that artifact: the binary has zero occurrences of a
+//! `conversations-<uuid>` name without a version token, and no
+//! `JSONEncoder`/`JSONDecoder` or conversation-related `.json` literal anywhere
+//! near the conversation code. It is the shape casr's own `write_session`
+//! produces and the shape the synthetic fixture uses — not a shape any shipped
+//! app generation has been observed to write. See `is_session_path` for what
+//! that does and does not justify.
 //!
 //! ## Resume
 //!
@@ -42,7 +67,9 @@ pub struct ChatGpt;
 
 impl ChatGpt {
     /// Root directory for ChatGPT app data.
-    /// Respects `CHATGPT_HOME` env var override.
+    ///
+    /// `CHATGPT_HOME` is casr's own override — the desktop app honours no such
+    /// variable — and off macOS it is the only way to reach a store at all.
     fn home_dir() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("CHATGPT_HOME") {
             return Some(PathBuf::from(home));
@@ -60,9 +87,19 @@ impl ChatGpt {
 
     /// Find conversation directories under a base path.
     ///
-    /// Returns `(path, is_encrypted)` pairs. Only `conversations-{uuid}/` (v1)
-    /// are currently readable; `conversations-v2-*` and `conversations-v3-*`
-    /// are encrypted and skipped.
+    /// Returns `(path, is_encrypted)` pairs, where `is_encrypted` means "the
+    /// app wrote this and casr cannot read it", not "casr found no files".
+    ///
+    /// Both separators are deliberate. The shipped app names its store with a
+    /// version token joined to the account id, and it changed separator between
+    /// generations: `conversations-v3-<accountID>` today,
+    /// `conversations_v2_<accountID>` and `conversations_v2_cache` before it.
+    /// Matching only `conversations-` — as this did — made an entire real v2
+    /// store invisible: not read, and not reported as refused either, so `list`
+    /// said "no sessions" about a directory that was full of them. Anything
+    /// carrying a version token is the app's own encrypted store; the plain
+    /// `conversations-<id>` form is the one casr writes itself, and an id is
+    /// hex, so it can never begin with `v`.
     fn find_conversation_dirs_reporting(
         base: &Path,
         unreadable: &mut Vec<UnreadableSource>,
@@ -79,8 +116,9 @@ impl ChatGpt {
                 continue;
             };
 
-            if name.starts_with("conversations-") {
-                let is_encrypted = name.contains("-v2-") || name.contains("-v3-");
+            if name.starts_with("conversations-") || name.starts_with("conversations_") {
+                let is_encrypted =
+                    name.starts_with("conversations-v") || name.starts_with("conversations_");
                 dirs.push((path, is_encrypted));
             }
         }
@@ -193,6 +231,49 @@ impl Provider for ChatGpt {
     /// One `<conversation-id>.json` per conversation, flat in a
     /// `conversations-<uuid>/` directory — the same shape `owns_session`
     /// resolves against, at the same depth.
+    ///
+    /// ## What this rule is, and what it is not
+    ///
+    /// It was committed as explicitly unverified, because no shipped artifact
+    /// for the desktop app could be obtained. One has since been read
+    /// (`ChatGPT.dmg`, sha256 `49b33cad…`), and it does **not** ratify the
+    /// rule. What it establishes:
+    ///
+    /// - The app's own object store names files by the bare item id with no
+    ///   extension: `ObjectLoader/FilenameStringConvertible.swift`,
+    ///   `init(fromFilenameValue:)`, `Failed to decode filename as item ID`,
+    ///   `Filename cannot be empty`. A full read of that string-pool block
+    ///   found no `.json`, `pathExtension`, or `appendingPathExtension` near
+    ///   it, and the nearest `.json` literals belong to unrelated features.
+    /// - That naming is *not* exclusive to the encrypted store. The literals
+    ///   sit in one contiguous block with `EncryptedObjectLoader.swift` **and**
+    ///   `UnencryptedObjectLoader.swift`, `FileBackedCache.swift`, and
+    ///   `SingleItemObjectLoader.swift` — one `ObjectLoader` module, confirmed
+    ///   by the mangled `$s12ObjectLoader25FilenameStringConvertibleP`. So
+    ///   "unencrypted" would not buy back a `.json` extension.
+    ///
+    /// The rule nevertheless stays, because it is not describing the app's
+    /// store. Every directory the artifact attests to carries a version token
+    /// and is refused before this predicate is ever reached, and off macOS
+    /// `home_dir` resolves to nothing at all. The tree this predicate actually
+    /// governs is the one casr's own `write_session` creates —
+    /// `conversations-<uuid>/<uuid>.json` — which the ten `*_to_chatgpt` tests
+    /// write and `list` must therefore keep showing. Widening it to
+    /// extension-less files would not gain a single real session, and would
+    /// hand the reader arbitrary non-JSON files to fail on, which is the
+    /// "reports a sidecar as an unreadable session" defect in a new place.
+    ///
+    /// ## Still unverified
+    ///
+    /// Whether any shipped generation ever wrote the plain
+    /// `conversations-<uuid>/<id>.json` tree this module reads. The artifact
+    /// shows no trace of one — zero `conversations-<uuid>` names without a
+    /// version token, no `JSONEncoder`/`JSONDecoder` near the conversation
+    /// code — but absence in one build is not proof it never existed, and the
+    /// reader was inherited from CASS rather than derived from an artifact.
+    /// The fixture backing it is marked `synthetic` in the manifest. If a real
+    /// readable store is ever obtained, this predicate is the thing to check
+    /// first.
     fn is_session_path(&self, path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()) == Some("json")
     }
