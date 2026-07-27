@@ -30,7 +30,6 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("CURSOR_HOME", tmp.path().join("cursor"))
         .env("CLINE_HOME", tmp.path().join("cline"))
         .env("AIDER_HOME", tmp.path().join("aider"))
-        .env("AMP_HOME", tmp.path().join("amp"))
         .env("OPENCODE_HOME", tmp.path().join("opencode"))
         .env("CHATGPT_HOME", tmp.path().join("chatgpt"))
         .env("CLAWDBOT_HOME", tmp.path().join("clawdbot"))
@@ -781,7 +780,10 @@ fn contract_info_accepts_a_session_file_path() {
 fn contract_list_tool_uses_is_null_when_uncountable() {
     const AMP_THREAD: &str = "T-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     let tmp = TempDir::new().unwrap();
-    let threads = tmp.path().join("amp/threads");
+    // `$XDG_DATA_HOME/amp/threads`, matching what `casr_cmd` exports. Not
+    // `$AMP_HOME`: Amp means its *install* tree by that name, so casr does not
+    // read it at all and a thread seeded under it belongs to nobody.
+    let threads = tmp.path().join("xdg-data/amp/threads");
     fs::create_dir_all(&threads).expect("mkdir");
     fs::copy(
         fixtures_dir().join(format!("amp/{AMP_THREAD}.json")),

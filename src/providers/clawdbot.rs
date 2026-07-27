@@ -35,11 +35,28 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 pub struct ClawdBot;
 
 impl ClawdBot {
-    /// Root directory for ClawdBot session storage.
-    /// Respects `CLAWDBOT_HOME` env var override.
+    /// Root directory for ClawdBot session storage, in precedence order:
+    ///
+    /// 1. `CLAWDBOT_HOME` — casr's own override, naming the sessions directory
+    ///    itself. ClawdBot has no variable with those semantics, so this one is
+    ///    casr's alone; it wins so that aiming casr at a tree never disturbs the
+    ///    ClawdBot the rest of the shell talks to.
+    /// 2. `CLAWDBOT_STATE_DIR` — the variable ClawdBot itself honours. It
+    ///    replaces the `~/.clawdbot` state root, so `sessions` is joined onto it
+    ///    exactly as ClawdBot does (`resolveConfigDir` returns the override,
+    ///    else `path.join(homedir(), ".clawdbot")`).
+    /// 3. `~/.clawdbot/sessions`.
+    ///
+    /// An empty value counts as unset, matching ClawdBot, which trims the
+    /// override and ignores it when blank.
     fn home_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("CLAWDBOT_HOME") {
+        if let Some(home) = std::env::var_os("CLAWDBOT_HOME").filter(|value| !value.is_empty()) {
             return PathBuf::from(home);
+        }
+        if let Some(state) =
+            std::env::var_os("CLAWDBOT_STATE_DIR").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(state).join("sessions");
         }
         dirs::home_dir()
             .unwrap_or_default()

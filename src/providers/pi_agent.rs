@@ -44,11 +44,25 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 pub struct PiAgent;
 
 impl PiAgent {
-    /// Root directory for Pi-Agent session storage.
-    /// Respects `PI_AGENT_HOME` env var override.
+    /// Root directory for Pi-Agent session storage, in precedence order:
+    ///
+    /// 1. `PI_AGENT_HOME` — casr's own override. `pi` has no variable of that
+    ///    name; it wins so that aiming casr at a tree never disturbs the `pi`
+    ///    the rest of the shell talks to.
+    /// 2. `PI_CODING_AGENT_DIR` — the variable `pi` itself honours for this
+    ///    directory. Same semantics as casr's: it names the agent dir, whose
+    ///    default is `~/.pi/agent`, and `pi` puts sessions in `<dir>/sessions`.
+    /// 3. `~/.pi/agent`.
+    ///
+    /// An empty value counts as unset, matching `pi`'s own truthiness check.
+    /// `pi` also honours `PI_CODING_AGENT_SESSION_DIR`, which names the sessions
+    /// directory directly; casr has no slot for it because it derives the
+    /// sessions directory from this one.
     fn home_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("PI_AGENT_HOME") {
-            return PathBuf::from(home);
+        for key in ["PI_AGENT_HOME", "PI_CODING_AGENT_DIR"] {
+            if let Some(home) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+                return PathBuf::from(home);
+            }
         }
         dirs::home_dir()
             .unwrap_or_default()

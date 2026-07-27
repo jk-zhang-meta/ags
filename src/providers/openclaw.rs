@@ -1,7 +1,7 @@
 //! OpenClaw provider — reads/writes JSONL sessions with typed entries and content blocks.
 //!
-//! Session files: `~/.openclaw/agents/openclaw/sessions/*.jsonl`
-//! Override root: `OPENCLAW_HOME` env var
+//! Session files: `~/.openclaw/agents/<agent-id>/sessions/*.jsonl`
+//! Override root: `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw`
 //!
 //! ## JSONL format
 //!
@@ -34,22 +34,74 @@ use crate::model::{
 };
 use crate::providers::{Provider, WriteOptions, WrittenSession};
 
+/// OpenClaw's default agent id. Sessions are keyed by agent, and an agent id is
+/// mandatory in the path, so casr writes as the agent OpenClaw itself defaults
+/// to rather than inventing one.
+const DEFAULT_AGENT_ID: &str = "main";
+
 /// OpenClaw provider implementation.
 pub struct OpenClaw;
 
 impl OpenClaw {
-    /// Root directory for OpenClaw session storage.
-    /// Respects `OPENCLAW_HOME` env var override.
-    fn home_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("OPENCLAW_HOME") {
-            return PathBuf::from(home);
+    /// OpenClaw's mutable state directory, resolved the way OpenClaw resolves
+    /// it. Both variables below are OpenClaw's own and mean what OpenClaw means
+    /// by them:
+    ///
+    /// 1. `OPENCLAW_STATE_DIR` — "Override the mutable state directory". It is
+    ///    an explicit path variable, so it outranks `OPENCLAW_HOME`.
+    /// 2. `OPENCLAW_HOME` — "Override the home directory used for OpenClaw path
+    ///    defaults". It replaces the *home* directory, so `.openclaw` is joined
+    ///    onto it. OpenClaw's own `docker-compose.yml` shows the pair:
+    ///    `OPENCLAW_HOME=/home/node` alongside
+    ///    `OPENCLAW_STATE_DIR=/home/node/.openclaw`.
+    /// 3. `~/.openclaw`.
+    ///
+    /// An empty value counts as unset.
+    fn state_dir() -> PathBuf {
+        if let Some(state) =
+            std::env::var_os("OPENCLAW_STATE_DIR").filter(|value| !value.is_empty())
+        {
+            return PathBuf::from(state);
         }
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".openclaw")
+        let home = match std::env::var_os("OPENCLAW_HOME").filter(|value| !value.is_empty()) {
+            Some(home) => PathBuf::from(home),
+            None => dirs::home_dir().unwrap_or_default(),
+        };
+        home.join(".openclaw")
+    }
+
+    /// The sessions directory of one agent: `<state>/agents/<agent-id>/sessions`.
+    fn agent_sessions_dir(agent_id: &str) -> PathBuf {
+        Self::state_dir()
             .join("agents")
-            .join("openclaw")
+            .join(agent_id)
             .join("sessions")
+    }
+
+    /// Where casr writes: the default agent's sessions directory.
+    ///
+    /// OpenClaw keys sessions by agent, and its default agent id is `main` —
+    /// documented in `docs/cli/sessions.md` as
+    /// `~/.openclaw/agents/main/sessions/`.
+    fn home_dir() -> PathBuf {
+        Self::agent_sessions_dir(DEFAULT_AGENT_ID)
+    }
+
+    /// Every agent's sessions directory, so that a session belonging to a
+    /// non-default agent (`openclaw sessions --agent work`) is still found.
+    /// Only directories that exist are returned.
+    fn session_dirs() -> Vec<PathBuf> {
+        let agents_dir = Self::state_dir().join("agents");
+        let Ok(entries) = std::fs::read_dir(&agents_dir) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path().join("sessions"))
+            .filter(|path| path.is_dir())
+            .collect();
+        dirs.sort();
+        dirs
     }
 
     /// Flatten OpenClaw content blocks into a single string.
@@ -127,24 +179,20 @@ impl Provider for OpenClaw {
     }
 
     fn detect(&self) -> DetectionResult {
-        let root = Self::home_dir();
-        let installed = root.is_dir();
-        // Also check parent dir in case sessions dir hasn't been created yet.
-        let parent_exists = if !installed {
-            root.parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-                .is_some_and(|p| p.is_dir())
-        } else {
-            false
-        };
-        let installed = installed || parent_exists;
-        let evidence = if root.is_dir() {
-            vec![format!("sessions directory found: {}", root.display())]
-        } else if parent_exists {
+        let dirs = Self::session_dirs();
+        let state = Self::state_dir();
+        // The state directory existing is enough to call OpenClaw installed:
+        // the per-agent sessions directory is only created once a session runs.
+        let state_exists = state.is_dir();
+        let installed = !dirs.is_empty() || state_exists;
+        let evidence = if !dirs.is_empty() {
+            dirs.iter()
+                .map(|dir| format!("sessions directory found: {}", dir.display()))
+                .collect()
+        } else if state_exists {
             vec![format!(
-                "parent directory found (sessions dir not yet created): {}",
-                root.display()
+                "state directory found (no agent sessions yet): {}",
+                state.display()
             )]
         } else {
             vec![]
@@ -158,51 +206,48 @@ impl Provider for OpenClaw {
     }
 
     fn session_roots(&self) -> Vec<PathBuf> {
-        let root = Self::home_dir();
-        if root.is_dir() { vec![root] } else { vec![] }
+        Self::session_dirs()
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let root = Self::home_dir();
-        if !root.is_dir() {
-            return None;
-        }
-        let candidate = root.join(format!("{session_id}.jsonl"));
-        if candidate.is_file() {
-            debug!(
-                provider = "openclaw",
-                path = %candidate.display(),
-                session_id,
-                "owns session"
-            );
-            return Some(candidate);
-        }
-        // Walk subdirectories.
-        for entry in walkdir::WalkDir::new(&root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if entry
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s == session_id)
-                && entry
-                    .path()
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e == "jsonl")
-            {
+        for root in Self::session_dirs() {
+            let candidate = root.join(format!("{session_id}.jsonl"));
+            if candidate.is_file() {
                 debug!(
                     provider = "openclaw",
-                    path = %entry.path().display(),
+                    path = %candidate.display(),
                     session_id,
-                    "owns session (subdirectory)"
+                    "owns session"
                 );
-                return Some(entry.path().to_path_buf());
+                return Some(candidate);
+            }
+            // Walk subdirectories.
+            for entry in walkdir::WalkDir::new(&root)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if entry
+                    .path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == session_id)
+                    && entry
+                        .path()
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e == "jsonl")
+                {
+                    debug!(
+                        provider = "openclaw",
+                        path = %entry.path().display(),
+                        session_id,
+                        "owns session (subdirectory)"
+                    );
+                    return Some(entry.path().to_path_buf());
+                }
             }
         }
         None

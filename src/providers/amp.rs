@@ -7,8 +7,9 @@
 //! ## Centralized thread storage (preferred)
 //!
 //! - Linux (default): `~/.local/share/amp/threads/<thread-id>.json`
-//! - Controlled by `XDG_DATA_HOME` (and casr override `AMP_DATA_HOME`)
-//! - Direct casr override: `AMP_HOME` points to the directory that contains `threads/`
+//! - Controlled by `XDG_DATA_HOME`, the only variable that moves Amp's data.
+//!   `AMP_HOME` relocates Amp's *install* tree, not this one, so casr does not
+//!   read it; `AMP_DATA_HOME` is real only in Amp's editor plugins.
 //!
 //! ## Legacy VS Code extension storage (fallback during migration)
 //!
@@ -44,17 +45,19 @@ const LEGACY_THREADS_DIR: &str = "threads3";
 pub struct Amp;
 
 impl Amp {
+    /// Amp's centralized data directory: `$XDG_DATA_HOME/amp`, else
+    /// `~/.local/share/amp`.
+    ///
+    /// `AMP_HOME` is deliberately not read here. It is Amp's own variable, but
+    /// what Amp means by it is the *install* directory — the tree holding
+    /// `bin/`, default `~/.amp` — which never contains threads. Reading it as a
+    /// data directory silently aimed casr at a directory that does not exist for
+    /// exactly the users who had set it correctly for Amp. `XDG_DATA_HOME` is
+    /// the only variable that moves Amp's data.
+    ///
+    /// An empty value counts as unset.
     fn amp_home_dir() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("AMP_HOME") {
-            return Some(PathBuf::from(home));
-        }
-
-        // Match Amp's own centralized storage behavior: XDG_DATA_HOME or ~/.local/share.
-        if let Ok(data_home) = std::env::var("AMP_DATA_HOME") {
-            return Some(PathBuf::from(data_home).join("amp"));
-        }
-
-        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
             return Some(PathBuf::from(xdg).join("amp"));
         }
 
@@ -332,7 +335,7 @@ impl Amp {
             .next()
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "Amp storage not found. Set AMP_HOME (dir containing threads/) or ensure Amp has created its thread storage."
+                    "Amp storage not found. Set XDG_DATA_HOME (threads live in <XDG_DATA_HOME>/amp/threads/) or ensure Amp has created its thread storage."
                 )
             })
     }
@@ -478,19 +481,6 @@ impl Provider for Amp {
     fn detect(&self) -> DetectionResult {
         let mut evidence = Vec::new();
         let mut installed = false;
-
-        if let Ok(home) = std::env::var("AMP_HOME") {
-            evidence.push(format!("AMP_HOME={home}"));
-            let p = PathBuf::from(&home);
-            if p.is_dir() {
-                evidence.push(format!("{} exists", p.display()));
-            } else {
-                evidence.push(format!("{} missing", p.display()));
-            }
-        }
-        if let Ok(data_home) = std::env::var("AMP_DATA_HOME") {
-            evidence.push(format!("AMP_DATA_HOME={data_home}"));
-        }
 
         if let Some(root) = Self::centralized_threads_root()
             && root.is_dir()

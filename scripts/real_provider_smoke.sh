@@ -77,13 +77,13 @@ declare -A PROVIDER_BIN=(
 )
 
 declare -A PROVIDER_HOME=(
-    [cc]="${CLAUDE_HOME:-$HOME/.claude}"
+    [cc]="${CLAUDE_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
     [cod]="${CODEX_HOME:-$HOME/.codex}"
-    [gmi]="${GEMINI_HOME:-$HOME/.gemini}"
+    [gmi]="${GEMINI_HOME:-${GEMINI_CLI_HOME:-$HOME}/.gemini}"
     [cur]="${CURSOR_HOME:-$HOME/.config/Cursor}"
     [cln]="${CLINE_HOME:-$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev}"
     [aid]="${AIDER_HOME:-$HOME/.aider}"
-    [amp]="${AMP_HOME:-$HOME/.local/share/amp}"
+    [amp]="${XDG_DATA_HOME:-$HOME/.local/share}/amp"
     [opc]="${OPENCODE_HOME:-$HOME/.opencode}"
 )
 

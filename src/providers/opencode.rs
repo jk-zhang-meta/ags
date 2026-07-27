@@ -33,9 +33,17 @@ const DATA_DIRNAME: &str = ".opencode";
 impl OpenCode {
     /// Parse OPENCODE environment overrides into a target DB path.
     ///
-    /// Supported overrides:
-    /// - `OPENCODE_DB_PATH` (direct file path)
-    /// - `OPENCODE_HOME` (directory containing `opencode.db`, or a direct `.db` path)
+    /// In precedence order:
+    /// - `OPENCODE_DB_PATH` — casr's own override, a direct file path.
+    /// - `OPENCODE_HOME` — casr's own override: a directory containing
+    ///   `opencode.db`, or a direct `.db` path. OpenCode has no variable of
+    ///   either name, so these two are casr's alone and win, so that aiming casr
+    ///   at a database never disturbs the OpenCode the rest of the shell uses.
+    /// - `OPENCODE_DB` — the variable OpenCode itself honours, resolved the way
+    ///   OpenCode resolves it: an absolute path is used verbatim, anything else
+    ///   is a *filename* joined onto OpenCode's data directory. `:memory:` names
+    ///   a private in-process database that no other process can read, so it
+    ///   yields no path and discovery falls through.
     fn env_db_path() -> Option<PathBuf> {
         if let Ok(path) = std::env::var("OPENCODE_DB_PATH")
             && !path.trim().is_empty()
@@ -53,7 +61,30 @@ impl OpenCode {
             return Some(home_path.join(DB_FILENAME));
         }
 
+        if let Ok(db) = std::env::var("OPENCODE_DB")
+            && !db.trim().is_empty()
+            && db != ":memory:"
+        {
+            let db_path = PathBuf::from(&db);
+            if db_path.is_absolute() {
+                return Some(db_path);
+            }
+            return Some(Self::upstream_data_dir()?.join(db_path));
+        }
+
         None
+    }
+
+    /// OpenCode's own data directory, the base a relative `OPENCODE_DB` resolves
+    /// against. OpenCode gets it from the `xdg-basedir` npm package, which uses
+    /// `$XDG_DATA_HOME` else `~/.local/share` on *every* platform — including
+    /// macOS, where it is deliberately not `~/Library/Application Support`.
+    fn upstream_data_dir() -> Option<PathBuf> {
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(xdg).join("opencode"));
+        }
+        let home = dirs::home_dir()?;
+        Some(home.join(".local").join("share").join("opencode"))
     }
 
     /// Candidate global config files that may contain `data.directory`.

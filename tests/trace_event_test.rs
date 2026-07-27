@@ -23,7 +23,6 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("CURSOR_HOME", tmp.path().join("cursor"))
         .env("CLINE_HOME", tmp.path().join("cline"))
         .env("AIDER_HOME", tmp.path().join("aider"))
-        .env("AMP_HOME", tmp.path().join("amp"))
         .env("OPENCODE_HOME", tmp.path().join("opencode"))
         .env("CHATGPT_HOME", tmp.path().join("chatgpt"))
         .env("CLAWDBOT_HOME", tmp.path().join("clawdbot"))

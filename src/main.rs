@@ -1485,10 +1485,9 @@ fn cmd_list(
         let ws = workspace_filter?;
         match provider_slug {
             "claude-code" => {
-                let claude_home = std::env::var("CLAUDE_HOME")
-                    .ok()
-                    .map(PathBuf::from)
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".claude")))?;
+                // Reuse the provider's own resolver so this fast path cannot
+                // drift from the env-var precedence the provider implements.
+                let claude_home = casr::providers::claude_code::ClaudeCode::home_dir()?;
                 let expected_dir = claude_home
                     .join("projects")
                     .join(casr::providers::claude_code::project_dir_key(ws.as_path()));
@@ -1515,10 +1514,9 @@ fn cmd_list(
                 Some(sessions)
             }
             "gemini" => {
-                let gemini_home = std::env::var("GEMINI_HOME")
-                    .ok()
-                    .map(PathBuf::from)
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".gemini")))?;
+                // Reuse the provider's own resolver so this fast path cannot
+                // drift from the env-var precedence the provider implements.
+                let gemini_home = casr::providers::gemini::Gemini::home_dir()?;
                 let tmp_root = gemini_home.join("tmp");
                 let hash = casr::providers::gemini::project_hash(ws.as_path());
                 let chats_dir = tmp_root.join(hash).join("chats");

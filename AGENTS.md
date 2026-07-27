@@ -466,10 +466,19 @@ cross_agent_session_resumer/
   - `agy` -> Antigravity CLI (read/resume only; `agy --conversation <uuid> --model "Gemini 3.1 Pro (High)"`)
   - `gmi` -> Gemini CLI (legacy)
   - `grk` -> Grok Build (read/resume only; `grok --resume <session-id>`)
-- Provider home overrides:
+- Provider home overrides — casr's own:
   - `CLAUDE_HOME`
-  - `CODEX_HOME`
   - `GEMINI_HOME`
+- Provider home overrides — the agent's own variable, which casr also honours so
+  that relocating an agent the supported way does not hide its sessions. casr's
+  own override wins when both are set; see the table in `README.md`.
+  - `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `CLINE_DATA_DIR` /
+    `CLINE_DIR`, `FACTORY_HOME_OVERRIDE`, `PI_CODING_AGENT_DIR`, `OPENCODE_DB`,
+    `CLAWDBOT_STATE_DIR`, `GROK_HOME`, `KIRO_HOME`, `VIBE_HOME`,
+    `OPENCLAW_STATE_DIR` / `OPENCLAW_HOME`, and `XDG_DATA_HOME` for Amp
+- A variable carrying a real tool's name must mean what that tool means by it.
+  `AMP_HOME` is therefore not read at all: it relocates Amp's install tree, not
+  its data. Never add a variable a tool does not actually honour.
 
 ### CLI Surface
 

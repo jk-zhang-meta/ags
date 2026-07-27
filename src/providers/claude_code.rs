@@ -49,11 +49,24 @@ pub fn project_dir_key(workspace: &Path) -> String {
 }
 
 impl ClaudeCode {
-    /// Root directory for Claude Code sessions.
-    /// Respects `CLAUDE_HOME` env var override.
-    fn home_dir() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("CLAUDE_HOME") {
-            return Some(PathBuf::from(home));
+    /// Root directory for Claude Code sessions, in precedence order:
+    ///
+    /// 1. `CLAUDE_HOME` — casr's own override. It aims casr at one tree without
+    ///    disturbing the Claude Code the rest of the shell talks to, so it wins
+    ///    over the ambient setting; the test harness and `scripts/` rely on that.
+    /// 2. `CLAUDE_CONFIG_DIR` — the variable Claude Code itself honours to
+    ///    relocate `~/.claude`. Verified against Claude Code 2.1.220: with it
+    ///    set, the CLI writes its transcripts to `<dir>/projects/<key>/`, which
+    ///    is exactly the tree this provider reads and writes.
+    /// 3. `~/.claude`.
+    ///
+    /// An empty value counts as unset, matching Claude Code, which falls back to
+    /// `~/.claude` when `CLAUDE_CONFIG_DIR` is set but empty.
+    pub fn home_dir() -> Option<PathBuf> {
+        for key in ["CLAUDE_HOME", "CLAUDE_CONFIG_DIR"] {
+            if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+                return Some(PathBuf::from(value));
+            }
         }
         dirs::home_dir().map(|h| h.join(".claude"))
     }

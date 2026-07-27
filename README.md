@@ -284,14 +284,65 @@ export GEMINI_HOME="$HOME/.gemini"
 export CURSOR_HOME="$HOME/.config/Cursor"
 export CLINE_HOME="$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev"
 export AIDER_HOME="$HOME/.aider"
-export AMP_HOME="$HOME/.local/share/amp"
 export OPENCODE_HOME="$HOME/.opencode"
+# Amp has no casr override: its data dir moves only with XDG_DATA_HOME.
+export XDG_DATA_HOME="$HOME/.local/share"
 
 # Logging verbosity (alternative to --verbose / --trace)
 export RUST_LOG="casr=debug"
 # or:
 export RUST_LOG="casr=trace"
 ```
+
+### Which variable belongs to whom
+
+Two different kinds of variable appear above and below, and mixing them up is
+how you end up reading the wrong directory:
+
+- **casr's own overrides** aim casr at a tree without touching the agent. Most
+  of the `*_HOME` names are casr's alone — the agent does not read them.
+- **the agent's own variables**, which casr also honours, so that relocating an
+  agent the supported way does not hide its sessions from casr.
+
+Where both exist, casr's override wins, so pointing casr somewhere never
+disturbs the agent the rest of your shell talks to. An empty value counts as
+unset. Note the semantics differ: several of the agents' variables name a *home
+directory* that the agent then appends a subdirectory to, so casr appends the
+same one.
+
+| Provider | casr's own override | The agent's own variable, also honoured |
+|---|---|---|
+| Claude Code | `CLAUDE_HOME` | `CLAUDE_CONFIG_DIR` → used as `~/.claude` |
+| Codex | — | `CODEX_HOME` → used as `~/.codex` |
+| Gemini CLI | `GEMINI_HOME` | `GEMINI_CLI_HOME` → `$GEMINI_CLI_HOME/.gemini` |
+| Cline | `CLINE_HOME` | `CLINE_DATA_DIR`, else `$CLINE_DIR/data` |
+| Factory (`droid`) | `FACTORY_HOME` | `FACTORY_HOME_OVERRIDE` → `…/.factory/sessions` |
+| Pi | `PI_AGENT_HOME` | `PI_CODING_AGENT_DIR` → used as `~/.pi/agent` |
+| OpenCode | `OPENCODE_HOME`, `OPENCODE_DB_PATH` | `OPENCODE_DB` (absolute path, or a filename under OpenCode's data dir) |
+| ClawdBot | `CLAWDBOT_HOME` | `CLAWDBOT_STATE_DIR` → `$CLAWDBOT_STATE_DIR/sessions` |
+| Aider | `AIDER_HOME` | `AIDER_CHAT_HISTORY_FILE` (a file, not a directory) |
+| Grok | — | `GROK_HOME` → used as `~/.grok` |
+| Kiro | — | `KIRO_HOME` → used as `~/.kiro` |
+| Amp | — | `XDG_DATA_HOME` → `$XDG_DATA_HOME/amp` |
+| Vibe | — | `VIBE_HOME` → `$VIBE_HOME/logs/session` |
+| OpenClaw | — | `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw` |
+| Cursor, ChatGPT | `CURSOR_HOME`, `CHATGPT_HOME` | none exists — these tools offer no relocation variable |
+
+A few names look like they should work but do not, because the real tool means
+something else by them:
+
+- **`AMP_HOME` is not read.** It is Amp's own variable, but it relocates Amp's
+  *install* directory (the tree holding `bin/`), which never contains threads.
+  `XDG_DATA_HOME` is the only variable that moves Amp's data.
+  `AMP_DATA_HOME` is real only inside Amp's editor plugins, so it is not read
+  either.
+- **`VIBE_HOME` is the `~/.vibe` root**, not the session-log directory; casr
+  appends `logs/session` exactly as Vibe does.
+- **`OPENCLAW_HOME` replaces `$HOME`**, so OpenClaw's state lives at
+  `$OPENCLAW_HOME/.openclaw`. `OPENCLAW_STATE_DIR` names that state directory
+  outright and outranks it. Sessions are keyed by agent —
+  `<state>/agents/<agent-id>/sessions/` — and casr reads every agent's
+  directory, writing as OpenClaw's default agent `main`.
 
 ## Canonical Session Model
 

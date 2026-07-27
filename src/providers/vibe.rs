@@ -33,17 +33,23 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 pub struct Vibe;
 
 impl Vibe {
-    /// Root directory for Vibe session storage.
-    /// Respects `VIBE_HOME` env var override.
+    /// Directory holding Vibe's session logs.
+    ///
+    /// `VIBE_HOME` is Vibe's own variable and means what Vibe means by it: the
+    /// `~/.vibe` root, not the session-log directory. Vibe's README — "By
+    /// default, Vibe stores its configuration in `~/.vibe/`. You can override
+    /// this by setting the `VIBE_HOME` environment variable" — lists `logs/`
+    /// as one of the subdirectories under that root, and session logs live in
+    /// `<root>/logs/session`. So `logs/session` is joined onto it, exactly as
+    /// Vibe does.
+    ///
+    /// An empty value counts as unset.
     fn home_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("VIBE_HOME") {
-            return PathBuf::from(home);
-        }
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".vibe")
-            .join("logs")
-            .join("session")
+        let root = match std::env::var_os("VIBE_HOME").filter(|value| !value.is_empty()) {
+            Some(home) => PathBuf::from(home),
+            None => dirs::home_dir().unwrap_or_default().join(".vibe"),
+        };
+        root.join("logs").join("session")
     }
 
     /// Extract role from a JSONL line, checking multiple field names.

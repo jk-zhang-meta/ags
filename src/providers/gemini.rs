@@ -58,11 +58,26 @@ pub fn session_filename(session_id: &str, now: &chrono::DateTime<chrono::Utc>) -
 }
 
 impl Gemini {
-    /// Root directory for Gemini data.
-    /// Respects `GEMINI_HOME` env var override.
-    fn home_dir() -> Option<PathBuf> {
-        if let Ok(home) = std::env::var("GEMINI_HOME") {
+    /// Root directory for Gemini data, in precedence order:
+    ///
+    /// 1. `GEMINI_HOME` — casr's own override, naming the `.gemini` directory
+    ///    itself. Gemini CLI has no variable with those semantics, so this one
+    ///    is casr's alone; it wins so that aiming casr at a tree never disturbs
+    ///    the Gemini CLI the rest of the shell talks to.
+    /// 2. `GEMINI_CLI_HOME` — the variable Gemini CLI itself honours. It
+    ///    replaces the *home directory*, not the `.gemini` directory, so
+    ///    `.gemini` is joined onto it exactly as the CLI does:
+    ///    `homedir()` returns `$GEMINI_CLI_HOME` when set, and
+    ///    `getGlobalGeminiDir()` is `path.join(homedir(), '.gemini')`.
+    /// 3. `~/.gemini`.
+    ///
+    /// An empty value counts as unset, matching the CLI's own truthiness check.
+    pub fn home_dir() -> Option<PathBuf> {
+        if let Some(home) = std::env::var_os("GEMINI_HOME").filter(|value| !value.is_empty()) {
             return Some(PathBuf::from(home));
+        }
+        if let Some(home) = std::env::var_os("GEMINI_CLI_HOME").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(home).join(".gemini"));
         }
         dirs::home_dir().map(|h| h.join(".gemini"))
     }

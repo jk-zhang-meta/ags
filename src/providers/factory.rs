@@ -34,16 +34,30 @@ use crate::providers::{Provider, WriteOptions, WrittenSession};
 pub struct Factory;
 
 impl Factory {
-    /// Root directory for Factory session storage.
-    /// Respects `FACTORY_HOME` env var override.
+    /// Root directory for Factory session storage, in precedence order:
+    ///
+    /// 1. `FACTORY_HOME` — casr's own override, naming the sessions directory
+    ///    itself. `droid` has no variable with those semantics, so this one is
+    ///    casr's alone; it wins so that aiming casr at a tree never disturbs the
+    ///    `droid` the rest of the shell talks to.
+    /// 2. `FACTORY_HOME_OVERRIDE` — the variable `droid` itself honours. It
+    ///    replaces the *home directory*, so `.factory/sessions` is joined onto
+    ///    it exactly as `droid` does (`getFactoryHome()` returns the override
+    ///    else `$HOME`, and the sessions path is `join(home, ".factory",
+    ///    "sessions")`).
+    /// 3. `~/.factory/sessions`.
+    ///
+    /// An empty value counts as unset, matching `droid`, which requires a
+    /// non-empty override.
     fn home_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("FACTORY_HOME") {
+        if let Some(home) = std::env::var_os("FACTORY_HOME").filter(|value| !value.is_empty()) {
             return PathBuf::from(home);
         }
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".factory")
-            .join("sessions")
+        let home = match std::env::var_os("FACTORY_HOME_OVERRIDE").filter(|v| !v.is_empty()) {
+            Some(override_home) => PathBuf::from(override_home),
+            None => dirs::home_dir().unwrap_or_default(),
+        };
+        home.join(".factory").join("sessions")
     }
 
     /// Decode a workspace path slug back to a filesystem path.

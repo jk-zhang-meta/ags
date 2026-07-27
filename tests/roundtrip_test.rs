@@ -412,7 +412,7 @@ fn roundtrip_cline_to_cc() {
 fn roundtrip_cc_to_amp() {
     let _lock = AMP_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("AMP_HOME", tmp.path());
+    let _env = EnvGuard::set("XDG_DATA_HOME", tmp.path());
 
     let original = read_cc_fixture("cc_simple");
     let written = Amp
@@ -432,7 +432,7 @@ fn roundtrip_amp_to_cc() {
     let amp_canonical = {
         let _amp_lock = AMP_ENV.lock().unwrap();
         let amp_tmp = tempfile::TempDir::new().unwrap();
-        let _amp_env = EnvGuard::set("AMP_HOME", amp_tmp.path());
+        let _amp_env = EnvGuard::set("XDG_DATA_HOME", amp_tmp.path());
 
         let seed = read_cc_fixture("cc_simple");
         let written_amp = Amp
@@ -1176,7 +1176,7 @@ fn roundtrip_amp_to_codex() {
     let amp_session = {
         let _lock = AMP_ENV.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("AMP_HOME", tmp.path());
+        let _env = EnvGuard::set("XDG_DATA_HOME", tmp.path());
 
         let seed = read_cc_fixture("cc_simple");
         let written = Amp
@@ -1472,7 +1472,7 @@ fn roundtrip_codex_to_aider() {
 fn roundtrip_codex_to_amp() {
     let _lock = AMP_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("AMP_HOME", tmp.path());
+    let _env = EnvGuard::set("XDG_DATA_HOME", tmp.path());
 
     let original = read_codex_fixture("codex_modern", "jsonl");
     let written = Amp
@@ -1752,7 +1752,7 @@ fn roundtrip_gemini_to_aider() {
 fn roundtrip_gemini_to_amp() {
     let _lock = AMP_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("AMP_HOME", tmp.path());
+    let _env = EnvGuard::set("XDG_DATA_HOME", tmp.path());
 
     let original = read_gemini_fixture("gmi_simple");
     let written = Amp
@@ -1978,7 +1978,7 @@ fn roundtrip_aider_to_amp() {
         "AIDER_HOME",
         &AIDER_ENV,
         &Amp,
-        "AMP_HOME",
+        "XDG_DATA_HOME",
         &AMP_ENV,
         "Aider→Amp",
     );
@@ -1988,7 +1988,7 @@ fn roundtrip_aider_to_amp() {
 fn roundtrip_amp_to_opencode() {
     cross_provider_roundtrip(
         &Amp,
-        "AMP_HOME",
+        "XDG_DATA_HOME",
         &AMP_ENV,
         &OpenCode,
         "OPENCODE_HOME",
@@ -2122,7 +2122,7 @@ fn roundtrip_aider_to_factory() {
 fn roundtrip_amp_to_vibe() {
     cross_provider_roundtrip(
         &Amp,
-        "AMP_HOME",
+        "XDG_DATA_HOME",
         &AMP_ENV,
         &Vibe,
         "VIBE_HOME",
@@ -2190,7 +2190,7 @@ fn roundtrip_factory_to_amp() {
         "FACTORY_HOME",
         &FACTORY_ENV,
         &Amp,
-        "AMP_HOME",
+        "XDG_DATA_HOME",
         &AMP_ENV,
         "Factory→Amp",
     );

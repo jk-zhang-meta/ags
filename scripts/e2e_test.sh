@@ -126,7 +126,6 @@ export GEMINI_HOME="$TMPDIR_ROOT/gemini"
 export CURSOR_HOME="$TMPDIR_ROOT/cursor"
 export CLINE_HOME="$TMPDIR_ROOT/cline"
 export AIDER_HOME="$TMPDIR_ROOT/aider"
-export AMP_HOME="$TMPDIR_ROOT/amp"
 export OPENCODE_HOME="$TMPDIR_ROOT/opencode"
 export CHATGPT_HOME="$TMPDIR_ROOT/chatgpt"
 export CLAWDBOT_HOME="$TMPDIR_ROOT/clawdbot"
@@ -135,6 +134,7 @@ export FACTORY_HOME="$TMPDIR_ROOT/factory"
 export OPENCLAW_HOME="$TMPDIR_ROOT/openclaw"
 export PI_AGENT_HOME="$TMPDIR_ROOT/pi-agent"
 export XDG_CONFIG_HOME="$TMPDIR_ROOT/xdg-config"
+# Amp threads live under $XDG_DATA_HOME/amp; casr does not read AMP_HOME.
 export XDG_DATA_HOME="$TMPDIR_ROOT/xdg-data"
 export NO_COLOR=1
 
@@ -466,7 +466,7 @@ setup_agy_fixture() {
 
 reset_env() {
     rm -rf "$CLAUDE_HOME" "$CODEX_HOME" "$GEMINI_HOME" "$CURSOR_HOME" \
-        "$CLINE_HOME" "$AIDER_HOME" "$AMP_HOME" "$OPENCODE_HOME" \
+        "$CLINE_HOME" "$AIDER_HOME" "$XDG_DATA_HOME/amp" "$OPENCODE_HOME" \
         "$CHATGPT_HOME" "$CLAWDBOT_HOME" "$VIBE_HOME" "$FACTORY_HOME" \
         "$OPENCLAW_HOME" "$PI_AGENT_HOME"
 }
@@ -724,7 +724,7 @@ if [[ -n "$amp_sid" ]]; then
 else
     fail "CC→Amp JSON includes target_session_id" "non-empty id" "<empty>"
 fi
-assert_file_exists "Amp thread file exists after conversion" "$AMP_HOME/threads/${amp_sid}.json"
+assert_file_exists "Amp thread file exists after conversion" "$XDG_DATA_HOME/amp/threads/${amp_sid}.json"
 
 log "TEST: Resume Amp → CC"
 run_casr "resume amp->cc" resume cc "$amp_sid" --source amp
@@ -915,7 +915,7 @@ if [[ -n "$vib_sid" ]]; then
 else
     fail "CC→Vibe JSON includes target_session_id" "non-empty id" "<empty>"
 fi
-assert_file_exists "Vibe messages.jsonl exists after conversion" "$VIBE_HOME/${vib_sid}/messages.jsonl"
+assert_file_exists "Vibe messages.jsonl exists after conversion" "$VIBE_HOME/logs/session/${vib_sid}/messages.jsonl"
 
 log "TEST: Resume Vibe → CC"
 run_casr "resume vib->cc" resume cc "$vib_sid" --source vib
@@ -962,7 +962,7 @@ if [[ -n "$ocl_sid" ]]; then
 else
     fail "CC→OpenClaw JSON includes target_session_id" "non-empty id" "<empty>"
 fi
-assert_file_exists "OpenClaw JSONL exists after conversion" "$OPENCLAW_HOME/${ocl_sid}.jsonl"
+assert_file_exists "OpenClaw JSONL exists after conversion" "$OPENCLAW_HOME/.openclaw/agents/main/sessions/${ocl_sid}.jsonl"
 
 log "TEST: Resume OpenClaw → CC"
 run_casr "resume ocl->cc" resume cc "$ocl_sid" --source ocl
@@ -1013,8 +1013,8 @@ cc_sid=$(setup_cc_fixture "cc_simple")
 run_casr "seed amp for malformed" --json resume amp "$cc_sid"
 assert_exit_ok "seed amp succeeds"
 amp_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-assert_file_exists "Amp thread file exists after seed" "$AMP_HOME/threads/${amp_sid}.json"
-printf '{' > "$AMP_HOME/threads/${amp_sid}.json"
+assert_file_exists "Amp thread file exists after seed" "$XDG_DATA_HOME/amp/threads/${amp_sid}.json"
+printf '{' > "$XDG_DATA_HOME/amp/threads/${amp_sid}.json"
 EXPECT_FAIL=1 run_casr "malformed amp read" --json resume cc "$amp_sid" --dry-run --source amp || true
 assert_exit_fail "malformed Amp session fails"
 assert_json_error_envelope "malformed Amp error is JSON"

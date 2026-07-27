@@ -39,12 +39,20 @@ const FILE_TASK_HISTORY: &str = "taskHistory.json";
 pub struct Cline;
 
 impl Cline {
-    /// Cline globalStorage root. Respects `CLINE_HOME` env var override.
+    /// Directories that each contain a `tasks/` (and possibly `state/`) tree.
     ///
-    /// The value is expected to be the extension's globalStorage directory, i.e.
-    /// the directory that contains `tasks/` and `state/`.
+    /// `CLINE_HOME` is casr's own override and names such a directory outright;
+    /// when set it is used alone, which is what aims casr at a single tree.
+    ///
+    /// Otherwise Cline keeps tasks in two unrelated places and casr reads both:
+    ///
+    /// - the SDK/CLI store, whose location Cline resolves from its own
+    ///   `CLINE_DATA_DIR`, else `$CLINE_DIR/data`, else `~/.cline/data`; and
+    /// - the VS Code extension's `globalStorage` directory, which the *editor*
+    ///   hands the extension. Cline honours no variable for that one, so there
+    ///   is nothing to read there beyond the well-known editor locations.
     fn storage_roots() -> Vec<PathBuf> {
-        if let Ok(home) = std::env::var("CLINE_HOME") {
+        if let Some(home) = std::env::var_os("CLINE_HOME").filter(|value| !value.is_empty()) {
             return vec![PathBuf::from(home)];
         }
 
@@ -68,7 +76,7 @@ impl Cline {
         host_roots.sort();
         host_roots.dedup();
 
-        host_roots
+        let mut roots: Vec<PathBuf> = host_roots
             .into_iter()
             .map(|host| {
                 host.join("User")
@@ -76,7 +84,29 @@ impl Cline {
                     .join(CLINE_EXTENSION_ID)
             })
             .filter(|p| p.is_dir())
-            .collect()
+            .collect();
+
+        // Appended, not prepended: `pick_storage_root_for_write` writes to the
+        // first root, and the editor's globalStorage stays the default target.
+        // Only directories that already exist are listed, so `detect` still
+        // reports Cline as absent on a machine that has never run it.
+        roots.extend(Self::sdk_data_dir().filter(|p| p.is_dir()));
+        roots
+    }
+
+    /// Cline's SDK/CLI task store, resolved exactly as Cline's own
+    /// `resolveDataDir()` does: `CLINE_DATA_DIR`, else `$CLINE_DIR/data`, else
+    /// `~/.cline/data`. Tasks live at `<dir>/tasks/<id>/`, the same shape as the
+    /// extension's `globalStorage`.
+    fn sdk_data_dir() -> Option<PathBuf> {
+        if let Some(data) = std::env::var_os("CLINE_DATA_DIR").filter(|value| !value.is_empty()) {
+            return Some(PathBuf::from(data));
+        }
+        let base = match std::env::var_os("CLINE_DIR").filter(|value| !value.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => dirs::home_dir()?.join(".cline"),
+        };
+        Some(base.join("data"))
     }
 
     fn tasks_root(storage_root: &Path) -> PathBuf {

@@ -3,8 +3,9 @@
 //! Uses `assert_cmd` to invoke the compiled binary and validate output.
 //! All tests use temp directories with env overrides (`CLAUDE_HOME`,
 //! `CODEX_HOME`, `GEMINI_HOME`, `CURSOR_HOME`, `CLINE_HOME`, `AIDER_HOME`,
-//! `AMP_HOME`, `OPENCODE_HOME`, `CHATGPT_HOME`, `CLAWDBOT_HOME`, `VIBE_HOME`,
-//! `FACTORY_HOME`) so they never touch real provider data.
+//! `OPENCODE_HOME`, `CHATGPT_HOME`, `CLAWDBOT_HOME`, `VIBE_HOME`,
+//! `FACTORY_HOME`, and `XDG_DATA_HOME` for Amp) so they never touch real
+//! provider data.
 
 use std::fs;
 use std::path::PathBuf;
@@ -31,7 +32,6 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("CURSOR_HOME", tmp.path().join("cursor"))
         .env("CLINE_HOME", tmp.path().join("cline"))
         .env("AIDER_HOME", tmp.path().join("aider"))
-        .env("AMP_HOME", tmp.path().join("amp"))
         .env("OPENCODE_HOME", tmp.path().join("opencode"))
         .env("CHATGPT_HOME", tmp.path().join("chatgpt"))
         .env("CLAWDBOT_HOME", tmp.path().join("clawdbot"))
@@ -990,7 +990,7 @@ fn cli_resume_cc_to_amp_works_and_is_discoverable() {
 
     let amp_thread = tmp
         .path()
-        .join("amp/threads")
+        .join("xdg-data/amp/threads")
         .join(format!("{amp_session_id}.json"));
     assert!(
         amp_thread.exists(),

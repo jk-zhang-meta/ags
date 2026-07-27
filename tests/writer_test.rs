@@ -5,7 +5,7 @@
 //!
 //! These tests serialize process environment access because `write_session()`
 //! reads provider home environment variables (`CLAUDE_HOME`, `CODEX_HOME`,
-//! `GEMINI_HOME`, `CLINE_HOME`, `AMP_HOME`, etc.) to determine the target
+//! `GEMINI_HOME`, `CLINE_HOME`, `XDG_DATA_HOME` for Amp, etc.) to determine the target
 //! directory and Rust 2024 makes env mutation `unsafe` under concurrency.
 
 mod test_env;
@@ -1265,7 +1265,7 @@ fn writer_cline_roundtrip() {
 fn writer_amp_roundtrip() {
     let _lock = AMP_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("AMP_HOME", tmp.path());
+    let _env = EnvGuard::set("XDG_DATA_HOME", tmp.path());
 
     let session = simple_session();
     let written = Amp
@@ -1278,8 +1278,8 @@ fn writer_amp_roundtrip() {
         "Amp session IDs should start with 'T-'"
     );
     assert!(
-        written.paths[0].starts_with(tmp.path().join("threads")),
-        "Amp thread should be written under $AMP_HOME/threads"
+        written.paths[0].starts_with(tmp.path().join("amp").join("threads")),
+        "Amp thread should be written under $XDG_DATA_HOME/amp/threads"
     );
     assert!(
         written.resume_command.contains(&written.session_id),
@@ -1317,7 +1317,7 @@ fn writer_amp_roundtrip() {
 fn writer_amp_output_has_expected_shape() {
     let _lock = AMP_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("AMP_HOME", tmp.path());
+    let _env = EnvGuard::set("XDG_DATA_HOME", tmp.path());
 
     let written = Amp
         .write_session(&simple_session(), &WriteOptions { force: false })
