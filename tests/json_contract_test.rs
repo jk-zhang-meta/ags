@@ -347,18 +347,30 @@ fn contract_providers_aliases_match_slugs() {
 // ---------------------------------------------------------------------------
 // Contract: `list --json`
 // ---------------------------------------------------------------------------
-// Expected shape: { schema_version: 4, items: [{ schema_version, session_id, provider, ... }] }
+// Expected shape: { schema_version: 5, items: [{ schema_version, session_id, provider, ... }],
+//                   skipped: [{ provider, path, error }] }
 
 fn assert_list_envelope(parsed: &serde_json::Value) -> &Vec<serde_json::Value> {
     let ctx = "list_envelope";
-    assert_exact_keys(parsed, &["schema_version", "items"], ctx);
+    assert_exact_keys(parsed, &["schema_version", "items", "skipped"], ctx);
     assert_uint(&parsed["schema_version"], "schema_version", ctx);
     assert_eq!(
         parsed["schema_version"].as_u64().unwrap(),
-        4,
-        "{ctx}: schema_version should be 4"
+        5,
+        "{ctx}: schema_version should be 5"
     );
     assert_array(&parsed["items"], "items", ctx);
+    // Always an array, `[]` on a clean run: an absent key would say "this
+    // build cannot tell you what it skipped", which is a different fact from
+    // "nothing was skipped".
+    assert_array(&parsed["skipped"], "skipped", ctx);
+    for (idx, obj) in parsed["skipped"].as_array().unwrap().iter().enumerate() {
+        let ctx = format!("list.skipped[{idx}]");
+        assert_exact_keys(obj, &["provider", "path", "error"], &ctx);
+        assert_string(&obj["provider"], "provider", &ctx);
+        assert_string(&obj["path"], "path", &ctx);
+        assert_string(&obj["error"], "error", &ctx);
+    }
     parsed["items"].as_array().unwrap()
 }
 
@@ -391,8 +403,8 @@ fn assert_list_item(obj: &serde_json::Value, idx: usize) {
     assert_uint(&obj["schema_version"], "schema_version", &ctx);
     assert_eq!(
         obj["schema_version"].as_u64().unwrap(),
-        4,
-        "{ctx}: per-item schema_version should be 4"
+        5,
+        "{ctx}: per-item schema_version should be 5"
     );
     assert_string(&obj["session_id"], "session_id", &ctx);
     assert_string(&obj["provider"], "provider", &ctx);
@@ -604,8 +616,8 @@ fn assert_info_object(obj: &serde_json::Value) {
     assert_uint(&obj["schema_version"], "schema_version", ctx);
     assert_eq!(
         obj["schema_version"].as_u64().unwrap(),
-        4,
-        "{ctx}: schema_version should be 4"
+        5,
+        "{ctx}: schema_version should be 5"
     );
     assert_string(&obj["session_id"], "session_id", ctx);
     assert_string(&obj["provider"], "provider", ctx);

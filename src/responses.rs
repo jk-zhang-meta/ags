@@ -29,7 +29,16 @@ use crate::store::{Availability, OriginState};
 /// [`ListItem::tool_uses`] an `Option`, because every provider but the four
 /// with a scanner had no way to count tool uses and was reporting `0` for
 /// every session.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// 5 added `skipped` to [`ListEnvelope`]: the session files `list` found and
+/// could not read, with the reader's own reason for each. `list` used to drop
+/// them with `read_session(&path).ok()?`, so a broken file — or a whole broken
+/// provider — subtracted itself from `items` and left nothing behind that a
+/// caller could see. `items` alone cannot carry that fact: a short list and a
+/// complete one are the same document. The field is always present and `[]`
+/// when nothing was skipped, because an absent key would mean "old build", not
+/// "clean run".
+pub const SCHEMA_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // `list --json`
@@ -40,15 +49,57 @@ pub const SCHEMA_VERSION: u32 = 4;
 pub struct ListEnvelope {
     pub schema_version: u32,
     pub items: Vec<ListItem>,
+    /// Session files the listing found and could not read; see
+    /// [`SkippedSession`].
+    ///
+    /// Serialized always, `[]` for a clean run. Omitting it when empty would
+    /// make "this build cannot tell you" and "nothing was skipped" the same
+    /// bytes, which is the distinction the field exists to draw.
+    pub skipped: Vec<SkippedSession>,
 }
 
 impl ListEnvelope {
-    pub fn new(items: Vec<ListItem>) -> Self {
+    pub fn new(items: Vec<ListItem>, skipped: Vec<SkippedSession>) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             items,
+            skipped,
         }
     }
+}
+
+/// One candidate `list` could not turn into a row, and the reader's reason.
+///
+/// # Why this is data and not only a warning
+///
+/// `list` reports two other things on stderr and nothing else — a store that
+/// would not open, and sessions hidden by `--workspace` — so stderr is the
+/// established channel for a listing's diagnostics, and this one is printed
+/// there too. But `--json` exists for callers that read stdout and nothing
+/// else, and for them a dropped session is invisible in exactly the way it is
+/// invisible to a human: `items` is shorter, and nothing in the document says
+/// shorter than what. The precedent that settles it is `resume --json`, which
+/// used to print `ok: true` on stdout while the same run put its failure on
+/// stderr and exited non-zero; the fix was to carry the failure in the envelope
+/// (`launch_error`, schema 3), not to trust the caller to read two streams.
+///
+/// # Why the reader's own text
+///
+/// A reason is what makes the count actionable: "3 skipped" tells a user their
+/// listing is incomplete, and "failed to parse JSON <path>" tells them whether
+/// to repair the file, report a reader bug, or ignore a stray file that was
+/// never a session. The reader already writes that sentence for `info`, which
+/// reads the same file through the same call and fails loudly; `list` had the
+/// text all along and threw it away with `.ok()`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedSession {
+    /// Slug of the provider whose reader was asked.
+    pub provider: String,
+    /// The file that could not be read.
+    pub path: String,
+    /// The reader's error, verbatim and unclassified — the same string `info`
+    /// prints for the same file.
+    pub error: String,
 }
 
 /// A single session entry in `list --json` output.
@@ -78,7 +129,7 @@ pub struct ListItem {
     /// populate the field" on most providers and "no tool calls" on a few, and
     /// nothing distinguishes the two from the outside.
     ///
-    /// Only four providers have such a scan. The other seventeen used to fall
+    /// Only four providers have such a scan. Every other one used to fall
     /// off the end of the match and report `0`, so every Aider, Cline, Cursor,
     /// Amp, OpenCode, ChatGPT, Vibe, Kiro, Grok and OpenClaw session in every
     /// `list --json` claimed to have made no tool calls at all. `null` says the
@@ -632,8 +683,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn schema_version_is_4() {
-        assert_eq!(SCHEMA_VERSION, 4);
+    fn schema_version_is_5() {
+        assert_eq!(SCHEMA_VERSION, 5);
     }
 
     // -----------------------------------------------------------------------
@@ -1060,10 +1111,35 @@ mod tests {
 
     #[test]
     fn list_envelope_empty_items_serializes() {
-        let envelope = ListEnvelope::new(vec![]);
+        let envelope = ListEnvelope::new(vec![], vec![]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert!(json["items"].as_array().unwrap().is_empty());
+        // Present and empty, not absent: "nothing was skipped" is a
+        // measurement and has to look different from a build that never made
+        // one.
+        assert!(json["skipped"].as_array().unwrap().is_empty());
+    }
+
+    /// A skipped file keeps its provider, its path and the reader's sentence.
+    #[test]
+    fn list_envelope_carries_skipped_sessions() {
+        let envelope = ListEnvelope::new(
+            vec![],
+            vec![SkippedSession {
+                provider: "gemini".to_string(),
+                path: "/tmp/chats/session-1.json".to_string(),
+                error: "failed to parse JSON /tmp/chats/session-1.json".to_string(),
+            }],
+        );
+        let json = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(json["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(json["skipped"][0]["provider"], "gemini");
+        assert_eq!(json["skipped"][0]["path"], "/tmp/chats/session-1.json");
+        assert_eq!(
+            json["skipped"][0]["error"],
+            "failed to parse JSON /tmp/chats/session-1.json"
+        );
     }
 
     #[test]
@@ -1089,12 +1165,12 @@ mod tests {
             workspace_name_source: Some("session_workspace_path".to_string()),
             repo_name: None,
         };
-        let envelope = ListEnvelope::new(vec![item]);
+        let envelope = ListEnvelope::new(vec![item], vec![]);
         let json = serde_json::to_value(&envelope).unwrap();
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert_eq!(json["items"].as_array().unwrap().len(), 1);
         let first = &json["items"][0];
-        assert_eq!(first["schema_version"], 4);
+        assert_eq!(first["schema_version"], 5);
         assert_eq!(first["session_id"], "sid-1");
         assert_eq!(first["provider"], "claude-code");
         assert_eq!(first["native_name"], "Renamed Session");
@@ -1131,7 +1207,7 @@ mod tests {
             transcript_tail: None,
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert_eq!(json["session_id"], "sid-info");
         assert_eq!(json["provider"], "codex");
         assert!(json["title"].is_null());

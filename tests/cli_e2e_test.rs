@@ -155,6 +155,40 @@ fn setup_gemini_fixture(tmp: &TempDir, fixture_name: &str) -> String {
     session_id
 }
 
+/// Put one Gemini session file in the chats directory, byte for byte.
+///
+/// Separate from [`setup_gemini_fixture`] because these tests need to write a
+/// file the reader *cannot* parse, and every helper above derives the filename
+/// from a session id it read out of valid JSON.
+#[allow(dead_code)]
+fn write_gemini_session_file(tmp: &TempDir, session_id: &str, content: &str) -> PathBuf {
+    let hash_dir = tmp.path().join("gemini/tmp/testhash123/chats");
+    fs::create_dir_all(&hash_dir).expect("create Gemini chats dir");
+    let path = hash_dir.join(format!("session-{session_id}.json"));
+    fs::write(&path, content).expect("write Gemini session file");
+    path
+}
+
+/// A Gemini session file that parses, with the id the caller asks for.
+#[allow(dead_code)]
+fn write_good_gemini_session(tmp: &TempDir, session_id: &str) -> PathBuf {
+    let source = fixtures_dir().join("gemini/gmi_simple.json");
+    let content = fs::read_to_string(&source).expect("read gemini fixture");
+    let mut root: serde_json::Value = serde_json::from_str(&content).expect("fixture parses");
+    root["sessionId"] = serde_json::Value::String(session_id.to_string());
+    write_gemini_session_file(tmp, session_id, &root.to_string())
+}
+
+/// A Gemini session file that does not parse: truncated mid-object.
+#[allow(dead_code)]
+fn write_corrupt_gemini_session(tmp: &TempDir, session_id: &str) -> PathBuf {
+    write_gemini_session_file(
+        tmp,
+        session_id,
+        "{\"sessionId\": \"x\", \"messages\": [ {\"type\": \"user\", \"content\": \"trunc",
+    )
+}
+
 /// Set up a Vibe session fixture in the temp dir.
 ///
 /// Vibe is the plainest case of a provider whose reader cannot determine a
@@ -321,7 +355,7 @@ fn cli_list_json_is_valid_array() {
         parsed.is_object(),
         "list --json should be an envelope object"
     );
-    assert_eq!(parsed["schema_version"], 4);
+    assert_eq!(parsed["schema_version"], 5);
     let items = parsed["items"].as_array().expect("items should be array");
     assert!(!items.is_empty());
     let first = &items[0];
@@ -565,6 +599,162 @@ fn cli_list_explicit_workspace_filter_still_selects_among_reporting_providers() 
         !items.iter().any(|s| s["provider"].as_str() == Some("vibe")),
         "an unplaceable session must not leak into an explicitly filtered list"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A session file that will not parse is missing from the listing, and said so
+// ---------------------------------------------------------------------------
+//
+// `list` used to read every candidate with `read_session(&path).ok()?`, so a
+// file the reader rejected left the listing through the same door as a file
+// that was never a session: no error, no warning, no count. The listing was
+// short, and nothing anywhere said short of what. The same file read through
+// `casr info` fails loudly and exits non-zero, which is what makes the silence
+// a defect rather than a policy.
+
+/// One bad file among good ones: the good ones still list, and the bad one is
+/// named on stderr instead of disappearing.
+#[test]
+fn cli_list_names_the_session_file_it_could_not_read() {
+    let tmp = TempDir::new().unwrap();
+    write_good_gemini_session(&tmp, "gmi-readable-0001");
+    write_good_gemini_session(&tmp, "gmi-readable-0002");
+    let corrupt = write_corrupt_gemini_session(&tmp, "gmi-corrupt-0003");
+
+    casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["list", "--provider", "gemini"])
+        .assert()
+        // One unreadable file must not take the listing with it.
+        .success()
+        .stdout(predicate::str::contains("gmi-readable-0001"))
+        .stdout(predicate::str::contains("gmi-readable-0002"))
+        .stderr(predicate::str::contains(
+            "1 session file(s) could not be read",
+        ))
+        .stderr(predicate::str::contains("gemini: 1"))
+        .stderr(predicate::str::contains(
+            corrupt.to_string_lossy().to_string(),
+        ));
+}
+
+/// `--json` is the only channel a machine caller reads, so the same fact has to
+/// be in the document, not only on stderr.
+#[test]
+fn cli_list_json_carries_the_session_files_it_could_not_read() {
+    let tmp = TempDir::new().unwrap();
+    write_good_gemini_session(&tmp, "gmi-readable-0011");
+    let corrupt = write_corrupt_gemini_session(&tmp, "gmi-corrupt-0012");
+
+    let output = casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["--json", "list", "--provider", "gemini"])
+        .output()
+        .expect("list should run");
+
+    assert!(output.status.success());
+    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout))
+        .expect("list --json should emit valid JSON");
+
+    let skipped = parsed["skipped"]
+        .as_array()
+        .expect("list --json must always carry a skipped array");
+    assert_eq!(
+        skipped.len(),
+        1,
+        "the one unreadable file should be reported once: {skipped:?}"
+    );
+    assert_eq!(skipped[0]["provider"], "gemini");
+    assert_eq!(
+        skipped[0]["path"].as_str().unwrap(),
+        corrupt.to_string_lossy()
+    );
+    assert!(
+        !skipped[0]["error"]
+            .as_str()
+            .expect("a reason, not a bare count")
+            .is_empty(),
+        "a skipped file without a reason is a count nobody can act on"
+    );
+    assert_eq!(parsed["schema_version"], 5);
+}
+
+/// Every file in the directory fails. The listing is empty and honest about
+/// why, rather than reporting the provider as having nothing.
+#[test]
+fn cli_list_says_so_when_a_whole_directory_will_not_parse() {
+    let tmp = TempDir::new().unwrap();
+    write_corrupt_gemini_session(&tmp, "gmi-corrupt-0021");
+    write_corrupt_gemini_session(&tmp, "gmi-corrupt-0022");
+    write_corrupt_gemini_session(&tmp, "gmi-corrupt-0023");
+
+    let output = casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["list", "--provider", "gemini"])
+        .output()
+        .expect("list should run");
+
+    // Partial results with an honest note, not an error page: a provider whose
+    // files all fail is still not a reason to fail the whole command.
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("No sessions found"),
+        "an empty listing is still an empty listing: {stdout}"
+    );
+    assert!(
+        stderr.contains("3 session file(s) could not be read"),
+        "\"no sessions\" and \"three sessions I could not read\" must not print \
+         the same thing: {stderr}"
+    );
+    assert!(
+        stderr.contains("gemini: 3"),
+        "the count has to name the provider it belongs to: {stderr}"
+    );
+}
+
+/// A run with nothing to report says nothing. A directory of files that were
+/// never sessions is not an error, and the warning must not become the line
+/// nobody reads.
+#[test]
+fn cli_list_is_quiet_when_nothing_was_skipped() {
+    let tmp = TempDir::new().unwrap();
+    write_good_gemini_session(&tmp, "gmi-readable-0031");
+    write_good_gemini_session(&tmp, "gmi-readable-0032");
+    // Files under the provider's own root that are not sessions at all.
+    let chats = tmp.path().join("gemini/tmp/testhash123/chats");
+    fs::write(chats.join("notes.md"), "# not a session\n").unwrap();
+    fs::write(
+        tmp.path().join("gemini/settings.json"),
+        "{\"theme\":\"dark\"}\n",
+    )
+    .unwrap();
+
+    let output = casr_cmd(&tmp)
+        .current_dir(tmp.path())
+        .args(["--json", "list", "--provider", "gemini"])
+        .output()
+        .expect("list should run");
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("could not be read"),
+        "a clean run must not warn: {stderr}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    assert!(
+        parsed["skipped"]
+            .as_array()
+            .expect("skipped is present even when empty — absent would mean \"old build\"")
+            .is_empty(),
+        "nothing was unreadable, so skipped must be empty: {}",
+        parsed["skipped"]
+    );
+    assert_eq!(parsed["items"].as_array().unwrap().len(), 2);
 }
 
 #[test]

@@ -581,6 +581,13 @@ The `list` command is optimized for project-local triage first.
   answer to it. `list --json` reports `"workspace": null` for these either way.
 - Providers that support `list_sessions()` can bypass expensive filesystem walks.
 - Fallback directory scans are capped by depth and extension filters.
+- A candidate the provider's reader **cannot parse** is not silently dropped.
+  It is missing from the table — one unreadable file must not abort the whole
+  listing — but the run reports how many were skipped, per provider, with up to
+  three paths and the reader's own reason on stderr. `list --json` carries every
+  one of them in `skipped: [{provider, path, error}]`, always present and `[]`
+  on a clean run, because a short listing and a complete one are otherwise the
+  same document.
 
 When sorting by date, probe size is capped to avoid slow scans:
 

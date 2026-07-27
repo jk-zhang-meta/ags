@@ -24,6 +24,7 @@ use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
 use casr::providers::Provider;
 use casr::responses::{
     self, ErrorEnvelope, InfoResponse, ListEnvelope, ListItem, ProviderInfo, ResumeSuccess,
+    SkippedSession,
 };
 
 /// Maximum characters per turn snippet in `info --peek` output.
@@ -1670,8 +1671,51 @@ fn cmd_list(
     );
 
     let mut sessions: Vec<SessionSummary> = Vec::new();
+    let mut skipped: Vec<SkippedSession> = Vec::new();
 
     const LIST_PARSE_PARALLEL_THRESHOLD: usize = 256;
+
+    /// What one candidate file became.
+    ///
+    /// Three outcomes, not two, for the reason [`WorkspaceHint`] has three
+    /// answers: "the layout places this file in another workspace" is a
+    /// measurement that answers the user's question, and "the reader could not
+    /// open it" is a failure to measure anything. The `filter_map` this
+    /// replaced returned `None` for both — `read_session(&path).ok()?` — so a
+    /// file that could not be parsed left the listing by the same door as a
+    /// file that was correctly excluded, and the listing had no way to tell the
+    /// user which had happened. One unreadable file must not end the listing,
+    /// so a failure is carried out as a value rather than raised.
+    enum Candidate {
+        /// Read, and belongs in the listing.
+        Row(SessionSummary),
+        /// Excluded on purpose: this provider's layout places it elsewhere.
+        Elsewhere,
+        /// Found, claimed as a session, and unreadable.
+        Unreadable(SkippedSession),
+    }
+
+    /// Read one candidate, keeping the reason when it cannot be read.
+    fn classify_candidate(
+        provider: &dyn Provider,
+        provider_slug: &str,
+        path: PathBuf,
+        workspace_filter: Option<&PathBuf>,
+    ) -> Candidate {
+        // Only a positive mismatch skips the parse. `Unknown` is not evidence,
+        // so it must not act like one.
+        if workspace_path_hint(provider_slug, &path, workspace_filter) == WorkspaceHint::Differs {
+            return Candidate::Elsewhere;
+        }
+        match provider.read_session(&path) {
+            Ok(session) => Candidate::Row(build_summary(provider_slug, path, session)),
+            Err(error) => Candidate::Unreadable(SkippedSession {
+                provider: provider_slug.to_string(),
+                path: path.display().to_string(),
+                error: format!("{error}"),
+            }),
+        }
+    }
 
     for provider in &installed {
         tracing::debug!(provider = provider.slug(), "scanning provider for sessions");
@@ -1695,36 +1739,27 @@ fn cmd_list(
             }
 
             let provider_slug = provider.slug().to_string();
-            let parsed: Vec<SessionSummary> = if listed.len() < LIST_PARSE_PARALLEL_THRESHOLD {
+            let classify = |path: PathBuf| {
+                classify_candidate(*provider, &provider_slug, path, workspace_filter.as_ref())
+            };
+            let parsed: Vec<Candidate> = if listed.len() < LIST_PARSE_PARALLEL_THRESHOLD {
                 listed
                     .into_iter()
-                    .filter_map(|(_session_id, path)| {
-                        // Only a positive mismatch skips the parse. `Unknown`
-                        // is not evidence, so it must not act like one.
-                        if workspace_path_hint(&provider_slug, &path, workspace_filter.as_ref())
-                            == WorkspaceHint::Differs
-                        {
-                            return None;
-                        }
-                        let session = provider.read_session(&path).ok()?;
-                        Some(build_summary(&provider_slug, path, session))
-                    })
+                    .map(|(_session_id, path)| classify(path))
                     .collect()
             } else {
                 listed
                     .into_par_iter()
-                    .filter_map(|(_session_id, path)| {
-                        if workspace_path_hint(&provider_slug, &path, workspace_filter.as_ref())
-                            == WorkspaceHint::Differs
-                        {
-                            return None;
-                        }
-                        let session = provider.read_session(&path).ok()?;
-                        Some(build_summary(&provider_slug, path, session))
-                    })
+                    .map(|(_session_id, path)| classify(path))
                     .collect()
             };
-            sessions.extend(parsed);
+            for candidate in parsed {
+                match candidate {
+                    Candidate::Row(summary) => sessions.push(summary),
+                    Candidate::Elsewhere => {}
+                    Candidate::Unreadable(skip) => skipped.push(skip),
+                }
+            }
             continue;
         }
 
@@ -1771,24 +1806,21 @@ fn cmd_list(
         }
 
         let provider_slug = provider.slug().to_string();
-        let parsed: Vec<SessionSummary> = if candidate_paths.len() < LIST_PARSE_PARALLEL_THRESHOLD {
-            candidate_paths
-                .into_iter()
-                .filter_map(|path| {
-                    let session = provider.read_session(&path).ok()?;
-                    Some(build_summary(&provider_slug, path, session))
-                })
-                .collect()
-        } else {
-            candidate_paths
-                .into_par_iter()
-                .filter_map(|path| {
-                    let session = provider.read_session(&path).ok()?;
-                    Some(build_summary(&provider_slug, path, session))
-                })
-                .collect()
+        let classify = |path: PathBuf| {
+            classify_candidate(*provider, &provider_slug, path, workspace_filter.as_ref())
         };
-        sessions.extend(parsed);
+        let parsed: Vec<Candidate> = if candidate_paths.len() < LIST_PARSE_PARALLEL_THRESHOLD {
+            candidate_paths.into_iter().map(classify).collect()
+        } else {
+            candidate_paths.into_par_iter().map(classify).collect()
+        };
+        for candidate in parsed {
+            match candidate {
+                Candidate::Row(summary) => sessions.push(summary),
+                Candidate::Elsewhere => {}
+                Candidate::Unreadable(skip) => skipped.push(skip),
+            }
+        }
     }
 
     // Sessions no source could place in *any* workspace, counted per provider.
@@ -1844,6 +1876,56 @@ fn cmd_list(
         );
     }
 
+    // Say so here too, and for the same reason: a listing that is short because
+    // some of it would not parse looks exactly like a listing that is short.
+    //
+    // # Why stderr, and why only without `--json`
+    //
+    // stdout is this command's data channel — `--json` callers parse it, and
+    // `list` already sends its other two diagnostics (a store that would not
+    // open, and sessions hidden by `--workspace`) to stderr. Under `--json` the
+    // envelope carries every one of these facts in full, so repeating them on
+    // stderr would only duplicate the document, which is the argument
+    // [`launch_line`] already makes for the launch line. Under plain `list`
+    // there is no envelope, so stderr is the only place left.
+    //
+    // # Why a count, then examples, then a number
+    //
+    // The count is the fact that changes what the user believes about the list
+    // they just read. The reasons are what make it actionable. Printing every
+    // reason is not: a provider whose reader has broken will produce one line
+    // per session and bury the listing it was supposed to annotate, so three
+    // are shown and the rest are counted, with `--json` named as the place that
+    // holds all of them. One broken file is under the cap and names itself,
+    // which is the case a user most needs the path for.
+    const SKIPPED_EXAMPLES: usize = 3;
+    if !skipped.is_empty() && !json_mode {
+        let mut by_provider: std::collections::BTreeMap<&str, usize> =
+            std::collections::BTreeMap::new();
+        for skip in &skipped {
+            *by_provider.entry(skip.provider.as_str()).or_default() += 1;
+        }
+        let counts: Vec<String> = by_provider
+            .iter()
+            .map(|(provider, count)| format!("{provider}: {count}"))
+            .collect();
+        eprintln!(
+            "{} {} session file(s) could not be read and are missing from this listing ({}).",
+            "⚠".yellow(),
+            skipped.len(),
+            counts.join(", ")
+        );
+        for skip in skipped.iter().take(SKIPPED_EXAMPLES) {
+            eprintln!("  {} — {}", skip.path, skip.error);
+        }
+        if skipped.len() > SKIPPED_EXAMPLES {
+            eprintln!(
+                "  … and {} more; `casr list --json` reports every one.",
+                skipped.len() - SKIPPED_EXAMPLES
+            );
+        }
+    }
+
     let mut sessions_by_provider: std::collections::BTreeMap<String, Vec<SessionSummary>> =
         std::collections::BTreeMap::new();
     for session in sessions {
@@ -1891,7 +1973,7 @@ fn cmd_list(
                 items.push(session.to_list_item(enrich_fs));
             }
         }
-        let envelope = ListEnvelope::new(items);
+        let envelope = ListEnvelope::new(items, skipped);
         println!("{}", serde_json::to_string_pretty(&envelope)?);
     } else {
         if non_empty_group_count == 0 {
