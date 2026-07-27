@@ -696,6 +696,25 @@ fn extract_tool_results(content: Option<&serde_json::Value>) -> Vec<ToolResult> 
         .collect()
 }
 
+// Claude Code has two message record types, and the third one is not a slot.
+//
+// Measured over the 268-session local corpus: `message.role` is `user` or
+// `assistant` on all 67,527 message records, and the `type: "system"` record
+// the format does have is chrome — `turn_duration`, `stop_hook_summary`,
+// `away_summary`, `compact_boundary`, `local_command` — never an operator
+// instruction. A converted system prompt written there would land somewhere
+// the replayed context never reads, so `user` is the better target and the
+// fold is permanent: this provider's reader returns `MessageRole::User` for it
+// and the role is gone for good.
+//
+// Right, and still a loss, so it is declared rather than performed in silence:
+// `pipeline::folded_role("claude-code", …)` names it before the write and the
+// conversion carries an `ir::Loss` for it — the same `LossKind::Metadata` at
+// `Fidelity::ConversationOnly` that `claude_code_ir_write`'s `recast_roles`
+// has always filed on the structured track. Change this match and that table
+// has to change with it:
+// `conformance_test::no_writer_folds_a_role_without_declaring_it` drives this
+// writer and fails if the two disagree, in either direction.
 fn claude_entry_type(role: &MessageRole) -> &'static str {
     match role {
         MessageRole::User => "user",
@@ -763,6 +782,24 @@ fn build_message_content(msg: &CanonicalMessage) -> serde_json::Value {
                         "content": tr.content,
                         "is_error": tr.is_error,
                     }));
+                }
+                // The message's own text, after the results.
+                //
+                // This arm used to emit the results *instead of* `content`, so a
+                // message carrying both was written with its text deleted — and
+                // silently, because `claude_extract_text_content` reads only
+                // `text` blocks, so the read-back agreed that the message had
+                // never had any. Writer and reader shared the mistake and the
+                // round-trip compared clean.
+                //
+                // `tool_result` first and `text` after is Claude Code's own
+                // shape, not a guess: 11 user records across the local corpus
+                // are `(tool_result, text)` in that order and none the other way
+                // round, and the Anthropic API requires tool results to lead the
+                // block list. `reader_extracts_tool_results` pins the same
+                // ordering from the reading side.
+                if !msg.content.is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": msg.content }));
                 }
                 serde_json::Value::Array(blocks)
             } else {
@@ -941,6 +978,33 @@ mod tests {
         assert_eq!(blocks[0]["tool_use_id"], "call-42");
         assert_eq!(blocks[0]["content"], "Done");
         assert_eq!(blocks[0]["is_error"], false);
+    }
+
+    /// A non-assistant message with both fields keeps both.
+    ///
+    /// This arm used to emit the tool results *instead of* `content`, which
+    /// deleted the message's own text on write. It was invisible because
+    /// `claude_extract_text_content` reads only `text` blocks, so the read-back
+    /// agreed there had never been any: the writer's mistake and the reader's
+    /// blind spot were the same mistake, and the round-trip compared clean.
+    /// `tests/claude_code_shape_test.rs` asserts the whole round-trip; this
+    /// pins the block order the reader depends on.
+    #[test]
+    fn writer_non_assistant_keeps_content_alongside_tool_results() {
+        let mut msg = sample_message(MessageRole::Tool, "the file was already up to date");
+        msg.tool_results.push(ToolResult {
+            call_id: Some("call-42".to_string()),
+            content: "0 replacements made".to_string(),
+            is_error: false,
+        });
+
+        let content = build_message_content(&msg);
+        let blocks = content.as_array().expect("blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["content"], "0 replacements made");
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[1]["text"], "the file was already up to date");
     }
 
     #[test]

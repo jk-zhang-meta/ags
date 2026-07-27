@@ -361,6 +361,33 @@ fn prune_forks(
     // lot as `AbandonedFork` — the whole post-compaction session, with the
     // fidelity report calling it a pruned branch.
     let mut keep: HashSet<&str> = checkpoint_ids.iter().copied().collect();
+
+    // The compaction's own output. A boundary re-roots the graph, and what the
+    // compaction *wrote* — the summary standing in for everything it discarded —
+    // hangs off the marker rather than off the branch the leaf sits on. That is
+    // not a fork, so neither the ancestor walk nor the descendant walk from the
+    // leaf is entitled to find it, and on the transcript that produced this rule
+    // neither did: a message submitted while the compaction was still running is
+    // written with its *pre-compaction* parent, so the leaf's chain runs back
+    // into the superseded history and passes the summary by on the other side.
+    // The prune then reported the one record carrying 1,259 compacted-away
+    // events as `AbandonedFork`, and the replay handed the target the tail of a
+    // conversation with no statement of what came before it.
+    //
+    // Direct children only, not the subtree: the records *below* the summary are
+    // ordinary content on an ordinary branch, and the prune is still the thing
+    // that decides whether the leaf lives on it. Claude Code reaches the same
+    // answer by rewriting the graph on load — it re-parents the preserved tail
+    // onto the summary and re-parents orphans onto that tail, which makes the
+    // summary an ancestor of everything and its siblings nothing special.
+    if let Some(marker) = checkpoint_marker {
+        for child in children_of.get(marker).into_iter().flatten() {
+            if let Some(ids) = records.get(child) {
+                keep.extend(ids.iter().copied());
+            }
+        }
+    }
+
     let mut walked: HashSet<&str> = HashSet::new();
     let mut cursor = Some(leaf);
     while let Some(record) = cursor {
@@ -847,6 +874,85 @@ mod tests {
             ["kept"],
             "the fold placed `kept` in the model's context; the fork prune \
              cannot take it back out"
+        );
+    }
+
+    /// The compaction's own summary is not an abandoned fork.
+    ///
+    /// The shape is Claude Code transcript `90b138a7`, compacted at line 2,003:
+    /// a message the user submitted while the compaction was still running is
+    /// written with its *pre-compaction* parent, so the live branch runs back
+    /// into the history the compaction discarded and never passes through the
+    /// summary the compaction wrote. Ancestors-plus-descendants-of-the-leaf
+    /// therefore missed it and the prune deleted it, leaving a replay of 4
+    /// events out of 1,267 captured with nothing to say what the other 1,263
+    /// had been about. The summary hangs off the marker, and the marker is the
+    /// boundary this fold already refuses to overrule.
+    #[test]
+    fn the_compaction_summary_is_not_an_abandoned_fork() {
+        let old = message("old");
+        let mut kept = message("kept");
+        kept.parent = Some("old".into());
+        // Claude writes the boundary with no `parentUuid` at all.
+        let boundary = compaction("cb", &["kept"], &["old"]);
+        // Submitted mid-compaction: parented on history the boundary superseded.
+        let mut inflight = message("inflight");
+        inflight.parent = Some("old".into());
+        // The compaction's output, attached to the marker.
+        let mut summary = message("summary");
+        summary.parent = Some("cb".into());
+        let mut reply = message("reply");
+        reply.parent = Some("inflight".into());
+
+        let plan = resolve(&forked(
+            vec![old, kept, boundary, inflight, summary, reply],
+            "inflight",
+        ));
+
+        assert_eq!(
+            plan.events,
+            ["kept", "inflight", "summary", "reply"],
+            "the summary is what the compaction put in the model's context in \
+             place of everything it dropped; a leaf that reaches it by another \
+             route cannot delete it"
+        );
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                id: "old".into(),
+                reason: ExclusionReason::Superseded { by: "cb".into() }
+            }],
+            "the discarded history is still reported as superseded — nothing \
+             here is entitled to relabel it as a pruned branch, or to keep it"
+        );
+    }
+
+    /// Only the marker's *children*, not its whole subtree.
+    ///
+    /// The summary is the compaction's output; what hangs below it is ordinary
+    /// conversation on an ordinary branch, and the prune still owns the question
+    /// of whether the leaf lives on that branch. Claude Code answers the same
+    /// way — on load it re-parents the summary's other children off the summary,
+    /// so being under it confers nothing.
+    #[test]
+    fn the_summarys_own_branch_is_still_prunable() {
+        let boundary = compaction("cb", &[], &[]);
+        let mut summary = message("summary");
+        summary.parent = Some("cb".into());
+        let mut abandoned = message("abandoned");
+        abandoned.parent = Some("summary".into());
+        let mut live = message("live");
+        live.parent = Some("cb".into());
+
+        let plan = resolve(&forked(vec![boundary, summary, abandoned, live], "live"));
+
+        assert_eq!(plan.events, ["summary", "live"]);
+        assert_eq!(
+            plan.excluded,
+            vec![Excluded {
+                id: "abandoned".into(),
+                reason: ExclusionReason::AbandonedFork
+            }]
         );
     }
 
