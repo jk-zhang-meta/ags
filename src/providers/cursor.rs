@@ -54,9 +54,23 @@
 //! ```
 //!
 //! `meta['0']` is the hex of UTF-8 JSON holding `{agentId, name, createdAt,
-//! mode, lastUsedModel, latestRootBlobId, …}` — that much is read. The
-//! conversation itself is a content-addressed graph of protobuf blobs rooted at
-//! `latestRootBlobId`, which this reader cannot decode.
+//! mode, lastUsedModel, latestRootBlobId, …}`. Only `name`, `createdAt` and
+//! `lastUsedModel` are read, and only those three are republished: the object
+//! also carries `blobEncryptionKey`, a live credential — see
+//! [`Cursor::cli_chat_metadata`].
+//!
+//! The conversation itself is a content-addressed blob graph rooted at
+//! `latestRootBlobId`. **This reader does not decode it**, which is not the
+//! same as it being undecodable: the root blob is protobuf
+//! (`agent.v1.ConversationStateStructure`), but its field 1
+//! `root_prompt_messages_json` is `repeated bytes` holding *blob ids*, and the
+//! blobs those ids name are plain JSON — `cursor-agent` reads them back with
+//! `JSON.parse`. Nothing is encrypted at rest: `setBlob` writes
+//! `Buffer.from(data)` straight into the `blobs` column, and
+//! `blobEncryptionKey` is a request header for Cursor's backend, not a local
+//! cipher. The CLI's own `generateTranscript` reconstructs a whole transcript
+//! from one `store.db` and nothing else. Decoding it here is a feature nobody
+//! has written, not a wall.
 //!
 //! ## `<id>.jsonl`
 //!
@@ -239,11 +253,30 @@ impl Cursor {
         out
     }
 
-    /// The `meta['0']` JSON from a chat's `store.db`, if one exists for `id`.
+    /// The fields of a chat's `meta['0']` this reader uses, if a store exists
+    /// for `id`.
     ///
     /// Returns `None` rather than an error: this is enrichment, and a chat
     /// store that will not open must not cost the transcript its listing.
+    ///
+    /// The decoded object is filtered here, at the one place it is decoded,
+    /// rather than at each use. `meta['0']` is a vendor blob whose contents are
+    /// Cursor's to change, and it carries a live credential: every conversation
+    /// is built from `cursor-agent`'s default metadata literal, which ends
+    /// `subagentInfo: void 0, blobEncryptionKey: Q()` with `Q()` returning 32
+    /// bytes from `crypto.getRandomValues`, hex-encoded. The CLI sends that
+    /// value to Cursor's backend as the `x-blob-encryption-key` header. Copying
+    /// the object wholesale republished it through `info --json`, a command
+    /// users pipe to a file and paste into bug reports.
+    ///
+    /// So this is an allow-list, not a deny-list of the names that are secret
+    /// today: a deny-list would have to be re-audited every time Cursor adds a
+    /// field, and would leak until someone noticed.
     fn cli_chat_metadata(id: &str) -> Option<serde_json::Value> {
+        /// Everything the reader asks of a chat store: the title, the creation
+        /// time and the model. Adding a name here republishes it.
+        const USED_FIELDS: [&str; 3] = ["name", "createdAt", "lastUsedModel"];
+
         let (_, db) = Self::cli_chat_stores(&mut Vec::new())
             .into_iter()
             .find(|(k, _)| k == id)?;
@@ -253,7 +286,15 @@ impl Cursor {
                 row.get(0)
             })
             .ok()?;
-        serde_json::from_slice(&decode_hex(&hex)?).ok()
+        let full: serde_json::Value = serde_json::from_slice(&decode_hex(&hex)?).ok()?;
+
+        let mut kept = serde_json::Map::new();
+        for field in USED_FIELDS {
+            if let Some(value) = full.get(field) {
+                kept.insert(field.to_string(), value.clone());
+            }
+        }
+        Some(serde_json::Value::Object(kept))
     }
 
     /// Build a virtual per-session path backed by a `state.vscdb` file.
@@ -426,10 +467,19 @@ impl Cursor {
     /// The file carries roles, text, thinking and tool calls, and nothing else:
     /// no per-message timestamps, no model, and no workspace path. The chat's
     /// `store.db` supplies the title, creation time and model when it is still
-    /// there; the workspace is supplied by nothing. Both directory names that
-    /// could name it — the `projects/<slug>` slug and the `chats/<md5>` bucket
-    /// — are one-way, so the workspace stays `None` instead of being guessed
-    /// from a lossy slug.
+    /// there; the workspace is supplied by nothing. Neither directory name that
+    /// could name it is invertible, so the workspace stays `None` rather than
+    /// being guessed.
+    ///
+    /// They are uninvertible for two different reasons, and only one of them is
+    /// a hash. `chats/<md5>` is `md5(resolve(cwd))`, genuinely one-way. The
+    /// `projects/<slug>` slug is not a hash at all — it is
+    /// `path.replace(/[^a-zA-Z0-9]/g, "-")` with runs collapsed — but it is
+    /// still ambiguous, because `/home/u/demo project`, `/home/u/demo_project`
+    /// and `/home/u/demo.project` all slugify to `home-u-demo-project`, and
+    /// nothing records which one it was. The CLI also has a second namer that
+    /// truncates at 84 characters and appends a 7-hex sha256 prefix, so a long
+    /// enough path is partly hashed as well.
     fn read_cli_transcript(path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading cursor-agent transcript");
 
@@ -867,9 +917,9 @@ impl Provider for Cursor {
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
             anyhow::bail!(
-                "cursor-agent chat {id}: its turns live in this store's `blobs` table as \
-                 protobuf, which casr cannot decode, and no transcript for it exists under \
-                 `projects/*/agent-transcripts/`"
+                "cursor-agent chat {id}: its turns live in this store's `blobs` table, \
+                 rooted at a protobuf record this reader does not decode, and no \
+                 transcript for it exists under `projects/*/agent-transcripts/`"
             );
         }
 
