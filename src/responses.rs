@@ -26,8 +26,9 @@ use crate::store::{Availability, OriginState};
 /// numbers, what the session holds by event type, and what of it the agent
 /// would actually see. Both summaries report `null`, not `0`, for a count
 /// their reader cannot establish — see [`EventSummary`]. It also made
-/// [`ListItem::tool_uses`] an `Option`, because 17 of the 21 providers had no
-/// way to count tool uses and were reporting `0` for every session.
+/// [`ListItem::tool_uses`] an `Option`, because every provider but the four
+/// with a scanner had no way to count tool uses and was reporting `0` for
+/// every session.
 pub const SCHEMA_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------

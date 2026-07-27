@@ -1099,7 +1099,8 @@ impl Store {
     /// two registries that could diverge is a latent bug: the pipeline reads the
     /// chosen candidate through *its* provider and the ranking counted capsules
     /// through a different instance of the same list. Sharing one instance also
-    /// removes the per-call construction of twenty-one boxed providers.
+    /// removes the per-call construction of a boxed provider for every entry in
+    /// the registry.
     pub fn best_source_for(
         &self,
         record: &Record,
@@ -1372,8 +1373,8 @@ impl Store {
 
     /// The candidate's structured IR, from the cache when we can.
     ///
-    /// `Ok(None)` means the provider has no structured reader — nineteen of
-    /// twenty-one answer that — which is also the honest answer to "how many
+    /// `Ok(None)` means the provider has no structured reader — every provider
+    /// but codex and claude-code answers that — which is also the honest answer to "how many
     /// capsules does it hold": none exist outside the IR.
     fn candidate_ir(
         &self,

@@ -205,8 +205,8 @@ pub trait Provider: Send + Sync {
     ///
     /// The read-side companion of [`Provider::supports_structured_write`], and
     /// it exists for the same reason: a capability is a property of the
-    /// provider, so asking about it should not cost a session parse. Nineteen
-    /// of the twenty-one providers answer `false`.
+    /// provider, so asking about it should not cost a session parse. Every
+    /// provider but codex and claude-code answers `false`.
     ///
     /// It buys less than the write-side probe does, and the gap is worth
     /// stating because it bounds where the probe may be used. Skipping
@@ -233,7 +233,7 @@ pub trait Provider: Send + Sync {
     /// `write_session_ir` cannot be asked whether it exists without first being
     /// handed an IR — and building that IR means parsing the source session a
     /// second time, 281 MiB for the largest rollout in the corpus, only to be
-    /// told `Ok(None)`. Nineteen of the twenty-one providers answer `false`.
+    /// told `Ok(None)`. Every provider but codex and claude-code answers `false`.
     ///
     /// `true` is a claim about the writer's existence, not about any particular
     /// session: a provider that supports the track still returns `Ok(None)`
@@ -256,7 +256,7 @@ pub trait Provider: Send + Sync {
     ///
     /// The flat track never sees one. Its budget is applied to the
     /// [`CanonicalSession`] in the pipeline, before any writer is called, so a
-    /// `budget` field on `WriteOptions` would hand all twenty-one flat writers a
+    /// `budget` field on `WriteOptions` would hand every flat writer a
     /// value that exactly one of the two tracks is expected to act on — an
     /// option that is silently ignored by most of its implementors is a bug
     /// waiting for its first reader. The structured writers cannot be served the
