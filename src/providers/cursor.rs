@@ -621,6 +621,57 @@ impl Cursor {
         Self::parse_composer(composer_id, &composer, &bubbles, db_path)
     }
 
+    /// The `modelConfig` sub-object of a `composerData:<uuid>` entry, reduced
+    /// to the fields Cursor is known to put there.
+    ///
+    /// Cursor 3.13.10 builds it in one place, and only one — `Gyr(t)` in
+    /// `resources/app/out/vs/workbench/workbench.desktop.main.js`:
+    ///
+    /// ```js
+    /// function Gyr(t){return{modelName:t.modelName,maxMode:t.maxMode,
+    ///   ...t.useExperimentalModelOptOut===!0?{useExperimentalModelOptOut:!0}:{},
+    ///   selectedModels:t.selectedModels?.map(e=>({modelId:e.modelId,
+    ///     parameters:e.parameters.map(n=>({...n}))}))}}
+    /// ```
+    ///
+    /// `modelConfig` is absent from the persist function's own field list and
+    /// arrives only through the default-object spread, so `Gyr` re-runs on
+    /// every write: the four names below are the whole set, and none of them
+    /// is a credential. Cursor's BYOK material lives elsewhere entirely — OS
+    /// secret storage (`cursorAuth/openAIKey`, …) and the `ItemTable` reactive
+    /// storage blob (`openAIBaseUrl`, `azureState.apiKey`, `bedrockState.*`) —
+    /// neither of which this reader touches.
+    ///
+    /// So this filter removes nothing that ships today. It is here for the
+    /// same reason [`Cursor::cli_chat_metadata`] is: `casr info --json` prints
+    /// the metadata bag verbatim, and the entry this object came from *does*
+    /// carry live secrets one level up — `blobEncryptionKey` and
+    /// `speculativeSummarizationEncryptionKey`, both 32 bytes of
+    /// `crypto.getRandomValues`, sitting at the top level of the same
+    /// `composerData` value. Copying any part of that value wholesale is the
+    /// habit that published the first one. Adding a name here republishes it.
+    fn composer_model_config(composer: &serde_json::Value) -> Option<serde_json::Value> {
+        const USED_FIELDS: [&str; 4] = [
+            "modelName",
+            "maxMode",
+            "useExperimentalModelOptOut",
+            "selectedModels",
+        ];
+
+        let full = composer.get("modelConfig")?;
+        // A non-object `modelConfig` is not something this reader can vouch
+        // for, and passing it through is exactly the wholesale copy.
+        let full = full.as_object()?;
+
+        let mut kept = serde_json::Map::new();
+        for field in USED_FIELDS {
+            if let Some(value) = full.get(field) {
+                kept.insert(field.to_string(), value.clone());
+            }
+        }
+        Some(serde_json::Value::Object(kept))
+    }
+
     /// Parse a composerData entry + bubbles into a CanonicalSession.
     fn parse_composer(
         composer_id: &str,
@@ -746,8 +797,8 @@ impl Cursor {
             "source".into(),
             serde_json::Value::String("cursor".to_string()),
         );
-        if let Some(model_config) = composer.get("modelConfig") {
-            metadata.insert("modelConfig".into(), model_config.clone());
+        if let Some(model_config) = Self::composer_model_config(composer) {
+            metadata.insert("modelConfig".into(), model_config);
         }
         if let Some(mode) = composer.get("unifiedMode").and_then(|v| v.as_str()) {
             metadata.insert(

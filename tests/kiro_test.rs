@@ -62,7 +62,7 @@ fn seed_kiro_home(home: &Path) {
 }
 
 #[test]
-fn full_filesystem_round_trip_preserves_history_and_state() {
+fn full_filesystem_round_trip_preserves_state_and_drops_history() {
     let _lock = KIRO_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _env = EnvGuard::set("KIRO_HOME", tmp.path());
@@ -73,8 +73,10 @@ fn full_filesystem_round_trip_preserves_history_and_state() {
         .write_session(&original, &WriteOptions { force: true })
         .expect("write session");
 
-    // .json + .jsonl + .history (history was present).
-    assert_eq!(written.paths.len(), 3, "json + jsonl + history");
+    // .json + .jsonl. No `.history`: the reader no longer carries the fixture's
+    // `.history` sidecar, so the writer has nothing to re-emit. That is the
+    // accepted cost of not publishing raw prompt input — see the read site.
+    assert_eq!(written.paths.len(), 2, "json + jsonl");
     assert!(written.resume_command.starts_with("kiro-cli --resume-id "));
     for p in &written.paths {
         assert!(p.exists(), "written file missing: {}", p.display());
@@ -109,11 +111,13 @@ fn full_filesystem_round_trip_preserves_history_and_state() {
         reread.metadata.get("session_state"),
         "session_state must round-trip verbatim"
     );
-    // .history plain text survives byte-for-byte.
-    assert_eq!(
-        original.metadata.get("history").and_then(|v| v.as_str()),
-        reread.metadata.get("history").and_then(|v| v.as_str()),
-        "history must round-trip"
+    // `.history` does not round-trip, on purpose. kiro-cli's `addToHistory`
+    // records every submitted line, not just slash commands, so the file is
+    // raw user input — and the metadata bag that would carry it is what
+    // `casr info --json` prints. Neither side may hold it.
+    assert!(
+        original.metadata.get("history").is_none() && reread.metadata.get("history").is_none(),
+        "`.history` must not be carried in either direction"
     );
     assert_eq!(original.workspace, reread.workspace);
     assert_eq!(

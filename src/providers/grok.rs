@@ -718,6 +718,44 @@ impl Provider for Grok {
                     serde_json::Value::String(t.to_string()),
                 );
             }
+            // An allow-list, and the only thing `summary.json` contributes to
+            // the metadata bag.
+            //
+            // This used to be followed by `metadata.insert("summary", s)` — the
+            // whole file — under the comment "preserve the full summary for
+            // round-trip fidelity". Both halves of that were wrong.
+            //
+            // There is no round-trip. The canonical metadata bag is read back
+            // in exactly three places: `native_name_from_metadata`, the
+            // `InfoResponse` in `main.rs` (which *prints* it), and the
+            // per-provider writers, of which only Gemini (`projectHash`), Pi
+            // (`provider`) and Kiro (`session_state`/`history`) consult a key
+            // at all. `Grok::write_session` below refuses outright, so a Grok
+            // tree rebuilt by casr does not exist to be faithful to.
+            //
+            // And the file is not inert. `summary.json` is 33 fields in grok
+            // 0.2.103 — recovered from the session-persistence serializer in
+            // the shipped `@xai-official/grok-linux-x64` binary (brotli
+            // `bin/grok.br`; the field names are emitted in declaration order
+            // and cross-check against the `persistence.rs` and `acp_agent.rs`
+            // string pools and against the CLI's own bundled
+            // `docs/user-guide/17-sessions.md`). One of them is `git_remotes`,
+            // an array of the workspace's git remote URLs. An HTTPS remote
+            // routinely embeds a credential —
+            // `https://x-access-token:ghp_…@github.com/…` — and grok's own
+            // secret scrubber (`xai-grok-secrets`, which knows `ghp_`,
+            // `glpat-`, `xai-`, `AKIA`, JWTs…) is wired to its sampler and
+            // telemetry paths, not to session persistence. So the value lands
+            // in `summary.json` unredacted, and the wholesale copy put it into
+            // `casr info --json` — a command users pipe to a file and paste
+            // into issues. `grok_home`, `info.cwd`, `prompt_display_cwd`,
+            // `source_workspace_dir` and `git_root_dir` rode along with it.
+            //
+            // 0.2.112 already adds fields 0.2.103 does not have, so the set is
+            // not stable even across patch releases. That is the argument for
+            // naming what we take rather than taking the file: `generated_title`
+            // above and these three are ours to justify, the rest are xAI's to
+            // change.
             for key in ["agent_name", "sandbox_profile", "parent_session_id"] {
                 if let Some(v) = s.get(key)
                     && !v.is_null()
@@ -725,8 +763,6 @@ impl Provider for Grok {
                     metadata.insert(key.into(), v.clone());
                 }
             }
-            // Preserve the full summary for round-trip fidelity.
-            metadata.insert("summary".into(), s.clone());
         }
         if let Some(m) = model_name.as_ref() {
             metadata.insert("model".into(), serde_json::Value::String(m.clone()));

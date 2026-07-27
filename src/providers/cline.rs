@@ -151,6 +151,58 @@ impl Cline {
         serde_json::from_reader(reader).with_context(|| format!("invalid json: {}", path.display()))
     }
 
+    /// Every field a `taskHistory.json` entry is known to hold.
+    ///
+    /// This list is an *allow-list*, and that is the point: the entry lands in
+    /// canonical metadata under `taskHistoryItem`, which `casr info --json`
+    /// prints verbatim — a command users pipe to a file and paste into issues.
+    /// Copying the entry wholesale means whatever Cline adds to it next is
+    /// republished with no change here and no one looking. Adding a name to
+    /// this list republishes it; that is the review this list exists to force.
+    ///
+    /// Audited against Cline (`saoudrizwan.claude-dev`) **4.0.11**, from two
+    /// independent artifacts that agree exactly:
+    ///
+    /// * the type — `apps/vscode/src/shared/HistoryItem.ts` at tag `v4.0.11`
+    ///   (the pre-monorepo path `src/shared/HistoryItem.ts` is gone), and
+    /// * the sole writer — `Task.saveClineMessagesAndUpdateHistoryInternal`
+    ///   in the shipped `extension/dist/extension.js`, whose object literal
+    ///   reaches disk through `Controller.updateTaskHistory`. That function
+    ///   *replaces* the entry rather than merging, so nothing accretes into it.
+    ///
+    /// No field in the type can hold a credential, in any version from 2.0.0
+    /// to 4.0.11. Cline keeps API keys in VS Code SecretStorage, mirrored to a
+    /// sibling `state/secrets.json` written 0600 — never inside a history
+    /// entry, and `apiConfiguration` is never embedded in one. `task` is the
+    /// user's first prompt verbatim, so it is free text rather than a secret
+    /// by construction; the three path/diagnostic fields carry absolute paths.
+    /// Those are the same values `title`/`workspace` already surface, so
+    /// filtering them here would buy nothing this reader does not already
+    /// print. What filtering buys is the *next* field.
+    ///
+    /// `checkpointTrackerErrorMessage` is the pre-3.50 name of
+    /// `checkpointManagerErrorMessage`; an entry written by an old Cline and
+    /// never rewritten still carries it.
+    const HISTORY_ITEM_FIELDS: [&str; 17] = [
+        "id",
+        "ulid",
+        "ts",
+        "task",
+        "tokensIn",
+        "tokensOut",
+        "cacheWrites",
+        "cacheReads",
+        "totalCost",
+        "size",
+        "shadowGitConfigWorkTree",
+        "cwdOnTaskInitialization",
+        "conversationHistoryDeletedRange",
+        "isFavorited",
+        "checkpointManagerErrorMessage",
+        "checkpointTrackerErrorMessage",
+        "modelId",
+    ];
+
     fn read_task_history_item(
         storage_root: &Path,
         task_id: &str,
@@ -167,7 +219,13 @@ impl Cline {
                 continue;
             };
             if obj.get("id").and_then(|v| v.as_str()) == Some(task_id) {
-                return Some(obj.clone());
+                let mut kept = serde_json::Map::new();
+                for field in Self::HISTORY_ITEM_FIELDS {
+                    if let Some(value) = obj.get(field) {
+                        kept.insert(field.to_string(), value.clone());
+                    }
+                }
+                return Some(kept);
             }
         }
         None

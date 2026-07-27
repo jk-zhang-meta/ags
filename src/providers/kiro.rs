@@ -69,7 +69,7 @@
 //! ```text
 //! <cliRoot>/sessions/cli/<id>.json      ← session metadata + nested session_state
 //! <cliRoot>/sessions/cli/<id>.jsonl     ← append-only conversation journal
-//! <cliRoot>/sessions/cli/<id>.history   ← plain-text slash-command history (optional)
+//! <cliRoot>/sessions/cli/<id>.history   ← raw prompt input, last 100 lines (optional, not read)
 //! ```
 //!
 //! # The bucketed layout (the shared "KAS" store)
@@ -145,7 +145,10 @@
 //!   "title": "…",
 //!   "parent_session_id": "<uuid|null>",
 //!   "session_created_reason": "subagent|user|…",
-//!   "session_state": { "version": "v1", "rts_model_state": { … }, "permissions": { … }, … }
+//!   "imported_from": …,
+//!   "session_state": { "version": "v1", "conversation_metadata": { … },
+//!                      "rts_model_state": { … }, "permissions": { … },
+//!                      "agent_name": …, "goal": … }
 //! }
 //! ```
 //!
@@ -342,6 +345,73 @@ impl Kiro {
     fn sibling(path: &Path, ext: &str) -> PathBuf {
         path.with_extension(ext)
     }
+
+    /// The `session_state` object, reduced to the fields `kiro-cli` puts there.
+    ///
+    /// The doc above described this as
+    /// `{"version": …, "rts_model_state": {…}, "permissions": {…}, … }`, and
+    /// the `…` was the whole problem: nobody had enumerated it, and the reader
+    /// copied it wholesale into a bag `casr info --json` prints verbatim.
+    ///
+    /// It is `chat_cli_v2::agent::session::SessionStateV1`, internally tagged
+    /// on `version`, and it is exactly five fields plus the tag. Read from the
+    /// shipped `kiro-cli-chat` 2.14.2 binary, which retains DWARF and a symbol
+    /// table: the serde visitor string `struct SessionStateV1 with 5 elements`
+    /// and its `FIELDS` table, cross-checked against two captured
+    /// `sessions/cli/<id>.json` files. (`rewind` sits next to `agent_name` in
+    /// `.rodata`, but the live serializer emits `goal`; string-table adjacency
+    /// is not struct membership, and the capture is authoritative.)
+    ///
+    /// No field is a credential. Kiro keeps auth in
+    /// `~/.local/share/kiro-cli/data.sqlite3` (mode 0600) — `auth_kv` holding
+    /// the OIDC device registration and tokens, `state` holding temporary STS
+    /// credentials — plus the `KIRO_API_KEY` variable. Grepping 872 captured
+    /// session files for the credential keyword set returns nothing.
+    ///
+    /// Filtering costs nothing at load. Measured against the real V2 loader
+    /// (`chat _ ensure-session`): the `session_state` *key* is required, but
+    /// its value is unvalidated — `{}`, `null`, `42`, any subset of sub-fields,
+    /// and unknown keys all load. Kiro's own `chat _ export-session` omits
+    /// `session_state` entirely and `import-session` accepts the result.
+    ///
+    /// Two residuals this list keeps but does not vouch for, recorded rather
+    /// than guessed at:
+    ///
+    /// * `conversation_metadata.user_turn_start_request` and `.last_request`
+    ///   are stored outbound model requests (`SendRequestArgs`: tool specs,
+    ///   system prompt, …). Both were `null` in every capture, and populating
+    ///   them needs a real model call, so their populated contents are
+    ///   **undetermined** — bulk content rather than a credential, since auth
+    ///   is applied at transport.
+    /// * `rts_model_state.additional_fields` is an open extension bag by
+    ///   construction. Naming its parent does not bound it.
+    ///
+    /// Adding a name here republishes it.
+    fn session_state_metadata(state: &serde_json::Value) -> serde_json::Value {
+        const KEPT_FIELDS: [&str; 6] = [
+            "version",
+            "conversation_metadata",
+            "rts_model_state",
+            "permissions",
+            "agent_name",
+            "goal",
+        ];
+
+        // A non-object `session_state` is not something this reader can vouch
+        // for; carry it as-is only when it is the empty/absent shapes the
+        // loader also accepts.
+        let Some(obj) = state.as_object() else {
+            return serde_json::Value::Null;
+        };
+
+        let mut kept = serde_json::Map::new();
+        for field in KEPT_FIELDS {
+            if let Some(value) = obj.get(field) {
+                kept.insert(field.to_string(), value.clone());
+            }
+        }
+        serde_json::Value::Object(kept)
+    }
 }
 
 impl Provider for Kiro {
@@ -527,7 +597,6 @@ impl Provider for Kiro {
         // journal; resolve both siblings regardless.
         let json_path = Self::sibling(path, "json");
         let jsonl_path = Self::sibling(path, "jsonl");
-        let history_path = Self::sibling(path, "history");
 
         // --- Metadata (.json) ---------------------------------------------
         let meta: serde_json::Value = if json_path.is_file() {
@@ -608,17 +677,45 @@ impl Provider for Kiro {
             });
 
         // --- History (.history) -------------------------------------------
-        let history = if history_path.is_file() {
-            std::fs::read_to_string(&history_path).ok()
-        } else {
-            None
-        };
+        //
+        // Deliberately not read, and deliberately not carried.
+        //
+        // The module doc used to call `.history` a "slash-command history",
+        // and that is what made copying it whole look harmless. It is not true.
+        // Driving the shipped 2.14.2 prompt under a pty writes *every*
+        // submitted line to `sessions/cli/<id>.history` — plain prompts and
+        // slash commands alike. The writer is `addToHistory` in the bundled
+        // `~/.local/share/kiro-cli/tui.js`:
+        //
+        // ```js
+        // addToHistory(e){let n=e.trim();if(!n)return;
+        //   if(this.history.length>0&&this.history[0]===n)return;
+        //   if(this.history.unshift(n),this.history.length>100)this.history.pop()}
+        // ```
+        //
+        // Empty lines and consecutive duplicates are suppressed; nothing else
+        // is. No slash gate, no secret filter, capped at 100 entries. The
+        // `--legacy-ui` path (rustyline 15.0.0, `InputSource::read_line`)
+        // reaches the same conclusion by a different route, and disassembly
+        // finds no `'/'` gate in either.
+        //
+        // So `.history` is 100 lines of raw user input, and a key pasted at
+        // the prompt is in it verbatim. `casr info --json` prints the metadata
+        // bag, and users pipe that to a file and paste it into issues. There
+        // is no allow-list to apply — the file has no fields, only the user's
+        // typing — so the only correct filter is not to carry it.
+        //
+        // The cost is real and accepted: `write_session` below re-emits
+        // `.history` from `metadata["history"]`, so a Kiro→…→Kiro round-trip
+        // no longer restores the prompt history. Recall convenience is not
+        // worth republishing everything the user ever typed. `write_session`
+        // still honours the key if some other reader ever supplies it.
 
         // --- Metadata bag (preserved for round-trip fidelity) -------------
         let mut metadata = serde_json::Map::new();
         metadata.insert("source".into(), serde_json::Value::String(SLUG.to_string()));
         if let Some(state) = meta.get("session_state") {
-            metadata.insert("session_state".into(), state.clone());
+            metadata.insert("session_state".into(), Self::session_state_metadata(state));
         }
         for key in ["parent_session_id", "session_created_reason"] {
             if let Some(v) = meta.get(key)
@@ -626,9 +723,6 @@ impl Provider for Kiro {
             {
                 metadata.insert(key.into(), v.clone());
             }
-        }
-        if let Some(h) = &history {
-            metadata.insert("history".into(), serde_json::Value::String(h.clone()));
         }
 
         debug!(session_id, messages = messages.len(), "Kiro session parsed");
@@ -1581,14 +1675,21 @@ mod tests {
             Some("98cb06e6-28da-4ba8-8ebe-be6bf16841c1")
         );
 
-        // The `.history` plain-text sidecar is captured.
-        let history = session
-            .metadata
-            .get("history")
-            .and_then(|v| v.as_str())
-            .expect("history captured");
-        assert!(history.contains("/model"));
-        assert!(history.contains("/exit"));
+        // The `.history` sidecar is deliberately *not* captured. It is not the
+        // slash-command log this reader once took it for: kiro-cli's
+        // `addToHistory` appends every submitted line, so the file is raw user
+        // input and `casr info --json` would print it. See the comment at the
+        // read site. The fixture still has one, so this asserts the drop and
+        // not merely its absence.
+        assert!(
+            fixture_json_path().with_extension("history").is_file(),
+            "the fixture must keep a .history sidecar, or this asserts nothing"
+        );
+        assert!(
+            session.metadata.get("history").is_none(),
+            "`.history` is 100 lines of whatever the user typed at the prompt; \
+             it must not reach the metadata bag that `info --json` prints"
+        );
     }
 
     // -----------------------------------------------------------------------

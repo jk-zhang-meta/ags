@@ -138,6 +138,73 @@ impl Amp {
         Some(PathBuf::from(decoded))
     }
 
+    /// The thread-level facts casr publishes, and nothing else.
+    ///
+    /// This reader used to set `metadata = thread.clone()` — the whole file —
+    /// and `casr info --json` prints the metadata bag verbatim. Measured on a
+    /// 283 KB thread of 240 messages, that made the metadata **99.6% of the
+    /// command's output**: 284 KB against 1.4 KB for the same session with the
+    /// transcript left out, a 210× difference. `info` deliberately reports
+    /// messages as *counts* plus an opt-in `--peek` tail; re-emitting every
+    /// message under `metadata` reversed that decision by accident.
+    ///
+    /// Size is only the visible half. Amp's own storage layer budgets ~3.3 MB
+    /// per thread (`CachedThreadStorage`: `maxSize: 1e8`, `sizeCalculation:
+    /// t => JSON.stringify(t).length`, `max: 30`) and refuses to load one over
+    /// 50 MB, so multi-megabyte threads are the expected case, not the tail.
+    /// And `messages` is the transcript: tool inputs and results, file
+    /// contents, bash stdout. If the agent ever ran `printenv` or `cat .env`,
+    /// the output is in there verbatim — Amp does no redaction on write.
+    ///
+    /// The field set below is taken from the *unminified* `sourcegraph.amp`
+    /// VSIX 0.0.1760429452 (`newEmptyThread`, the `newThreadDeltaUpdater`
+    /// reducer, `createForkedThread`, `archive`), re-confirmed against the
+    /// current minified `dist/extension.cjs` and the `@ampcode/cli-linux-x64`
+    /// 0.0.1785142937 binary. Honesty note: Amp ships **no** zod schema,
+    /// JSON-schema or validator for this file — the reader is a bare
+    /// `JSON.parse` — so this set is reconstructed from every write path, not
+    /// declared by the vendor. Which is the argument for naming what we take.
+    ///
+    /// Deliberately dropped, with the reason:
+    ///
+    /// * `messages`, `draft`, `queuedMessages`, `summaryThreads`,
+    ///   `forkThreads` — conversation content. `messages` is already the
+    ///   canonical `messages` array; the rest is unsent or superseded text.
+    /// * `env` — `{initial: {trees, platform, tags}}`. It carries no process
+    ///   environment (checked: every `env: {...process.env}` in the bundle is
+    ///   a `spawn` option, never serialized into a thread), but
+    ///   `platform.installationID` is a stable per-install UUID and
+    ///   `platform.deviceFingerprint` is a `v1:fp_<sha256>` cohort hash —
+    ///   tracking identifiers, in output people paste into public issues. The
+    ///   one thing casr wants from `env` is the workspace, and
+    ///   [`Amp::extract_workspace`] already lifts that into `workspace`.
+    /// * `meta` (`{traces: […]}`) and `"~debug"` — debug payloads. Amp's own
+    ///   `getPluginTracer()` lets third-party plugins set span attributes, so
+    ///   their contents are not Amp's to vouch for either.
+    ///
+    /// Adding a name here republishes it.
+    fn thread_metadata(thread: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+        const KEPT_FIELDS: [&str; 9] = [
+            "v",
+            "id",
+            "created",
+            "title",
+            "agentMode",
+            "archived",
+            "mainThreadID",
+            "originThreadID",
+            "forkPointIndex",
+        ];
+
+        let mut kept = serde_json::Map::new();
+        for field in KEPT_FIELDS {
+            if let Some(value) = thread.get(field) {
+                kept.insert(field.to_string(), value.clone());
+            }
+        }
+        serde_json::Value::Object(kept)
+    }
+
     fn extract_workspace(thread: &serde_json::Value) -> Option<PathBuf> {
         let env_init = thread
             .get("env")
@@ -647,9 +714,10 @@ impl Provider for Amp {
             "read Amp thread"
         );
 
-        // Surface the native thread title under the canonical metadata key so
-        // `casr list`/`info` can render it in the provider-neutral Name column.
-        let mut metadata = thread.clone();
+        // Thread-level facts, and only those. Plus the native thread title
+        // under the canonical metadata key, so `casr list`/`info` can render it
+        // in the provider-neutral Name column.
+        let mut metadata = Self::thread_metadata(thread_obj);
         if let (Some(name), Some(obj)) = (native_name, metadata.as_object_mut()) {
             obj.insert(
                 crate::model::NATIVE_NAME_META_KEY.to_string(),
