@@ -1443,7 +1443,7 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 
     // Roles the target writer has no slot for, grouped by what it emits
     // instead: one target can fold two source roles onto two different things
-    // (Kiro sends `System` to a user turn and `Other` to an assistant one), and
+    // (Cursor sends `System`/`Other` to a human bubble and `Tool` to an AI one), and
     // "became a user turn" and "became an assistant turn" are not the same
     // news. Insertion-ordered rather than sorted, so the note order follows the
     // conversation.
@@ -1507,10 +1507,13 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 /// Vibe, Factory, Pi-Agent, ChatGPT and Codex write an unrecognised source role
 /// through under its own name, and casr's own `model::normalize_role` then maps
 /// `"developer"` back onto [`MessageRole::System`] — so a read-back would report
-/// a fold those files did not perform. Conversely Cursor and Kiro send a system
-/// turn somewhere a read-back reports blandly: Cursor writes bubble type 2 and
-/// Kiro an `AssistantMessage`, which is not "the operator distinction was lost"
-/// but "the operator is now speaking as the agent".
+/// a fold those files did not perform. Conversely Cursor and Kiro have no third
+/// bubble or journal variant to send a system turn to — Cursor's
+/// `aiserver.v1.ConversationMessage.MessageType` is `{UNSPECIFIED, HUMAN, AI}`
+/// and Kiro's `LogEntryV1` is `{Prompt, AssistantMessage, ToolResults,
+/// Compaction, ResetTo}` — so the operator arrives anonymised as the human. It
+/// used to arrive as the agent, which was not "the operator distinction was
+/// lost" but "the operator is now speaking as the agent" (defect #74).
 ///
 /// # Why `User` and `Assistant` are never folds
 ///
@@ -1530,11 +1533,11 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
     match role {
         MessageRole::User | MessageRole::Assistant => None,
         // `claude_code.rs:703`, `cline.rs:316`, `openclaw.rs:1293`,
-        // `amp.rs:418`, `cursor.rs:1068`, `kiro.rs:1515`, `aider.rs:594`.
+        // `amp.rs:418`, `cursor.rs:1113`, `kiro.rs:1541`, `aider.rs:594`.
         MessageRole::System => match target_slug {
             "claude-code" | "cline" | "openclaw" => Some("plain user turns"),
             "amp" => Some("`info` records"),
-            "cursor" => Some("assistant bubbles"),
+            "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
             "aider" => Some("`>` blockquotes, the same channel tool output uses"),
             _ => None,
@@ -1543,8 +1546,8 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
         MessageRole::Other(_) => match target_slug {
             "claude-code" | "cline" | "openclaw" => Some("plain user turns"),
             "amp" => Some("`info` records"),
-            "cursor" => Some("assistant bubbles"),
-            "kiro" => Some("`AssistantMessage` records, which Kiro replays as the agent"),
+            "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
+            "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
             "aider" => Some("`>` blockquotes, the same channel tool output uses"),
             _ => None,
         },

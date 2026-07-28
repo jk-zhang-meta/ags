@@ -113,6 +113,31 @@ pub struct Cursor;
 // Bubble type constants (v0.40+ numeric message types)
 // ---------------------------------------------------------------------------
 
+/// A bubble's `type` is `aiserver.v1.ConversationMessage.MessageType`, and the
+/// whole vocabulary is three values. From the shipped Cursor 3.13.10 bundle,
+/// `resources/app/out/vs/workbench/workbench.desktop.main.js`, verbatim:
+///
+/// ```js
+/// yo = L.makeEnum("aiserver.v1.ConversationMessage.MessageType", [
+///   { no: 0, name: "MESSAGE_TYPE_UNSPECIFIED", localName: "UNSPECIFIED" },
+///   { no: 1, name: "MESSAGE_TYPE_HUMAN",       localName: "HUMAN"       },
+///   { no: 2, name: "MESSAGE_TYPE_AI",          localName: "AI"          }])
+/// ```
+///
+/// There is no system, developer, or tool member, and `UNSPECIFIED` is not a
+/// third channel: `yo.UNSPECIFIED` appears zero times in that bundle, against
+/// 132 uses of `yo.HUMAN` and 96 of `yo.AI`. A bubble that is neither is not
+/// rendered neutrally, it is dropped — the function that groups a conversation
+/// into turns pushes a bubble only on an explicit match:
+///
+/// ```js
+/// l.type === yo.HUMAN ? s.messages.push(l)
+///   : l.type === yo.AI && (o === void 0 && (o = {…}), o.messages.push(l))
+/// ```
+///
+/// So every role has to arrive as one of these two, and which one is the whole
+/// question — see [`Cursor::write_session`].
+///
 /// User message type in modern Cursor format.
 const BUBBLE_TYPE_USER: i64 = 1;
 /// Assistant message type in modern Cursor format.
@@ -1064,9 +1089,30 @@ impl Provider for Cursor {
 
         for msg in &session.messages {
             let bubble_id = uuid::Uuid::new_v4().to_string();
+            // Cursor has two bubble types and four roles to place in them (see
+            // `BUBBLE_TYPE_USER`), so two of these are folds. Which fold is not
+            // a matter of taste:
+            //
+            // * A system prompt and an unrecognised source role go to the human
+            //   bubble. Cursor has no operator channel, so their provenance is
+            //   lost either way — but an AI bubble does not lose it, it inverts
+            //   it, and the resumed model reads the operator's instruction as
+            //   something it said itself. `pipeline::folded_role` files the
+            //   anonymisation as a `Loss`; nothing can file back the authority
+            //   of a turn the file says the model spoke.
+            // * A tool observation goes to the AI bubble, because that is where
+            //   Cursor itself puts one. Every tool bubble the workbench builds
+            //   is AI-typed with empty text and the payload beside it —
+            //   `{...Qb(), codeBlocks: [], type: yo.AI, text: "",
+            //   capabilityType: Vs.TOOL_FORMER, toolFormerData: r}` in
+            //   `upsertToolCall`, and the same literal in
+            //   `getOrCreateToolFormerBubbleId` and
+            //   `populateConversationFromState.js`. Only the structure is lost
+            //   here, which is what `pipeline::writer_carries_tool_calls`
+            //   reports; the speaker is not.
             let bubble_type = match msg.role {
-                MessageRole::User => BUBBLE_TYPE_USER,
-                _ => BUBBLE_TYPE_ASSISTANT,
+                MessageRole::User | MessageRole::System | MessageRole::Other(_) => BUBBLE_TYPE_USER,
+                MessageRole::Assistant | MessageRole::Tool => BUBBLE_TYPE_ASSISTANT,
             };
 
             let bubble = serde_json::json!({
@@ -2034,9 +2080,12 @@ mod tests {
         let mut headers: Vec<serde_json::Value> = Vec::new();
         for msg in &session.messages {
             let bubble_id = uuid::Uuid::new_v4().to_string();
+            // Kept identical to `write_session`'s mapping above: this test
+            // re-implements the write because it cannot set `CURSOR_HOME`, and a
+            // second copy that drifts is a second copy that can be wrong.
             let bubble_type = match msg.role {
-                MessageRole::User => BUBBLE_TYPE_USER,
-                _ => BUBBLE_TYPE_ASSISTANT,
+                MessageRole::User | MessageRole::System | MessageRole::Other(_) => BUBBLE_TYPE_USER,
+                MessageRole::Assistant | MessageRole::Tool => BUBBLE_TYPE_ASSISTANT,
             };
             let bubble = json!({
                 "text": msg.content,

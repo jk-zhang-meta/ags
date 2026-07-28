@@ -155,8 +155,14 @@
 //! ## `.jsonl` (conversation journal)
 //!
 //! Each line is a versioned envelope `{"version":"v1","kind":<Kind>,"data":{…}}`
-//! where `kind` is one of `Prompt` (user), `AssistantMessage` (assistant), or
-//! `ToolResults` (tool). The `data.content` array carries typed parts whose
+//! carrying the adjacently tagged `LogEntryV1`, whose five variants the shipped
+//! `kiro-cli-chat` 2.14.2 binary names in its serde strings: `Prompt` (user),
+//! `AssistantMessage` (assistant), `ToolResults` (tool), `Compaction`
+//! (`summary` + `messages_snapshot`) and `ResetTo` (`target_index`). The last
+//! two carry no turn and no `content`, so [`parse_envelope`] yields nothing for
+//! them. There is no system or operator member, which is what
+//! [`message_to_envelope`] has to place a system turn against. The
+//! `data.content` array carries typed parts whose
 //! own `kind` is `text` | `thinking` | `toolUse` | `toolResult`:
 //!
 //! - `text`     → `data` is a plain string.
@@ -1511,11 +1517,31 @@ fn message_to_envelope(msg: &CanonicalMessage) -> Option<serde_json::Value> {
     }
 
     // Synthesize for messages that did not originate from Kiro.
+    //
+    // `kind` is not a free-form label. The journal line is an adjacently tagged
+    // Rust enum, and the shipped `kiro-cli-chat` 2.14.2 binary names it and its
+    // whole membership in the serde strings it carries — `adjacently tagged
+    // enum LogEntryV1`, then `struct variant LogEntryV1::Prompt`,
+    // `::AssistantMessage`, `::ToolResults`, `::Compaction`, `::ResetTo`, and
+    // the field list they are built from, `V1 Prompt message_id content
+    // ToolResults results Compaction summary messages_snapshot ResetTo
+    // target_index`. Five variants, all of them struct variants, so there is no
+    // `#[serde(other)]` unit arm to absorb a sixth: a `kind` outside that set is
+    // an `unknown variant` deserialization error, not a graceful degradation.
+    // Inventing a `System` kind is therefore not one of the options.
+    //
+    // Of the five, `Compaction` (a summary plus a snapshot) and `ResetTo` (an
+    // index) hold no turn. That leaves three, and a system prompt or an
+    // unrecognised source role has to become one of them. `Prompt` — the same
+    // place `System` already goes — anonymises the operator, which
+    // `pipeline::folded_role` declares as a `Loss`. `AssistantMessage` does not
+    // anonymise anything; it tells the resumed agent that it issued the
+    // instruction itself. The first is recoverable news, the second is a
+    // falsehood about who holds authority in the session.
     let kind = match msg.role {
-        MessageRole::User | MessageRole::System => "Prompt",
+        MessageRole::User | MessageRole::System | MessageRole::Other(_) => "Prompt",
         MessageRole::Assistant => "AssistantMessage",
         MessageRole::Tool => "ToolResults",
-        MessageRole::Other(_) => "AssistantMessage",
     };
 
     let mut content: Vec<serde_json::Value> = Vec::new();
