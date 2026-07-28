@@ -447,7 +447,7 @@ mod unix_error_paths {
         let tmp = tempfile::TempDir::new().unwrap();
         let _env = EnvGuard::set("FACTORY_HOME", tmp.path());
 
-        // Factory writes to <HOME>/<workspace-hash>/ — make home read-only.
+        // Factory writes directly to its sessions root — make it read-only.
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
         let _guard = PermGuard {
             path: tmp.path().to_path_buf(),

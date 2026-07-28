@@ -20,7 +20,7 @@
 //! |----------|-----------------------------------------------|
 //! | ClawdBot | `<home>/{id}.jsonl`                           |
 //! | OpenClaw | `<home>/.openclaw/agents/main/sessions/{id}.jsonl` |
-//! | Factory  | `<home>/{workspace-slug}/{id}.jsonl`          |
+//! | Factory  | `<home>/{id}.jsonl`                           |
 //! | Vibe     | `<home>/logs/session/{id}/messages.jsonl`     |
 //! | Pi-Agent | `<home>/sessions/{timestamp}_{id}.jsonl`      |
 //!

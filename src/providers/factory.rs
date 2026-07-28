@@ -3,6 +3,8 @@
 //! Session files: `~/.factory/sessions/{workspace-slug}/{uuid}.jsonl`, or
 //! `~/.factory/sessions/{uuid}.jsonl` for a session started with no project
 //! cwd. Those two levels are the whole store; droid never recurses past them.
+//! casr reads both forms and writes the flat form, which droid explicitly
+//! enumerates without requiring casr to reproduce its workspace slugger.
 //! Settings file: `~/.factory/sessions/{workspace-slug}/{uuid}.settings.json`
 //! Override root: `FACTORY_HOME` env var
 //!
@@ -72,14 +74,6 @@ impl Factory {
         } else {
             None
         }
-    }
-
-    /// Encode a workspace path as a Factory directory slug.
-    ///
-    /// e.g., `/Users/alice/Dev/myproject` → `-Users-alice-Dev-myproject`
-    fn encode_workspace_slug(path: &Path) -> String {
-        let s = path.to_string_lossy();
-        s.replace('/', "-")
     }
 
     fn extract_tool_calls(
@@ -535,14 +529,19 @@ impl Provider for Factory {
         };
         let session_id = filename_safe_session_id(&session_id);
 
-        let workspace_slug = session
+        // A flat file is an explicit droid listing case and avoids having to
+        // reproduce its path canonicalisation for project-directory slugs.
+        let target_path = Self::home_dir().join(format!("{session_id}.jsonl"));
+        let cwd = session
             .workspace
-            .as_ref()
-            .map(|p| Self::encode_workspace_slug(p))
-            .unwrap_or_else(|| "-tmp".to_string());
-
-        let target_dir = Self::home_dir().join(&workspace_slug);
-        let target_path = target_dir.join(format!("{session_id}.jsonl"));
+            .as_deref()
+            .filter(|path| path.is_absolute())
+            .map(|path| path.to_string_lossy().into_owned());
+        let title = session
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("Converted session");
 
         debug!(
             session_id,
@@ -554,15 +553,19 @@ impl Provider for Factory {
         let mut lines: Vec<String> = Vec::with_capacity(session.messages.len() + 1);
 
         // Write session_start header.
-        let header = serde_json::json!({
+        let mut header = serde_json::json!({
             "type": "session_start",
             "id": session_id,
-            "title": session.title,
-            "cwd": session.workspace.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "title": title,
+            "owner": "casr",
         });
+        if let Some(cwd) = cwd {
+            header["cwd"] = serde_json::Value::String(cwd);
+        }
         lines.push(serde_json::to_string(&header)?);
 
         // Write message entries.
+        let mut parent_id: Option<String> = None;
         for msg in &session.messages {
             let role_str = match &msg.role {
                 MessageRole::User => "user",
@@ -590,6 +593,14 @@ impl Provider for Factory {
                 "type".into(),
                 serde_json::Value::String("message".to_string()),
             );
+            let message_id = uuid::Uuid::new_v4().to_string();
+            entry.insert("id".into(), serde_json::Value::String(message_id.clone()));
+            if let Some(parent_id) = &parent_id {
+                entry.insert(
+                    "parentId".into(),
+                    serde_json::Value::String(parent_id.clone()),
+                );
+            }
             if let Some(ts) = msg.timestamp {
                 let dt =
                     chrono::DateTime::from_timestamp_millis(ts).unwrap_or_else(chrono::Utc::now);
@@ -601,6 +612,7 @@ impl Provider for Factory {
             entry.insert("message".into(), serde_json::Value::Object(message_obj));
 
             lines.push(serde_json::to_string(&serde_json::Value::Object(entry))?);
+            parent_id = Some(message_id);
         }
 
         let content = lines.join("\n") + "\n";
@@ -912,14 +924,6 @@ mod tests {
     #[test]
     fn decode_workspace_slug_empty() {
         assert_eq!(Factory::decode_workspace_slug(""), None);
-    }
-
-    #[test]
-    fn encode_workspace_slug_basic() {
-        assert_eq!(
-            Factory::encode_workspace_slug(Path::new("/Users/alice/Dev")),
-            "-Users-alice-Dev"
-        );
     }
 
     // -----------------------------------------------------------------------

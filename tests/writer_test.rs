@@ -1789,9 +1789,68 @@ fn writer_factory_session_start_header() {
         first_line["id"].is_string(),
         "Factory session_start should have id"
     );
+    assert_eq!(first_line["id"], written.session_id);
+    assert_eq!(
+        written.paths[0].file_stem().and_then(|stem| stem.to_str()),
+        Some(written.session_id.as_str()),
+        "the filename and native header must name the same session"
+    );
+    assert!(
+        first_line["title"].is_string(),
+        "Factory session_start requires a non-null title"
+    );
+    assert_eq!(
+        first_line["owner"], "casr",
+        "Factory session_start requires an owner"
+    );
     assert!(
         first_line["cwd"].is_string(),
         "Factory session_start should have cwd"
+    );
+    assert!(
+        std::path::Path::new(first_line["cwd"].as_str().unwrap()).is_absolute(),
+        "Factory session_start cwd should be absolute"
+    );
+    assert_eq!(
+        written.paths[0].parent(),
+        Some(tmp.path()),
+        "droid explicitly lists flat sessions, avoiding a guessed workspace slug"
+    );
+}
+
+#[test]
+fn writer_factory_omits_unknown_cwd_and_supplies_title() {
+    let _lock = FACTORY_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("FACTORY_HOME", tmp.path());
+
+    let mut session = simple_session();
+    session.workspace = None;
+    session.title = None;
+    let written = Factory
+        .write_session(&session, &WriteOptions { force: false })
+        .unwrap();
+
+    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
+    let header: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(
+        header.get("cwd").is_none(),
+        "droid accepts an absent cwd; an unknown workspace must not be invented"
+    );
+    assert_eq!(header["title"], "Converted session");
+
+    let mut relative_workspace = simple_session();
+    relative_workspace.session_id = "src-relative-workspace".to_string();
+    relative_workspace.workspace = Some(PathBuf::from("relative/workspace"));
+    let relative_written = Factory
+        .write_session(&relative_workspace, &WriteOptions { force: false })
+        .unwrap();
+    let relative_content = std::fs::read_to_string(&relative_written.paths[0]).unwrap();
+    let relative_header: serde_json::Value =
+        serde_json::from_str(relative_content.lines().next().unwrap()).unwrap();
+    assert!(
+        relative_header.get("cwd").is_none(),
+        "a relative workspace is not a droid cwd"
     );
 }
 
@@ -1836,7 +1895,8 @@ fn writer_factory_message_structure() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
 
-    // Lines after header should be type: "message" with nested message object.
+    // Lines after header should be native message events with unique IDs.
+    let mut parent_id: Option<&str> = None;
     for (i, entry) in lines.iter().skip(1).enumerate() {
         assert_eq!(
             entry["type"],
@@ -1859,6 +1919,22 @@ fn writer_factory_message_structure() {
             "Factory line {}: message should have content",
             i + 1
         );
+        let id = entry["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Factory line {}: needs a message id", i + 1));
+        assert!(
+            uuid::Uuid::parse_str(id).is_ok(),
+            "Factory line {}: id must be a UUID",
+            i + 1
+        );
+        match parent_id {
+            Some(parent_id) => assert_eq!(entry["parentId"], parent_id),
+            None => assert!(
+                entry.get("parentId").is_none(),
+                "Factory's first message has no parent"
+            ),
+        }
+        parent_id = Some(id);
     }
 }
 
