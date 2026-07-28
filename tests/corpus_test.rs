@@ -172,11 +172,9 @@ fn report(totals: &Totals) {
         "with compaction  {} / {} ({}%)",
         totals.with_compaction,
         totals.parsed,
-        if totals.parsed == 0 {
-            0
-        } else {
-            totals.with_compaction * 100 / totals.parsed
-        }
+        (totals.with_compaction * 100)
+            .checked_div(totals.parsed)
+            .unwrap_or(0)
     );
     println!("by kind:");
     for (kind, count) in &totals.by_kind {
