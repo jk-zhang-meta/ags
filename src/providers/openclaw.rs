@@ -1047,47 +1047,18 @@ impl Provider for OpenClaw {
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        for root in Self::session_dirs() {
-            let candidate = root.join(format!("{session_id}.jsonl"));
-            if candidate.is_file() {
-                debug!(
-                    provider = "openclaw",
-                    path = %candidate.display(),
-                    session_id,
-                    "owns session"
-                );
-                return Some(candidate);
-            }
-            // Walk subdirectories.
-            for entry in walkdir::WalkDir::new(&root)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                if entry
-                    .path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s == session_id)
-                    && entry
-                        .path()
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .is_some_and(|e| e == "jsonl")
-                {
-                    debug!(
-                        provider = "openclaw",
-                        path = %entry.path().display(),
-                        session_id,
-                        "owns session (subdirectory)"
-                    );
-                    return Some(entry.path().to_path_buf());
-                }
-            }
-        }
-        None
+        let path = self
+            .list_sessions()?
+            .sessions
+            .into_iter()
+            .find_map(|(listed_id, path)| (listed_id == session_id).then_some(path))?;
+        debug!(
+            provider = "openclaw",
+            path = %path.display(),
+            session_id,
+            "owns listed session"
+        );
+        Some(path)
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {

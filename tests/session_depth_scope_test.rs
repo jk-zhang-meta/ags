@@ -542,3 +542,52 @@ fn openclaw_does_not_walk_below_an_agent_sessions_directory() {
          warnings {skipped:?}"
     );
 }
+
+/// Resolution and listing must apply the same depth boundary.
+///
+/// Before this regression was fixed, both providers omitted these distinct
+/// depth-three transcripts from `list` but recursively claimed the shared
+/// filename in `owns_session`, turning `info deep` into a false ambiguity.
+#[test]
+fn claw_providers_do_not_resolve_sessions_they_would_not_list() {
+    let tmp = TempDir::new().expect("tempdir");
+    let clawdbot_sessions = tmp.path().join("clawdbot");
+    let openclaw_sessions = tmp
+        .path()
+        .join("openclaw-state")
+        .join("agents")
+        .join("main")
+        .join("sessions");
+
+    write(
+        &clawdbot_sessions
+            .join("archive")
+            .join("a")
+            .join("deep.jsonl"),
+        &pi_transcript("clawdbot-deep"),
+    );
+    write(
+        &openclaw_sessions
+            .join("archive")
+            .join("b")
+            .join("deep.jsonl"),
+        &pi_transcript("openclaw-deep"),
+    );
+
+    let output = casr_cmd(&tmp)
+        .args(["--json", "info", "deep"])
+        .output()
+        .expect("casr info should run");
+    assert!(!output.status.success(), "an unlisted id must not resolve");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json_start = stderr
+        .find('{')
+        .unwrap_or_else(|| panic!("JSON error envelope missing: {stderr}"));
+    let error: serde_json::Value =
+        serde_json::from_str(&stderr[json_start..]).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    assert_eq!(
+        error["error_type"], "SessionNotFound",
+        "unlisted paths are absent, not competing ownership claims: {error}"
+    );
+}
