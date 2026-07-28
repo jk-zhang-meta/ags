@@ -342,6 +342,16 @@ pub trait Provider: Send + Sync {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession>;
 
+    /// Explain why this provider cannot be a conversion target.
+    ///
+    /// The pipeline checks this before choosing a write track or returning a
+    /// dry-run result, so a provider that cannot create a natively resumable
+    /// session never reports a conversion that the real writer would refuse.
+    /// `None` means the provider has a supported write path.
+    fn write_refusal(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Build the shell command to resume a session with this provider.
     ///
     /// Display form. To actually start the agent, use

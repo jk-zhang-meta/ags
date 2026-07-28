@@ -22,7 +22,7 @@ That installer is the primary distribution path. It handles platform detection, 
 
 **The Problem**: AI coding sessions are siloed by provider. A useful Codex session cannot be resumed directly in Claude Code, and vice versa.
 
-**The Solution**: `casr` discovers a session across installed providers, reads it into a canonical IR, writes a native session file for your target provider, verifies read-back fidelity, and prints the exact resume command.
+**The Solution**: `casr` discovers a session across installed providers, reads it into a canonical IR, writes a verified native session for supported targets, and prints the exact resume command.
 
 ### Why Use casr?
 
@@ -92,8 +92,8 @@ claude --resume <new-session-id>
 | Cline | `cln` | Yes | Yes | `code .` |
 | Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
 | Amp | `amp` | Yes | Yes | `amp threads continue <session-id>` |
-| OpenCode | `opc` | Yes | Yes | `opencode` |
-| ChatGPT | `gpt` | Yes | Yes | `open "https://chatgpt.com/c/<session-id>"` |
+| OpenCode | `opc` | Yes | No | `opencode` |
+| ChatGPT | `gpt` | Yes | No | `open "https://chatgpt.com/c/<session-id>"` |
 | ClawdBot | `cwb` | Yes | Yes | `clawdbot --resume <session-id>` |
 | Vibe | `vib` | Yes | Yes | `vibe --resume <session-id>` |
 | Factory | `fac` | Yes | Yes | `factory --resume <session-id>` |
@@ -101,6 +101,10 @@ claude --resume <new-session-id>
 | Pi-Agent | `pi` | Yes | Yes | `pi --session <path-to-session.jsonl>` |
 | Kiro CLI | `kr` | Yes | Yes | `kiro-cli --resume-id <session-id>` |
 | Grok Build | `grk` | Yes | No | `grok --resume <session-id>` |
+
+Providers marked `Write: No` are valid sources and can resume their existing
+sessions, but casr refuses to target them—even with `--force` or `--dry-run`—
+until a vendor-supported, natively resumable import path is verified.
 
 Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
@@ -835,11 +839,13 @@ These are external projects, not maintained here. If you've built a similar inte
 
 ### Is casr only for one-way migration?
 
-No. It supports bidirectional conversion across supported providers.
+No. It supports both directions where both providers expose verified native
+write paths; read/resume-only providers remain valid sources.
 
 ### Does casr modify my source session?
 
-No. It reads source sessions and writes to target provider storage.
+No. It reads source sessions and writes only to a supported target provider's
+storage.
 
 ### What happens when target session file already exists?
 

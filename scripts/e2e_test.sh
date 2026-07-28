@@ -316,7 +316,9 @@ assert_valid_json() {
 
 assert_json_error_envelope() {
     local label="$1"
-    if echo "$LAST_STDERR" | jq -e '.ok == false and (.error_type | type == "string")' > /dev/null 2>&1; then
+    local stderr_json
+    stderr_json=$(echo "$LAST_STDERR" | sed -n '/^{/,$p')
+    if echo "$stderr_json" | jq -e '.ok == false and (.error_type | type == "string")' > /dev/null 2>&1; then
         pass "$label (stderr JSON error)"
         return
     fi
@@ -449,6 +451,22 @@ setup_gemini_fixture() {
     echo "$session_id"
 }
 
+setup_opencode_fixture() {
+    local session_id="ses_imported000000000000001"
+    mkdir -p "$OPENCODE_HOME"
+    cp "$FIXTURES_DIR/opencode-current/opencode.db" "$OPENCODE_HOME/opencode.db"
+    echo "$session_id"
+}
+
+setup_chatgpt_fixture() {
+    local src="$FIXTURES_DIR/chatgpt/chatgpt_simple.json"
+    local session_id
+    session_id=$(jq -r '.id' "$src")
+    mkdir -p "$CHATGPT_HOME/conversations-fixture"
+    cp "$src" "$CHATGPT_HOME/conversations-fixture/${session_id}.json"
+    echo "$session_id"
+}
+
 # Stage an Antigravity (agy) conversation under the shared GEMINI_HOME.
 # agy and gmi share the ~/.gemini parent: agy lives under antigravity-cli/.
 # Copies the conversations/<uuid>.db + brain/<uuid>/.../transcript.jsonl tree
@@ -554,20 +572,23 @@ assert_stdout_contains "list shows no sessions" "No sessions found"
 log "TEST: List with CC session"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "list cc" list
+run_casr "list cc" list --workspace "/data/projects/myapp"
 assert_exit_ok "casr list with CC session succeeds"
 assert_stdout_contains "list shows CC session" "$cc_sid"
 
 log "TEST: List --json"
-run_casr "list json" --json list
+run_casr "list json" --json list --workspace "/data/projects/myapp"
 assert_exit_ok "casr --json list succeeds"
 assert_valid_json "list JSON is valid"
 
 log "TEST: List --limit"
-setup_cc_fixture "cc_malformed" > /dev/null
-run_casr "list limit" --json list --limit 1
+cc_project_dir="$CLAUDE_HOME/projects/-data-projects-myapp"
+sed 's/cc-simple-001/cc-simple-002/g' \
+    "$FIXTURES_DIR/claude_code/cc_simple.jsonl" \
+    > "$cc_project_dir/cc-simple-002.jsonl"
+run_casr "list limit" --json list --workspace "/data/projects/myapp" --limit 1
 assert_exit_ok "casr list --limit 1 succeeds"
-local_count=$(echo "$LAST_STDOUT" | jq 'length')
+local_count=$(echo "$LAST_STDOUT" | jq '.items | length')
 if [[ "$local_count" -eq 1 ]]; then
     pass "list --limit 1 returns 1 session"
 else
@@ -761,18 +782,19 @@ assert_stdout_contains "aider→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → OpenCode"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->opc" --json resume opc "$cc_sid"
-assert_exit_ok "CC→OpenCode write succeeds"
-assert_valid_json "CC→OpenCode JSON is valid"
-opc_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-if [[ -n "$opc_sid" ]]; then
-    pass "CC→OpenCode JSON includes target_session_id"
-else
-    fail "CC→OpenCode JSON includes target_session_id" "non-empty id" "<empty>"
-fi
-assert_file_exists "OpenCode DB exists after conversion" "$OPENCODE_HOME/opencode.db"
+EXPECT_FAIL=1 run_casr "resume cc->opc refused" --json resume opc "$cc_sid" || true
+assert_exit_fail "CC→OpenCode write is refused"
+assert_json_error_envelope "CC→OpenCode refusal is JSON"
+assert_stderr_contains "CC→OpenCode explains refusal" "OpenCode is read/resume-only"
+assert_file_count "CC→OpenCode refusal creates no database" "$OPENCODE_HOME" 0
+
+EXPECT_FAIL=1 run_casr "dry-run cc->opc refused" --json resume opc "$cc_sid" --dry-run || true
+assert_exit_fail "CC→OpenCode dry-run is also refused"
+assert_json_error_envelope "CC→OpenCode dry-run refusal is JSON"
+assert_file_count "CC→OpenCode dry-run creates no database" "$OPENCODE_HOME" 0
 
 log "TEST: Resume OpenCode → CC"
+opc_sid=$(setup_opencode_fixture)
 run_casr "resume opc->cc" resume cc "$opc_sid" --source opc
 assert_exit_ok "OpenCode→CC write succeeds"
 assert_stdout_contains "opencode→cc shows claude-code" "claude-code"
@@ -860,19 +882,14 @@ assert_exit_fail "CC→Antigravity write is refused (agy is read/resume-only)"
 log "TEST: Resume CC → ChatGPT"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->gpt" --json resume gpt "$cc_sid"
-assert_exit_ok "CC→ChatGPT write succeeds"
-assert_valid_json "CC→ChatGPT JSON is valid"
-gpt_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-if [[ -n "$gpt_sid" ]]; then
-    pass "CC→ChatGPT JSON includes target_session_id"
-else
-    fail "CC→ChatGPT JSON includes target_session_id" "non-empty id" "<empty>"
-fi
-assert_file_exists "ChatGPT conversation file exists after conversion" \
-    "$CHATGPT_HOME/conversations-${gpt_sid}/${gpt_sid}.json"
+EXPECT_FAIL=1 run_casr "resume cc->gpt refused" --json resume gpt "$cc_sid" || true
+assert_exit_fail "CC→ChatGPT write is refused"
+assert_json_error_envelope "CC→ChatGPT refusal is JSON"
+assert_stderr_contains "CC→ChatGPT explains refusal" "no supported session import path"
+assert_file_count "CC→ChatGPT refusal creates no files" "$CHATGPT_HOME" 0
 
 log "TEST: Resume ChatGPT → CC"
+gpt_sid=$(setup_chatgpt_fixture)
 run_casr "resume gpt->cc" resume cc "$gpt_sid" --source gpt
 assert_exit_ok "ChatGPT→CC write succeeds"
 assert_stdout_contains "chatgpt→cc shows claude-code" "claude-code"
@@ -911,12 +928,13 @@ run_casr "resume cc->vib" --json resume vib "$cc_sid"
 assert_exit_ok "CC→Vibe write succeeds"
 assert_valid_json "CC→Vibe JSON is valid"
 vib_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
+vib_path=$(echo "$LAST_STDOUT" | jq -r '.written_paths[0] // empty')
 if [[ -n "$vib_sid" ]]; then
     pass "CC→Vibe JSON includes target_session_id"
 else
     fail "CC→Vibe JSON includes target_session_id" "non-empty id" "<empty>"
 fi
-assert_file_exists "Vibe messages.jsonl exists after conversion" "$VIBE_HOME/logs/session/${vib_sid}/messages.jsonl"
+assert_file_exists "Vibe messages.jsonl exists after conversion" "$vib_path"
 
 log "TEST: Resume Vibe → CC"
 run_casr "resume vib->cc" resume cc "$vib_sid" --source vib
@@ -981,12 +999,13 @@ run_casr "resume cc->pi" --json resume pi "$cc_sid"
 assert_exit_ok "CC→PiAgent write succeeds"
 assert_valid_json "CC→PiAgent JSON is valid"
 pi_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
+pi_path=$(echo "$LAST_STDOUT" | jq -r '.written_paths[0] // empty')
 if [[ -n "$pi_sid" ]]; then
     pass "CC→PiAgent JSON includes target_session_id"
 else
     fail "CC→PiAgent JSON includes target_session_id" "non-empty id" "<empty>"
 fi
-assert_file_exists "Pi-Agent JSONL exists after conversion" "$PI_AGENT_HOME/sessions/${pi_sid}.jsonl"
+assert_file_exists "Pi-Agent JSONL exists after conversion" "$pi_path"
 
 log "TEST: Resume PiAgent → CC"
 run_casr "resume pi->cc" resume cc "$pi_sid" --source pi
@@ -1035,11 +1054,8 @@ assert_json_error_envelope "malformed Cline error is JSON"
 
 log "TEST: Malformed ChatGPT session (invalid JSON)"
 reset_env
-cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "seed gpt for malformed" --json resume gpt "$cc_sid"
-assert_exit_ok "seed gpt succeeds"
-gpt_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-gpt_file="$CHATGPT_HOME/conversations-${gpt_sid}/${gpt_sid}.json"
+gpt_sid=$(setup_chatgpt_fixture)
+gpt_file="$CHATGPT_HOME/conversations-fixture/${gpt_sid}.json"
 assert_file_exists "ChatGPT conversation exists after seed" "$gpt_file"
 printf 'not-json\n' > "$gpt_file"
 EXPECT_FAIL=1 run_casr "malformed gpt read" --json resume cc "$gpt_sid" --dry-run --source gpt || true
@@ -1117,10 +1133,11 @@ assert_json_field "dry-run Cursor ok=true" ".ok" "true"
 log "TEST: Dry-run JSON content — CC→ChatGPT"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "dry-run json cc->gpt" --json resume gpt "$cc_sid" --dry-run
-assert_exit_ok "CC→ChatGPT dry-run JSON succeeds"
-assert_valid_json "dry-run ChatGPT JSON is valid"
-assert_json_field "dry-run ChatGPT ok=true" ".ok" "true"
+EXPECT_FAIL=1 run_casr "dry-run json cc->gpt refused" --json resume gpt "$cc_sid" --dry-run || true
+assert_exit_fail "CC→ChatGPT dry-run is refused"
+assert_json_error_envelope "CC→ChatGPT dry-run refusal is JSON"
+assert_stderr_contains "CC→ChatGPT dry-run explains refusal" "no supported session import path"
+assert_file_count "CC→ChatGPT dry-run writes no files" "$CHATGPT_HOME" 0
 
 log "TEST: Dry-run JSON content — Codex→CC"
 reset_env
@@ -1166,11 +1183,13 @@ cc_sid=$(setup_cc_fixture "cc_simple")
 run_casr "force cwb: write" resume cwb "$cc_sid" --force
 assert_exit_ok "CC→ClawdBot --force accepted"
 
-log "TEST: --force accepted — CC→ChatGPT"
+log "TEST: --force cannot bypass ChatGPT refusal"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "force gpt: write" resume gpt "$cc_sid" --force
-assert_exit_ok "CC→ChatGPT --force accepted"
+EXPECT_FAIL=1 run_casr "force gpt: refused" --json resume gpt "$cc_sid" --force || true
+assert_exit_fail "CC→ChatGPT --force is refused"
+assert_json_error_envelope "CC→ChatGPT --force refusal is JSON"
+assert_file_count "CC→ChatGPT --force writes no files" "$CHATGPT_HOME" 0
 
 log "TEST: --force accepted — CC→PiAgent"
 reset_env
@@ -1181,11 +1200,12 @@ assert_exit_ok "CC→PiAgent --force accepted"
 log "TEST: --force double write — CC→Codex"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-# Write twice with --force — both should succeed (unique paths).
-run_casr "force double: first" --json resume cod "$cc_sid" --force
+# Bypass the conversion store so this measures the writer, not the store's
+# intentional reuse of the best existing Codex incarnation.
+run_casr "force double: first" --json resume cod "$cc_sid" --force --no-store
 assert_exit_ok "CC→Codex --force first write"
 first_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-run_casr "force double: second" --json resume cod "$cc_sid" --force
+run_casr "force double: second" --json resume cod "$cc_sid" --force --no-store
 assert_exit_ok "CC→Codex --force second write"
 second_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
 if [[ "$first_sid" != "$second_sid" && -n "$first_sid" && -n "$second_sid" ]]; then
@@ -1244,26 +1264,26 @@ assert_json_field "enrich dry-run ok=true" ".ok" "true"
 assert_file_count "enrich dry-run writes no files" "$CODEX_HOME/sessions" 0
 
 # ===========================================================================
-# TEST: Full 14x14 conversion matrix (bd-1bh.29)
+# TEST: Full 14x14 source/target behavior matrix (bd-1bh.29)
 # ===========================================================================
 # Tests every directed (source, target) provider pair — 14 sources × 13
-# targets = 182 conversion paths. For native-fixture sources (CC, Codex,
-# Gemini) we load the fixture directly. For the other 11 providers, we seed
-# a session via CC → provider, then use that session as the source.
+# targets = 182 behaviors. OpenCode and ChatGPT are fixture-backed sources and
+# expected-refusal targets. CC, Codex, and Gemini also load native fixtures;
+# the other nine providers are seeded via CC → provider.
 # Each source is set up once and reused across all 13 targets.
-#
-# This is the ultimate validation that every pair works end-to-end.
 
 ALL_ALIASES=(cc cod gmi cur cln aid amp opc gpt cwb vib fac ocl pi)
 
 # Set up a source session and echo its session ID.
-# CC/Codex/Gemini use native fixtures; others are seeded from CC.
+# Read/resume-only providers must use native fixtures, never self-written seeds.
 setup_source_session() {
     local source_alias="$1"
     case "$source_alias" in
         cc)  setup_cc_fixture "cc_simple" ;;
         cod) setup_codex_fixture "codex_modern" "jsonl" ;;
         gmi) setup_gemini_fixture "gmi_simple" ;;
+        opc) setup_opencode_fixture ;;
+        gpt) setup_chatgpt_fixture ;;
         *)
             # Seed: set up CC fixture, convert CC→source, return target sid.
             local _cc_sid _json_out _target_sid
@@ -1297,6 +1317,34 @@ for source in "${ALL_ALIASES[@]}"; do
         MATRIX_PAIRS=$((MATRIX_PAIRS + 1))
         local_pair="${source}->${target}"
 
+        if [[ "$target" == "opc" || "$target" == "gpt" ]]; then
+            if [[ "$target" == "opc" ]]; then
+                refusal_text="OpenCode is read/resume-only"
+                refusal_home="$OPENCODE_HOME"
+            else
+                refusal_text="no supported session import path"
+                refusal_home="$CHATGPT_HOME"
+            fi
+
+            EXPECT_FAIL=1 run_casr "matrix:${local_pair}:refused" \
+                --json resume "$target" "$source_sid" --source "$source" || true
+            refusal_files=0
+            if [[ -d "$refusal_home" ]]; then
+                refusal_files=$(find "$refusal_home" -type f | wc -l)
+            fi
+            if [[ "$LAST_EXIT" -ne 0 ]] \
+                && echo "$LAST_STDERR" | grep -q "$refusal_text" \
+                && [[ "$refusal_files" -eq 0 ]]; then
+                pass "matrix:${local_pair} expected refusal"
+                MATRIX_OK=$((MATRIX_OK + 1))
+            else
+                fail "matrix:${local_pair}" \
+                    "non-zero refusal containing '$refusal_text' and no target files" \
+                    "exit=$LAST_EXIT files=$refusal_files"
+            fi
+            continue
+        fi
+
         run_casr "matrix:${local_pair}" --json resume "$target" "$source_sid" --source "$source"
 
         if [[ "$LAST_EXIT" -eq 0 ]]; then
@@ -1313,7 +1361,7 @@ for source in "${ALL_ALIASES[@]}"; do
     done
 done
 
-echo -e "  ${BOLD}Matrix summary:${RESET} ${GREEN}${MATRIX_OK}/${MATRIX_PAIRS} pairs passed${RESET}"
+echo -e "  ${BOLD}Matrix summary:${RESET} ${GREEN}${MATRIX_OK}/${MATRIX_PAIRS} behaviors passed${RESET}"
 
 # ===========================================================================
 # TEST: Completions

@@ -479,7 +479,7 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 ///
 /// # The requirement
 ///
-/// Eight of the fifteen flat writers have no slot for a system turn and send it
+/// Eight of the thirteen flat writers have no slot for a system turn and send it
 /// somewhere else — Claude Code, Cline and OpenClaw to a plain user record, Amp
 /// to `info`, Cursor to a human bubble, Kiro to `Prompt`, Aider to a
 /// blockquote, and Vibe to a plain user record. Each of those mappings is right:
@@ -505,6 +505,7 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 /// artifact and the read-back agree about.
 #[test]
 fn no_writer_folds_a_role_without_declaring_it() {
+    const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode"];
     let probed = [
         MessageRole::System,
         MessageRole::Tool,
@@ -520,12 +521,24 @@ fn no_writer_folds_a_role_without_declaring_it() {
 
         for provider in registry.all_providers() {
             let slug = provider.slug();
-            // Antigravity and Grok refuse to be targets at all; a provider that
-            // cannot be written to cannot fold anything.
-            let Ok(written) = provider.write_session(&session, &WriteOptions { force: true })
-            else {
+            let result = provider.write_session(&session, &WriteOptions { force: true });
+            if REFUSES.contains(&slug) {
+                assert!(
+                    provider.write_refusal().is_some(),
+                    "{slug} refuses writes but did not declare that capability to the pipeline"
+                );
+                assert!(
+                    result.is_err(),
+                    "{slug} is declared read/resume-only but accepted a target write"
+                );
                 continue;
             };
+            assert!(
+                provider.write_refusal().is_none(),
+                "{slug} declares a target refusal but is missing from REFUSES"
+            );
+            let written =
+                result.unwrap_or_else(|error| panic!("{slug} unexpectedly refused: {error:#}"));
             for path in &written.paths {
                 assert!(
                     path.starts_with(sandbox),

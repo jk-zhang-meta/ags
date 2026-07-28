@@ -1,4 +1,4 @@
-//! OpenCode provider — reads/writes sessions from SQLite `opencode.db`.
+//! OpenCode provider — reads sessions from SQLite `opencode.db`.
 //!
 //! OpenCode stores session state in a SQLite database named `opencode.db`.
 //! Two physical layouts of that database are in the wild and this provider
@@ -10,13 +10,12 @@
 //! casr addresses specific OpenCode sessions using a virtual path form:
 //! `<db-path>/<urlencoded-session-id>`
 //! This mirrors the approach used by Cursor and Aider providers.
-
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::discovery::DetectionResult;
 use crate::model::{
@@ -30,6 +29,9 @@ pub struct OpenCode;
 
 const DB_FILENAME: &str = "opencode.db";
 const DATA_DIRNAME: &str = ".opencode";
+const OPENCODE_WRITE_REFUSAL: &str = "OpenCode is read/resume-only: casr cannot create a \
+natively resumable OpenCode session without using OpenCode's own import machinery. Refusing to \
+modify opencode.db; use OpenCode as a conversion source, not a target.";
 
 /// Which physical layout an `opencode.db` uses.
 ///
@@ -231,59 +233,6 @@ impl OpenCode {
         dedup_existing_files(candidates)
     }
 
-    /// Resolve target DB path for writes.
-    ///
-    /// A database that already exists beats one casr would have to invent,
-    /// because the only useful outcome of `casr resume opc <session>` is a
-    /// session OpenCode can open. A fresh workspace-local database is not one:
-    /// current OpenCode reads a single database in its own data directory, so
-    /// inventing one there makes the conversion succeed, report a fidelity
-    /// grade, and leave the user nothing to resume — success and emptiness at
-    /// the same time, which is the same defect on the write side that the
-    /// reader was just fixed for.
-    ///
-    /// Reaching into the agent's live state is the price of the session being
-    /// resumable at all. Codex already makes the same trade, registering a
-    /// converted thread into `~/.codex/state_*.sqlite`.
-    ///
-    /// Because of this, *every* caller of `write_session` reads the process
-    /// environment. Tests that exercise it therefore live in
-    /// `tests/opencode_write_test.rs`, where `XDG_DATA_HOME` and friends can be
-    /// redirected — `src/lib.rs` forbids unsafe code, so an in-crate test
-    /// cannot call `set_var` and cannot isolate itself from a real install.
-    fn choose_target_db_path(session: &CanonicalSession) -> anyhow::Result<PathBuf> {
-        // 1. An explicit override is the user naming the target, so it wins over
-        //    anything discovery could infer.
-        if let Some(env_db) = Self::env_db_path() {
-            return Ok(env_db);
-        }
-
-        // 2. A database already sitting beside the workspace. Current OpenCode
-        //    never puts one there, so its presence means somebody deliberately
-        //    did — an older OpenCode, or a user who keeps a per-project store.
-        if let Some(workspace) = &session.workspace {
-            let workspace_db = workspace.join(DATA_DIRNAME).join(DB_FILENAME);
-            if workspace_db.is_file() {
-                return Ok(workspace_db);
-            }
-        }
-
-        // 3. Any database discovery found — in practice the one OpenCode itself
-        //    writes and reads.
-        if let Some(existing) = Self::find_db_files().into_iter().next() {
-            return Ok(existing);
-        }
-
-        // 4. Nothing exists anywhere. Create beside the workspace, else the cwd
-        //    — and `write_session_legacy` warns that what lands here is not
-        //    something this OpenCode will read.
-        if let Some(workspace) = &session.workspace {
-            return Ok(workspace.join(DATA_DIRNAME).join(DB_FILENAME));
-        }
-        let cwd = std::env::current_dir().context("failed to determine current directory")?;
-        Ok(cwd.join(DATA_DIRNAME).join(DB_FILENAME))
-    }
-
     /// Build virtual per-session path: `<db-path>/<urlencoded-session-id>`.
     fn virtual_session_path(db_path: &Path, session_id: &str) -> PathBuf {
         let encoded = urlencoding::encode(session_id);
@@ -316,85 +265,10 @@ impl OpenCode {
         Ok(conn)
     }
 
-    /// Open DB in read-write/create mode.
-    fn open_db_rw(path: &Path) -> anyhow::Result<Connection> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
-        }
-
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("failed to open OpenCode DB for writing: {}", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(conn)
-    }
-
     fn table_exists(conn: &Connection, table: &str) -> bool {
         conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")
             .and_then(|mut stmt| stmt.exists(rusqlite::params![table]))
             .unwrap_or(false)
-    }
-
-    fn trigger_exists(conn: &Connection, trigger: &str) -> bool {
-        conn.prepare("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1")
-            .and_then(|mut stmt| stmt.exists(rusqlite::params![trigger]))
-            .unwrap_or(false)
-    }
-
-    /// Ensure core OpenCode tables exist.
-    fn ensure_schema(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
-            r#"
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS sessions (
-    id TEXT PRIMARY KEY,
-    parent_session_id TEXT,
-    title TEXT NOT NULL,
-    message_count INTEGER NOT NULL DEFAULT 0 CHECK (message_count >= 0),
-    prompt_tokens INTEGER NOT NULL DEFAULT 0 CHECK (prompt_tokens >= 0),
-    completion_tokens INTEGER NOT NULL DEFAULT 0 CHECK (completion_tokens >= 0),
-    cost REAL NOT NULL DEFAULT 0.0 CHECK (cost >= 0.0),
-    updated_at INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    summary_message_id TEXT
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    parts TEXT NOT NULL DEFAULT '[]',
-    model TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    finished_at INTEGER,
-    FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS files (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    path TEXT NOT NULL,
-    content TEXT NOT NULL,
-    version TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
-    UNIQUE(path, session_id, version)
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages (session_id);
-CREATE INDEX IF NOT EXISTS idx_files_session_id ON files (session_id);
-"#,
-        )
-        .context("failed to initialize OpenCode schema")?;
-        Ok(())
     }
 
     /// Which layout this database uses, or `None` when it is not an OpenCode
@@ -961,38 +835,14 @@ impl Provider for OpenCode {
 
     fn write_session(
         &self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
+        _session: &CanonicalSession,
+        _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let db_path = Self::choose_target_db_path(session)?;
+        Err(anyhow::anyhow!(OPENCODE_WRITE_REFUSAL))
+    }
 
-        // Which layout to write is decided by what is already at the target, not
-        // by preference: a session is only useful if the OpenCode that owns this
-        // database can open it. A live OpenCode database gets
-        // session/message/part rows, exactly as OpenCode's own `import` writes
-        // them; a pre-rename database keeps getting the legacy layout, because
-        // the OpenCode that created it reads nothing else.
-        let existing_schema = if db_path.is_file() {
-            Self::open_db(&db_path)
-                .ok()
-                .and_then(|conn| Self::detect_schema(&conn))
-        } else {
-            None
-        };
-
-        match existing_schema {
-            Some(Schema::Current) => Self::write_session_current(self, session, opts, &db_path),
-            // No database yet, or a file that is not one. casr cannot bootstrap
-            // a current-schema database from nothing: OpenCode's migrator runs
-            // on open and aborts with "table `project` already exists" if the
-            // tables are already there, so a hand-built one would brick the
-            // install it was meant to feed. Write the legacy layout, which is
-            // self-contained and round-trips through casr, and say plainly that
-            // this OpenCode will not read it.
-            Some(Schema::Legacy) | None => {
-                Self::write_session_legacy(self, session, opts, &db_path, existing_schema.is_none())
-            }
-        }
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(OPENCODE_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, _session_id: &str) -> String {
@@ -1085,387 +935,6 @@ impl Provider for OpenCode {
             path.extension().and_then(|e| e.to_str()),
             Some("db" | "sqlite")
         )
-    }
-}
-
-impl OpenCode {
-    /// Write into a live OpenCode database (`session`/`message`/`part`).
-    ///
-    /// The row shapes here are not inferred from documentation: they are what
-    /// the released `opencode` 1.18.6 binary itself writes, measured by running
-    /// its own `opencode import` against an empty database and diffing the
-    /// result. That run touched `project`, `session`, `message` and `part` and
-    /// nothing else — in particular the `session_message` projection stays
-    /// empty and is rebuilt by OpenCode on demand.
-    fn write_session_current(
-        provider: &Self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
-        db_path: &Path,
-    ) -> anyhow::Result<WrittenSession> {
-        let mut conn = Self::open_db_rw(db_path)?;
-
-        let target_session_id = opencode_session_id(&session.session_id);
-
-        if Self::session_exists(&conn, &target_session_id) {
-            if opts.force {
-                let _ = conn.execute(
-                    "DELETE FROM part WHERE session_id = ?1",
-                    rusqlite::params![target_session_id],
-                );
-                let _ = conn.execute(
-                    "DELETE FROM message WHERE session_id = ?1",
-                    rusqlite::params![target_session_id],
-                );
-                conn.execute(
-                    "DELETE FROM session WHERE id = ?1",
-                    rusqlite::params![target_session_id],
-                )
-                .context("failed to delete existing OpenCode session for --force overwrite")?;
-            } else {
-                return Err(crate::error::CasrError::SessionConflict {
-                    session_id: target_session_id,
-                    existing_path: db_path.to_path_buf(),
-                }
-                .into());
-            }
-        }
-
-        let now = chrono::Utc::now().timestamp_millis();
-        let created_at = session.started_at.unwrap_or(now);
-        let updated_at = session.ended_at.unwrap_or(now);
-        let directory = session
-            .workspace
-            .as_ref()
-            .map(|ws| ws.display().to_string())
-            .unwrap_or_default();
-
-        let title = session
-            .title
-            .clone()
-            .or_else(|| {
-                session
-                    .messages
-                    .iter()
-                    .find(|m| m.role == MessageRole::User)
-                    .map(|m| truncate_title(&m.content, 80))
-                    .filter(|t| !t.is_empty())
-            })
-            .unwrap_or_else(|| "Converted session".to_string());
-
-        let project_id = Self::resolve_project_id(&conn, &directory, created_at)?;
-        // `session.version` is NOT NULL and records the OpenCode that created
-        // the row. casr is not OpenCode, so it copies the version already in the
-        // database rather than inventing one.
-        let version: String = conn
-            .query_row(
-                "SELECT version FROM session ORDER BY time_created DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| "0.0.0".to_string());
-        let (provider_id, model_id) = split_model_ref(session.model_name.as_deref());
-
-        let tx = conn.transaction().context("failed to begin transaction")?;
-
-        tx.execute(
-            "INSERT INTO session (
-                id, project_id, workspace_id, parent_id, slug, directory, path, title, version,
-                cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
-                tokens_cache_write, agent, model, time_created, time_updated
-             ) VALUES (?1, ?2, NULL, NULL, ?3, ?4, '', ?5, ?6, 0, 0, 0, 0, 0, 0, NULL, NULL, ?7, ?8)",
-            rusqlite::params![
-                target_session_id,
-                project_id,
-                format!("casr-{}", &target_session_id),
-                directory,
-                title,
-                version,
-                created_at,
-                updated_at,
-            ],
-        )
-        .context("failed to insert OpenCode session")?;
-
-        let timestamps = monotonic_timestamps(&session.messages, created_at);
-        for (i, msg) in session.messages.iter().enumerate() {
-            // OpenCode orders a session's messages by `(time_created, id)`, and
-            // a converted transcript routinely has many messages inside the same
-            // millisecond. A random id would let those tie-break into a
-            // different order than they were written, so the index goes in the
-            // id — zero-padded, because the tie-break is a string comparison.
-            let message_id = format!("msg_{i:06}_{}", uuid::Uuid::new_v4().simple());
-            let timestamp = timestamps[i];
-            let data = build_message_data(msg, timestamp, &provider_id, &model_id);
-
-            tx.execute(
-                "INSERT INTO message (id, session_id, time_created, time_updated, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    message_id,
-                    target_session_id,
-                    timestamp,
-                    timestamp,
-                    serde_json::to_string(&data)
-                        .context("failed to serialize OpenCode message data")?,
-                ],
-            )
-            .with_context(|| format!("failed to insert OpenCode message {}", msg.idx))?;
-
-            for (part_idx, part) in build_current_parts(msg).into_iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        // Zero-padded so string ordering — which is how OpenCode
-                        // orders parts within a message — matches insert order.
-                        format!("prt_{message_id}_{part_idx:06}"),
-                        message_id,
-                        target_session_id,
-                        timestamp,
-                        timestamp,
-                        serde_json::to_string(&part)
-                            .context("failed to serialize OpenCode part data")?,
-                    ],
-                )
-                .with_context(|| format!("failed to insert OpenCode part {part_idx}"))?;
-            }
-        }
-
-        tx.commit().context("failed to commit transaction")?;
-
-        let virtual_path = Self::virtual_session_path(db_path, &target_session_id);
-        info!(
-            session_id = target_session_id,
-            path = %db_path.display(),
-            messages = session.messages.len(),
-            schema = Schema::Current.label(),
-            "OpenCode session written"
-        );
-
-        Ok(WrittenSession {
-            paths: vec![virtual_path],
-            session_id: target_session_id.clone(),
-            resume_command: provider.resume_command(&target_session_id),
-            backups: Vec::new(),
-            warnings: Vec::new(),
-        })
-    }
-
-    /// The `project` row a written session should hang off.
-    ///
-    /// Prefers the project OpenCode already has for this worktree so the session
-    /// shows up under the directory the user is in; only creates one when the
-    /// database has nothing that fits.
-    fn resolve_project_id(
-        conn: &Connection,
-        directory: &str,
-        created_at: i64,
-    ) -> anyhow::Result<String> {
-        if !directory.is_empty()
-            && let Ok(id) = conn.query_row(
-                "SELECT id FROM project WHERE worktree = ?1 LIMIT 1",
-                rusqlite::params![directory],
-                |row| row.get::<_, String>(0),
-            )
-        {
-            return Ok(id);
-        }
-
-        if directory.is_empty()
-            && let Ok(id) = conn.query_row(
-                "SELECT id FROM project ORDER BY time_updated DESC LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-        {
-            return Ok(id);
-        }
-
-        let project_id = uuid::Uuid::new_v4().simple().to_string();
-        conn.execute(
-            "INSERT INTO project (id, worktree, vcs, time_created, time_updated, sandboxes)
-             VALUES (?1, ?2, NULL, ?3, ?3, '[]')",
-            rusqlite::params![project_id, directory, created_at],
-        )
-        .context("failed to create OpenCode project row")?;
-        Ok(project_id)
-    }
-
-    /// Write into the pre-rename `sessions`/`messages`/`files` layout.
-    ///
-    /// `created` says the database did not exist before this call, which is the
-    /// only case that warrants a warning: an OpenCode old enough to own a legacy
-    /// database reads it fine, but a database casr just invented is one no
-    /// current OpenCode will ever look at.
-    fn write_session_legacy(
-        provider: &Self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
-        db_path: &Path,
-        created: bool,
-    ) -> anyhow::Result<WrittenSession> {
-        let mut conn = Self::open_db_rw(db_path)?;
-        Self::ensure_schema(&conn)?;
-
-        let has_count_trigger =
-            Self::trigger_exists(&conn, "update_session_message_count_on_insert");
-
-        // Derive a STABLE target id from the source session so re-converting the
-        // same session targets the same row (matching the clawdbot/cursor/pi_agent
-        // idiom). This makes `--force` meaningful: without a stable id every run
-        // would silently create an orphaned duplicate row, and with a colliding id
-        // the INSERT would otherwise fail on the PRIMARY KEY. Fall back to a random
-        // UUID only when the source has no id.
-        let target_session_id = if session.session_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            session.session_id.clone()
-        };
-
-        // Honor `--force`: if the target session already exists, either overwrite
-        // it (delete-then-insert; `ON DELETE CASCADE` clears messages/files) or
-        // return a clean conflict error, matching the cursor provider's behavior.
-        if Self::session_exists(&conn, &target_session_id) {
-            if opts.force {
-                // `ensure_schema` already enabled `PRAGMA foreign_keys = ON` on
-                // this connection, so deleting the session cascades to messages
-                // and files. Delete dependents explicitly too, in case the live
-                // DB predates the FK constraint or has the pragma disabled.
-                let _ = conn.execute(
-                    "DELETE FROM files WHERE session_id = ?1",
-                    rusqlite::params![target_session_id],
-                );
-                let _ = conn.execute(
-                    "DELETE FROM messages WHERE session_id = ?1",
-                    rusqlite::params![target_session_id],
-                );
-                conn.execute(
-                    "DELETE FROM sessions WHERE id = ?1",
-                    rusqlite::params![target_session_id],
-                )
-                .context("failed to delete existing OpenCode session for --force overwrite")?;
-            } else {
-                return Err(crate::error::CasrError::SessionConflict {
-                    session_id: target_session_id,
-                    existing_path: db_path.to_path_buf(),
-                }
-                .into());
-            }
-        }
-
-        let now = chrono::Utc::now().timestamp_millis();
-        let created_at = session.started_at.unwrap_or(now);
-        let updated_at = session.ended_at.unwrap_or(now);
-
-        let title = session.title.clone().or_else(|| {
-            session
-                .messages
-                .iter()
-                .find(|m| m.role == MessageRole::User)
-                .map(|m| truncate_title(&m.content, 80))
-                .filter(|t| !t.is_empty())
-        });
-        let title = title.unwrap_or_else(|| "Converted session".to_string());
-
-        let tx = conn.transaction().context("failed to begin transaction")?;
-
-        tx.execute(
-            "INSERT INTO sessions (
-                id, parent_session_id, title, message_count, prompt_tokens, completion_tokens, cost,
-                summary_message_id, updated_at, created_at
-             ) VALUES (?1, NULL, ?2, ?3, 0, 0, 0.0, NULL, ?4, ?5)",
-            rusqlite::params![
-                target_session_id,
-                title,
-                if has_count_trigger {
-                    0_i64
-                } else {
-                    i64::try_from(session.messages.len()).unwrap_or(i64::MAX)
-                },
-                updated_at,
-                created_at,
-            ],
-        )
-        .context("failed to insert OpenCode session")?;
-
-        let default_model = session.model_name.clone();
-        let timestamps = monotonic_timestamps(&session.messages, created_at);
-        for (i, msg) in session.messages.iter().enumerate() {
-            // Ordered id and clamped timestamp, for the same reason as the
-            // current-schema writer: this layout is read back with
-            // `ORDER BY created_at ASC, id ASC` too.
-            let message_id = format!("{i:06}-{}", uuid::Uuid::new_v4());
-            let parts = build_parts(msg);
-            let parts_json =
-                serde_json::to_string(&parts).context("failed to serialize OpenCode parts")?;
-            let timestamp = timestamps[i];
-            let model = msg.author.clone().or_else(|| default_model.clone());
-
-            tx.execute(
-                "INSERT INTO messages (
-                    id, session_id, role, parts, model, created_at, updated_at, finished_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
-                rusqlite::params![
-                    message_id,
-                    target_session_id,
-                    role_to_opencode(&msg.role),
-                    parts_json,
-                    model,
-                    timestamp,
-                    timestamp,
-                ],
-            )
-            .with_context(|| format!("failed to insert OpenCode message {}", msg.idx))?;
-        }
-
-        // If the DB has no count trigger, set message_count explicitly.
-        if !has_count_trigger {
-            tx.execute(
-                "UPDATE sessions SET message_count = ?1 WHERE id = ?2",
-                rusqlite::params![
-                    i64::try_from(session.messages.len()).unwrap_or(i64::MAX),
-                    target_session_id
-                ],
-            )
-            .context("failed to update OpenCode session message_count")?;
-        }
-
-        tx.commit().context("failed to commit transaction")?;
-
-        let virtual_path = Self::virtual_session_path(db_path, &target_session_id);
-        info!(
-            session_id = target_session_id,
-            path = %db_path.display(),
-            messages = session.messages.len(),
-            schema = Schema::Legacy.label(),
-            "OpenCode session written"
-        );
-
-        let warnings = if created {
-            vec![format!(
-                "created a new OpenCode database at {} using the legacy \
-                 {} schema. Current OpenCode reads only its own database \
-                 ({}) and will not show this session; re-run with \
-                 OPENCODE_DB_PATH pointing at that file to write a session \
-                 OpenCode can open.",
-                db_path.display(),
-                Schema::Legacy.label(),
-                Self::upstream_data_dir()
-                    .map(|dir| dir.join(DB_FILENAME).display().to_string())
-                    .unwrap_or_else(|| "~/.local/share/opencode/opencode.db".to_string()),
-            )]
-        } else {
-            Vec::new()
-        };
-
-        Ok(WrittenSession {
-            paths: vec![virtual_path],
-            session_id: target_session_id.clone(),
-            resume_command: provider.resume_command(&target_session_id),
-            backups: Vec::new(),
-            warnings,
-        })
     }
 }
 
@@ -1701,273 +1170,9 @@ fn parse_current_parts(parts: &[serde_json::Value]) -> (String, Vec<ToolCall>, V
     (content, tool_calls, tool_results)
 }
 
-fn build_parts(message: &CanonicalMessage) -> serde_json::Value {
-    let mut parts = Vec::new();
-
-    if !message.content.trim().is_empty() {
-        parts.push(serde_json::json!({
-            "type": "text",
-            "data": { "text": message.content },
-        }));
-    }
-
-    for call in &message.tool_calls {
-        let input = if let Some(s) = call.arguments.as_str() {
-            s.to_string()
-        } else {
-            serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string())
-        };
-
-        parts.push(serde_json::json!({
-            "type": "tool_call",
-            "data": {
-                "id": call.id.clone().unwrap_or_default(),
-                "name": call.name,
-                "input": input,
-                "type": "function",
-                "finished": true
-            }
-        }));
-    }
-
-    for result in &message.tool_results {
-        parts.push(serde_json::json!({
-            "type": "tool_result",
-            "data": {
-                "tool_call_id": result.call_id.clone().unwrap_or_default(),
-                "name": "tool",
-                "content": result.content,
-                "metadata": "",
-                "is_error": result.is_error
-            }
-        }));
-    }
-
-    serde_json::Value::Array(parts)
-}
-
-/// A session id current OpenCode will accept.
-///
-/// OpenCode brands its ids: `opencode export`, and every other command that
-/// takes a session, rejects anything not starting with `ses` — a converted
-/// session written under its source's own id is listed but cannot be opened.
-///
-/// The id stays *derived* from the source rather than random, because
-/// re-conversion, `--force` and [`Provider::owns_session`] all depend on the
-/// same source session resolving to the same target row.
-fn opencode_session_id(source_id: &str) -> String {
-    if source_id.starts_with("ses_") {
-        return source_id.to_string();
-    }
-    let sanitized: String = source_id
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .collect();
-    if sanitized.is_empty() {
-        return format!("ses_{}", uuid::Uuid::new_v4().simple());
-    }
-    format!("ses_{sanitized}")
-}
-
-/// Message timestamps that preserve message order in a time-sorted store.
-///
-/// Both layouts order a session's messages by `(created, id)`, so a source
-/// whose message order disagrees with its own timestamps reads back reordered.
-/// That is not a corner case: in a real Claude Code transcript a tool result is
-/// routinely stamped a millisecond *before* the message it follows, and the
-/// round-trip then returns two messages swapped.
-///
-/// Holding each timestamp at no less than its predecessor fixes the order while
-/// keeping every message inside the session's own span — the clamp only ever
-/// moves a timestamp forward to one already present earlier in the session.
-fn monotonic_timestamps(messages: &[CanonicalMessage], fallback: i64) -> Vec<i64> {
-    let mut last = i64::MIN;
-    messages
-        .iter()
-        .map(|msg| {
-            let ts = msg.timestamp.unwrap_or(fallback).max(last);
-            last = ts;
-            ts
-        })
-        .collect()
-}
-
-/// Split casr's single `model_name` into OpenCode's `(providerID, modelID)`.
-///
-/// OpenCode names a model `provider/model`; casr carries whatever the source
-/// provider recorded, which is usually just the bare model. Both fields are
-/// required by OpenCode's message schema, so an unsplittable name yields an
-/// explicit `"unknown"` provider rather than a plausible-looking guess.
-fn split_model_ref(model_name: Option<&str>) -> (String, String) {
-    let Some(name) = model_name.map(str::trim).filter(|n| !n.is_empty()) else {
-        return ("unknown".to_string(), "unknown".to_string());
-    };
-    match name.split_once('/') {
-        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
-            (provider.to_string(), model.to_string())
-        }
-        Some(_) | None => ("unknown".to_string(), name.to_string()),
-    }
-}
-
-/// Build the `message.data` blob for the current schema.
-fn build_message_data(
-    message: &CanonicalMessage,
-    timestamp: i64,
-    provider_id: &str,
-    model_id: &str,
-) -> serde_json::Value {
-    let model_id = message.author.as_deref().unwrap_or(model_id);
-    // OpenCode's message union has exactly two roles. Everything that is not an
-    // assistant turn becomes a user turn, which is the same equivalence
-    // `pipeline::readback_role_bucket` applies — collapsing them the other way
-    // would turn a tool or system message into something that reads back as the
-    // model's own words.
-    match message.role {
-        MessageRole::User | MessageRole::Tool | MessageRole::System | MessageRole::Other(_) => {
-            serde_json::json!({
-                "role": "user",
-                "time": { "created": timestamp },
-                "agent": "build",
-                "model": { "providerID": provider_id, "modelID": model_id },
-            })
-        }
-        MessageRole::Assistant => serde_json::json!({
-            "role": "assistant",
-            "time": { "created": timestamp, "completed": timestamp },
-            "mode": "build",
-            "agent": "build",
-            "path": { "cwd": "", "root": "" },
-            "cost": 0,
-            "tokens": {
-                "input": 0, "output": 0, "reasoning": 0,
-                "cache": { "read": 0, "write": 0 }
-            },
-            "modelID": model_id,
-            "providerID": provider_id,
-        }),
-    }
-}
-
-/// Build the `part.data` blobs for the current schema.
-///
-/// The current layout stores each part as its own row whose `data` blob is the
-/// part itself, so — unlike [`build_parts`] — there is no `{type, data}`
-/// wrapper and a tool call and its result are one `tool` part, not two.
-fn build_current_parts(message: &CanonicalMessage) -> Vec<serde_json::Value> {
-    let mut parts = Vec::new();
-
-    if !message.content.trim().is_empty() {
-        parts.push(serde_json::json!({ "type": "text", "text": message.content }));
-    }
-
-    // Each result is claimed by at most one call, so calls that share a missing
-    // id do not all end up reporting the same output.
-    let mut claimed = vec![false; message.tool_results.len()];
-
-    for call in &message.tool_calls {
-        let input = if call.arguments.is_object() {
-            call.arguments.clone()
-        } else {
-            serde_json::json!({ "input": call.arguments })
-        };
-
-        // OpenCode pairs a result to its call by `callID`, so the result is
-        // folded into the call's state rather than emitted separately.
-        let matched =
-            message.tool_results.iter().enumerate().find(|(i, result)| {
-                !claimed[*i] && result.call_id.as_deref() == call.id.as_deref()
-            });
-        if let Some((i, _)) = matched {
-            claimed[i] = true;
-        }
-
-        let state = match matched.map(|(_, result)| result) {
-            Some(result) if result.is_error => serde_json::json!({
-                "status": "error",
-                "input": input,
-                "error": result.content,
-                "time": { "start": 0, "end": 0 },
-            }),
-            Some(result) => serde_json::json!({
-                "status": "completed",
-                "input": input,
-                "output": result.content,
-                "title": call.name,
-                "metadata": {},
-                "time": { "start": 0, "end": 0 },
-            }),
-            // No result recorded: the call really is unfinished, and OpenCode
-            // has a status that says exactly that.
-            None => serde_json::json!({ "status": "pending", "input": input, "raw": "" }),
-        };
-
-        parts.push(serde_json::json!({
-            "type": "tool",
-            "callID": call.id.clone().unwrap_or_default(),
-            "tool": call.name,
-            "state": state,
-        }));
-    }
-
-    // A result whose call lives in an earlier message — the shape Claude Code
-    // and Codex use — still has to survive. It gets its own tool part rather
-    // than a text part: the current schema has nowhere else to put a result,
-    // and appending it to the text would put tool output into the transcript as
-    // if someone had said it.
-    for (i, result) in message.tool_results.iter().enumerate() {
-        if claimed[i] {
-            continue;
-        }
-        let state = if result.is_error {
-            serde_json::json!({
-                "status": "error",
-                "input": {},
-                "error": result.content,
-                "time": { "start": 0, "end": 0 },
-            })
-        } else {
-            serde_json::json!({
-                "status": "completed",
-                "input": {},
-                "output": result.content,
-                "title": "tool",
-                "metadata": {},
-                "time": { "start": 0, "end": 0 },
-            })
-        };
-        parts.push(serde_json::json!({
-            "type": "tool",
-            "callID": result.call_id.clone().unwrap_or_default(),
-            "tool": "tool",
-            "state": state,
-        }));
-    }
-
-    parts
-}
-
-fn role_to_opencode(role: &MessageRole) -> &str {
-    match role {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::Tool => "tool",
-        MessageRole::System => "system",
-        MessageRole::Other(role) => role.as_str(),
-    }
-}
-
-/// Note on what is *not* tested here.
-///
-/// Every path that reaches [`OpenCode::choose_target_db_path`] reads the
-/// process environment, so a test that exercised it in-crate would consult the
-/// developer's real OpenCode install. `src/lib.rs` declares
-/// `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in edition
-/// 2024, so an in-crate test cannot redirect `XDG_DATA_HOME` and cannot isolate
-/// itself. Those tests live in `tests/opencode_write_test.rs`, which can.
-///
-/// What stays here needs no environment: pure parsing, virtual-path round
-/// trips, and schema questions asked about a path the test was handed.
+/// Reader tests use only isolated fixture databases. Target-side tests live in
+/// `tests/opencode_write_test.rs` and prove that every write mode refuses
+/// without creating or changing an `opencode.db`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1983,6 +1188,7 @@ mod tests {
             <OpenCode as Provider>::resume_command(&provider, "sid"),
             "opencode"
         );
+        assert_eq!(provider.write_refusal(), Some(OPENCODE_WRITE_REFUSAL));
     }
 
     #[test]
@@ -2147,93 +1353,6 @@ mod tests {
         assert_eq!(result["input"], "not json");
     }
 
-    // ── role_to_opencode ────────────────────────────────────────────────
-
-    #[test]
-    fn role_to_opencode_all_variants() {
-        assert_eq!(role_to_opencode(&MessageRole::User), "user");
-        assert_eq!(role_to_opencode(&MessageRole::Assistant), "assistant");
-        assert_eq!(role_to_opencode(&MessageRole::Tool), "tool");
-        assert_eq!(role_to_opencode(&MessageRole::System), "system");
-        assert_eq!(
-            role_to_opencode(&MessageRole::Other("custom".to_string())),
-            "custom"
-        );
-    }
-
-    // ── build_parts ─────────────────────────────────────────────────────
-
-    #[test]
-    fn build_parts_text_only() {
-        let msg = CanonicalMessage {
-            idx: 0,
-            role: MessageRole::User,
-            content: "Hello world".to_string(),
-            timestamp: None,
-            author: None,
-            tool_calls: vec![],
-            tool_results: vec![],
-            extra: serde_json::json!({}),
-        };
-        let parts = build_parts(&msg);
-        let arr = parts.as_array().expect("should be array");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["type"], "text");
-        assert_eq!(arr[0]["data"]["text"], "Hello world");
-    }
-
-    #[test]
-    fn build_parts_with_tool_call_and_result() {
-        let msg = CanonicalMessage {
-            idx: 0,
-            role: MessageRole::Assistant,
-            content: "Let me check.".to_string(),
-            timestamp: None,
-            author: None,
-            tool_calls: vec![ToolCall {
-                id: Some("tc-1".to_string()),
-                name: "Bash".to_string(),
-                arguments: serde_json::json!({"cmd": "ls"}),
-            }],
-            tool_results: vec![ToolResult {
-                call_id: Some("tc-1".to_string()),
-                content: "file1.rs\nfile2.rs".to_string(),
-                is_error: false,
-            }],
-            extra: serde_json::json!({}),
-        };
-        let parts = build_parts(&msg);
-        let arr = parts.as_array().expect("should be array");
-        assert_eq!(arr.len(), 3); // text + tool_call + tool_result
-        assert_eq!(arr[0]["type"], "text");
-        assert_eq!(arr[1]["type"], "tool_call");
-        assert_eq!(arr[1]["data"]["name"], "Bash");
-        assert_eq!(arr[2]["type"], "tool_result");
-        assert!(!arr[2]["data"]["is_error"].as_bool().unwrap());
-    }
-
-    #[test]
-    fn build_parts_empty_content_skips_text() {
-        let msg = CanonicalMessage {
-            idx: 0,
-            role: MessageRole::Tool,
-            content: "  ".to_string(),
-            timestamp: None,
-            author: None,
-            tool_calls: vec![],
-            tool_results: vec![ToolResult {
-                call_id: Some("c1".to_string()),
-                content: "result".to_string(),
-                is_error: false,
-            }],
-            extra: serde_json::json!({}),
-        };
-        let parts = build_parts(&msg);
-        let arr = parts.as_array().expect("array");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["type"], "tool_result");
-    }
-
     // ── workspace_from_db_path ──────────────────────────────────────────
 
     #[test]
@@ -2271,10 +1390,6 @@ mod tests {
         assert_eq!(parsed_db, db);
         assert_eq!(parsed_sid, sid);
     }
-
-    // ── writer edge cases ───────────────────────────────────────────────
-
-    // ── reader edge cases ───────────────────────────────────────────────
 
     // ── dedup_existing_files ────────────────────────────────────────────
 
@@ -2339,7 +1454,7 @@ CREATE TABLE `project` (
 "#;
 
     fn make_current_db(path: &Path) {
-        let conn = OpenCode::open_db_rw(path).expect("create db");
+        let conn = Connection::open(path).expect("create db");
         conn.execute_batch(CURRENT_SCHEMA_DDL).expect("ddl");
     }
 
@@ -2353,15 +1468,20 @@ CREATE TABLE `project` (
         assert_eq!(OpenCode::detect_schema(&conn), Some(Schema::Current));
 
         let legacy = tmp.path().join("legacy.db");
-        let conn = OpenCode::open_db_rw(&legacy).expect("create");
-        OpenCode::ensure_schema(&conn).expect("legacy schema");
+        let conn = Connection::open(&legacy).expect("create");
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT);
+             CREATE TABLE messages (id TEXT);
+             CREATE TABLE files (id TEXT);",
+        )
+        .expect("legacy schema");
         drop(conn);
         let conn = OpenCode::open_db(&legacy).expect("open");
         assert_eq!(OpenCode::detect_schema(&conn), Some(Schema::Legacy));
 
         // A database that is neither is reported as neither, not as empty.
         let foreign = tmp.path().join("foreign.db");
-        let conn = OpenCode::open_db_rw(&foreign).expect("create");
+        let conn = Connection::open(&foreign).expect("create");
         conn.execute_batch("CREATE TABLE unrelated (id TEXT)")
             .expect("ddl");
         drop(conn);
@@ -2386,7 +1506,7 @@ CREATE TABLE `project` (
         );
 
         let foreign = tmp.path().join("foreign.db");
-        let conn = OpenCode::open_db_rw(&foreign).expect("create");
+        let conn = Connection::open(&foreign).expect("create");
         conn.execute_batch("CREATE TABLE unrelated (id TEXT)")
             .expect("ddl");
         drop(conn);
@@ -2395,25 +1515,6 @@ CREATE TABLE `project` (
             described.is_err(),
             "an unrecognised database must be an error, not zero sessions: {described:?}"
         );
-    }
-
-    #[test]
-    fn opencode_session_id_brands_foreign_ids_deterministically() {
-        // Already an OpenCode id: left alone, so re-reading a session casr wrote
-        // back into OpenCode does not rename it again.
-        assert_eq!(
-            opencode_session_id("ses_05db873bfffesTmyTPhYKMceqn"),
-            "ses_05db873bfffesTmyTPhYKMceqn"
-        );
-        // A foreign id is folded into OpenCode's branded form, and the same
-        // source always yields the same target.
-        let uuid = "7732146b-7bb7-4d07-9899-1f54565de931";
-        assert_eq!(
-            opencode_session_id(uuid),
-            "ses_7732146b7bb74d0798991f54565de931"
-        );
-        assert_eq!(opencode_session_id(uuid), opencode_session_id(uuid));
-        assert!(opencode_session_id("").starts_with("ses_"));
     }
 
     #[test]
@@ -2459,25 +1560,5 @@ CREATE TABLE `project` (
             "state":{"status":"completed","input":{},"output":"file body","title":"t","metadata":{},
                      "time":{"start":1,"end":2}}})]);
         assert_eq!(content, "file body");
-    }
-
-    #[test]
-    fn monotonic_timestamps_only_moves_time_forward() {
-        let msg = |ts: Option<i64>| CanonicalMessage {
-            idx: 0,
-            role: MessageRole::User,
-            content: String::new(),
-            timestamp: ts,
-            author: None,
-            tool_calls: vec![],
-            tool_results: vec![],
-            extra: serde_json::json!({}),
-        };
-        let messages = vec![msg(Some(100)), msg(Some(90)), msg(None), msg(Some(300))];
-        assert_eq!(
-            monotonic_timestamps(&messages, 42),
-            vec![100, 100, 100, 300],
-            "clamped values must be ones the session already contains"
-        );
     }
 }

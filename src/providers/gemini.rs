@@ -793,9 +793,15 @@ impl Provider for Gemini {
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         let mut json_messages: Vec<serde_json::Value> = Vec::with_capacity(session.messages.len());
+        let preserve_native_extra = session.provider_slug == self.slug();
 
         for (position, msg) in session.messages.iter().enumerate() {
-            json_messages.push(gemini_message_entry(msg, position, &target_session_id));
+            json_messages.push(gemini_message_entry(
+                msg,
+                position,
+                &target_session_id,
+                preserve_native_extra,
+            ));
         }
 
         let root = serde_json::json!({
@@ -1146,6 +1152,7 @@ fn gemini_message_entry(
     msg: &CanonicalMessage,
     position: usize,
     session_id: &str,
+    preserve_native_extra: bool,
 ) -> serde_json::Value {
     let ts = msg
         .timestamp
@@ -1154,13 +1161,15 @@ fn gemini_message_entry(
 
     let mut entry = serde_json::json!({
         "type": gemini_message_type(msg),
-        "content": gemini_message_content(msg),
+        "content": gemini_message_content(msg, preserve_native_extra),
     });
     if let Some(t) = ts {
         entry["timestamp"] = serde_json::Value::String(t);
     }
 
-    merge_gemini_extra_fields(&mut entry, &msg.extra);
+    if preserve_native_extra {
+        merge_gemini_extra_fields(&mut entry, &msg.extra);
+    }
     // After the merge, so a real Gemini id carried in `extra` wins and only a
     // message that has none gets a derived one.
     if !entry.get("id").is_some_and(serde_json::Value::is_string) {
@@ -1437,8 +1446,12 @@ fn gemini_tool_call_result_text(call: &serde_json::Value) -> String {
     String::new()
 }
 
-fn gemini_message_content(msg: &CanonicalMessage) -> serde_json::Value {
-    if let Some(content) = msg.extra.get("content")
+fn gemini_message_content(
+    msg: &CanonicalMessage,
+    preserve_native_extra: bool,
+) -> serde_json::Value {
+    if preserve_native_extra
+        && let Some(content) = msg.extra.get("content")
         && !content.is_null()
     {
         return content.clone();
@@ -1804,13 +1817,39 @@ mod tests {
             }),
         };
 
-        let content = gemini_message_content(&msg);
+        let content = gemini_message_content(&msg, true);
         assert_eq!(
             content,
             json!([
                 {"type": "text", "text": "primary"},
                 {"type": "grounding", "source": "doc://1"}
             ])
+        );
+    }
+
+    #[test]
+    fn message_content_does_not_copy_a_foreign_provider_shape() {
+        let msg = CanonicalMessage {
+            idx: 0,
+            role: MessageRole::User,
+            content: "Canonical words".to_string(),
+            timestamp: None,
+            author: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            extra: json!({
+                "author": {"role": "user"},
+                "content": {
+                    "content_type": "text",
+                    "parts": ["ChatGPT words"]
+                }
+            }),
+        };
+
+        assert_eq!(
+            gemini_message_content(&msg, false),
+            json!("Canonical words"),
+            "foreign extra is provenance, not a Gemini-native payload"
         );
     }
 
@@ -1835,7 +1874,7 @@ mod tests {
             extra: serde_json::Value::Null,
         };
 
-        let content = gemini_message_content(&msg);
+        let content = gemini_message_content(&msg, false);
         let blocks = content
             .as_array()
             .expect("tool-rich Gemini content should serialize as array");
@@ -2233,7 +2272,7 @@ mod tests {
             tool_results: vec![],
             extra: serde_json::Value::Null,
         };
-        let content = gemini_message_content(&msg);
+        let content = gemini_message_content(&msg, false);
         assert!(
             content.is_string(),
             "Gemini content without extra should be plain string"
@@ -2489,11 +2528,11 @@ mod tests {
             extra: serde_json::Value::Null,
         };
 
-        let entry = gemini_message_entry(&msg, 3, "sess-1");
+        let entry = gemini_message_entry(&msg, 3, "sess-1", false);
         assert_eq!(entry["id"], json!("sess-1-m3"));
         // Derived from the position, so re-running the same conversion twice
         // produces the same bytes.
-        assert_eq!(gemini_message_entry(&msg, 3, "sess-1"), entry);
+        assert_eq!(gemini_message_entry(&msg, 3, "sess-1", false), entry);
     }
 
     /// A real Gemini id survives the round trip instead of being overwritten.
@@ -2510,7 +2549,7 @@ mod tests {
             extra: json!({"id": "g-1", "model": "gemini-3-pro"}),
         };
 
-        let entry = gemini_message_entry(&msg, 0, "sess-1");
+        let entry = gemini_message_entry(&msg, 0, "sess-1", true);
         assert_eq!(entry["id"], json!("g-1"));
         assert_eq!(entry["model"], json!("gemini-3-pro"));
     }

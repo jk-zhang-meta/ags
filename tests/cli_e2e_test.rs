@@ -155,6 +155,32 @@ fn setup_gemini_fixture(tmp: &TempDir, fixture_name: &str) -> String {
     session_id
 }
 
+fn setup_opencode_fixture(tmp: &TempDir) -> &'static str {
+    let source = fixtures_dir().join("opencode-current/opencode.db");
+    let target = tmp.path().join("opencode/opencode.db");
+    fs::create_dir_all(target.parent().expect("OpenCode fixture parent"))
+        .expect("create OpenCode home");
+    fs::copy(source, target).expect("copy OpenCode fixture");
+    "ses_imported000000000000001"
+}
+
+fn setup_chatgpt_fixture(tmp: &TempDir) -> &'static str {
+    let source = fixtures_dir().join("chatgpt/chatgpt_simple.json");
+    let dir = tmp.path().join("chatgpt/conversations-fixture");
+    fs::create_dir_all(&dir).expect("create ChatGPT fixture directory");
+    fs::copy(source, dir.join("chatgpt-conv-001.json")).expect("copy ChatGPT fixture");
+    "chatgpt-conv-001"
+}
+
+fn parse_json_error(stderr: &[u8]) -> serde_json::Value {
+    let stderr = String::from_utf8_lossy(stderr);
+    let json_start = stderr
+        .find('{')
+        .unwrap_or_else(|| panic!("JSON error envelope missing: {stderr}"));
+    serde_json::from_str(&stderr[json_start..])
+        .unwrap_or_else(|error| panic!("JSON error should parse: {error}\nOutput: {stderr}"))
+}
+
 /// Put one Gemini session file in the chats directory, byte for byte.
 ///
 /// Separate from [`setup_gemini_fixture`] because these tests need to write a
@@ -1460,71 +1486,39 @@ fn cli_resume_aider_to_cc_works_with_source_hint() {
 }
 
 #[test]
-fn cli_resume_cc_to_opencode_works_and_is_discoverable() {
+fn cli_resume_cc_to_opencode_refuses_real_and_dry_run_without_a_database() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
-        .args(["--json", "resume", "opc", &session_id])
-        .output()
-        .expect("resume should run");
+    for dry_run in [false, true] {
+        let mut args = vec!["--json", "resume", "opc", session_id.as_str()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = casr_cmd(&tmp)
+            .args(args)
+            .output()
+            .expect("resume should run");
+        assert!(!output.status.success(), "OpenCode target must refuse");
+        let error = parse_json_error(&output.stderr);
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("OpenCode is read/resume-only")),
+            "unexpected refusal: {error}"
+        );
+    }
     assert!(
-        output.status.success(),
-        "CC→OpenCode conversion should succeed"
-    );
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("resume --json output should parse");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["target_provider"].as_str().unwrap(), "opencode");
-    let opencode_session_id = parsed["target_session_id"]
-        .as_str()
-        .expect("target_session_id should be present for non-dry-run");
-
-    let opencode_db = tmp.path().join("opencode/opencode.db");
-    assert!(
-        opencode_db.exists(),
-        "OpenCode DB should exist after CC→OpenCode conversion"
-    );
-
-    // The converted OpenCode session now carries a STABLE id derived from the
-    // source session (the #14 fix), so it shares the source CC session's id and
-    // exists under both providers. A bare lookup is therefore ambiguous...
-    casr_cmd(&tmp)
-        .args(["--json", "info", opencode_session_id])
-        .assert()
-        .failure();
-
-    // ...and `--source` resolves it to the OpenCode copy specifically.
-    let info = casr_cmd(&tmp)
-        .args(["--json", "info", opencode_session_id, "--source", "opc"])
-        .output()
-        .expect("info --source should run");
-    assert!(info.status.success(), "info --source opc should succeed");
-    let info_json: serde_json::Value =
-        serde_json::from_slice(&info.stdout).expect("info --json should parse");
-    assert_eq!(
-        info_json["provider"].as_str().unwrap(),
-        "opencode",
-        "--source opc must resolve to the OpenCode session, not the CC source"
+        !tmp.path().join("opencode/opencode.db").exists(),
+        "real and dry-run refusals must not create opencode.db"
     );
 }
 
 #[test]
 fn cli_resume_opencode_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
-    let source_id = setup_cc_fixture(&tmp, "cc_simple");
-
-    let opencode_result = casr_cmd(&tmp)
-        .args(["--json", "resume", "opc", &source_id])
-        .output()
-        .expect("CC→OpenCode seed conversion should run");
-    assert!(opencode_result.status.success());
-    let opencode_json: serde_json::Value =
-        serde_json::from_slice(&opencode_result.stdout).expect("seed conversion JSON should parse");
-    let opencode_session_id = opencode_json["target_session_id"]
-        .as_str()
-        .expect("opencode target_session_id should be present");
+    let opencode_session_id = setup_opencode_fixture(&tmp);
 
     casr_cmd(&tmp)
         .args(["resume", "cc", opencode_session_id, "--source", "opc"])
@@ -1540,48 +1534,39 @@ fn cli_resume_opencode_to_cc_works_with_source_hint() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_resume_cc_to_chatgpt_works_and_is_discoverable() {
+fn cli_resume_cc_to_chatgpt_refuses_real_and_dry_run_without_files() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
-        .args(["--json", "resume", "gpt", &session_id])
-        .output()
-        .expect("resume should run");
+    for dry_run in [false, true] {
+        let mut args = vec!["--json", "resume", "gpt", session_id.as_str()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = casr_cmd(&tmp)
+            .args(args)
+            .output()
+            .expect("resume should run");
+        assert!(!output.status.success(), "ChatGPT target must refuse");
+        let error = parse_json_error(&output.stderr);
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("no supported session import path")),
+            "unexpected refusal: {error}"
+        );
+    }
     assert!(
-        output.status.success(),
-        "CC→ChatGPT conversion should succeed"
+        !tmp.path().join("chatgpt").exists(),
+        "real and dry-run refusals must not create ChatGPT files"
     );
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("resume --json output should parse");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["target_provider"].as_str().unwrap(), "chatgpt");
-    let gpt_session_id = parsed["target_session_id"]
-        .as_str()
-        .expect("target_session_id should be present for non-dry-run");
-
-    casr_cmd(&tmp)
-        .args(["--json", "info", gpt_session_id])
-        .assert()
-        .success();
 }
 
 #[test]
 fn cli_resume_chatgpt_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
-    let source_id = setup_cc_fixture(&tmp, "cc_simple");
-
-    let gpt_result = casr_cmd(&tmp)
-        .args(["--json", "resume", "gpt", &source_id])
-        .output()
-        .expect("CC→ChatGPT seed conversion should run");
-    assert!(gpt_result.status.success());
-    let gpt_json: serde_json::Value =
-        serde_json::from_slice(&gpt_result.stdout).expect("seed conversion JSON should parse");
-    let gpt_session_id = gpt_json["target_session_id"]
-        .as_str()
-        .expect("chatgpt target_session_id should be present");
+    let gpt_session_id = setup_chatgpt_fixture(&tmp);
 
     casr_cmd(&tmp)
         .args(["resume", "cc", gpt_session_id, "--source", "gpt"])

@@ -1,4 +1,4 @@
-//! ChatGPT desktop app provider — reads/writes JSON sessions.
+//! ChatGPT desktop app provider — reads JSON conversation exports.
 //!
 //! Session files are individual JSON files per conversation with a tree-based
 //! `mapping` structure (node IDs → messages with parent pointers).
@@ -29,14 +29,14 @@
 //! no complete directory path exists in the binary as a literal and the exact
 //! concatenation below the prefix is *not* established.
 //!
-//! The plain `conversations-<id>/<id>.json` tree this module reads has no
+//! The plain `conversations-<id>/<id>.json` tree this module can read has no
 //! counterpart in that artifact: the binary has zero occurrences of a
 //! `conversations-<uuid>` name without a version token, and no
 //! `JSONEncoder`/`JSONDecoder` or conversation-related `.json` literal anywhere
-//! near the conversation code. It is the shape casr's own `write_session`
-//! produces and the shape the synthetic fixture uses — not a shape any shipped
-//! app generation has been observed to write. See `is_session_path` for what
-//! that does and does not justify.
+//! near the conversation code. It remains useful for explicitly supplied
+//! exports and fixtures, but it is not a shape any shipped app generation has
+//! been observed to write. See `is_session_path` for what that does and does
+//! not justify.
 //!
 //! ## The `system` turn is a turn
 //!
@@ -46,18 +46,9 @@
 //! tool / developer` at byte 94870708 and `user / assistant / critic / system /
 //! developer` at 94778914.
 //!
-//! [`ChatGpt::write_session`] emits `"system"` for [`MessageRole::System`], and
-//! `pipeline::folded_role` declares chatgpt folds *nothing* — the writer's own
-//! statement that this format can name the role. The reader used to drop every
-//! node whose `author.role` was `"system"` before looking at it. Writer and
-//! reader disagreed about the same file, so a conversion of any session holding
-//! a system turn came back one message short and was rolled back:
-//!
-//! ```text
-//! VerifyFailed: message count mismatch: wrote 3 messages, read back 2
-//! ```
-//!
-//! No vendor rule was being transcribed. What the format has instead is a
+//! The reader used to drop every node whose `author.role` was `"system"`
+//! before looking at it, even though the format names that role directly. What
+//! the format has instead is a
 //! *visibility* marker — `isVisuallyHiddenFromConversation` and
 //! `isUserSystemMessage`, stored properties of `ConversationMessageMetadata`
 //! (byte 85387904/85387936, snake-cased on the wire by
@@ -65,13 +56,9 @@
 //! Across six real exported conversations, every one of the eight `system`
 //! nodes carried `content: {"content_type":"text","parts":[""]}` and
 //! `is_visually_hidden_from_conversation: true`, and **none** carried words:
-//! the empty-content test two branches down already drops all of them. A flag
-//! casr's own writer never emits could not help the round trip either.
-//!
-//! So the fix is the one that changes nothing about reading a real
-//! conversation and everything about reading casr's own: report the role the
-//! file states, and let `normalize_role` hand it to every target with a system
-//! slot of its own.
+//! the empty-content test two branches down already drops all of them. So the
+//! reader reports the role the file states and lets the ordinary
+//! empty-content rule discard wordless hidden nodes.
 //!
 //! Two adjacent read gaps this deliberately does *not* close, named so they are
 //! not mistaken for handled. Custom instructions arrive in two shapes — an
@@ -92,7 +79,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 use walkdir::WalkDir;
 
 use crate::discovery::DetectionResult;
@@ -103,6 +90,10 @@ use crate::model::{
 use crate::providers::{
     Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
 };
+
+const CHATGPT_WRITE_REFUSAL: &str = "ChatGPT has no supported session import path: exported or \
+casr-generated conversation JSON cannot be added to ChatGPT history. Use ChatGPT as a conversion \
+source, not a target.";
 
 /// ChatGPT desktop app provider implementation.
 pub struct ChatGpt;
@@ -169,7 +160,7 @@ impl ChatGpt {
     }
 
     /// `find_conversation_dirs_reporting` for the callers with nowhere to put a
-    /// read failure — `detect`, `session_roots`, `owns_session`, the writer.
+    /// read failure — `detect`, `session_roots`, and `owns_session`.
     fn find_conversation_dirs(base: &Path) -> Vec<(PathBuf, bool)> {
         Self::find_conversation_dirs_reporting(base, &mut Vec::new())
     }
@@ -294,16 +285,12 @@ impl Provider for ChatGpt {
     ///   by the mangled `$s12ObjectLoader25FilenameStringConvertibleP`. So
     ///   "unencrypted" would not buy back a `.json` extension.
     ///
-    /// The rule nevertheless stays, because it is not describing the app's
-    /// store. Every directory the artifact attests to carries a version token
-    /// and is refused before this predicate is ever reached, and off macOS
-    /// `home_dir` resolves to nothing at all. The tree this predicate actually
-    /// governs is the one casr's own `write_session` creates —
-    /// `conversations-<uuid>/<uuid>.json` — which the ten `*_to_chatgpt` tests
-    /// write and `list` must therefore keep showing. Widening it to
-    /// extension-less files would not gain a single real session, and would
-    /// hand the reader arbitrary non-JSON files to fail on, which is the
-    /// "reports a sidecar as an unreadable session" defect in a new place.
+    /// The rule nevertheless stays for explicitly supplied plain export trees.
+    /// Every directory the artifact attests to carries a version token and is
+    /// refused before this predicate is reached, and off macOS `home_dir`
+    /// resolves to nothing at all. Widening it to extension-less files would
+    /// not gain a single verified session and would hand the reader arbitrary
+    /// non-JSON files to fail on.
     ///
     /// ## Still unverified
     ///
@@ -573,110 +560,14 @@ impl Provider for ChatGpt {
 
     fn write_session(
         &self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
+        _session: &CanonicalSession,
+        _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let target_session_id = uuid::Uuid::new_v4().to_string();
+        Err(anyhow::anyhow!(CHATGPT_WRITE_REFUSAL))
+    }
 
-        // Determine target directory.
-        let home = Self::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine ChatGPT home directory"))?;
-
-        // Write into conversations-<uuid>/ directory.
-        let conv_dir = home.join(format!("conversations-{target_session_id}"));
-        let target_path = conv_dir.join(format!("{target_session_id}.json"));
-
-        debug!(
-            target_session_id,
-            target_path = %target_path.display(),
-            "writing ChatGPT session"
-        );
-
-        // Build the ChatGPT mapping structure.
-        let now_secs = chrono::Utc::now().timestamp() as f64;
-        let create_time = session
-            .started_at
-            .map(|ms| ms as f64 / 1000.0)
-            .unwrap_or(now_secs);
-        let update_time = session
-            .ended_at
-            .map(|ms| ms as f64 / 1000.0)
-            .unwrap_or(now_secs);
-
-        let mut mapping = serde_json::Map::new();
-        let mut prev_node_id: Option<String> = None;
-
-        for msg in &session.messages {
-            let node_id = uuid::Uuid::new_v4().to_string();
-            let chatgpt_role = match msg.role {
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                MessageRole::Tool => "tool",
-                MessageRole::System => "system",
-                MessageRole::Other(ref s) => s.as_str(),
-            };
-
-            let msg_ts = msg.timestamp.map(|ms| ms as f64 / 1000.0);
-
-            let mut message_obj = serde_json::json!({
-                "author": {"role": chatgpt_role},
-                "content": {"parts": [msg.content]},
-            });
-
-            if let Some(ts) = msg_ts {
-                message_obj["create_time"] = serde_json::Value::from(ts);
-            }
-
-            // Add model info for assistant messages.
-            if msg.role == MessageRole::Assistant {
-                let model_slug = msg.author.as_deref().or(session.model_name.as_deref());
-                if let Some(slug) = model_slug {
-                    message_obj["metadata"] = serde_json::json!({
-                        "model_slug": slug,
-                    });
-                }
-            }
-
-            let mut node = serde_json::json!({
-                "message": message_obj,
-            });
-
-            node["parent"] = prev_node_id
-                .as_ref()
-                .map(|id| serde_json::Value::String(id.clone()))
-                .unwrap_or(serde_json::Value::Null);
-
-            mapping.insert(node_id.clone(), node);
-            prev_node_id = Some(node_id);
-        }
-
-        let root = serde_json::json!({
-            "id": target_session_id,
-            "title": session.title.as_deref().unwrap_or("Imported conversation"),
-            "create_time": create_time,
-            "update_time": update_time,
-            "mapping": mapping,
-        });
-
-        let content_bytes = serde_json::to_string_pretty(&root)?.into_bytes();
-
-        let outcome =
-            crate::pipeline::atomic_write(&target_path, &content_bytes, opts.force, self.slug())?;
-
-        info!(
-            target_session_id,
-            path = %outcome.target_path.display(),
-            messages = session.messages.len(),
-            "ChatGPT session written"
-        );
-
-        Ok(WrittenSession {
-            paths: vec![outcome.target_path.clone()],
-            session_id: target_session_id.clone(),
-            resume_command: self.resume_command(&target_session_id),
-            backups: outcome.displaced().into_iter().collect(),
-            warnings: Vec::new(),
-        })
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(CHATGPT_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -690,11 +581,11 @@ impl Provider for ChatGpt {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatGpt;
+    use super::{CHATGPT_WRITE_REFUSAL, ChatGpt};
     use serde_json::json;
     use std::io::Write as _;
 
-    use crate::model::{CanonicalMessage, MessageRole};
+    use crate::model::MessageRole;
     use crate::providers::Provider;
 
     /// Write JSON to a temp file and read it back via the ChatGPT reader.
@@ -717,6 +608,7 @@ mod tests {
         assert_eq!(p.name(), "ChatGPT");
         assert_eq!(p.slug(), "chatgpt");
         assert_eq!(p.cli_alias(), "gpt");
+        assert_eq!(p.write_refusal(), Some(CHATGPT_WRITE_REFUSAL));
     }
 
     #[test]
@@ -853,10 +745,9 @@ mod tests {
         assert_eq!(session.messages[1].content, "Second");
     }
 
-    /// `author.role` is read, not filtered on. Dropping the system node here is
-    /// what made `write_session` and `read_session` disagree about the file
-    /// between them — `message count mismatch: wrote 3 messages, read back 2` —
-    /// and roll every such conversion back.
+    /// `author.role` is read, not filtered on. A visible system node is
+    /// conversation content and must not disappear merely because hidden,
+    /// wordless system bookkeeping nodes are common in exports.
     #[test]
     fn reader_mapping_keeps_system_messages() {
         let session = read_chatgpt_json(
@@ -1175,11 +1066,9 @@ mod tests {
         assert_eq!(session.messages[1].role, MessageRole::User);
     }
 
-    /// The whole defect in one test: a session with a system turn has to
-    /// survive its own writer and reader. `pipeline`'s read-back verification
-    /// compares counts first, and this is the pair it compares.
+    /// The mapping reader preserves all roles that carry visible text.
     #[test]
-    fn writer_system_turn_survives_read_back() {
+    fn reader_mapping_preserves_system_user_assistant_roles() {
         let messages = [
             ("system", "You are helpful."),
             ("user", "Question?"),
@@ -1348,210 +1237,6 @@ mod tests {
         assert_eq!(session.messages[1].idx, 1);
         assert_eq!(session.messages[2].idx, 2);
     }
-
-    // -----------------------------------------------------------------------
-    // Writer
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn writer_produces_valid_json() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let session = crate::model::CanonicalSession {
-            session_id: "test-write".to_string(),
-            provider_slug: "chatgpt".to_string(),
-            workspace: Some(dir.path().to_path_buf()),
-            title: Some("Test Write".to_string()),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_010_000),
-            messages: vec![
-                CanonicalMessage {
-                    idx: 0,
-                    role: MessageRole::User,
-                    content: "Hello".to_string(),
-                    timestamp: Some(1_700_000_001_000),
-                    author: None,
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: serde_json::Value::Null,
-                },
-                CanonicalMessage {
-                    idx: 1,
-                    role: MessageRole::Assistant,
-                    content: "Hi there".to_string(),
-                    timestamp: Some(1_700_000_002_000),
-                    author: Some("gpt-4".to_string()),
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: serde_json::Value::Null,
-                },
-            ],
-            metadata: json!({"source": "test"}),
-            source_path: std::path::PathBuf::from("/tmp/test.json"),
-            model_name: Some("gpt-4".to_string()),
-        };
-
-        // Set CHATGPT_HOME to temp dir so writer has a target.
-        // Since we can't use set_var (unsafe), we test the JSON structure
-        // by serializing what the writer would produce.
-        let now_secs = chrono::Utc::now().timestamp() as f64;
-        let mut mapping = serde_json::Map::new();
-        let mut prev_node_id: Option<String> = None;
-
-        for msg in &session.messages {
-            let node_id = uuid::Uuid::new_v4().to_string();
-            let role = match msg.role {
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                _ => "user",
-            };
-            let ts = msg.timestamp.map(|ms| ms as f64 / 1000.0);
-
-            let mut message_obj = json!({
-                "author": {"role": role},
-                "content": {"parts": [msg.content]},
-            });
-            if let Some(t) = ts {
-                message_obj["create_time"] = serde_json::Value::from(t);
-            }
-            if msg.role == MessageRole::Assistant
-                && let Some(ref author) = msg.author
-            {
-                message_obj["metadata"] = json!({"model_slug": author});
-            }
-
-            let mut node = json!({"message": message_obj});
-            node["parent"] = prev_node_id
-                .as_ref()
-                .map(|id| serde_json::Value::String(id.clone()))
-                .unwrap_or(serde_json::Value::Null);
-
-            mapping.insert(node_id.clone(), node);
-            prev_node_id = Some(node_id);
-        }
-
-        let root = json!({
-            "id": "test-id",
-            "title": session.title,
-            "create_time": session.started_at.map(|ms| ms as f64 / 1000.0).unwrap_or(now_secs),
-            "update_time": session.ended_at.map(|ms| ms as f64 / 1000.0).unwrap_or(now_secs),
-            "mapping": mapping,
-        });
-
-        // Verify the JSON is valid and has the expected structure.
-        let serialized = serde_json::to_string_pretty(&root).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
-
-        assert_eq!(parsed["id"], "test-id");
-        assert_eq!(parsed["title"], "Test Write");
-        assert!(parsed["mapping"].is_object());
-        let mapping_obj = parsed["mapping"].as_object().unwrap();
-        assert_eq!(mapping_obj.len(), 2);
-
-        // Verify parent chain.
-        let nodes: Vec<&serde_json::Value> = mapping_obj.values().collect();
-        let root_nodes: Vec<_> = nodes.iter().filter(|n| n["parent"].is_null()).collect();
-        assert_eq!(root_nodes.len(), 1, "should have exactly one root node");
-    }
-
-    #[test]
-    fn writer_roundtrip() {
-        // Create a session, serialize it as ChatGPT JSON, then read it back.
-        let session = crate::model::CanonicalSession {
-            session_id: "roundtrip-test".to_string(),
-            provider_slug: "chatgpt".to_string(),
-            workspace: None,
-            title: Some("Roundtrip Test".to_string()),
-            started_at: Some(1_700_000_000_000),
-            ended_at: Some(1_700_000_010_000),
-            messages: vec![
-                CanonicalMessage {
-                    idx: 0,
-                    role: MessageRole::User,
-                    content: "User says hello".to_string(),
-                    timestamp: Some(1_700_000_001_000),
-                    author: None,
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: serde_json::Value::Null,
-                },
-                CanonicalMessage {
-                    idx: 1,
-                    role: MessageRole::Assistant,
-                    content: "Assistant responds".to_string(),
-                    timestamp: Some(1_700_000_002_000),
-                    author: Some("gpt-4o".to_string()),
-                    tool_calls: vec![],
-                    tool_results: vec![],
-                    extra: serde_json::Value::Null,
-                },
-            ],
-            metadata: json!({"source": "chatgpt"}),
-            source_path: std::path::PathBuf::from("/tmp/test.json"),
-            model_name: Some("gpt-4o".to_string()),
-        };
-
-        // Build the ChatGPT JSON manually (writer logic).
-        let mut mapping = serde_json::Map::new();
-        let mut prev_node_id: Option<String> = None;
-
-        for msg in &session.messages {
-            let node_id = uuid::Uuid::new_v4().to_string();
-            let role = match msg.role {
-                MessageRole::User => "user",
-                MessageRole::Assistant => "assistant",
-                _ => "user",
-            };
-            let ts = msg.timestamp.map(|ms| ms as f64 / 1000.0);
-
-            let mut message_obj = json!({
-                "author": {"role": role},
-                "content": {"parts": [msg.content]},
-            });
-            if let Some(t) = ts {
-                message_obj["create_time"] = serde_json::Value::from(t);
-            }
-            if msg.role == MessageRole::Assistant
-                && let Some(ref author) = msg.author
-            {
-                message_obj["metadata"] = json!({"model_slug": author});
-            }
-
-            let mut node = json!({"message": message_obj});
-            node["parent"] = prev_node_id
-                .as_ref()
-                .map(|id| serde_json::Value::String(id.clone()))
-                .unwrap_or(serde_json::Value::Null);
-
-            mapping.insert(node_id.clone(), node);
-            prev_node_id = Some(node_id);
-        }
-
-        let root = json!({
-            "id": "roundtrip-id",
-            "title": "Roundtrip Test",
-            "create_time": 1700000000.0,
-            "update_time": 1700000010.0,
-            "mapping": mapping,
-        });
-
-        // Write to temp file and read back.
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        tmp.write_all(serde_json::to_string_pretty(&root).unwrap().as_bytes())
-            .unwrap();
-        tmp.flush().unwrap();
-
-        let read_back = ChatGpt.read_session(tmp.path()).unwrap();
-
-        assert_eq!(read_back.session_id, "roundtrip-id");
-        assert_eq!(read_back.title.as_deref(), Some("Roundtrip Test"));
-        assert_eq!(read_back.messages.len(), 2);
-        assert_eq!(read_back.messages[0].role, MessageRole::User);
-        assert_eq!(read_back.messages[0].content, "User says hello");
-        assert_eq!(read_back.messages[1].role, MessageRole::Assistant);
-        assert_eq!(read_back.messages[1].content, "Assistant responds");
-        assert_eq!(read_back.messages[1].author.as_deref(), Some("gpt-4o"));
-    }
-
     // -----------------------------------------------------------------------
     // Owns session
     // -----------------------------------------------------------------------

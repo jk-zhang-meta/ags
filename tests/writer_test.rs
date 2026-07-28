@@ -1092,7 +1092,10 @@ fn writer_gemini_extra_fields_preserved() {
     let _env = EnvGuard::set("GEMINI_HOME", tmp.path());
 
     let mut session = simple_session();
-    // Simulate grounding metadata on the assistant message.
+    // Native Gemini annotations survive a Gemini-to-Gemini rewrite. Foreign
+    // providers' `extra` objects are provenance and must not be copied into
+    // Gemini's target-native message shape.
+    session.provider_slug = Gemini.slug().to_string();
     session.messages[1].extra = serde_json::json!({
         "type": "model",
         "content": "I'll fix that now.",
@@ -1343,136 +1346,29 @@ fn writer_amp_output_has_expected_shape() {
 }
 
 // ===========================================================================
-// ChatGPT writer tests
+// ChatGPT target refusal
 // ===========================================================================
 
 #[test]
-fn writer_chatgpt_roundtrip() {
+fn writer_chatgpt_refuses_default_and_force_without_creating_files() {
     let _lock = CHATGPT_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
 
-    let session = simple_session();
-    let written = ChatGpt
-        .write_session(&session, &WriteOptions { force: false })
-        .expect("ChatGPT write_session should succeed");
-
-    assert_eq!(
-        written.paths.len(),
-        1,
-        "ChatGPT should produce exactly one file"
-    );
-    assert!(
-        written.paths[0].exists(),
-        "ChatGPT output file should exist"
-    );
-    assert!(
-        written.resume_command.contains("chatgpt.com"),
-        "ChatGPT resume command should reference chatgpt.com"
-    );
-
-    let readback = ChatGpt
-        .read_session(&written.paths[0])
-        .expect("ChatGPT read_session should parse written output");
-
-    assert_eq!(
-        readback.messages.len(),
-        session.messages.len(),
-        "ChatGPT roundtrip: message count"
-    );
-    for (i, (orig, rb)) in session
-        .messages
-        .iter()
-        .zip(readback.messages.iter())
-        .enumerate()
-    {
-        assert_eq!(
-            orig.role, rb.role,
-            "ChatGPT roundtrip msg {i}: role mismatch"
-        );
-        assert_eq!(
-            orig.content, rb.content,
-            "ChatGPT roundtrip msg {i}: content mismatch"
+    for force in [false, true] {
+        let error = ChatGpt
+            .write_session(&simple_session(), &WriteOptions { force })
+            .expect_err("ChatGPT target writes must fail closed");
+        assert!(
+            error.to_string().contains("no supported session import path"),
+            "unexpected refusal: {error:#}"
         );
     }
-}
-
-#[test]
-fn writer_chatgpt_output_valid_json_with_mapping() {
-    let _lock = CHATGPT_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
-
-    let written = ChatGpt
-        .write_session(&simple_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let root: serde_json::Value =
-        serde_json::from_str(&content).expect("ChatGPT output should be valid JSON");
-
-    assert!(root["id"].is_string(), "ChatGPT should have string id");
-    assert!(
-        root["mapping"].is_object(),
-        "ChatGPT should have mapping object"
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "refusal must not create a synthetic conversations directory"
     );
-
-    let mapping = root["mapping"].as_object().unwrap();
-    // 4 messages → 4 mapping nodes (plus possible root node).
-    assert!(
-        mapping.len() >= 4,
-        "ChatGPT mapping should have at least 4 nodes, got {}",
-        mapping.len()
-    );
-}
-
-#[test]
-fn writer_chatgpt_timestamps_are_float_seconds() {
-    let _lock = CHATGPT_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
-
-    let written = ChatGpt
-        .write_session(&simple_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let root: serde_json::Value = serde_json::from_str(&content).unwrap();
-
-    // Top-level timestamps should be numeric (seconds).
-    assert!(
-        root["create_time"].is_f64() || root["create_time"].is_i64(),
-        "ChatGPT create_time should be numeric"
-    );
-    assert!(
-        root["update_time"].is_f64() || root["update_time"].is_i64(),
-        "ChatGPT update_time should be numeric"
-    );
-}
-
-#[test]
-fn writer_chatgpt_mapping_has_parent_chain() {
-    let _lock = CHATGPT_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
-
-    let written = ChatGpt
-        .write_session(&simple_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let root: serde_json::Value = serde_json::from_str(&content).unwrap();
-    let mapping = root["mapping"].as_object().unwrap();
-
-    // Every node with a message should have a parent pointer (string or null).
-    for (node_id, node) in mapping {
-        if node.get("message").is_some() {
-            assert!(
-                node.get("parent").is_some(),
-                "ChatGPT mapping node '{node_id}' should have parent field"
-            );
-        }
-    }
 }
 
 // ===========================================================================

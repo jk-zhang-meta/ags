@@ -31,9 +31,13 @@ use casr::{
     },
     model::{CanonicalMessage, CanonicalSession, MessageRole, ToolResult},
     pipeline::{ConversionPipeline, ConvertOptions, validate_session},
+    providers::antigravity::Antigravity,
+    providers::chatgpt::ChatGpt,
     providers::claude_code::ClaudeCode,
     providers::codex::Codex,
     providers::gemini::Gemini,
+    providers::grok::Grok,
+    providers::opencode::OpenCode,
     providers::{Displaced, Provider, StructuredWrite, WriteOptions, WrittenSession},
 };
 
@@ -523,6 +527,59 @@ fn pipeline_dry_run_skips_write() {
         0,
         "dry-run should not call write_session"
     );
+}
+
+fn assert_pipeline_refuses_target_in_every_mode(target: Box<dyn Provider>) {
+    let target_alias = target.cli_alias().to_string();
+    let target_slug = target.slug().to_string();
+    let reason = target
+        .write_refusal()
+        .unwrap_or_else(|| panic!("{target_slug} must declare its target refusal"));
+    let source = MockProvider::new(
+        "Mock Source",
+        "mock-source",
+        "src",
+        vec![PathBuf::from("/tmp/src-root")],
+    );
+    let source_path = PathBuf::from("/tmp/src-root/refused-target.json");
+    source.set_owned_session("sid-refused", source_path.clone());
+    source.set_read_session(source_path, valid_session_with_id("sid-refused"));
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(source), target]),
+        store: None,
+    };
+
+    for (label, force, dry_run) in [
+        ("normal", false, false),
+        ("force", true, false),
+        ("dry-run", false, true),
+    ] {
+        let mut opts = options(dry_run, Some("src".to_string()));
+        opts.force = force;
+        let error = match pipeline.convert(&target_alias, "sid-refused", opts) {
+            Ok(_) => panic!("{target_slug} {label} conversion unexpectedly reported success"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            reason,
+            "{target_slug} {label} refusal drifted"
+        );
+    }
+}
+
+#[test]
+fn every_read_only_target_refuses_normal_force_and_dry_run() {
+    let targets: Vec<Box<dyn Provider>> = vec![
+        Box::new(Antigravity),
+        Box::new(ChatGpt),
+        Box::new(Grok),
+        Box::new(OpenCode),
+    ];
+    for target in targets {
+        assert_pipeline_refuses_target_in_every_mode(target);
+    }
 }
 
 #[test]

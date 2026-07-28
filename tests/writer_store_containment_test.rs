@@ -50,10 +50,6 @@
 //! rejects only *absolute* session ids, deliberately, because a Codex session
 //! id genuinely is the relative `2026/07/27/rollout-…`.
 //!
-//! OpenCode is the counter-example that shows the shape of the fix. Its writer
-//! percent-encodes the id before it becomes a path component, so the same input
-//! stays one component and stays in the store.
-//!
 //! # Read this as a characterisation, not an endorsement
 //!
 //! [`every_writer_contains_a_traversing_session_id`] pins the repaired
@@ -92,8 +88,6 @@ const CONTAINS: &[&str] = &[
     "cline",
     "aider",
     "amp",
-    "opencode",
-    "chatgpt",
     "kiro",
     "clawdbot",
     "vibe",
@@ -108,7 +102,7 @@ const ESCAPES: &[&str] = &[];
 
 /// Providers that refuse to write at all, and say so rather than emitting a
 /// stub their tool would reject.
-const REFUSES: &[&str] = &["antigravity", "grok"];
+const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode"];
 
 // ---------------------------------------------------------------------------
 // Environment sandbox
@@ -394,14 +388,9 @@ fn every_writer_contains_a_traversing_session_id() {
     );
 }
 
-/// The fix already exists in the tree, in one provider.
-///
-/// OpenCode percent-encodes the id on its way into a path, so the same input
-/// that walks four other writers out of their store stays one component here.
-/// Pinned because it is the shape the other five need, and because losing it
-/// would be a silent regression in the only writer that has it.
+/// A hostile id cannot turn a refused OpenCode write into a filesystem effect.
 #[test]
-fn opencode_encodes_a_traversing_id_instead_of_joining_it() {
+fn opencode_refuses_a_traversing_id_without_creating_a_database() {
     let _lock = ENV.lock().unwrap();
     let registry = ProviderRegistry::default_registry();
     let opencode = registry
@@ -414,24 +403,19 @@ fn opencode_encodes_a_traversing_id_instead_of_joining_it() {
     std::fs::create_dir_all(&workspace).expect("workspace");
     let _guards = sandbox(&root);
 
-    let written = opencode
+    let error = opencode
         .write_session(
             &session(TRAVERSING_ID, &workspace),
             &WriteOptions { force: false },
         )
-        .expect("opencode write");
-
-    let last = written.paths[0]
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("a final component");
+        .expect_err("OpenCode target must refuse");
     assert!(
-        !last.contains(std::path::MAIN_SEPARATOR),
-        "the id survived as a path, not as a component: {last:?}"
+        error.to_string().contains("OpenCode is read/resume-only"),
+        "unexpected refusal: {error:#}"
     );
     assert!(
-        last.contains("%2F"),
-        "expected the separators to be percent-encoded, got {last:?}"
+        !root.join("opencode.db").exists(),
+        "refusal must not create opencode.db"
     );
 }
 

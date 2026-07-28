@@ -1,7 +1,8 @@
-//! Round-trip fidelity tests for core conversion paths plus extended provider paths.
+//! Round-trip fidelity and fail-closed target tests.
 //!
-//! Each test: read source fixture → canonical → write to target (temp dir) →
-//! read back → compare canonical fields against original.
+//! Writable targets follow: read source fixture → canonical → write to target
+//! (temp dir) → read back → compare canonical fields against original.
+//! ChatGPT and OpenCode targets instead must refuse without creating state.
 //!
 //! Tests verify: `read_T(write_T(read_S(source))) ≈ read_S(source)` where
 //! S = source provider, T = target provider.
@@ -114,6 +115,44 @@ fn read_gemini_fixture(name: &str) -> CanonicalSession {
     Gemini
         .read_session(&path)
         .unwrap_or_else(|e| panic!("Failed to read Gemini fixture '{name}': {e}"))
+}
+
+/// Read the vendor-shaped OpenCode fixture instead of manufacturing a source
+/// through the provider under test.
+fn read_opencode_fixture() -> CanonicalSession {
+    OpenCode
+        .read_session(&fixtures_dir().join("opencode-current/opencode.db"))
+        .expect("Failed to read current OpenCode fixture")
+}
+
+/// Read an exported ChatGPT mapping fixture. ChatGPT has no supported target
+/// import path, so a writer cannot honestly be used to seed this source.
+fn read_chatgpt_fixture() -> CanonicalSession {
+    ChatGpt
+        .read_session(&fixtures_dir().join("chatgpt/chatgpt_simple.json"))
+        .expect("Failed to read ChatGPT fixture")
+}
+
+fn assert_target_refuses(
+    target: &dyn Provider,
+    session: &CanonicalSession,
+    expected: &str,
+    label: &str,
+) {
+    for force in [false, true] {
+        match target.write_session(session, &WriteOptions { force }) {
+            Err(error) => {
+                assert!(
+                    error.to_string().contains(expected),
+                    "[{label}] unexpected refusal: {error:#}"
+                );
+            }
+            Ok(written) => panic!(
+                "[{label}] a read/resume-only target unexpectedly wrote {:?}",
+                written.paths
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,22 +336,19 @@ fn roundtrip_cursor_to_cc() {
 // ===========================================================================
 
 #[test]
-fn roundtrip_cc_to_opencode() {
+fn opencode_refuses_cc_as_a_target() {
     let _lock = OPENCODE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
 
     let original = read_cc_fixture("cc_simple");
-    let written = OpenCode
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("CC→Opc: write should succeed");
-
-    let readback = OpenCode
-        .read_session(&written.paths[0])
-        .expect("CC→Opc: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "CC→Opc");
-    assert_new_session_id(&readback, "CC→Opc");
+    assert_target_refuses(
+        &OpenCode,
+        &original,
+        "OpenCode is read/resume-only",
+        "CC→Opc",
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 // ===========================================================================
@@ -321,20 +357,7 @@ fn roundtrip_cc_to_opencode() {
 
 #[test]
 fn roundtrip_opencode_to_cc() {
-    let opencode_canonical = {
-        let _opencode_lock = OPENCODE_ENV.lock().unwrap();
-        let opencode_tmp = tempfile::TempDir::new().unwrap();
-        let _opencode_env = EnvGuard::set("OPENCODE_HOME", opencode_tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written_opencode = OpenCode
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Opc write should succeed");
-
-        OpenCode
-            .read_session(&written_opencode.paths[0])
-            .expect("seed Opc read-back should succeed")
-    };
+    let opencode_canonical = read_opencode_fixture();
 
     let _cc_lock = CC_ENV.lock().unwrap();
     let cc_tmp = tempfile::TempDir::new().unwrap();
@@ -781,42 +804,28 @@ fn roundtrip_gmi_missing_workspace_to_cc() {
 // ===========================================================================
 
 #[test]
-fn roundtrip_cc_to_chatgpt() {
+fn chatgpt_refuses_cc_as_a_target() {
     let _lock = CHATGPT_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
 
     let original = read_cc_fixture("cc_simple");
-    let written = ChatGpt
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("CC→ChatGPT: write should succeed");
-
-    let readback = ChatGpt
-        .read_session(&written.paths[0])
-        .expect("CC→ChatGPT: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "CC→ChatGPT");
-    assert_new_session_id(&readback, "CC→ChatGPT");
+    assert_target_refuses(
+        &ChatGpt,
+        &original,
+        "no supported session import path",
+        "CC→ChatGPT",
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
 fn roundtrip_chatgpt_to_cc() {
-    let _lock_gpt = CHATGPT_ENV.lock().unwrap();
     let _lock_cc = CC_ENV.lock().unwrap();
-    let tmp_gpt = tempfile::TempDir::new().unwrap();
     let tmp_cc = tempfile::TempDir::new().unwrap();
-    let _env_gpt = EnvGuard::set("CHATGPT_HOME", tmp_gpt.path());
     let _env_cc = EnvGuard::set("CLAUDE_HOME", tmp_cc.path());
 
-    // Seed: CC → ChatGPT.
-    let original = read_cc_fixture("cc_simple");
-    let written = ChatGpt
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("seed CC→ChatGPT write");
-
-    let gpt_session = ChatGpt
-        .read_session(&written.paths[0])
-        .expect("read ChatGPT");
+    let gpt_session = read_chatgpt_fixture();
 
     // Target: ChatGPT → CC.
     let cc_written = ClaudeCode
@@ -827,7 +836,24 @@ fn roundtrip_chatgpt_to_cc() {
         .read_session(&cc_written.paths[0])
         .expect("read CC back");
 
-    assert_roundtrip_fidelity(&original, &readback, "ChatGPT→CC");
+    assert_roundtrip_fidelity(&gpt_session, &readback, "ChatGPT→CC");
+}
+
+#[test]
+fn roundtrip_chatgpt_to_gemini_uses_canonical_content() {
+    let _lock = GEMINI_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("GEMINI_HOME", tmp.path());
+    let original = read_chatgpt_fixture();
+
+    let written = Gemini
+        .write_session(&original, &WriteOptions { force: false })
+        .expect("ChatGPT→Gemini write should succeed");
+    let readback = Gemini
+        .read_session(&written.paths[0])
+        .expect("ChatGPT→Gemini read-back should succeed");
+
+    assert_roundtrip_fidelity(&original, &readback, "ChatGPT→Gemini");
 }
 
 // ===========================================================================
@@ -1201,19 +1227,7 @@ fn roundtrip_amp_to_codex() {
 
 #[test]
 fn roundtrip_opencode_to_codex() {
-    let opencode_session = {
-        let _lock = OPENCODE_ENV.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written = OpenCode
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→OpenCode");
-        OpenCode
-            .read_session(&written.paths[0])
-            .expect("read OpenCode")
-    };
+    let opencode_session = read_opencode_fixture();
 
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1231,19 +1245,7 @@ fn roundtrip_opencode_to_codex() {
 
 #[test]
 fn roundtrip_chatgpt_to_codex() {
-    let chatgpt_session = {
-        let _lock = CHATGPT_ENV.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written = ChatGpt
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→ChatGPT");
-        ChatGpt
-            .read_session(&written.paths[0])
-            .expect("read ChatGPT")
-    };
+    let chatgpt_session = read_chatgpt_fixture();
 
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1488,41 +1490,35 @@ fn roundtrip_codex_to_amp() {
 }
 
 #[test]
-fn roundtrip_codex_to_opencode() {
+fn opencode_refuses_codex_as_a_target() {
     let _lock = OPENCODE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    let written = OpenCode
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Cod→OpenCode: write should succeed");
-
-    let readback = OpenCode
-        .read_session(&written.paths[0])
-        .expect("Cod→OpenCode: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Cod→OpenCode");
-    assert_new_session_id(&readback, "Cod→OpenCode");
+    assert_target_refuses(
+        &OpenCode,
+        &original,
+        "OpenCode is read/resume-only",
+        "Cod→OpenCode",
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
-fn roundtrip_codex_to_chatgpt() {
+fn chatgpt_refuses_codex_as_a_target() {
     let _lock = CHATGPT_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    let written = ChatGpt
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Cod→ChatGPT: write should succeed");
-
-    let readback = ChatGpt
-        .read_session(&written.paths[0])
-        .expect("Cod→ChatGPT: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Cod→ChatGPT");
-    assert_new_session_id(&readback, "Cod→ChatGPT");
+    assert_target_refuses(
+        &ChatGpt,
+        &original,
+        "no supported session import path",
+        "Cod→ChatGPT",
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -1768,41 +1764,35 @@ fn roundtrip_gemini_to_amp() {
 }
 
 #[test]
-fn roundtrip_gemini_to_opencode() {
+fn opencode_refuses_gemini_as_a_target() {
     let _lock = OPENCODE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
 
     let original = read_gemini_fixture("gmi_simple");
-    let written = OpenCode
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Gmi→OpenCode: write should succeed");
-
-    let readback = OpenCode
-        .read_session(&written.paths[0])
-        .expect("Gmi→OpenCode: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Gmi→OpenCode");
-    assert_new_session_id(&readback, "Gmi→OpenCode");
+    assert_target_refuses(
+        &OpenCode,
+        &original,
+        "OpenCode is read/resume-only",
+        "Gmi→OpenCode",
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
-fn roundtrip_gemini_to_chatgpt() {
+fn chatgpt_refuses_gemini_as_a_target() {
     let _lock = CHATGPT_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CHATGPT_HOME", tmp.path());
 
     let original = read_gemini_fixture("gmi_simple");
-    let written = ChatGpt
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Gmi→ChatGPT: write should succeed");
-
-    let readback = ChatGpt
-        .read_session(&written.paths[0])
-        .expect("Gmi→ChatGPT: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Gmi→ChatGPT");
-    assert_new_session_id(&readback, "Gmi→ChatGPT");
+    assert_target_refuses(
+        &ChatGpt,
+        &original,
+        "no supported session import path",
+        "Gmi→ChatGPT",
+    );
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -1904,7 +1894,8 @@ fn roundtrip_gemini_to_piagent() {
 // Cross-provider pairs (representative selection among non-CC/Codex/Gemini)
 // ===========================================================================
 
-/// Helper: create a canonical session via CC→Source→read-back, then test Source→Target roundtrip.
+/// Exercise a source/target pair. Read/resume-only sources come from vendor
+/// fixtures; read/resume-only targets must refuse without filesystem effects.
 fn cross_provider_roundtrip(
     source: &dyn Provider,
     source_env_key: &'static str,
@@ -1914,25 +1905,40 @@ fn cross_provider_roundtrip(
     target_lock: &'static test_env::EnvLock,
     label: &str,
 ) {
-    // Step 1: Create source session (seed from CC fixture → write to source → read back).
-    let source_session = {
-        let _lock = source_lock.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set(source_env_key, tmp.path());
+    let source_session = match source.slug() {
+        "chatgpt" => read_chatgpt_fixture(),
+        "opencode" => read_opencode_fixture(),
+        _ => {
+            let _lock = source_lock.lock().unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _env = EnvGuard::set(source_env_key, tmp.path());
 
-        let seed = read_cc_fixture("cc_simple");
-        let written = source
-            .write_session(&seed, &WriteOptions { force: false })
-            .unwrap_or_else(|e| panic!("[{label}] seed write failed: {e}"));
-        source
-            .read_session(&written.paths[0])
-            .unwrap_or_else(|e| panic!("[{label}] seed read-back failed: {e}"))
+            let seed = read_cc_fixture("cc_simple");
+            let written = source
+                .write_session(&seed, &WriteOptions { force: false })
+                .unwrap_or_else(|e| panic!("[{label}] seed write failed: {e}"));
+            source
+                .read_session(&written.paths[0])
+                .unwrap_or_else(|e| panic!("[{label}] seed read-back failed: {e}"))
+        }
     };
 
-    // Step 2: Write source session to target, read back, compare.
     let _lock = target_lock.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set(target_env_key, tmp.path());
+
+    if let Some(reason) = target.write_refusal() {
+        let error = target
+            .write_session(&source_session, &WriteOptions { force: false })
+            .expect_err("read/resume-only target must refuse");
+        assert_eq!(error.to_string(), reason, "[{label}] refusal drifted");
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            0,
+            "[{label}] refusal created target-store state"
+        );
+        return;
+    }
 
     let written = target
         .write_session(&source_session, &WriteOptions { force: false })
@@ -1985,7 +1991,7 @@ fn roundtrip_aider_to_amp() {
 }
 
 #[test]
-fn roundtrip_amp_to_opencode() {
+fn opencode_refuses_amp_as_a_target() {
     cross_provider_roundtrip(
         &Amp,
         "XDG_DATA_HOME",
@@ -1998,7 +2004,7 @@ fn roundtrip_amp_to_opencode() {
 }
 
 #[test]
-fn roundtrip_opencode_to_chatgpt() {
+fn chatgpt_refuses_opencode_as_a_target() {
     cross_provider_roundtrip(
         &OpenCode,
         "OPENCODE_HOME",
@@ -2093,7 +2099,7 @@ fn roundtrip_piagent_to_cursor() {
 // ===========================================================================
 
 #[test]
-fn roundtrip_cursor_to_chatgpt() {
+fn chatgpt_refuses_cursor_as_a_target() {
     cross_provider_roundtrip(
         &Cursor,
         "CURSOR_HOME",
@@ -2197,7 +2203,7 @@ fn roundtrip_factory_to_amp() {
 }
 
 #[test]
-fn roundtrip_openclaw_to_opencode() {
+fn opencode_refuses_openclaw_as_a_target() {
     cross_provider_roundtrip(
         &OpenClaw,
         "OPENCLAW_HOME",
@@ -2223,9 +2229,10 @@ fn roundtrip_piagent_to_clawdbot() {
 }
 
 // ===========================================================================
-// Newer-6 full pairwise matrix (bd-1bh.39)
-// ChatGPT, ClawdBot, Vibe, Factory, OpenClaw, PiAgent — all 30 directed pairs.
-// Tests above already cover 7: ChatGPT→ClawdBot, ChatGPT→PiAgent,
+// Newer-6 pairwise behavior matrix (bd-1bh.39).
+// ChatGPT is a fixture-backed source and a fail-closed target; the other five
+// providers still exercise both write/read directions. Tests above cover 7:
+// ChatGPT→ClawdBot, ChatGPT→PiAgent,
 // ClawdBot→Vibe, Vibe→Factory, Factory→OpenClaw, OpenClaw→PiAgent,
 // PiAgent→ClawdBot. Remaining 23 pairs below.
 // ===========================================================================
@@ -2270,7 +2277,7 @@ fn roundtrip_chatgpt_to_openclaw() {
 }
 
 #[test]
-fn roundtrip_clawdbot_to_chatgpt() {
+fn chatgpt_refuses_clawdbot_as_a_target() {
     cross_provider_roundtrip(
         &ClawdBot,
         "CLAWDBOT_HOME",
@@ -2322,7 +2329,7 @@ fn roundtrip_clawdbot_to_piagent() {
 }
 
 #[test]
-fn roundtrip_vibe_to_chatgpt() {
+fn chatgpt_refuses_vibe_as_a_target() {
     cross_provider_roundtrip(
         &Vibe,
         "VIBE_HOME",
@@ -2374,7 +2381,7 @@ fn roundtrip_vibe_to_piagent() {
 }
 
 #[test]
-fn roundtrip_factory_to_chatgpt() {
+fn chatgpt_refuses_factory_as_a_target() {
     cross_provider_roundtrip(
         &Factory,
         "FACTORY_HOME",
@@ -2426,7 +2433,7 @@ fn roundtrip_factory_to_piagent() {
 }
 
 #[test]
-fn roundtrip_openclaw_to_chatgpt() {
+fn chatgpt_refuses_openclaw_as_a_target() {
     cross_provider_roundtrip(
         &OpenClaw,
         "OPENCLAW_HOME",
@@ -2478,7 +2485,7 @@ fn roundtrip_openclaw_to_factory() {
 }
 
 #[test]
-fn roundtrip_piagent_to_chatgpt() {
+fn chatgpt_refuses_piagent_as_a_target() {
     cross_provider_roundtrip(
         &PiAgent,
         "PI_AGENT_HOME",

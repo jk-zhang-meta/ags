@@ -585,6 +585,14 @@ but resume may fail until the CLI is installed.",
             });
         }
 
+        // A dry run predicts the write path; it must not bypass a provider's
+        // declaration that no natively resumable write path exists. Keep this
+        // after the same-provider short-circuit because resuming an existing
+        // native session does not write anything.
+        if let Some(reason) = target_provider.write_refusal() {
+            return Err(anyhow::anyhow!(reason));
+        }
+
         // 7a1. Track selection.
         //
         // The structured track is taken only when both ends support it: an IR
@@ -794,9 +802,9 @@ but resume may fail until the CLI is installed.",
         //
         // A tool call reaches a target twice over: structurally, in
         // [`CanonicalMessage::tool_calls`], and as prose, as `[Tool: <name>]`
-        // inside [`CanonicalMessage::content`]. Seven of the fifteen writable
+        // inside [`CanonicalMessage::content`]. Six of the thirteen writable
         // targets have only the second channel — clawdbot, vibe, factory,
-        // pi-agent, cursor, aider and chatgpt write `content` and nothing else
+        // pi-agent, cursor and aider write `content` and nothing else
         // — so for those, whatever `content` does not say when the writer runs
         // is not in the session the model resumes. This step makes `content`
         // self-sufficient for exactly those targets: it renders the calls the
@@ -1594,7 +1602,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 pub fn writer_carries_tool_calls(target_slug: &str) -> bool {
     matches!(
         target_slug,
-        "claude-code" | "codex" | "gemini" | "cline" | "amp" | "opencode" | "openclaw" | "kiro"
+        "claude-code" | "codex" | "gemini" | "cline" | "amp" | "openclaw" | "kiro"
     )
 }
 

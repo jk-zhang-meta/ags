@@ -97,6 +97,10 @@ use crate::providers::{
 /// Antigravity CLI provider implementation.
 pub struct Antigravity;
 
+const ANTIGRAVITY_WRITE_REFUSAL: &str = "Antigravity (agy) is read/resume-only: casr cannot \
+create a resumable agy conversation from another provider's history. Use agy as a conversion \
+SOURCE (e.g. `casr cc resume <agy-uuid> --source agy`), not a target.";
+
 impl Antigravity {
     /// Root directory for the shared Gemini family data.
     /// Respects the `GEMINI_HOME` env var override (shared with the legacy
@@ -372,11 +376,11 @@ impl Provider for Antigravity {
         // plus the sibling `brain/<uuid>/` working tree). There is no supported
         // way to synthesize a *resumable* conversation from foreign session
         // history, so we refuse rather than write an un-resumable stub.
-        Err(anyhow::anyhow!(
-            "Antigravity (agy) is read/resume-only: casr cannot create a resumable \
-             agy conversation from another provider's history. Use agy as a conversion \
-             SOURCE (e.g. `casr cc resume <agy-uuid> --source agy`), not a target."
-        ))
+        Err(anyhow::anyhow!(ANTIGRAVITY_WRITE_REFUSAL))
+    }
+
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(ANTIGRAVITY_WRITE_REFUSAL)
     }
 
     /// `agy --conversation <uuid>`, with no `--model` / `--effort` pin. See the
@@ -509,8 +513,8 @@ fn step_to_message(step: &serde_json::Value) -> Option<CanonicalMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Antigravity, is_housekeeping_type, list_conversations_in, role_for_source, step_to_message,
-        unwrap_user_request,
+        ANTIGRAVITY_WRITE_REFUSAL, Antigravity, is_housekeeping_type, list_conversations_in,
+        role_for_source, step_to_message, unwrap_user_request,
     };
     use crate::model::MessageRole;
     use crate::providers::Provider;
@@ -644,6 +648,7 @@ mod tests {
         assert_eq!(p.name(), "Antigravity CLI");
         assert_eq!(p.slug(), "antigravity");
         assert_eq!(p.cli_alias(), "agy");
+        assert_eq!(p.write_refusal(), Some(ANTIGRAVITY_WRITE_REFUSAL));
     }
 
     /// The resume command must be exactly what the shipped `agy` accepts.
@@ -692,7 +697,7 @@ mod tests {
         let err = p
             .write_session(&session, &opts)
             .expect_err("agy must refuse writes");
-        assert!(err.to_string().contains("read/resume-only"));
+        assert_eq!(err.to_string(), ANTIGRAVITY_WRITE_REFUSAL);
     }
 
     // -----------------------------------------------------------------------

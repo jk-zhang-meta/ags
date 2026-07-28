@@ -74,6 +74,9 @@ use crate::providers::{
 
 /// Provider slug used in canonical metadata.
 const SLUG: &str = "grok";
+const GROK_WRITE_REFUSAL: &str = "Grok Build (grok) is read/resume-only for now: casr cannot yet \
+create a resumable Grok session from another provider's history. Use Grok as a conversion SOURCE \
+(e.g. `casr cc resume <grok-session-id> --source grk`), not a target.";
 
 /// Grok Build provider implementation.
 pub struct Grok;
@@ -794,12 +797,11 @@ impl Provider for Grok {
         // SQLite search index), and a synthesized tree has not yet been
         // round-trip verified against a live `grok --resume`. Refuse rather
         // than write a stub the CLI may reject or mis-restore.
-        Err(anyhow::anyhow!(
-            "Grok Build (grok) is read/resume-only for now: casr cannot yet create a \
-             resumable Grok session from another provider's history. Use Grok as a \
-             conversion SOURCE (e.g. `casr cc resume <grok-session-id> --source grk`), \
-             not a target."
-        ))
+        Err(anyhow::anyhow!(GROK_WRITE_REFUSAL))
+    }
+
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(GROK_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -1232,6 +1234,7 @@ mod tests {
         assert_eq!(p.name(), "Grok Build");
         assert_eq!(p.slug(), "grok");
         assert_eq!(p.cli_alias(), "grk");
+        assert_eq!(p.write_refusal(), Some(GROK_WRITE_REFUSAL));
     }
 
     #[test]
@@ -1259,7 +1262,6 @@ mod tests {
         let err = Grok
             .write_session(&session, &WriteOptions { force: false })
             .expect_err("grok must refuse writes");
-        assert!(err.to_string().contains("read/resume-only"));
-        assert!(err.to_string().contains("SOURCE"));
+        assert_eq!(err.to_string(), GROK_WRITE_REFUSAL);
     }
 }
