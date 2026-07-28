@@ -12,9 +12,9 @@
 //!
 //! # What this pins
 //!
-//! With a well-formed id every writer lands inside its own declared root. With
-//! an id that contains `../` five of them do not, and the file lands outside
-//! every root the provider declares:
+//! With a well-formed id every writer lands inside its own declared root. An id
+//! containing `../` must be encoded before it becomes a target-store component,
+//! so the resulting file stays under the provider's declared root:
 //!
 //! | writer   | target it builds                              |
 //! |----------|-----------------------------------------------|
@@ -24,9 +24,9 @@
 //! | Vibe     | `<home>/logs/session/{id}/messages.jsonl`     |
 //! | Pi-Agent | `<home>/sessions/{timestamp}_{id}.jsonl`      |
 //!
-//! None of them constrains `{id}` to a single path component, and
-//! [`casr::pipeline::atomic_write`] calls `create_dir_all` on whatever parent
-//! falls out, so the traversal is materialised rather than refused.
+//! These target stores are flat at the id boundary. [`casr::pipeline::atomic_write`]
+//! calls `create_dir_all` on the supplied parent, so letting an incoming id
+//! supply that parent would materialise a traversal.
 //!
 //! # Why a hostile id may not need to be typed to reach it
 //!
@@ -56,13 +56,10 @@
 //!
 //! # Read this as a characterisation, not an endorsement
 //!
-//! [`five_writers_escape_the_store_when_the_session_id_traverses`] asserts the
-//! behaviour as measured at this commit so that a change to it is a visible
-//! diff rather than a silent one. It is a defect. Fixing it — by rejecting or
-//! encoding a multi-component id in those five writers, as OpenCode already
-//! does — is *expected* to fail that test, and the correct response is to move
-//! the writer's name from `ESCAPES` to `CONTAINS` here, not to relax the
-//! assertion.
+//! [`every_writer_contains_a_traversing_session_id`] pins the repaired
+//! behaviour. A newly found escaping writer belongs in `ESCAPES` until its
+//! writer is fixed; fixing it means moving that name to `CONTAINS`, never
+//! weakening the containment assertion.
 
 mod test_env;
 
@@ -85,7 +82,7 @@ const PLAIN_ID: &str = "019c3eae-94c3-7d73-9b2a-9edb18f1563b";
 /// absorbs the first component.
 const TRAVERSING_ID: &str = "../../../../../../escaped";
 
-/// The writers whose target path stayed inside their own declared roots when
+/// The writers whose target path stays inside their own declared roots when
 /// handed [`TRAVERSING_ID`].
 const CONTAINS: &[&str] = &[
     "claude-code",
@@ -98,11 +95,16 @@ const CONTAINS: &[&str] = &[
     "opencode",
     "chatgpt",
     "kiro",
+    "clawdbot",
+    "vibe",
+    "factory",
+    "openclaw",
+    "pi-agent",
 ];
 
-/// The writers whose target path left every root they declare. A defect; see
-/// the module docs.
-const ESCAPES: &[&str] = &["clawdbot", "vibe", "factory", "openclaw", "pi-agent"];
+/// A newly discovered escaping writer belongs here until it is fixed by moving
+/// it to [`CONTAINS`].
+const ESCAPES: &[&str] = &[];
 
 /// Providers that refuse to write at all, and say so rather than emitting a
 /// stub their tool would reject.
@@ -351,15 +353,13 @@ fn every_writer_reports_an_id_that_resolves_to_what_it_wrote() {
     });
 }
 
-/// **This asserts a defect.** See the module docs before changing it.
+/// Every writer keeps a traversing source id inside its declared store.
 ///
-/// Five writers join the incoming session id into a filesystem path without
-/// constraining it to one component. Handed an id that traverses, they write
-/// outside every root they declare — where neither the agent's own picker nor
-/// `casr list` will ever see it, and where an existing file is overwritten if
-/// one is in the way.
+/// A target provider may not treat an incoming canonical id as a path. Writers
+/// that need a flat native id percent-encode it before it reaches the filename,
+/// header, or returned resume command.
 #[test]
-fn five_writers_escape_the_store_when_the_session_id_traverses() {
+fn every_writer_contains_a_traversing_session_id() {
     let _lock = ENV.lock().unwrap();
     let mut contained = Vec::new();
     let mut escaped = Vec::new();
@@ -445,8 +445,7 @@ fn opencode_encodes_a_traversing_id_instead_of_joining_it() {
 /// half of the defect above: a source file supplied the value that walked five
 /// writers out of their store.
 ///
-/// It was closed in the same round by an unrelated change, which is why this
-/// test now asserts the opposite of what it was written to assert. Amp's
+/// It was closed in the same round by an unrelated change. Amp's
 /// `read_session` was flipped to prefer the filename stem because Amp's own
 /// *storage* layer keys on the filename (`get(key)` is
 /// `joinPath(root, key + ".json")`) while only its product layer keys on the
@@ -457,10 +456,9 @@ fn opencode_encodes_a_traversing_id_instead_of_joining_it() {
 ///
 /// Two things this does NOT establish, both deliberately left open:
 ///
-/// * The writer-side defect is untouched. Five writers still join an
-///   unconstrained id into a path — `five_writers_escape_the_store_when_the_
-///   session_id_traverses` above still passes, which is the point of keeping
-///   it. Closing one delivery route is not fixing the hole.
+/// * Writer-side containment is independently pinned by
+///   [`every_writer_contains_a_traversing_session_id`]. Closing one delivery
+///   route was not the writer fix.
 /// * Whether another reader can still supply a traversing id from content was
 ///   not surveyed. Amp was the one measured, not the only one possible.
 #[test]

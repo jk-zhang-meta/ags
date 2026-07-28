@@ -41,7 +41,7 @@ use crate::discovery::DetectionResult;
 use crate::launch::LaunchSpec;
 use crate::model::{CanonicalSession, MessageRole, truncate_title};
 use crate::providers::pi_session;
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, WriteOptions, WrittenSession, filename_safe_session_id};
 
 /// Pi-Agent provider implementation.
 pub struct PiAgent;
@@ -508,6 +508,7 @@ impl Provider for PiAgent {
             let now = chrono::Utc::now();
             format!("{}_{}", now.format("%Y-%m-%dT%H-%M-%S"), session.session_id)
         };
+        let session_id = filename_safe_session_id(&session_id);
 
         // Session header.
         //

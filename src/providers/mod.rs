@@ -218,6 +218,16 @@ pub fn walk_entry_reporting(
     }
 }
 
+/// Convert a canonical id into one filename-safe target-provider id.
+///
+/// A canonical id can legitimately contain separators (Codex rollouts do),
+/// but a flat provider store must never interpret those separators as path
+/// components. Writers use the returned value consistently for the filename,
+/// native header, and resume command.
+pub(crate) fn filename_safe_session_id(session_id: &str) -> String {
+    urlencoding::encode(session_id).into_owned()
+}
+
 /// Options controlling how a session is written to disk.
 #[derive(Debug, Clone)]
 pub struct WriteOptions {

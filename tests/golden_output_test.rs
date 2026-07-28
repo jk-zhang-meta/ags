@@ -989,9 +989,9 @@ mod gemini_golden {
         let root: serde_json::Value = serde_json::from_str(&content).unwrap();
         let messages = root["messages"].as_array().unwrap();
 
-        // simple_session: User, Assistant, User → "user", "model", "user"
+        // simple_session: User, Assistant, User → "user", "gemini", "user"
         assert_eq!(messages[0]["type"], "user");
-        assert_eq!(messages[1]["type"], "model");
+        assert_eq!(messages[1]["type"], "gemini");
         assert_eq!(messages[2]["type"], "user");
     }
 
@@ -1198,10 +1198,11 @@ mod negative {
         assert_eq!(meta_count, 1, "should have exactly one session_meta");
     }
 
-    /// Verify Gemini uses "model" (not "assistant") for assistant messages.
+    /// Verify Gemini uses "gemini" (not "assistant" or legacy "model") for
+    /// assistant messages.
     /// A symmetric bug could use "assistant" in both reader and writer.
     #[test]
-    fn negative_gemini_uses_model_not_assistant() {
+    fn negative_gemini_uses_gemini_not_assistant_or_model() {
         let _lock = GEMINI_ENV.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let _guard = EnvGuard::set("GEMINI_HOME", tmp.path());
@@ -1218,7 +1219,11 @@ mod negative {
             let msg_type = msg["type"].as_str().unwrap();
             assert_ne!(
                 msg_type, "assistant",
-                "Gemini should never use 'assistant' type — should be 'model'"
+                "Gemini should never use 'assistant' type — assistant turns use 'gemini'"
+            );
+            assert_ne!(
+                msg_type, "model",
+                "Gemini should never emit legacy 'model' type — assistant turns use 'gemini'"
             );
         }
     }

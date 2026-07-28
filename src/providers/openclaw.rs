@@ -115,8 +115,8 @@ use crate::model::{
     parse_timestamp, reindex_messages, truncate_title,
 };
 use crate::providers::{
-    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
-    walk_entry_reporting,
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession,
+    filename_safe_session_id, read_dir_reporting, walk_entry_reporting,
 };
 
 /// OpenClaw's default agent id. Sessions are keyed by agent, and an agent id is
@@ -1151,6 +1151,7 @@ impl Provider for OpenClaw {
         } else {
             session.session_id.clone()
         };
+        let session_id = filename_safe_session_id(&session_id);
 
         let target_dir = Self::home_dir();
         let target_path = target_dir.join(format!("{session_id}.jsonl"));

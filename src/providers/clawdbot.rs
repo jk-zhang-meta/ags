@@ -57,8 +57,8 @@ use crate::discovery::DetectionResult;
 use crate::model::{CanonicalSession, MessageRole, truncate_title};
 use crate::providers::pi_session;
 use crate::providers::{
-    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
-    walk_entry_reporting,
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession,
+    filename_safe_session_id, read_dir_reporting, walk_entry_reporting,
 };
 
 /// ClawdBot's default agent id (`dist/routing/session-key.js`:
@@ -352,6 +352,7 @@ impl Provider for ClawdBot {
         } else {
             session.session_id.clone()
         };
+        let session_id = filename_safe_session_id(&session_id);
 
         let target_dir = Self::home_dir();
         let target_path = target_dir.join(format!("{session_id}.jsonl"));

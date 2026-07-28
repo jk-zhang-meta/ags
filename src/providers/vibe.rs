@@ -27,7 +27,7 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, WriteOptions, WrittenSession, filename_safe_session_id};
 
 /// Vibe provider implementation.
 pub struct Vibe;
@@ -327,6 +327,7 @@ impl Provider for Vibe {
         } else {
             session.session_id.clone()
         };
+        let session_id = filename_safe_session_id(&session_id);
 
         let target_dir = Self::home_dir().join(&session_id);
         let target_path = target_dir.join("messages.jsonl");

@@ -996,13 +996,13 @@ fn writer_gemini_message_types() {
 
     assert_eq!(messages[0]["type"], "user", "Gemini msg 0 should be 'user'");
     assert_eq!(
-        messages[1]["type"], "model",
-        "Gemini msg 1 should be 'model'"
+        messages[1]["type"], "gemini",
+        "Gemini msg 1 should be 'gemini'"
     );
     assert_eq!(messages[2]["type"], "user", "Gemini msg 2 should be 'user'");
     assert_eq!(
-        messages[3]["type"], "model",
-        "Gemini msg 3 should be 'model'"
+        messages[3]["type"], "gemini",
+        "Gemini msg 3 should be 'gemini'"
     );
 }
 

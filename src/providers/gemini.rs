@@ -42,7 +42,8 @@
 //! }
 //! ```
 //!
-//! Note: Gemini may use `"gemini"` or `"model"` for assistant responses.
+//! Note: historical files may use `"model"` for assistant responses. The
+//! current CLI accepts and writes `"gemini"`, which this writer emits.
 //!
 //! ## JSONL — a fold, not a log
 //!
@@ -613,7 +614,8 @@ impl Provider for Gemini {
         let mut messages: Vec<CanonicalMessage> = Vec::new();
 
         for (i, msg) in msg_array.iter().enumerate() {
-            // Role: Gemini uses "type" field with "user" or "model".
+            // Role: historical Gemini files use "model"; current files use
+            // "gemini". Both normalize to Assistant.
             let role_str = msg
                 .get("type")
                 .or_else(|| msg.get("role"))
@@ -1170,7 +1172,7 @@ fn gemini_message_entry(
 fn gemini_message_type(msg: &CanonicalMessage) -> String {
     match msg.role {
         MessageRole::User => "user".to_string(),
-        MessageRole::Assistant => "model".to_string(),
+        MessageRole::Assistant => "gemini".to_string(),
         MessageRole::Tool => "tool".to_string(),
         MessageRole::System => "system".to_string(),
         MessageRole::Other(ref other) => other.clone(),
@@ -2514,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_assistant_type_is_model() {
+    fn writer_assistant_type_is_gemini() {
         let msg = CanonicalMessage {
             idx: 0,
             role: MessageRole::Assistant,
@@ -2525,6 +2527,6 @@ mod tests {
             tool_results: vec![],
             extra: serde_json::Value::Null,
         };
-        assert_eq!(gemini_message_type(&msg), "model");
+        assert_eq!(gemini_message_type(&msg), "gemini");
     }
 }

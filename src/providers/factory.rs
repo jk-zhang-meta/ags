@@ -30,7 +30,7 @@ use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, WriteOptions, WrittenSession};
+use crate::providers::{Provider, WriteOptions, WrittenSession, filename_safe_session_id};
 
 /// Factory provider implementation.
 pub struct Factory;
@@ -533,6 +533,7 @@ impl Provider for Factory {
         } else {
             session.session_id.clone()
         };
+        let session_id = filename_safe_session_id(&session_id);
 
         let workspace_slug = session
             .workspace
