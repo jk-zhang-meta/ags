@@ -193,7 +193,7 @@ fn an_empty_session_id_targets_nothing() {
     }
 }
 
-/// Pi-Agent is launched at the file it wrote, whatever its home is called.
+/// Pi-Agent's path argument survives a home directory with a space in it.
 ///
 /// The only provider whose resume form interpolates a filesystem path. Rendered
 /// to a string and split back apart, `PI_AGENT_HOME=/tmp/Pi Home` produced
@@ -201,12 +201,19 @@ fn an_empty_session_id_targets_nothing() {
 /// `/tmp/Pi`, and the stray third word still contained the id, so the launcher
 /// reported the session as targeted. The spec is built from the path now rather
 /// than recovered from a rendering of it.
+///
+/// `/tmp/Pi Home` holds no session, which is the point of using it here: an id
+/// that names no file on disk is answered with the flat `sessions/<id>.jsonl`
+/// location, the only one an id alone can name. Where the session *does* exist
+/// the answer is the file itself — `pi_is_launched_at_the_file_it_wrote`.
 #[test]
-fn pi_is_launched_at_the_session_path_it_wrote() {
+fn pi_path_argument_survives_a_home_with_a_space() {
     let _lock = ENV.lock().unwrap();
     let _guard = EnvGuard::set("PI_AGENT_HOME", "/tmp/Pi Home");
     let registry = ProviderRegistry::default_registry();
-    let pi = registry.find_by_slug("pi-agent").expect("pi-agent in registry");
+    let pi = registry
+        .find_by_slug("pi-agent")
+        .expect("pi-agent in registry");
     let spec = pi.launch_spec(SESSION).expect("spec");
 
     assert_eq!(spec.program, "pi");
@@ -222,6 +229,106 @@ fn pi_is_launched_at_the_session_path_it_wrote() {
     // And the displayed form still parses back to what runs.
     let reparsed = LaunchSpec::from_command_line(&spec.display()).expect("display re-parses");
     assert_eq!(reparsed.args, spec.args);
+}
+
+/// Pi-Agent is launched at the file it wrote, wherever the workspace put it.
+///
+/// `pi` offers a session in `pi --resume` and `/sessions` only out of the two
+/// directories its listers read — `<agent-dir>/sessions/<dir>/*.jsonl` for
+/// `listAll` and `getDefaultSessionDir(cwd)` flat for `list` — so the writer
+/// files a converted session under the encoded workspace name rather than
+/// beside `sessions/`. That makes the location a function of the session's
+/// workspace and not of its id, which is why the launch spec finds the file
+/// instead of computing its path. Measured against
+/// `@mariozechner/pi-coding-agent@0.73.1`: both listers return this file, and
+/// neither returns the same session at `sessions/<id>.jsonl`.
+#[test]
+fn pi_is_launched_at_the_file_it_wrote() {
+    let _lock = ENV.lock().unwrap();
+    let home = tempfile::TempDir::new().expect("tempdir");
+    let _guard = EnvGuard::set("PI_AGENT_HOME", &home.path().display().to_string());
+    let registry = ProviderRegistry::default_registry();
+    let pi = registry
+        .find_by_slug("pi-agent")
+        .expect("pi-agent in registry");
+
+    let session = casr::model::CanonicalSession {
+        session_id: format!("2026-01-01T00-00-00_{SESSION}"),
+        provider_slug: "test-source".to_string(),
+        workspace: Some(std::path::PathBuf::from("/data/projects/myapp")),
+        title: None,
+        started_at: Some(1_700_000_000_000),
+        ended_at: Some(1_700_000_000_000),
+        messages: vec![casr::model::CanonicalMessage {
+            idx: 0,
+            role: casr::model::MessageRole::User,
+            content: "hello".to_string(),
+            timestamp: Some(1_700_000_000_000),
+            author: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            extra: serde_json::Value::Null,
+        }],
+        model_name: None,
+        metadata: serde_json::Value::Null,
+        source_path: std::path::PathBuf::from("/dev/null"),
+    };
+
+    let written = pi
+        .write_session(&session, &casr::providers::WriteOptions { force: false })
+        .expect("write_session");
+
+    let expected = home
+        .path()
+        .join("sessions")
+        .join("--data-projects-myapp--")
+        .join(format!("2026-01-01T00-00-00_{SESSION}.jsonl"));
+    assert_eq!(
+        written.paths[0], expected,
+        "a converted session belongs in the directory `pi`'s own listers read"
+    );
+
+    let spec = pi.launch_spec(&written.session_id).expect("spec");
+    assert_eq!(
+        spec.args,
+        vec!["--session".to_string(), expected.display().to_string(),],
+        "the launch spec must name the file that was written, not where an id \
+         alone would have put it"
+    );
+}
+
+/// A session written before the layout changed still resumes at its own path.
+///
+/// Round 7 admitted depth 1 under `sessions/` on purpose, so that nothing
+/// already on disk stopped being listable. The resume command has to hold the
+/// same line: `pi --session <path>` takes its argument verbatim
+/// (`dist/main.js:106-109`), so a session left at `sessions/<id>.jsonl` opens
+/// from there — but only if the spec still names *that* path rather than the
+/// encoded-workspace one a fresh write would use.
+#[test]
+fn pi_still_launches_a_session_left_at_the_old_flat_path() {
+    let _lock = ENV.lock().unwrap();
+    let home = tempfile::TempDir::new().expect("tempdir");
+    let _guard = EnvGuard::set("PI_AGENT_HOME", &home.path().display().to_string());
+    let registry = ProviderRegistry::default_registry();
+    let pi = registry
+        .find_by_slug("pi-agent")
+        .expect("pi-agent in registry");
+
+    let flat = home.path().join("sessions");
+    std::fs::create_dir_all(&flat).expect("sessions dir");
+    let legacy = flat.join(format!("{SESSION}.jsonl"));
+    std::fs::write(
+        &legacy,
+        "{\"type\":\"session\",\"id\":\"x\",\"cwd\":\"/data/projects/myapp\"}\n",
+    )
+    .expect("legacy session");
+
+    let spec = pi.launch_spec(SESSION).expect("spec");
+    assert_eq!(
+        spec.args,
+        vec!["--session".to_string(), legacy.display().to_string()],
+    );
 }
 
 struct EnvGuard {

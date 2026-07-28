@@ -373,30 +373,72 @@ fn write_falls_back_to_the_hash_directory_when_unregistered() {
     );
 }
 
-/// Truthfulness is not traded away for the fix.
+/// A directory that says nothing is not a session that says nothing.
 ///
-/// A directory that is neither marked nor a hash says nothing about any
-/// workspace, and must still be reported as excluded rather than guessed into
-/// or out of the listing.
+/// `mystery-dir` is neither marked nor a hash, so nothing about the *directory*
+/// places it — and the `--workspace` fast path still refuses to answer from the
+/// directories that did classify, which is the only reason `mysterysess`
+/// reaches the general listing at all. What places it there is its own file:
+/// `projectHash` is `SHA256(projectRoot)` (`chatRecordingService.js:328`,
+/// `utils/paths.js:263`), which this helper writes because Gemini writes it,
+/// and it names this workspace exactly.
+///
+/// The field used to be parsed into `metadata.project_hash` and read by
+/// nothing, so this session was hidden with "workspace could not be determined"
+/// while the file it was hidden on the strength of said which workspace it was.
+/// Listing it is not a guess widened — it is a second witness consulted, after
+/// the directory has declined and only for the file it belongs to.
 #[test]
-fn unmarked_non_hash_directory_stays_undetermined() {
+fn a_session_in_an_unclassifiable_directory_is_placed_by_its_own_header() {
     let tmp = TempDir::new().expect("tempdir");
     let ws = workspace(&tmp, "known");
     seed_session(&tmp, "known", &ws, true, "knownsess");
     seed_session(&tmp, "mystery-dir", &ws, false, "mysterysess");
 
     let listed = list_for_workspace(&tmp, &ws);
+    let mut ids = listed.ids.clone();
+    ids.sort();
     assert_eq!(
-        listed.ids,
-        vec!["knownsess"],
-        "an unclassifiable directory must not be guessed into the \
-         listing.\nstderr:\n{}",
+        ids,
+        vec!["knownsess", "mysterysess"],
+        "the header names this workspace, so the session belongs in the \
+         listing however its directory is named.\nstderr:\n{}",
         listed.stderr
     );
     assert!(
-        listed.hides_sessions(),
-        "excluding a session casr could not classify must still be \
-         reported.\nstderr:\n{}",
+        !listed.hides_sessions(),
+        "nothing was hidden, so nothing should be reported as hidden.\
+         \nstderr:\n{}",
+        listed.stderr
+    );
+}
+
+/// The same directory, and a session whose header names somewhere else.
+///
+/// The witness has to answer both ways or it is not a witness: a `projectHash`
+/// that is some other workspace's excludes the session exactly as a
+/// `.project_root` naming some other workspace would. Excluded on evidence is
+/// not the same as hidden for lack of it, so nothing is reported as hidden here
+/// either.
+#[test]
+fn a_session_whose_header_names_another_workspace_is_excluded() {
+    let tmp = TempDir::new().expect("tempdir");
+    let ws = workspace(&tmp, "known");
+    let other = workspace(&tmp, "other");
+    seed_session(&tmp, "known", &ws, true, "knownsess");
+    seed_session(&tmp, "mystery-dir", &other, false, "elsewheresess");
+
+    let listed = list_for_workspace(&tmp, &ws);
+    assert_eq!(
+        listed.ids,
+        vec!["knownsess"],
+        "a header naming another workspace places the session there.\
+         \nstderr:\n{}",
+        listed.stderr
+    );
+    assert!(
+        !listed.hides_sessions(),
+        "excluded on evidence, not hidden for want of it.\nstderr:\n{}",
         listed.stderr
     );
 }

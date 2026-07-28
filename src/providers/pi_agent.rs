@@ -136,8 +136,76 @@ impl PiAgent {
 
     /// The directory a *new* session goes in — `pi`'s `sessionDir`, which is
     /// where the writer puts its file and where `pi --session` is pointed.
+    ///
+    /// With no override this is `<agent-dir>/sessions`, which is one level
+    /// *above* where `pi` puts a session of its own. It is kept as the fallback
+    /// answer for an id that names no file on disk (see [`Self::session_path`]),
+    /// and as the location every session casr wrote before
+    /// [`Self::project_sessions_dir`] existed still occupies.
     fn leaf_sessions_dir() -> PathBuf {
         Self::env_sessions_dir().unwrap_or_else(|| Self::home_dir().join("sessions"))
+    }
+
+    /// `getDefaultSessionDir`'s encoding of a workspace path into a directory
+    /// name (`@mariozechner/pi-coding-agent@0.73.1`,
+    /// `dist/core/session-manager.js:212-219`):
+    ///
+    /// ```text
+    /// const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+    /// ```
+    ///
+    /// One leading separator is dropped, then every separator and every colon
+    /// becomes a dash. Transcribed rather than approximated because the name is
+    /// what `SessionManager.list(cwd, …)` computes when it goes looking, so a
+    /// name that is close is a name that is not found.
+    fn project_dir_name(workspace: &str) -> String {
+        let stripped = workspace
+            .strip_prefix('/')
+            .or_else(|| workspace.strip_prefix('\\'))
+            .unwrap_or(workspace);
+        let body: String = stripped
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':') {
+                    '-'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        format!("--{body}--")
+    }
+
+    /// Where a session belonging to `workspace` has to sit for `pi` to offer it.
+    ///
+    /// # Why the flat directory was not enough
+    ///
+    /// `pi --session <path>` takes its argument verbatim when it contains a
+    /// separator or ends `.jsonl` (`dist/main.js:106-109`), so a session at
+    /// `sessions/<id>.jsonl` did resume. It was invisible everywhere else.
+    /// `pi --resume` and interactive `/sessions` both drive
+    /// `selectSession(SessionManager.list(cwd, sessionDir), SessionManager.listAll)`
+    /// (`dist/main.js:203`, `dist/modes/interactive/interactive-mode.js:3564`),
+    /// and neither lister reaches a file there: `listAll` (`:1065-1081`) keeps
+    /// only the *directories* under `<agent-dir>/sessions` and reads `.jsonl`
+    /// inside them, and `list` (`:1055-1059`) reads `getDefaultSessionDir(cwd)`
+    /// — the encoded-cwd directory — flat. A converted session resumed only if
+    /// the user still had casr's printed command; opening `pi` normally showed
+    /// nothing.
+    ///
+    /// # With the override set, flat is right
+    ///
+    /// `PI_CODING_AGENT_SESSION_DIR` names `sessionDir` itself
+    /// (`dist/main.js:384-387`), and `list` reads *that* directory flat. So the
+    /// override is written into directly; encoding a project directory under it
+    /// would hide the session from the one lister that looks there.
+    fn project_sessions_dir(workspace: Option<&Path>) -> PathBuf {
+        if let Some(leaf) = Self::env_sessions_dir() {
+            return leaf;
+        }
+        let name =
+            Self::project_dir_name(&workspace.unwrap_or(Path::new("/tmp")).to_string_lossy());
+        Self::home_dir().join("sessions").join(name)
     }
 
     /// Every directory `pi` *lists* sessions out of, paired with how deep its
@@ -179,11 +247,66 @@ impl PiAgent {
         }
     }
 
-    /// Where a session with this id lives — the path the writer produces and
-    /// the path `pi --session` is pointed at, resolved once so the two cannot
-    /// disagree.
+    /// The path `pi --session` is pointed at for a session that already exists.
+    ///
+    /// # Why this is a lookup and not a formula
+    ///
+    /// It used to be `leaf_sessions_dir().join("<id>.jsonl")` — one expression
+    /// the writer and the resume command shared, so they could not disagree.
+    /// They still cannot, but the shared expression is gone: the writer now
+    /// puts a session in [`Self::project_sessions_dir`], which depends on the
+    /// session's workspace, and an id does not carry one.
+    ///
+    /// So the file is found instead of computed, by the same walk that answers
+    /// `owns_session`. That also keeps every session casr wrote at
+    /// `sessions/<id>.jsonl` before this change resumable at exactly the path
+    /// it is at: the walk finds it there, and the argument `pi` receives is
+    /// still the verbatim path `dist/main.js:106-109` opens without consulting
+    /// any lister.
+    ///
+    /// An id with no file is answered with [`Self::leaf_sessions_dir`], which
+    /// is where such a session would have been written before and is the only
+    /// location an id alone can name. Nothing in the tree asks for the path of
+    /// a session that does not exist except tests, but a `resume_command` that
+    /// returned nothing would be a worse answer than a stale one.
     fn session_path(session_id: &str) -> PathBuf {
-        Self::leaf_sessions_dir().join(format!("{session_id}.jsonl"))
+        Self::locate_session(session_id)
+            .unwrap_or_else(|| Self::leaf_sessions_dir().join(format!("{session_id}.jsonl")))
+    }
+
+    /// The `*.jsonl` whose stem is `session_id`, in the directories `pi` reads
+    /// sessions out of. The walk `owns_session` performs; see it for why the
+    /// agent root is searched one level beyond what is listed.
+    fn locate_session(session_id: &str) -> Option<PathBuf> {
+        let mut roots = Self::listing_roots();
+        roots.push((Self::home_dir(), 1));
+
+        for (root, max_depth) in roots {
+            if !root.is_dir() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&root)
+                .max_depth(max_depth)
+                .into_iter()
+                .filter_map(Result::ok)
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|s| s == session_id)
+                {
+                    return Some(path.to_path_buf());
+                }
+            }
+        }
+        None
     }
 }
 
@@ -299,41 +422,16 @@ impl Provider for PiAgent {
     /// `*.jsonl` children, and out of nothing else. `<agent-dir>` also holds
     /// `auth.json`.
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let mut roots = Self::listing_roots();
-        roots.push((Self::home_dir(), 1));
-
-        for (root, max_depth) in roots {
-            if !root.is_dir() {
-                continue;
-            }
-            for entry in walkdir::WalkDir::new(&root)
-                .max_depth(max_depth)
-                .into_iter()
-                .filter_map(Result::ok)
-            {
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                if path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s == session_id)
-                {
-                    debug!(
-                        provider = "pi-agent",
-                        path = %path.display(),
-                        session_id,
-                        "owns session"
-                    );
-                    return Some(path.to_path_buf());
-                }
-            }
+        let found = Self::locate_session(session_id);
+        if let Some(ref path) = found {
+            debug!(
+                provider = "pi-agent",
+                path = %path.display(),
+                session_id,
+                "owns session"
+            );
         }
-        None
+        found
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
@@ -411,11 +509,28 @@ impl Provider for PiAgent {
             format!("{}_{}", now.format("%Y-%m-%dT%H-%M-%S"), session.session_id)
         };
 
-        // The same path `resume_command` and `launch_spec` will name, and — when
-        // `PI_CODING_AGENT_SESSION_DIR` is set — the directory `pi` itself is
-        // reading, so a converted session lands where `pi` will find it rather
-        // than in the default tree `pi` has been configured away from.
-        let target_path = Self::session_path(&session_id);
+        // Session header.
+        //
+        // Hoisted above the path because the two have to agree: the directory
+        // name `pi`'s project-scoped lister computes is
+        // `getDefaultSessionDir(header.cwd)`, so a session filed under one cwd
+        // and declaring another is one `pi` looks for in a directory it is not
+        // in. `/tmp` is the writer's standing answer for a session that records
+        // no workspace, and it is now the directory name too.
+        let workspace = session
+            .workspace
+            .as_ref()
+            .and_then(|w| w.to_str())
+            .unwrap_or("/tmp");
+
+        // The directory `pi` itself would have written this session into —
+        // `getDefaultSessionDir(cwd)`, or `PI_CODING_AGENT_SESSION_DIR` when
+        // `pi` has been configured away from the default tree. Writing beside
+        // `sessions/` instead left the file resumable by path and absent from
+        // both of `pi`'s listers, so it never appeared in `pi --resume` or
+        // `/sessions`. See [`Self::project_sessions_dir`].
+        let target_path = Self::project_sessions_dir(session.workspace.as_deref())
+            .join(format!("{session_id}.jsonl"));
 
         debug!(
             session_id,
@@ -426,12 +541,6 @@ impl Provider for PiAgent {
 
         let mut lines: Vec<String> = Vec::new();
 
-        // Session header.
-        let workspace = session
-            .workspace
-            .as_ref()
-            .and_then(|w| w.to_str())
-            .unwrap_or("/tmp");
         let header = serde_json::json!({
             "type": "session",
             "id": session_id,

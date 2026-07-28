@@ -876,7 +876,10 @@ fn run_launch(
             ),
         );
         for path in &written.paths {
-            launch_line(json_mode, &format!("  Converted session: {}", path.display()));
+            launch_line(
+                json_mode,
+                &format!("  Converted session: {}", path.display()),
+            );
         }
     }
 
@@ -1505,15 +1508,29 @@ fn cmd_list(
                 // testing for a 64-hex directory here reported `Unknown` for
                 // every session a current Gemini writes, because 0.52.0 names
                 // the directory with a registry slug.
-                match path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|dir| {
-                        casr::providers::gemini::project_dir_matches(dir, ws.as_path())
-                    }) {
+                let by_directory = path.parent().and_then(|p| p.parent()).and_then(|dir| {
+                    casr::providers::gemini::project_dir_matches(dir, ws.as_path())
+                });
+                // Neither marked nor hashed — but the file itself is a second
+                // witness, and an independent one: Gemini stamps
+                // `SHA256(projectRoot)` into every session header it writes
+                // (`chatRecordingService.js:328`). Consulted only here, after
+                // the directory has declined, because where the two can
+                // disagree the directory is right — see
+                // `gemini::session_workspace_hint`.
+                //
+                // This does not answer for a directory, and the `--workspace`
+                // fast path below still refuses to classify a tree from the
+                // part of it that happened to classify. It narrows which
+                // *sessions* end up in the "workspace could not be determined"
+                // count, which before this was every session in any project
+                // directory whose marker was missing or unreadable.
+                let resolved = by_directory.or_else(|| {
+                    casr::providers::gemini::session_workspace_hint(path, ws.as_path())
+                });
+                match resolved {
                     Some(true) => WorkspaceHint::Matches,
                     Some(false) => WorkspaceHint::Differs,
-                    // Neither marked nor hashed: not evidence either way.
                     None => WorkspaceHint::Unknown,
                 }
             }

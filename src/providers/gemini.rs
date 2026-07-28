@@ -198,6 +198,71 @@ pub fn project_dir_matches(project_dir: &Path, workspace: &Path) -> Option<bool>
         .then(|| name == project_hash(workspace))
 }
 
+/// Does the session file at `session_path` say it belongs to `workspace`?
+///
+/// The second, independent answer to the question [`project_dir_matches`] asks
+/// of the directory — and the one that still answers when the directory cannot.
+///
+/// # The witness
+///
+/// Every session Gemini writes opens with a metadata record carrying
+/// `projectHash`, and that hash is `SHA256` of the project root:
+/// `@google/gemini-cli-core@0.52.0`,
+/// `dist/src/services/chatRecordingService.js:328` is
+/// `this.projectHash = getProjectHash(context.config.getProjectRoot())`, stamped
+/// into `initialMetadata` at `:410` for a new session and at `:346` when a
+/// legacy `.json` is migrated. `getProjectRoot()` returns `this.targetDir`
+/// (`dist/src/config/config.js:1321`) — the same string
+/// `ProjectRegistry.getShortId` and `Storage.getFilePathHash` are given, so this
+/// hash and the pre-0.52.0 directory name are computed from the same input and
+/// [`project_hash`] already matches both.
+///
+/// It is not legacy: `getProjectHash` is alive at `dist/src/utils/paths.js:263`
+/// and the field is written on every session a current Gemini creates.
+///
+/// # Why it is consulted second
+///
+/// The directory answers first and this only speaks when the directory is
+/// silent. They can disagree, and when they do the directory is right: casr's
+/// own writer carries a source session's `projectHash` through unchanged while
+/// filing the file in the *target* workspace's registered directory, so a
+/// converted session's header names where it came from. Asking the directory
+/// first makes that disagreement unreachable rather than merely unlikely.
+///
+/// # What it does not do
+///
+/// It answers about one file. It cannot classify a *directory*, so it is no
+/// help to `list`'s workspace fast path, which bails on any project directory
+/// it cannot place — deliberately, because answering from the ones it could
+/// classify would drop the rest uncounted. This narrows what "cannot be
+/// determined" means for a session; it does not widen what may be concluded
+/// from partial evidence about a tree.
+///
+/// `None` for a file with no `projectHash`, an unreadable file, or one whose
+/// leading record is not JSON: absent evidence, reported as absent.
+pub fn session_workspace_hint(session_path: &Path, workspace: &Path) -> Option<bool> {
+    Some(session_project_hash(session_path)? == project_hash(workspace))
+}
+
+/// The `projectHash` a session file declares.
+///
+/// The leading record, whichever format the file is in: JSONL opens with the
+/// metadata record (`chatRecordingService.js:408-416`), and a legacy whole-file
+/// JSON *is* one object carrying the same field. Streaming rather than reading
+/// the file: for JSONL that stops after the first line.
+fn session_project_hash(session_path: &Path) -> Option<String> {
+    let file = std::fs::File::open(session_path).ok()?;
+    let first = serde_json::Deserializer::from_reader(std::io::BufReader::new(file))
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    first
+        .get("projectHash")
+        .and_then(|v| v.as_str())
+        .filter(|hash| !hash.is_empty())
+        .map(String::from)
+}
+
 /// The `~/.gemini/tmp/<id>` directory Gemini has already registered for
 /// `workspace`, if one exists.
 ///
@@ -1536,7 +1601,7 @@ mod tests {
     use super::{
         Gemini, gemini_message_content, gemini_message_entry, gemini_message_type,
         is_session_file_name, merge_gemini_extra_fields, normalize_workspace_candidate,
-        project_dir_matches, project_hash, session_filename,
+        project_dir_matches, project_hash, session_filename, session_workspace_hint,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -1620,6 +1685,79 @@ mod tests {
         )
         .expect("marker");
         assert_eq!(project_dir_matches(&dir, workspace), Some(true));
+    }
+
+    /// The header answers for a session whose directory cannot.
+    ///
+    /// `projectHash` is `SHA256(getProjectRoot())`
+    /// (`@google/gemini-cli-core@0.52.0`,
+    /// `chatRecordingService.js:328` and `utils/paths.js:263`), so it decides
+    /// membership outright — both ways. Before this it was parsed into
+    /// `metadata.project_hash` and read by nothing, and a session in a project
+    /// directory with no marker was reported as "workspace could not be
+    /// determined" while the file itself said which workspace it was.
+    #[test]
+    fn the_header_hash_places_a_session_the_directory_cannot() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mine = Path::new("/data/projects/myapp");
+        let theirs = Path::new("/data/projects/other");
+
+        // JSONL: the metadata record leads the file.
+        let jsonl = tmp.path().join("session-2026-03-02T09-00-abcdef12.jsonl");
+        std::fs::write(
+            &jsonl,
+            format!(
+                "{{\"sessionId\":\"s1\",\"projectHash\":\"{}\",\"startTime\":\"2026-03-02T09:00:00.000Z\"}}\n\
+                 {{\"id\":\"m1\",\"type\":\"user\",\"content\":\"hi\"}}\n",
+                project_hash(mine)
+            ),
+        )
+        .expect("write jsonl");
+        assert_eq!(session_workspace_hint(&jsonl, mine), Some(true));
+        assert_eq!(session_workspace_hint(&jsonl, theirs), Some(false));
+
+        // Legacy whole-file JSON carries the same field on the root object.
+        let json = tmp.path().join("session-2026-03-02T09-00-abcdef12.json");
+        std::fs::write(
+            &json,
+            serde_json::to_vec_pretty(&json!({
+                "sessionId": "s1",
+                "projectHash": project_hash(mine),
+                "messages": [{"id": "m1", "type": "user", "content": "hi"}],
+            }))
+            .expect("serialize"),
+        )
+        .expect("write json");
+        assert_eq!(session_workspace_hint(&json, mine), Some(true));
+        assert_eq!(session_workspace_hint(&json, theirs), Some(false));
+    }
+
+    /// No witness is `None`, never `false`.
+    ///
+    /// A missing, empty or unreadable `projectHash` is absent evidence. Reading
+    /// it as "not this workspace" would delete the session from a `--workspace`
+    /// listing, which is the failure the three-valued answer exists to prevent.
+    #[test]
+    fn an_absent_header_hash_is_not_a_negative_answer() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let ws = Path::new("/data/projects/myapp");
+
+        let no_field = tmp.path().join("no-field.jsonl");
+        std::fs::write(&no_field, "{\"sessionId\":\"s1\"}\n").expect("write");
+        assert_eq!(session_workspace_hint(&no_field, ws), None);
+
+        let empty = tmp.path().join("empty-hash.jsonl");
+        std::fs::write(&empty, "{\"sessionId\":\"s1\",\"projectHash\":\"\"}\n").expect("write");
+        assert_eq!(session_workspace_hint(&empty, ws), None);
+
+        let garbage = tmp.path().join("garbage.jsonl");
+        std::fs::write(&garbage, "not json at all\n").expect("write");
+        assert_eq!(session_workspace_hint(&garbage, ws), None);
+
+        assert_eq!(
+            session_workspace_hint(&tmp.path().join("absent.jsonl"), ws),
+            None
+        );
     }
 
     #[test]

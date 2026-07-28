@@ -111,8 +111,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
 use crate::model::{
-    CanonicalMessage, CanonicalSession, MessageRole, ToolCall, normalize_role, parse_timestamp,
-    reindex_messages, truncate_title,
+    CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, normalize_role,
+    parse_timestamp, reindex_messages, truncate_title,
 };
 use crate::providers::{
     Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
@@ -596,24 +596,32 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
                         extra: entry.value.clone(),
                     })
                 }
-                // A tool's output. The text goes in `content`; `tool_results`
-                // is deliberately left empty, matching
-                // [`crate::providers::pi_session`], which reads the very same
-                // record in the sibling format.
+                // A tool's output. The prose the model was shown goes in
+                // `content`; `toolCallId` and `isError` go in `tool_results`,
+                // because nothing else here can hold them — `content` is text
+                // and `author` is the tool's name.
                 //
-                // Populating both is what the canonical model looks like it
-                // wants, and it breaks conversion: `claude_code`'s writer drops
-                // `msg.content` for any non-assistant message that has
-                // `tool_results` and emits `tool_result` blocks instead, while
-                // its reader's `claude_extract_text_content` never reads those
-                // blocks back as text. Read-back verification then fails with
-                // "wrote N bytes, read back 0 bytes" and the conversion is
-                // rolled back. That asymmetry is a `claude_code` defect, not an
-                // OpenClaw one — it is latent only because no reader in the
-                // tree populated `content` and `tool_results` together — so it
-                // is reported rather than worked around here. `toolCallId` and
-                // `isError` are the cost, and they are structural rather than
-                // model-visible: the prose the model was shown is `content`.
+                // `convertToLlm` (`dist/proxy-BzhBz8iM.js`) reads all three off
+                // this record, so all three are read here. The call id is what
+                // makes the observation an answer to a particular call rather
+                // than a loose paragraph, and it is what
+                // [`crate::pipeline::repair_tool_pairing`] pairs on: with it
+                // empty, every OpenClaw tool call arrived at the budget as an
+                // orphan.
+                //
+                // Both fields together used to be unrepresentable. `claude_code`
+                // wrote `tool_result` blocks *instead of* `msg.content` for a
+                // non-assistant message that had results, and its reader takes
+                // text only from `text` blocks — so the observation was deleted
+                // on write and its absence confirmed on read, and the pipeline's
+                // read-back check failed with "wrote N bytes, read back 0
+                // bytes". That writer now emits `tool_result` and then `text`
+                // (`claude_code.rs`, `writer_non_assistant_keeps_content_alongside_tool_results`),
+                // and `tests/claude_code_shape_test.rs`'s
+                // `a_message_with_both_text_and_tool_results_survives_the_round_trip`
+                // asserts the whole round-trip rather than the block shape. Every
+                // other writer in the tree that emits `tool_results` already kept
+                // `content` beside them.
                 "toolResult" => {
                     let content = msg.get("content").map_or_else(String::new, |c| {
                         flatten_content(c, out, ToolCallText::Rendered)
@@ -622,13 +630,25 @@ fn entry_message(entry: &Entry, out: &mut Transcript) -> Option<CanonicalMessage
                         out.count("message (toolResult, no text)");
                         return None;
                     }
-                    build(
+                    let mut message = build(
                         MessageRole::Tool,
-                        content,
+                        content.clone(),
                         msg.get("toolName")
                             .and_then(|v| v.as_str())
                             .map(String::from),
-                    )
+                    )?;
+                    message.tool_results = vec![ToolResult {
+                        call_id: msg
+                            .get("toolCallId")
+                            .and_then(|v| v.as_str())
+                            .map(String::from),
+                        content,
+                        is_error: msg
+                            .get("isError")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false),
+                    }];
+                    Some(message)
                 }
                 "bashExecution" => {
                     // `excludeFromContext` keeps a command in session history
@@ -1570,8 +1590,31 @@ mod tests {
         assert_eq!(session.messages[0].role, MessageRole::Tool);
         assert_eq!(session.messages[0].content, "out");
         assert_eq!(session.messages[0].author.as_deref(), Some("bash"));
-        // Empty on purpose — see the `toolResult` arm of `entry_message`.
-        assert!(session.messages[0].tool_results.is_empty());
+        // `toolCallId` and `isError` have nowhere else to go: `content` is text
+        // and `author` is the tool's name. Empty here meant every OpenClaw tool
+        // call reached the budget unpaired.
+        assert_eq!(session.messages[0].tool_results.len(), 1);
+        assert_eq!(
+            session.messages[0].tool_results[0].call_id.as_deref(),
+            Some("c1")
+        );
+        assert_eq!(session.messages[0].tool_results[0].content, "out");
+        assert!(!session.messages[0].tool_results[0].is_error);
+    }
+
+    /// `isError` is the difference between "the tool answered" and "the tool
+    /// failed", and it is a field of the record rather than of its text.
+    #[test]
+    fn tool_result_failure_is_carried_as_a_failure() {
+        let session = read_openclaw(&[
+            r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-14T09:00:01.000Z","message":{"role":"toolResult","toolCallId":"c9","toolName":"bash","content":[{"type":"text","text":"no such file"}],"isError":true}}"#,
+        ]);
+        assert_eq!(session.messages[0].tool_results.len(), 1);
+        assert!(session.messages[0].tool_results[0].is_error);
+        assert_eq!(
+            session.messages[0].tool_results[0].call_id.as_deref(),
+            Some("c9")
+        );
     }
 
     #[test]

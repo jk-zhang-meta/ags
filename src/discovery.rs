@@ -534,6 +534,73 @@ fn is_plausible_session(session: &CanonicalSession) -> bool {
 }
 
 impl ProviderRegistry {
+    /// Which of the three `pi-coding-agent`-shaped providers wrote `path`, when
+    /// the file's *contents* have already been read and did not say.
+    ///
+    /// # The formats are the same format
+    ///
+    /// `openclaw@2026.7.1-2`, `clawdbot@2026.1.24-3` (which drives
+    /// `@mariozechner/pi-coding-agent@0.49.3`) and `pi@0.73.1` were each
+    /// installed and driven through their own `SessionManager` to write the
+    /// same three-message conversation. The two transcripts differ in their
+    /// ids, their timestamps and nothing else:
+    ///
+    /// ```text
+    /// {"type":"session","version":3,"id":"…","timestamp":"…","cwd":"/work/proj"}
+    /// {"type":"message","id":"…","parentId":null,"timestamp":"…","message":{"role":"user","content":"…"}}
+    /// ```
+    ///
+    /// `version: 3` is `CURRENT_SESSION_VERSION` in all three
+    /// (`dist/core/session-manager.js:8` in both `pi` builds,
+    /// `dist/version-Bsehiavt.js:3` in OpenClaw), and the message union is the
+    /// same four extensions — `bashExecution`, `custom`, `branchSummary`,
+    /// `compactionSummary` (`pi`'s `dist/core/messages.d.ts:16-56`, OpenClaw's
+    /// `dist/types-D0CdrmU4.d.ts:269-296`). The `hookMessage`/`custom` split
+    /// that used to separate them closed from `pi`'s side: `migrateV2ToV3`
+    /// (`session-manager.js:47-61`) renames the role, so a current `pi` writes
+    /// `custom` too.
+    ///
+    /// So `type: "session"` plus a `version` field — which is what this
+    /// function replaced — was never OpenClaw's signature. It was the family's,
+    /// and OpenClaw was claiming all three.
+    ///
+    /// # What is left to go on
+    ///
+    /// The filename, which the three do not share. ClawdBot names a transcript
+    /// `<sessionId>.jsonl`, or `<sessionId>-topic-<topicId>.jsonl` for a topic
+    /// session (`clawdbot@2026.1.24-3`,
+    /// `dist/config/sessions/paths.js: resolveSessionTranscriptPath`); it never
+    /// prefixes a timestamp. `pi` and OpenClaw both name theirs
+    /// `<ISO-timestamp>_<sessionId>.jsonl` (`session-manager.js:502`,
+    /// `session-manager-BC-U4J87.js:1535`), so the underscore separates
+    /// ClawdBot from the other two and cannot separate those two from each
+    /// other.
+    ///
+    /// # The remaining case stays where it already was
+    ///
+    /// A timestamped name leaves `pi` and OpenClaw genuinely indistinguishable,
+    /// and this function answers `pi-agent` — not because that is measured, but
+    /// because it is the answer the rule this replaced already gave for exactly
+    /// this filename, and moving it would be a preference invented here.
+    ///
+    /// Returning `None` and letting [`Self::resolve_from_path`] fall through to
+    /// its probe loop was tried and is worse: with several readers recovering
+    /// the same three messages the loop's `(plausible, message count, slug)`
+    /// ordering decides on the slug, and a real OpenClaw transcript came back
+    /// as `vibe`, whose reader took the session id from the *directory* name.
+    /// A tie-break on a provider's name is not evidence about a file.
+    ///
+    /// Only files outside every provider's session roots reach any of this;
+    /// `resolve_from_path` matches roots first, and a session sitting in
+    /// `~/.clawdbot/agents/<id>/sessions/` was never ambiguous.
+    fn pi_family_provider(&self, path: &Path) -> Option<&dyn Provider> {
+        let stem = path.file_stem().and_then(|s| s.to_str())?;
+        if stem.contains('_') {
+            return self.find_by_slug("pi-agent");
+        }
+        self.find_by_slug("clawdbot")
+    }
+
     fn infer_provider_for_path(&self, path: &Path) -> Option<&dyn Provider> {
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
@@ -542,6 +609,13 @@ impl ProviderRegistry {
                 let file = std::fs::File::open(path).ok()?;
                 let reader = std::io::BufReader::new(file);
                 let mut lines_checked = 0;
+                // The `pi-coding-agent` envelope, once one of its records has
+                // been seen. Held rather than returned: the record that would
+                // settle it — an OpenClaw `leaf` — can be anywhere in the file,
+                // so the scan has to finish before the answer is given. `None`
+                // at the end of the scan is deliberate; see
+                // [`Self::pi_family_provider`].
+                let mut pi_family = false;
                 for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -552,8 +626,9 @@ impl ProviderRegistry {
                         continue;
                     };
                     lines_checked += 1;
+                    let record_type = value.get("type").and_then(|v| v.as_str());
 
-                    if value.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+                    if record_type == Some("session_meta") {
                         return self.find_by_slug("codex");
                     }
                     // Grok Build: ACP session-update envelope lines
@@ -562,31 +637,36 @@ impl ProviderRegistry {
                         return self.find_by_slug("grok");
                     }
                     // Factory: JSONL with session_start typed entry.
-                    if value.get("type").and_then(|v| v.as_str()) == Some("session_start") {
+                    if record_type == Some("session_start") {
                         return self.find_by_slug("factory");
                     }
-                    // OpenClaw: type:"session" with version field.
-                    if value.get("type").and_then(|v| v.as_str()) == Some("session")
-                        && value.get("version").is_some()
-                    {
+                    // A navigation control, and the one record in this family
+                    // only OpenClaw writes — `createLeafControl`
+                    // (`openclaw@2026.7.1-2`,
+                    // `dist/session-manager-BC-U4J87.js:1678-1687`). Neither
+                    // `@mariozechner/pi-coding-agent@0.49.3` (the copy ClawdBot
+                    // embeds) nor `@0.73.1` has any `type: "leaf"` at all.
+                    if record_type == Some("leaf") {
                         return self.find_by_slug("openclaw");
                     }
-                    // Pi-Agent: type:"session" with provider/modelId fields.
-                    if value.get("type").and_then(|v| v.as_str()) == Some("session")
+                    // casr's own Pi-Agent header, which carries the two fields
+                    // `pi` itself stopped writing: `SessionManager.newSession`
+                    // (`dist/core/session-manager.js:486-494`) writes
+                    // `{type,version,id,timestamp,cwd,parentSession}` and
+                    // nothing else, so on a file `pi` wrote this never fires.
+                    if record_type == Some("session")
                         && (value.get("provider").is_some() || value.get("modelId").is_some())
                     {
                         return self.find_by_slug("pi-agent");
                     }
-                    // OpenClaw/Pi-Agent: type:"message" with nested "message" object.
-                    if value.get("type").and_then(|v| v.as_str()) == Some("message")
-                        && value.get("message").is_some()
-                    {
-                        // Disambiguate by filename pattern: Pi-Agent uses underscore.
-                        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                        if stem.contains('_') {
-                            return self.find_by_slug("pi-agent");
-                        }
-                        return self.find_by_slug("openclaw");
+                    // The shared envelope: a header, or a message wrapped in
+                    // one. Which of the three providers wrote it is decided
+                    // after the scan.
+                    if record_type == Some("session") && value.get("version").is_some() {
+                        pi_family = true;
+                    }
+                    if record_type == Some("message") && value.get("message").is_some() {
+                        pi_family = true;
                     }
                     if value.get("sessionId").is_some()
                         && value.get("uuid").is_some()
@@ -605,6 +685,9 @@ impl ProviderRegistry {
                     if lines_checked >= 50 {
                         break;
                     }
+                }
+                if pi_family {
+                    return self.pi_family_provider(path);
                 }
             }
             "json" => {
@@ -909,24 +992,90 @@ mod tests {
         assert_eq!(infer_slug_for_file(tmp.path()).as_deref(), Some("clawdbot"));
     }
 
+    /// The three lines below are a real ClawdBot transcript, byte for byte
+    /// except for the ids: written by driving
+    /// `@mariozechner/pi-coding-agent@0.49.3` — the copy `clawdbot@2026.1.24-3`
+    /// depends on — through `SessionManager.create` / `.appendMessage`.
+    /// Substituting the real OpenClaw writer (`openclaw@2026.7.1-2`, via
+    /// `openclaw/plugin-sdk/agent-sessions`) changes nothing but the ids and
+    /// the timestamps, which is the whole problem: this envelope names no
+    /// provider.
+    const PI_FAMILY_TRANSCRIPT: &str = concat!(
+        r#"{"type":"session","version":3,"id":"986ecf9a","timestamp":"2026-07-28T05:51:33.015Z","cwd":"/work/proj"}"#,
+        "\n",
+        r#"{"type":"message","id":"a05242b5","parentId":null,"timestamp":"2026-07-28T05:51:33.015Z","message":{"role":"user","content":"hello"}}"#,
+        "\n",
+    );
+
+    /// A ClawdBot transcript is ClawdBot's, not OpenClaw's.
+    ///
+    /// `type: "session"` with a `version` used to return `openclaw` outright,
+    /// and every ClawdBot and `pi` transcript on the machine carries it — all
+    /// three write `version: 3`. What is left to separate them is the name:
+    /// ClawdBot's `resolveSessionTranscriptPath`
+    /// (`clawdbot@2026.1.24-3`, `dist/config/sessions/paths.js`) is
+    /// `<sessionId>.jsonl`, with no timestamp in front of it.
     #[test]
-    fn infer_provider_for_path_jsonl_message_disambiguates_by_filename_stem() {
+    fn a_clawdbot_transcript_is_not_claimed_by_openclaw() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let content = br#"{"type":"message","message":{"role":"user","content":"hi"}}"#;
+        let path = dir
+            .path()
+            .join("986ecf9a-883a-445d-aea5-7592ccfcc05d.jsonl");
+        std::fs::write(&path, PI_FAMILY_TRANSCRIPT).expect("write");
+        assert_eq!(infer_slug_for_file(&path).as_deref(), Some("clawdbot"));
+    }
 
-        let openclaw_path = dir.path().join("openclaw.jsonl");
-        std::fs::write(&openclaw_path, content).expect("write openclaw");
-        assert_eq!(
-            infer_slug_for_file(&openclaw_path).as_deref(),
-            Some("openclaw")
-        );
+    /// `pi` and OpenClaw both name a transcript `<ISO-timestamp>_<id>.jsonl`
+    /// (`session-manager.js:502`, `session-manager-BC-U4J87.js:1535`), so the
+    /// name cannot separate those two. The answer stays where the previous rule
+    /// already put this shape.
+    #[test]
+    fn a_timestamped_pi_family_name_stays_with_pi_agent() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir
+            .path()
+            .join("2026-07-28T05-51-33-015Z_986ecf9a-883a-445d-aea5-7592ccfcc05d.jsonl");
+        std::fs::write(&path, PI_FAMILY_TRANSCRIPT).expect("write");
+        assert_eq!(infer_slug_for_file(&path).as_deref(), Some("pi-agent"));
+    }
 
-        let pi_agent_path = dir.path().join("pi_agent.jsonl");
-        std::fs::write(&pi_agent_path, content).expect("write pi_agent");
-        assert_eq!(
-            infer_slug_for_file(&pi_agent_path).as_deref(),
-            Some("pi-agent")
+    /// A `leaf` record settles it wherever it appears and whatever the file is
+    /// called: it is a navigation control OpenClaw's fork added
+    /// (`createLeafControl`, `dist/session-manager-BC-U4J87.js:1678-1687`) and
+    /// neither published `pi` build has any `type: "leaf"` at all.
+    #[test]
+    fn a_leaf_record_identifies_openclaw_against_the_filename() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir
+            .path()
+            .join("986ecf9a-883a-445d-aea5-7592ccfcc05d.jsonl");
+        let mut content = PI_FAMILY_TRANSCRIPT.to_string();
+        content.push_str(
+            r#"{"type":"leaf","id":"L1","parentId":null,"timestamp":"2026-07-28T05:51:34.000Z","targetId":"a05242b5"}"#,
         );
+        content.push('\n');
+        std::fs::write(&path, content).expect("write");
+        assert_eq!(infer_slug_for_file(&path).as_deref(), Some("openclaw"));
+    }
+
+    /// casr's own Pi-Agent writer stamps `provider` and `modelId` into the
+    /// header; `SessionManager.newSession` (`session-manager.js:486-494`) does
+    /// not, so this rule fires only on files casr wrote and must outrank the
+    /// filename.
+    #[test]
+    fn a_casr_written_pi_header_is_pi_agent_whatever_the_filename() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("plain-name.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-07-28T05:51:33.015Z","#,
+                r#""cwd":"/work/proj","provider":"anthropic","modelId":"unknown"}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        assert_eq!(infer_slug_for_file(&path).as_deref(), Some("pi-agent"));
     }
 
     #[test]
