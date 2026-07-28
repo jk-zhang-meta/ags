@@ -21,7 +21,7 @@
 //! | ClawdBot | `<home>/{id}.jsonl`                           |
 //! | OpenClaw | `<home>/.openclaw/agents/main/sessions/{id}.jsonl` |
 //! | Factory  | `<home>/{id}.jsonl`                           |
-//! | Vibe     | `<home>/logs/session/{id}/messages.jsonl`     |
+//! | Vibe     | `<home>/logs/session/session_<utc>_<id8>/messages.jsonl` |
 //! | Pi-Agent | `<home>/sessions/{timestamp}_{id}.jsonl`      |
 //!
 //! These target stores are flat at the id boundary. [`casr::pipeline::atomic_write`]

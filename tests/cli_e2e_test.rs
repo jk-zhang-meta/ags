@@ -192,16 +192,36 @@ fn write_corrupt_gemini_session(tmp: &TempDir, session_id: &str) -> PathBuf {
 /// Set up a Vibe session fixture in the temp dir.
 ///
 /// Vibe is the plainest case of a provider whose reader cannot determine a
-/// workspace: nothing in `messages.jsonl` records one, and the directory it
-/// lives in is named after the session, not the project. Its layout is
-/// `<VIBE_HOME>/logs/session/<session-id>/messages.jsonl`.
+/// workspace: `meta.json` has an explicitly null working directory. Its
+/// default layout is
+/// `<VIBE_HOME>/logs/session/session_<timestamp>_<id8>/messages.jsonl`.
 #[allow(dead_code)]
 fn setup_vibe_fixture(tmp: &TempDir, session_id: &str) -> String {
     let content =
         fs::read_to_string(fixtures_dir().join("vibe/messages.jsonl")).expect("read vibe fixture");
-    let session_dir = tmp.path().join("vibe/logs/session").join(session_id);
+    let total_messages = content.lines().count();
+    let short_id = session_id.get(..8).unwrap_or(session_id);
+    let session_dir = tmp
+        .path()
+        .join("vibe/logs/session")
+        .join(format!("session_20260101_000000_{short_id}"));
     fs::create_dir_all(&session_dir).expect("create Vibe session dir");
     fs::write(session_dir.join("messages.jsonl"), content).expect("write Vibe fixture");
+    fs::write(
+        session_dir.join("meta.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "session_id": session_id,
+            "start_time": "2026-01-01T00:00:00+00:00",
+            "end_time": null,
+            "git_commit": null,
+            "git_branch": null,
+            "environment": {"working_directory": null},
+            "username": "casr",
+            "total_messages": total_messages,
+        }))
+        .expect("serialize Vibe metadata"),
+    )
+    .expect("write Vibe metadata");
     session_id.to_string()
 }
 

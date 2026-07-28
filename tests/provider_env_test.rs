@@ -448,12 +448,31 @@ fn vibe_joins_logs_session_onto_vibe_home() {
     let _lock = PROVIDER_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("VIBE_HOME", tmp.path());
-    let session_dir = tmp.path().join("logs").join("session").join(SESSION_ID);
+    let session_dir = tmp
+        .path()
+        .join("logs")
+        .join("session")
+        .join(format!("session_20260727_100000_{}", &SESSION_ID[..8]));
     std::fs::create_dir_all(&session_dir).unwrap();
     let expected = session_dir.join("messages.jsonl");
     std::fs::write(
         &expected,
         "{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":\"2026-07-27T10:00:00Z\"}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        session_dir.join("meta.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "session_id": SESSION_ID,
+            "start_time": "2026-07-27T10:00:00+00:00",
+            "end_time": null,
+            "git_commit": null,
+            "git_branch": null,
+            "environment": {"working_directory": null},
+            "username": "casr",
+            "total_messages": 1,
+        }))
+        .unwrap(),
     )
     .unwrap();
 

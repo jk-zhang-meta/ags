@@ -477,7 +477,17 @@ fn vibe_metadata_sidecar_is_not_rendered_as_a_session() {
     );
     write(
         &session_dir.join("meta.json"),
-        "{\n  \"id\": \"abc123\"\n}\n",
+        r#"{
+  "session_id": "abc123",
+  "start_time": "2026-01-01T00:00:00+00:00",
+  "end_time": null,
+  "git_commit": null,
+  "git_branch": null,
+  "environment": {"working_directory": null},
+  "username": "casr",
+  "total_messages": 1
+}
+"#,
     );
 
     let envelope = list_json(&tmp);

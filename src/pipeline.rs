@@ -1504,7 +1504,7 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 /// Every row below was read out of the artifact each writer produces for a
 /// session holding one message of each role, not out of casr reading its own
 /// output back. The distinction matters in both directions. Gemini, ClawdBot,
-/// Vibe, Factory, Pi-Agent, ChatGPT and Codex write an unrecognised source role
+/// Factory, Pi-Agent, ChatGPT and Codex write an unrecognised source role
 /// through under its own name, and casr's own `model::normalize_role` then maps
 /// `"developer"` back onto [`MessageRole::System`] — so a read-back would report
 /// a fold those files did not perform. Conversely Cursor and Kiro have no third
@@ -1533,9 +1533,11 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
     match role {
         MessageRole::User | MessageRole::Assistant => None,
         // `claude_code.rs:703`, `cline.rs:316`, `openclaw.rs:1293`,
-        // `amp.rs:418`, `cursor.rs:1113`, `kiro.rs:1541`, `aider.rs:594`.
+        // `amp.rs:418`, `cursor.rs:1113`, `kiro.rs:1541`, `aider.rs:594`,
+        // Vibe persists both as plain user rows because its loader drops
+        // system rows and rejects unknown roles.
         MessageRole::System => match target_slug {
-            "claude-code" | "cline" | "openclaw" => Some("plain user turns"),
+            "claude-code" | "cline" | "openclaw" | "vibe" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
@@ -1544,7 +1546,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
         },
         // Same writers, and the source's own name for the turn goes with it.
         MessageRole::Other(_) => match target_slug {
-            "claude-code" | "cline" | "openclaw" => Some("plain user turns"),
+            "claude-code" | "cline" | "openclaw" | "vibe" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),

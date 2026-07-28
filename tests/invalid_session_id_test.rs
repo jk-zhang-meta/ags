@@ -8,13 +8,15 @@
 
 mod test_env;
 
-use casr::discovery::ProviderRegistry;
+use casr::discovery::{ProviderRegistry, SourceHint};
 use casr::error::CasrError;
 use casr::providers::Provider;
 use casr::providers::claude_code::ClaudeCode;
+use casr::providers::clawdbot::ClawdBot;
 use casr::providers::codex::Codex;
 
 static CC_ENV: test_env::EnvLock = test_env::EnvLock;
+static CLAWDBOT_ENV: test_env::EnvLock = test_env::EnvLock;
 static CODEX_ENV: test_env::EnvLock = test_env::EnvLock;
 
 struct EnvGuard {
@@ -98,6 +100,26 @@ fn resolve_very_long_session_id() {
 #[test]
 fn resolve_path_traversal_dot_dot_slash() {
     assert_session_not_found("../../etc/passwd", "path traversal ../../etc/passwd");
+}
+
+#[test]
+fn registry_rejects_relative_traversal_that_reaches_an_existing_file() {
+    let _lock = CLAWDBOT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().expect("tmpdir");
+    let sessions = tmp.path().join("sessions");
+    std::fs::create_dir_all(&sessions).expect("create sessions root");
+    let outside = tmp.path().join("outside.jsonl");
+    std::fs::write(&outside, "{}\n").expect("write outside transcript");
+    let _env = EnvGuard::set("CLAWDBOT_HOME", &sessions);
+
+    let registry = ProviderRegistry::new(vec![Box::new(ClawdBot)]);
+    let hint = SourceHint::Alias("cwb".to_string());
+    let resolved = registry.resolve_session("../outside", Some(&hint));
+
+    assert!(
+        matches!(resolved, Err(CasrError::SessionNotFound { .. })),
+        "a relative session id escaped the ClawdBot store: {resolved:?}"
+    );
 }
 
 #[test]

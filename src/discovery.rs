@@ -11,7 +11,7 @@
 //! 2. If `--source <alias>` → only search that provider.
 //! 3. Otherwise → search all installed providers, detect ambiguity.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use tracing::{debug, info, trace, warn};
 
@@ -474,8 +474,8 @@ impl ProviderRegistry {
 /// its own roots — `sessions_dir.join(session_id)` in Codex,
 /// `dir.join(format!("{session_id}.jsonl"))` in Claude Code and Kiro, and so on
 /// for the rest. [`std::path::Path::join`] **discards the receiver when the
-/// argument is absolute**, so an absolute path handed in as an identifier comes
-/// straight back out as if the provider had found it under its own root.
+/// argument is absolute** and resolves `..` components outside it, so either
+/// form can make a provider claim a file beyond its own root.
 ///
 /// Measured: `owns_session` on an absolute path was claimed by three of the
 /// seventeen registered providers — `claude-code`, `codex` and `kiro` — and
@@ -495,14 +495,17 @@ impl ProviderRegistry {
 /// the input at the boundary makes the whole class unreachable through the
 /// registry, which is how every session in the product is resolved.
 ///
-/// Relative paths are deliberately still allowed: a Codex session id genuinely
-/// *is* `2026/07/27/rollout-…`, and that form joins onto the sessions directory
-/// exactly as intended. Only the absolute case is a lie.
+/// Multi-component relative identifiers are deliberately still allowed: a
+/// Codex session id genuinely *is* `2026/07/27/rollout-…`. Every component must
+/// be normal, though; `.` and `..` are path instructions, not identifier data.
 ///
 /// A caller with a real path wants [`SourceHint::Path`], which resolves by
 /// path on purpose and identifies the owner from the provider roots.
 fn session_id_is_identifier(session_id: &str) -> bool {
-    !Path::new(session_id).is_absolute()
+    !session_id.is_empty()
+        && Path::new(session_id)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 fn normalize_provider_token(token: &str) -> String {

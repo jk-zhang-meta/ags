@@ -326,9 +326,10 @@ pub trait Provider: Send + Sync {
     /// the provider claims a file it has never owned. Three of the registered
     /// providers were doing exactly that.
     ///
-    /// [`crate::discovery::ProviderRegistry`] rejects such an argument before
-    /// any implementor sees it, which is why implementors need no guard of
-    /// their own. Resolve a real path with [`crate::discovery::SourceHint::Path`].
+    /// [`crate::discovery::ProviderRegistry`] rejects absolute paths and `..`
+    /// components before any implementor sees them, which is why implementors
+    /// need no guard of their own. Resolve a real path with
+    /// [`crate::discovery::SourceHint::Path`].
     fn owns_session(&self, session_id: &str) -> Option<PathBuf>;
 
     /// Read a session from its native format into canonical IR.

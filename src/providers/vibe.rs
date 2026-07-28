@@ -1,6 +1,6 @@
 //! Vibe (Mistral) provider — reads/writes JSONL chat sessions.
 //!
-//! Session files: `~/.vibe/logs/session/*/messages.jsonl`
+//! Session files: `~/.vibe/logs/session/session_<UTC>_<id8>/messages.jsonl`
 //! Override root: `VIBE_HOME` env var
 //!
 //! ## JSONL format
@@ -14,12 +14,14 @@
 //!
 //! ## Session ID scheme
 //!
-//! Sessions live in subdirectories (`~/.vibe/logs/session/<session-id>/messages.jsonl`).
-//! The session ID is the subdirectory name.
+//! Sessions live in `session_<UTC>_<id8>` subdirectories. `meta.json` carries
+//! the full session ID; the directory's suffix is only its first eight bytes.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
@@ -31,6 +33,13 @@ use crate::providers::{Provider, WriteOptions, WrittenSession, filename_safe_ses
 
 /// Vibe provider implementation.
 pub struct Vibe;
+
+const MESSAGES_FILENAME: &str = "messages.jsonl";
+const METADATA_FILENAME: &str = "meta.json";
+const DEFAULT_SESSION_PREFIX: &str = "session";
+const SHORT_ID_ALPHABET: &[u8; 62] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+type VendorCandidate = (PathBuf, Option<String>, std::time::SystemTime);
 
 impl Vibe {
     /// Directory holding Vibe's session logs.
@@ -50,6 +59,157 @@ impl Vibe {
             None => dirs::home_dir().unwrap_or_default().join(".vibe"),
         };
         root.join("logs").join("session")
+    }
+
+    /// Read the sidecar Vibe uses to identify and describe a session.
+    fn session_metadata(session_dir: &Path) -> Option<Value> {
+        let bytes = std::fs::read(session_dir.join(METADATA_FILENAME)).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    fn metadata_session_id(metadata: &Value) -> Option<&str> {
+        metadata
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+    }
+
+    /// The extra condition Vibe's `list_sessions` applies after its structural
+    /// log check. Full metadata validation happens only when Vibe resumes the
+    /// selected session; reproducing Pydantic's schema here would be a second,
+    /// inevitably drifting oracle.
+    fn metadata_is_listable(metadata: &Value) -> bool {
+        metadata.is_object() && Self::metadata_session_id(metadata).is_some()
+    }
+
+    /// Whether Vibe's resolver considers this a structurally valid log. This
+    /// is deliberately looser than both `list_sessions` and Pydantic metadata
+    /// validation: direct `--resume ID` selects from this set.
+    fn is_vendor_log_dir(session_dir: &Path) -> bool {
+        let Some(name) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        if !name.starts_with("session_") {
+            return false;
+        }
+
+        let Some(metadata) = Self::session_metadata(session_dir) else {
+            return false;
+        };
+        if !metadata.is_object() {
+            return false;
+        }
+
+        let Ok(content) = std::fs::read_to_string(session_dir.join(MESSAGES_FILENAME)) else {
+            return false;
+        };
+        let mut lines: Vec<&str> = content.split('\n').collect();
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        if lines.is_empty() && metadata.get("total_messages").and_then(Value::as_u64) != Some(0) {
+            return false;
+        }
+
+        lines
+            .iter()
+            .all(|line| matches!(serde_json::from_str::<Value>(line), Ok(Value::Object(_))))
+    }
+
+    /// Whether Vibe's default-config loader admits this directory to its
+    /// session list. The writer emits the complete `SessionMetadata` schema;
+    /// this predicate intentionally mirrors the vendor's looser list oracle.
+    fn is_vendor_session_dir(session_dir: &Path) -> bool {
+        Self::is_vendor_log_dir(session_dir)
+            && Self::session_metadata(session_dir)
+                .as_ref()
+                .is_some_and(Self::metadata_is_listable)
+    }
+
+    /// Encode 47 digest bits as eight alphanumeric base62 characters. Vibe
+    /// resolves a session using only these first eight characters, so a
+    /// conventional hex prefix would leave just 32 bits to distinguish
+    /// imported sessions. Keeping the prefix alphanumeric also makes the
+    /// returned id unambiguous as an argument to `vibe --resume`.
+    fn short_session_id(source_id: &str) -> String {
+        let digest = Sha256::digest(source_id.as_bytes());
+        let mut value = digest[..6]
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+            >> 1;
+        let mut encoded = [SHORT_ID_ALPHABET[0]; 8];
+        for byte in encoded.iter_mut().rev() {
+            *byte = SHORT_ID_ALPHABET[(value % 62) as usize];
+            value /= 62;
+        }
+        encoded.into_iter().map(char::from).collect()
+    }
+
+    /// Give the target a high-entropy native short prefix while retaining the
+    /// source id in filename-safe form for provenance and diagnostics.
+    fn native_session_id(source_id: &str) -> String {
+        format!(
+            "{}-{}",
+            Self::short_session_id(source_id),
+            filename_safe_session_id(source_id)
+        )
+    }
+
+    /// Return every structurally valid directory Vibe's short-id glob can
+    /// select, including logs whose metadata has no usable full id.
+    fn vendor_candidates(short_id: &str) -> std::io::Result<Vec<VendorCandidate>> {
+        let root = Self::home_dir();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let prefix = format!("{DEFAULT_SESSION_PREFIX}_");
+        let suffix = format!("_{short_id}");
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let session_dir = entry.path();
+            let Some(name) = session_dir.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(&prefix)
+                || !name.ends_with(&suffix)
+                || !Self::is_vendor_log_dir(&session_dir)
+            {
+                continue;
+            }
+            let Some(metadata) = Self::session_metadata(&session_dir) else {
+                continue;
+            };
+            let full_id = Self::metadata_session_id(&metadata).map(str::to_owned);
+            let messages_path = session_dir.join(MESSAGES_FILENAME);
+            let Ok(modified) =
+                std::fs::metadata(&messages_path).and_then(|metadata| metadata.modified())
+            else {
+                continue;
+            };
+            candidates.push((session_dir, full_id, modified));
+        }
+        Ok(candidates)
+    }
+
+    /// Select the same exact-id incarnation that Vibe would prefer, but only
+    /// when the complete short-prefix set is unambiguous. Returning a path
+    /// from a mixed set would claim a session that `vibe --resume` may not open.
+    fn latest_session_dir_for_id(session_id: &str) -> Option<PathBuf> {
+        let short_id: String = session_id.chars().take(8).collect();
+        let candidates = Self::vendor_candidates(&short_id).ok()?;
+        if candidates
+            .iter()
+            .any(|(_, full_id, _)| full_id.as_deref() != Some(session_id))
+        {
+            return None;
+        }
+        candidates
+            .into_iter()
+            .max_by_key(|(_, _, modified)| *modified)
+            .map(|(session_dir, _, _)| session_dir)
     }
 
     /// Extract role from a JSONL line, checking multiple field names.
@@ -136,13 +296,9 @@ impl Provider for Vibe {
         if root.is_dir() { vec![root] } else { vec![] }
     }
 
-    /// A Vibe session is a *directory*, and `messages.jsonl` is the file that
-    /// makes it one. `mistral-vibe==2.22.0` names each
-    /// `logs/session/session_<YYYYmmdd_HHMMSS>_<shortid>/` and its loader's
-    /// existence test is `if (session_dir / MESSAGES_FILENAME).is_file()`,
-    /// where `MESSAGES_FILENAME = "messages.jsonl"`. This provider's
-    /// `owns_session` and writer already agree on that path; only the listing
-    /// did not.
+    /// A Vibe session is a default-config `session_*` directory admitted by
+    /// the vendor's list oracle. The vendor uses a direct `glob`, so only
+    /// children of `logs/session/` participate.
     ///
     /// Named exactly, because the siblings are all things a looser rule admits:
     /// `meta.json` beside the transcript (rendered as an empty session), the
@@ -171,60 +327,26 @@ impl Provider for Vibe {
     /// transcript Vibe writes and never lists. casr was listing it as a peer of
     /// the session that spawned it.
     ///
-    /// Only the depth half of Vibe's rule is transcribed. The prefix half
-    /// (`session_*`, and the `meta.json` the loader also requires) is
-    /// deliberately left out: casr's own writer names a session `casr-<stamp>`
-    /// and writes no `meta.json`, so enforcing either would make a session casr
-    /// itself wrote unlistable.
     fn is_session_path(&self, path: &Path) -> bool {
-        if path.file_name().and_then(|n| n.to_str()) != Some("messages.jsonl") {
+        if path.file_name().and_then(|n| n.to_str()) != Some(MESSAGES_FILENAME) {
             return false;
         }
         let root = Self::home_dir();
-        path.parent().and_then(Path::parent) == Some(root.as_path())
+        let Some(session_dir) = path.parent() else {
+            return false;
+        };
+        session_dir.parent() == Some(root.as_path()) && Self::is_vendor_session_dir(session_dir)
     }
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
-        let root = Self::home_dir();
-        if !root.is_dir() {
-            return None;
-        }
-        // Sessions are in subdirectories: <root>/<session-id>/messages.jsonl
-        let candidate = root.join(session_id).join("messages.jsonl");
-        if candidate.is_file() {
-            debug!(
-                provider = "vibe",
-                path = %candidate.display(),
-                session_id,
-                "owns session"
-            );
-            return Some(candidate);
-        }
-        // Walk looking for a matching subdirectory.
-        for entry in walkdir::WalkDir::new(&root)
-            .max_depth(2)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if entry.file_name() == "messages.jsonl"
-                && entry.file_type().is_file()
-                && entry
-                    .path()
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == session_id)
-            {
-                debug!(
-                    provider = "vibe",
-                    path = %entry.path().display(),
-                    session_id,
-                    "owns session (walk)"
-                );
-                return Some(entry.path().to_path_buf());
-            }
-        }
-        None
+        let candidate = Self::latest_session_dir_for_id(session_id)?.join(MESSAGES_FILENAME);
+        debug!(
+            provider = "vibe",
+            path = %candidate.display(),
+            session_id,
+            "owns session"
+        );
+        Some(candidate)
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
@@ -253,6 +375,12 @@ impl Provider for Vibe {
             };
 
             let role_str = Self::extract_role(&val);
+            // Vibe's session loader discards persisted system rows before it
+            // constructs the resumable conversation. Mirror that visibility
+            // here so a conversion never treats them as resumable history.
+            if role_str == "system" {
+                continue;
+            }
             let role = normalize_role(&role_str);
             let content = Self::extract_content(&val);
 
@@ -282,22 +410,44 @@ impl Provider for Vibe {
 
         reindex_messages(&mut messages);
 
-        // Session ID from parent directory name or filename.
-        let session_id = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
+        // Vibe's directory ends in only the first eight id characters.  The
+        // metadata carries the complete id that `vibe --resume` accepts.
+        let metadata = path.parent().and_then(Self::session_metadata);
+        let session_id = metadata
+            .as_ref()
+            .and_then(Self::metadata_session_id)
+            .map(str::to_owned)
             .unwrap_or_else(|| {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-            })
-            .to_string();
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_else(|| {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                    })
+                    .to_string()
+            });
 
-        let title = messages
-            .iter()
-            .find(|m| m.role == MessageRole::User)
-            .map(|m| truncate_title(&m.content, 100));
+        let title = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("title"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| truncate_title(&m.content, 100))
+            });
+        let workspace = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("environment"))
+            .and_then(|environment| environment.get("working_directory"))
+            .and_then(Value::as_str)
+            .filter(|workspace| !workspace.is_empty())
+            .map(PathBuf::from);
 
         let metadata = serde_json::json!({ "source": "vibe" });
 
@@ -306,7 +456,7 @@ impl Provider for Vibe {
         Ok(CanonicalSession {
             session_id,
             provider_slug: "vibe".to_string(),
-            workspace: None,
+            workspace,
             title,
             started_at,
             ended_at,
@@ -322,15 +472,75 @@ impl Provider for Vibe {
         session: &CanonicalSession,
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let session_id = if session.session_id.is_empty() {
+        let source_session_id = if session.session_id.is_empty() {
             format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
         } else {
             session.session_id.clone()
         };
-        let session_id = filename_safe_session_id(&session_id);
+        let session_id = Self::native_session_id(&source_session_id);
 
-        let target_dir = Self::home_dir().join(&session_id);
-        let target_path = target_dir.join("messages.jsonl");
+        // `SessionLogger.save_folder` writes `session_<UTC>_<id[:8]>`.  The
+        // full id lives in metadata and is what `vibe --resume` resolves.
+        let short_id = &session_id[..8];
+        let candidates = Self::vendor_candidates(short_id).map_err(|error| {
+            crate::error::CasrError::SessionWriteError {
+                path: Self::home_dir(),
+                provider: self.slug().to_string(),
+                detail: format!(
+                    "failed to inspect Vibe's `{short_id}` short-id candidates: {error}"
+                ),
+            }
+        })?;
+        if let Some((collision_dir, collision_id, _)) = candidates
+            .iter()
+            .find(|(_, full_id, _)| full_id.as_deref() != Some(session_id.as_str()))
+        {
+            let collision_id = collision_id.as_deref().unwrap_or("<missing>");
+            return Err(crate::error::CasrError::SessionWriteError {
+                path: collision_dir.clone(),
+                provider: self.slug().to_string(),
+                detail: format!(
+                    "Vibe short-id collision: `{short_id}` also resolves session `{collision_id}`; refusing to write because `vibe --resume` could open the wrong conversation"
+                ),
+            }
+            .into());
+        }
+        let existing_dir = candidates
+            .into_iter()
+            .max_by_key(|(_, _, modified)| *modified)
+            .map(|(session_dir, _, _)| session_dir);
+        let target_dir = match existing_dir {
+            Some(existing_dir) if !opts.force => {
+                return Err(crate::error::CasrError::SessionConflict {
+                    session_id,
+                    existing_path: existing_dir.join(MESSAGES_FILENAME),
+                }
+                .into());
+            }
+            Some(existing_dir) => existing_dir,
+            None => {
+                let generated = Self::home_dir().join(format!(
+                    "{DEFAULT_SESSION_PREFIX}_{}_{}",
+                    chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+                    short_id
+                ));
+                // A corrupt/racing entry can appear after the candidate scan.
+                // `--force` must never turn that ambiguity into permission to
+                // overwrite a directory we did not identify as this session.
+                if generated.exists() {
+                    return Err(crate::error::CasrError::SessionWriteError {
+                        path: generated,
+                        provider: self.slug().to_string(),
+                        detail: "refusing to overwrite an unrecognized Vibe session directory"
+                            .to_string(),
+                    }
+                    .into());
+                }
+                generated
+            }
+        };
+        let target_path = target_dir.join(MESSAGES_FILENAME);
+        let metadata_path = target_dir.join(METADATA_FILENAME);
 
         debug!(
             session_id,
@@ -344,9 +554,11 @@ impl Provider for Vibe {
             let role_str = match &msg.role {
                 MessageRole::User => "user",
                 MessageRole::Assistant => "assistant",
-                MessageRole::System => "system",
+                // Vibe discards persisted `system` rows on resume and has no
+                // role for arbitrary source labels.  Keep the words as user
+                // turns; `pipeline::folded_role` reports the role loss.
+                MessageRole::System | MessageRole::Other(_) => "user",
                 MessageRole::Tool => "tool",
-                MessageRole::Other(r) => r.as_str(),
             };
 
             let mut obj = serde_json::Map::new();
@@ -370,27 +582,101 @@ impl Provider for Vibe {
             lines.push(serde_json::to_string(&serde_json::Value::Object(obj))?);
         }
 
-        let content = lines.join("\n") + "\n";
-        let outcome = crate::pipeline::atomic_write(
+        let content = if lines.is_empty() {
+            String::new()
+        } else {
+            lines.join("\n") + "\n"
+        };
+        let messages_outcome = crate::pipeline::atomic_write(
             &target_path,
             content.as_bytes(),
             opts.force,
             self.slug(),
         )?;
 
+        let start_time = session
+            .started_at
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        let end_time = session
+            .ended_at
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|timestamp| timestamp.to_rfc3339());
+        let workspace = session
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.to_str())
+            .map(str::to_owned);
+        let metadata = serde_json::json!({
+            "session_id": &session_id,
+            "parent_session_id": null,
+            "start_time": start_time,
+            "end_time": end_time,
+            "git_commit": null,
+            "git_branch": null,
+            "environment": { "working_directory": workspace },
+            "username": "casr",
+            "loops": [],
+            "title": session.title,
+            "title_source": "auto",
+            "experiments": null,
+            "total_messages": lines.len(),
+        });
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+        let metadata_outcome = match crate::pipeline::atomic_write(
+            &metadata_path,
+            &metadata_bytes,
+            opts.force,
+            self.slug(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(write_error) => {
+                if let Err(rollback_error) =
+                    crate::pipeline::restore_backup(&messages_outcome, self.slug())
+                {
+                    return Err(anyhow::anyhow!(
+                        "failed to write Vibe metadata ({write_error}); transcript rollback also failed ({rollback_error})"
+                    ));
+                }
+                return Err(write_error.into());
+            }
+        };
+
+        let mut backups = Vec::new();
+        backups.extend(messages_outcome.displaced());
+        backups.extend(metadata_outcome.displaced());
+        let resume_command = self.resume_command(&session_id);
+        let warnings = if session
+            .workspace
+            .as_ref()
+            .is_none_or(|workspace| !workspace.is_absolute())
+        {
+            vec![format!(
+                "Vibe's session picker filters by the current working directory, but this session has no absolute workspace and may not appear there; resume it directly with `{resume_command}`"
+            )]
+        } else {
+            Vec::new()
+        };
+
         info!(
             session_id,
-            path = %outcome.target_path.display(),
+            path = %messages_outcome.target_path.display(),
             messages = session.messages.len(),
             "Vibe session written"
         );
 
         Ok(WrittenSession {
-            paths: vec![outcome.target_path.clone()],
+            // The pipeline reads back `paths[0]`; it must remain the
+            // transcript rather than the metadata sidecar.
+            paths: vec![
+                messages_outcome.target_path.clone(),
+                metadata_outcome.target_path.clone(),
+            ],
             session_id: session_id.clone(),
-            resume_command: self.resume_command(&session_id),
-            backups: outcome.displaced().into_iter().collect(),
-            warnings: Vec::new(),
+            resume_command,
+            backups,
+            warnings,
         })
     }
 
@@ -509,6 +795,21 @@ mod tests {
             ],
         );
         assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn reader_skips_system_rows_the_vendor_drops_on_resume() {
+        let session = read_vibe(
+            "sess-system",
+            &[
+                r#"{"role":"system","content":"Never reaches a resumed Vibe conversation"}"#,
+                r#"{"role":"user","content":"Visible prompt"}"#,
+            ],
+        );
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(session.messages[0].content, "Visible prompt");
     }
 
     #[test]

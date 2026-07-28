@@ -334,10 +334,6 @@ fn cline_only_lists_tasks_one_level_under_the_tasks_root() {
 /// transcript Vibe writes, two levels down, that Vibe itself never lists. casr
 /// listed it as a peer of the session that spawned it.
 ///
-/// Only the depth half of Vibe's rule is transcribed here. The prefix half
-/// (`session_*`) is deliberately not, because casr's own writer names a session
-/// `casr-<stamp>`; enforcing the prefix would make casr-written Vibe sessions
-/// unlistable, which is the trap that keeps pi-agent out of this change.
 #[test]
 fn vibe_does_not_list_a_subagent_transcript_as_a_session() {
     let tmp = TempDir::new().expect("tempdir");
@@ -350,7 +346,17 @@ fn vibe_does_not_list_a_subagent_transcript_as_a_session() {
     );
     write(
         &session_dir.join("meta.json"),
-        "{\n  \"id\": \"abc123\"\n}\n",
+        r#"{
+  "session_id": "abc123",
+  "start_time": "2026-01-01T00:00:00+00:00",
+  "end_time": null,
+  "git_commit": null,
+  "git_branch": null,
+  "environment": {"working_directory": null},
+  "username": "casr",
+  "total_messages": 1
+}
+"#,
     );
 
     // A subagent spawned by the `task` tool.
@@ -361,7 +367,46 @@ fn vibe_does_not_list_a_subagent_transcript_as_a_session() {
         &subagent.join("messages.jsonl"),
         "{\"role\":\"user\",\"content\":\"explore\"}\n",
     );
-    write(&subagent.join("meta.json"), "{\n  \"id\": \"def456\"\n}\n");
+    write(
+        &subagent.join("meta.json"),
+        r#"{
+  "session_id": "def456",
+  "start_time": "2026-01-01T00:01:00+00:00",
+  "end_time": null,
+  "git_commit": null,
+  "git_branch": null,
+  "environment": {"working_directory": null},
+  "username": "casr",
+  "total_messages": 1
+}
+"#,
+    );
+
+    // Vibe's glob only sees direct `session_*` children. Its list oracle needs
+    // a JSON-object transcript and a non-empty metadata session id; full
+    // Pydantic metadata validation happens later, during resume.
+    write(
+        &sessions.join("raw-id").join("messages.jsonl"),
+        "{\"role\":\"user\",\"content\":\"raw directory\"}\n",
+    );
+    write(
+        &sessions
+            .join("session_20260101_000200_nometa")
+            .join("messages.jsonl"),
+        "{\"role\":\"user\",\"content\":\"no metadata\"}\n",
+    );
+    write(
+        &sessions
+            .join("session_20260101_000300_badmeta")
+            .join("messages.jsonl"),
+        "{\"role\":\"user\",\"content\":\"bad metadata\"}\n",
+    );
+    write(
+        &sessions
+            .join("session_20260101_000300_badmeta")
+            .join("meta.json"),
+        "{\"session_id\":\"\"}\n",
+    );
 
     let envelope = list_json(&tmp);
     let listed = rows(&envelope, "vibe", &sessions);

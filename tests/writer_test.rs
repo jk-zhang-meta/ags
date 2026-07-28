@@ -1628,8 +1628,8 @@ fn writer_vibe_roundtrip() {
 
     assert_eq!(
         written.paths.len(),
-        1,
-        "Vibe should produce exactly one file"
+        2,
+        "Vibe needs both its transcript and metadata sidecar"
     );
     assert!(written.paths[0].exists(), "Vibe output file should exist");
     assert!(
@@ -1658,10 +1658,14 @@ fn writer_vibe_roundtrip() {
             "Vibe roundtrip msg {i}: content mismatch"
         );
     }
+    assert_eq!(
+        readback.workspace, session.workspace,
+        "Vibe roundtrip: workspace"
+    );
 }
 
 #[test]
-fn writer_vibe_directory_structure() {
+fn writer_vibe_directory_structure_and_metadata() {
     let _lock = VIBE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("VIBE_HOME", tmp.path());
@@ -1671,7 +1675,7 @@ fn writer_vibe_directory_structure() {
         .unwrap();
 
     let path = &written.paths[0];
-    // Should be under <VIBE_HOME>/<session_id>/messages.jsonl
+    // Vibe's default logger uses `session_<UTC>_<id8>/messages.jsonl`.
     let filename = path.file_name().unwrap().to_str().unwrap();
     assert_eq!(
         filename, "messages.jsonl",
@@ -1682,6 +1686,40 @@ fn writer_vibe_directory_structure() {
         session_dir.starts_with(tmp.path()),
         "Vibe session dir should be under VIBE_HOME"
     );
+    let directory_name = session_dir.file_name().unwrap().to_str().unwrap();
+    assert!(
+        directory_name.starts_with("session_"),
+        "Vibe directory should use the vendor prefix, got {directory_name:?}"
+    );
+    let short_id = &written.session_id[..8];
+    assert!(
+        directory_name.ends_with(short_id),
+        "Vibe directory should end with the first eight session-id characters, got {directory_name:?}"
+    );
+
+    let metadata_path = session_dir.join("meta.json");
+    assert_eq!(
+        written.paths[1], metadata_path,
+        "metadata is a written path"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata["session_id"], written.session_id);
+    assert!(metadata["parent_session_id"].is_null());
+    assert!(metadata["start_time"].is_string());
+    assert!(metadata["end_time"].is_string());
+    assert!(metadata["git_commit"].is_null());
+    assert!(metadata["git_branch"].is_null());
+    assert_eq!(
+        metadata["environment"]["working_directory"],
+        "/data/projects/myapp"
+    );
+    assert_eq!(metadata["username"], "casr");
+    assert_eq!(metadata["loops"], serde_json::json!([]));
+    assert_eq!(metadata["title"], "Fix the login bug");
+    assert_eq!(metadata["title_source"], "auto");
+    assert!(metadata["experiments"].is_null());
+    assert_eq!(metadata["total_messages"], 4);
 }
 
 #[test]
@@ -1710,6 +1748,240 @@ fn writer_vibe_output_valid_jsonl() {
             "Vibe line {i}: should have content"
         );
     }
+}
+
+#[test]
+fn writer_vibe_folds_roles_the_vendor_cannot_resume() {
+    let _lock = VIBE_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("VIBE_HOME", tmp.path());
+
+    let mut session = simple_session();
+    session.messages.push(simple_msg(
+        4,
+        MessageRole::System,
+        "System instructions survive as user text",
+        1_700_000_011_000,
+    ));
+    session.messages.push(simple_msg(
+        5,
+        MessageRole::Other("developer".to_string()),
+        "Unknown role survives as user text",
+        1_700_000_012_000,
+    ));
+
+    let written = Vibe
+        .write_session(&session, &WriteOptions { force: false })
+        .expect("Vibe write_session should succeed");
+    let roles: Vec<String> = std::fs::read_to_string(&written.paths[0])
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|message| message["role"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(roles[4], "user");
+    assert_eq!(roles[5], "user");
+
+    let readback = Vibe.read_session(&written.paths[0]).unwrap();
+    assert_eq!(readback.messages[4].role, MessageRole::User);
+    assert_eq!(readback.messages[5].role, MessageRole::User);
+}
+
+#[test]
+fn writer_vibe_marks_an_empty_log_as_empty() {
+    let _lock = VIBE_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("VIBE_HOME", tmp.path());
+
+    let mut session = simple_session();
+    session.session_id = "empty-vibe".to_string();
+    session.messages.clear();
+
+    let written = Vibe
+        .write_session(&session, &WriteOptions { force: false })
+        .expect("Vibe empty write_session should succeed");
+    assert_eq!(std::fs::read_to_string(&written.paths[0]).unwrap(), "");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&written.paths[1]).unwrap()).unwrap();
+    assert_eq!(metadata["total_messages"], 0);
+    assert!(
+        Vibe.read_session(&written.paths[0])
+            .unwrap()
+            .messages
+            .is_empty()
+    );
+}
+
+#[test]
+fn writer_vibe_short_prefix_distinguishes_similar_source_ids() {
+    let _lock = VIBE_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("VIBE_HOME", tmp.path());
+
+    let mut first_session = simple_session();
+    first_session.session_id = "2026/07/27/rollout-a".to_string();
+    let mut second_session = simple_session();
+    second_session.session_id = "2026/07/27/rollout-b".to_string();
+
+    let first = Vibe
+        .write_session(&first_session, &WriteOptions { force: false })
+        .unwrap();
+    let second = Vibe
+        .write_session(&second_session, &WriteOptions { force: false })
+        .unwrap();
+
+    assert_ne!(
+        &first.session_id[..8],
+        &second.session_id[..8],
+        "Vibe resolves only the first eight characters, so similar source ids need independent native prefixes"
+    );
+    for written in [&first, &second] {
+        let suffix = format!("_{}", &written.session_id[..8]);
+        let matches: Vec<_> = std::fs::read_dir(tmp.path().join("logs/session"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(&suffix))
+            })
+            .collect();
+        assert_eq!(
+            matches,
+            vec![written.paths[0].parent().unwrap().to_path_buf()],
+            "the vendor's short-id glob must resolve exactly one imported session"
+        );
+    }
+}
+
+#[test]
+fn writer_vibe_repeated_id_conflicts_and_force_replaces_the_vendor_target() {
+    let _lock = VIBE_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("VIBE_HOME", tmp.path());
+
+    let mut session = simple_session();
+    let first = Vibe
+        .write_session(&session, &WriteOptions { force: false })
+        .unwrap();
+    let error = Vibe
+        .write_session(&session, &WriteOptions { force: false })
+        .expect_err("the same target id must conflict without --force");
+    assert!(error.to_string().contains("already exists"), "{error:#}");
+
+    session.messages[0].content = "replacement prompt".to_string();
+    let replacement = Vibe
+        .write_session(&session, &WriteOptions { force: true })
+        .unwrap();
+
+    assert_eq!(replacement.paths, first.paths);
+    assert_eq!(
+        replacement.backups.len(),
+        2,
+        "both displaced Vibe files need recoverable backups"
+    );
+    assert!(
+        std::fs::read_to_string(&replacement.paths[0])
+            .unwrap()
+            .contains("replacement prompt")
+    );
+    let session_dirs = std::fs::read_dir(tmp.path().join("logs/session"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .count();
+    assert_eq!(
+        session_dirs, 1,
+        "force must replace the directory Vibe resolves, not create another incarnation"
+    );
+}
+
+#[test]
+fn writer_vibe_refuses_an_ambiguous_short_prefix_even_with_force() {
+    let _lock = VIBE_ENV.lock().unwrap();
+    let probe = tempfile::TempDir::new().unwrap();
+    let session = simple_session();
+    let target_id = {
+        let _env = EnvGuard::set("VIBE_HOME", probe.path());
+        Vibe
+            .write_session(&session, &WriteOptions { force: false })
+            .unwrap()
+            .session_id
+    };
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sessions_root = tmp.path().join("logs/session");
+    let short_id = &target_id[..8];
+    let seed = |stamp: &str, full_id: &str, content: &str| {
+        let session_dir = sessions_root.join(format!("session_{stamp}_{short_id}"));
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(
+            session_dir.join("messages.jsonl"),
+            format!("{{\"role\":\"user\",\"content\":\"{content}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            session_dir.join("meta.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "session_id": full_id,
+                "start_time": "2026-01-01T00:00:00+00:00",
+                "end_time": null,
+                "git_commit": null,
+                "git_branch": null,
+                "environment": {"working_directory": "/data/projects/myapp"},
+                "username": "casr",
+                "total_messages": 1,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        session_dir
+    };
+    seed("20260101_000000", &target_id, "target");
+    let collision_dir = seed("20260101_000001", "different-full-id", "foreign");
+    let foreign_before = std::fs::read(collision_dir.join("messages.jsonl")).unwrap();
+
+    let _env = EnvGuard::set("VIBE_HOME", tmp.path());
+    assert!(
+        Vibe.owns_session(&target_id).is_none(),
+        "CASR must not claim an id that the vendor resolver can redirect"
+    );
+    let error = Vibe
+        .write_session(&session, &WriteOptions { force: true })
+        .expect_err("--force must not overwrite or bless a short-id collision");
+
+    assert!(error.to_string().contains("short-id collision"), "{error:#}");
+    assert_eq!(
+        std::fs::read(collision_dir.join("messages.jsonl")).unwrap(),
+        foreign_before,
+        "collision refusal must leave the foreign session untouched"
+    );
+    assert_eq!(
+        std::fs::read_dir(&sessions_root).unwrap().count(),
+        2,
+        "collision refusal must not add another ambiguous directory"
+    );
+}
+
+#[test]
+fn writer_vibe_warns_when_the_picker_cannot_match_a_workspace() {
+    let _lock = VIBE_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("VIBE_HOME", tmp.path());
+
+    let mut session = simple_session();
+    session.workspace = None;
+    let written = Vibe
+        .write_session(&session, &WriteOptions { force: false })
+        .unwrap();
+
+    assert_eq!(written.warnings.len(), 1);
+    assert!(written.warnings[0].contains("session picker"));
+    assert!(written.warnings[0].contains(&written.resume_command));
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&written.paths[1]).unwrap()).unwrap();
+    assert!(metadata["environment"]["working_directory"].is_null());
 }
 
 // ===========================================================================
@@ -2019,6 +2291,7 @@ fn writer_openclaw_session_header() {
         first_line["id"].is_string(),
         "OpenClaw session header should have id"
     );
+    assert_eq!(first_line["id"], written.session_id);
     assert!(
         first_line["timestamp"].is_string(),
         "OpenClaw session header should have timestamp"
@@ -2033,6 +2306,88 @@ fn writer_openclaw_session_header() {
         first_line["version"], 3,
         "OpenClaw session header version should be the current schema number"
     );
+}
+
+#[test]
+fn writer_openclaw_maps_an_unsafe_source_id_to_a_vendor_id() {
+    let _lock = OPENCLAW_ENV.lock().unwrap();
+    let mut session = simple_session();
+    session.session_id = "../../2026/07/27/rollout".to_string();
+
+    let write_once = |root: &std::path::Path| {
+        let _env = EnvGuard::set("OPENCLAW_HOME", root);
+        let written = OpenClaw
+            .write_session(&session, &WriteOptions { force: false })
+            .expect("OpenClaw write_session should map the source id");
+        let header: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&written.paths[0])
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        (written, header)
+    };
+
+    let first = tempfile::TempDir::new().unwrap();
+    let (written, header) = write_once(first.path());
+    let id = written.session_id;
+    assert_eq!(header["id"], id);
+    assert_eq!(
+        written.paths[0].file_stem().and_then(|stem| stem.to_str()),
+        Some(id.as_str())
+    );
+    assert!(
+        (1..=128).contains(&id.len())
+            && id.as_bytes()[0].is_ascii_alphanumeric()
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+        "OpenClaw session id must satisfy validateSessionId, got {id:?}"
+    );
+    assert!(
+        !id.contains('%'),
+        "OpenClaw's validator rejects percent escapes"
+    );
+    assert!(
+        !written.paths[0]
+            .parent()
+            .unwrap()
+            .join("sessions.json")
+            .exists(),
+        "the writer must not race OpenClaw's mutable sessions index"
+    );
+
+    let second = tempfile::TempDir::new().unwrap();
+    let (again, _) = write_once(second.path());
+    assert_eq!(again.session_id, id, "surrogate ids must be deterministic");
+}
+
+#[test]
+fn writer_openclaw_does_not_reuse_a_reserved_checkpoint_stem() {
+    let _lock = OPENCLAW_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+    let mut session = simple_session();
+    session.session_id =
+        "primary.checkpoint.aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".to_string();
+
+    let written = OpenClaw
+        .write_session(&session, &WriteOptions { force: false })
+        .unwrap();
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(&written.paths[0])
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+
+    assert_ne!(written.session_id, session.session_id);
+    assert!(written.session_id.starts_with("casr-"));
+    assert_eq!(header["id"], written.session_id);
 }
 
 #[test]

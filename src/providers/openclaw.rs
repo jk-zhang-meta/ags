@@ -107,6 +107,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
@@ -115,8 +116,8 @@ use crate::model::{
     parse_timestamp, reindex_messages, truncate_title,
 };
 use crate::providers::{
-    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession,
-    filename_safe_session_id, read_dir_reporting, walk_entry_reporting,
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+    walk_entry_reporting,
 };
 
 /// OpenClaw's default agent id. Sessions are keyed by agent, and an agent id is
@@ -130,6 +131,39 @@ const DEFAULT_AGENT_ID: &str = "main";
 /// fails that comparison, and OpenClaw then reports the file as migrated and
 /// rewrites it.
 const SESSION_VERSION: u64 = 3;
+
+/// OpenClaw reserves `<session>.checkpoint.<uuid>.jsonl` for compaction
+/// artifacts and rejects the corresponding stem as a primary session id.
+fn is_compaction_checkpoint_id(session_id: &str) -> bool {
+    let Some((primary_id, checkpoint_id)) = session_id.rsplit_once(".checkpoint.") else {
+        return false;
+    };
+    let bytes = checkpoint_id.as_bytes();
+    !primary_id.is_empty()
+        && bytes.len() == 36
+        && matches!(bytes[14], b'1'..=b'5')
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'A' | b'b' | b'B')
+        && uuid::Uuid::parse_str(checkpoint_id).is_ok()
+}
+
+/// `validateSessionId` in OpenClaw accepts only an ASCII letter or digit
+/// followed by at most 127 ASCII letters, digits, dots, underscores or
+/// hyphens, excluding compaction checkpoint stems. A generic filesystem escape
+/// encoding uses `%`, which is safe as a filename but invalid to
+/// `openclaw agent --session-id`.
+fn native_session_id(source_id: &str) -> String {
+    let bytes = source_id.as_bytes();
+    let valid = (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
+        && !is_compaction_checkpoint_id(source_id);
+    if valid {
+        return source_id.to_string();
+    }
+    format!("casr-{:x}", Sha256::digest(source_id.as_bytes()))
+}
 
 /// The record types `isCanonicalSessionEntryType` accepts
 /// (`src/config/sessions/transcript-tree.ts`). `session` is the header and
@@ -1151,7 +1185,7 @@ impl Provider for OpenClaw {
         } else {
             session.session_id.clone()
         };
-        let session_id = filename_safe_session_id(&session_id);
+        let session_id = native_session_id(&session_id);
 
         let target_dir = Self::home_dir();
         let target_path = target_dir.join(format!("{session_id}.jsonl"));

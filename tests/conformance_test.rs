@@ -479,14 +479,14 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 ///
 /// # The requirement
 ///
-/// Seven of the fifteen flat writers have no slot for a system turn and send it
+/// Eight of the fifteen flat writers have no slot for a system turn and send it
 /// somewhere else — Claude Code, Cline and OpenClaw to a plain user record, Amp
 /// to `info`, Cursor to a human bubble, Kiro to `Prompt`, Aider to a
-/// blockquote. Each of those mappings is right: the alternative is a row the
-/// target deletes on its next rewrite. What was wrong is that a conversion
-/// performing one reported `conversation_only` with an empty `losses` list, so
-/// the person resuming the session could not tell a system prompt they had been
-/// given from something they had typed.
+/// blockquote, and Vibe to a plain user record. Each of those mappings is right:
+/// the alternative is a row the target deletes on its next rewrite. What was
+/// wrong is that a conversion performing one reported `conversation_only` with
+/// an empty `losses` list, so the person resuming the session could not tell a
+/// system prompt they had been given from something they had typed.
 ///
 /// `pipeline::folded_role` is where that is now declared, and this is what
 /// stops the declaration from being a comment that rots. It runs every provider
