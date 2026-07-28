@@ -38,6 +38,48 @@
 //! app generation has been observed to write. See `is_session_path` for what
 //! that does and does not justify.
 //!
+//! ## The `system` turn is a turn
+//!
+//! `author.role` is a slot, not a filter. `system` is one of the cases of the
+//! app's own author-role enum — `ConversationMessage.Author.KnownRole`, whose
+//! field descriptor in `ChatGPT.framework` reads `assistant / system / critic /
+//! tool / developer` at byte 94870708 and `user / assistant / critic / system /
+//! developer` at 94778914.
+//!
+//! [`ChatGpt::write_session`] emits `"system"` for [`MessageRole::System`], and
+//! `pipeline::folded_role` declares chatgpt folds *nothing* — the writer's own
+//! statement that this format can name the role. The reader used to drop every
+//! node whose `author.role` was `"system"` before looking at it. Writer and
+//! reader disagreed about the same file, so a conversion of any session holding
+//! a system turn came back one message short and was rolled back:
+//!
+//! ```text
+//! VerifyFailed: message count mismatch: wrote 3 messages, read back 2
+//! ```
+//!
+//! No vendor rule was being transcribed. What the format has instead is a
+//! *visibility* marker — `isVisuallyHiddenFromConversation` and
+//! `isUserSystemMessage`, stored properties of `ConversationMessageMetadata`
+//! (byte 85387904/85387936, snake-cased on the wire by
+//! `JSONDecoder.convertFromSnakeCase`) — and casr does not need to consult it.
+//! Across six real exported conversations, every one of the eight `system`
+//! nodes carried `content: {"content_type":"text","parts":[""]}` and
+//! `is_visually_hidden_from_conversation: true`, and **none** carried words:
+//! the empty-content test two branches down already drops all of them. A flag
+//! casr's own writer never emits could not help the round trip either.
+//!
+//! So the fix is the one that changes nothing about reading a real
+//! conversation and everything about reading casr's own: report the role the
+//! file states, and let `normalize_role` hand it to every target with a system
+//! slot of its own.
+//!
+//! Two adjacent read gaps this deliberately does *not* close, named so they are
+//! not mistaken for handled. Custom instructions arrive in two shapes — an
+//! older `role: "system"` node whose text lives in
+//! `metadata.user_context_message_data.about_model_message`, and a newer
+//! `role: "user"` node with `content_type: "user_editable_context"` and **no
+//! `parts` key at all**. Both are read as empty here and dropped.
+//!
 //! ## Resume
 //!
 //! ChatGPT doesn't have a CLI resume mechanism. The resume command opens the
@@ -400,11 +442,6 @@ impl Provider for ChatGpt {
                     .and_then(|v| v.as_str())
                     .unwrap_or("assistant");
 
-                // Skip system messages.
-                if role_str == "system" {
-                    continue;
-                }
-
                 let role = normalize_role(role_str);
 
                 // Content: prefer "parts" array, then "text" field.
@@ -463,10 +500,6 @@ impl Provider for ChatGpt {
                     .get("role")
                     .and_then(|v| v.as_str())
                     .unwrap_or("assistant");
-
-                if role_str == "system" {
-                    continue;
-                }
 
                 let role = normalize_role(role_str);
 
@@ -820,8 +853,12 @@ mod tests {
         assert_eq!(session.messages[1].content, "Second");
     }
 
+    /// `author.role` is read, not filtered on. Dropping the system node here is
+    /// what made `write_session` and `read_session` disagree about the file
+    /// between them — `message count mismatch: wrote 3 messages, read back 2` —
+    /// and roll every such conversion back.
     #[test]
-    fn reader_mapping_skips_system_messages() {
+    fn reader_mapping_keeps_system_messages() {
         let session = read_chatgpt_json(
             &json!({
                 "mapping": {
@@ -830,6 +867,39 @@ mod tests {
                             "author": {"role": "system"},
                             "content": {"parts": ["You are helpful."]},
                             "create_time": 1700000000.0
+                        }
+                    },
+                    "user": {
+                        "message": {
+                            "author": {"role": "user"},
+                            "content": {"parts": ["Hi!"]},
+                            "create_time": 1700000001.0
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(session.messages[0].content, "You are helpful.");
+        assert_eq!(session.messages[1].role, MessageRole::User);
+    }
+
+    /// The hidden system node a real conversation opens with. It is dropped, but
+    /// by the rule that drops any wordless turn — not by its role.
+    #[test]
+    fn reader_mapping_drops_the_empty_system_node_as_wordless_not_as_system() {
+        let session = read_chatgpt_json(
+            &json!({
+                "mapping": {
+                    "sys": {
+                        "message": {
+                            "author": {"role": "system"},
+                            "content": {"parts": [""]},
+                            "create_time": 1700000000.0,
+                            "metadata": {"is_visually_hidden_from_conversation": true}
                         }
                     },
                     "user": {
@@ -1089,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_simple_messages_skips_system() {
+    fn reader_simple_messages_keeps_system() {
         let session = read_chatgpt_json(
             &json!({
                 "messages": [
@@ -1100,8 +1170,51 @@ mod tests {
             .to_string(),
         );
 
-        assert_eq!(session.messages.len(), 1);
-        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(session.messages[1].role, MessageRole::User);
+    }
+
+    /// The whole defect in one test: a session with a system turn has to
+    /// survive its own writer and reader. `pipeline`'s read-back verification
+    /// compares counts first, and this is the pair it compares.
+    #[test]
+    fn writer_system_turn_survives_read_back() {
+        let messages = [
+            ("system", "You are helpful."),
+            ("user", "Question?"),
+            ("assistant", "Answer!"),
+        ];
+        let mapping: serde_json::Map<String, serde_json::Value> = messages
+            .iter()
+            .enumerate()
+            .map(|(i, (role, text))| {
+                (
+                    format!("node-{i}"),
+                    json!({"message": {
+                        "author": {"role": role},
+                        "content": {"parts": [text]},
+                        "create_time": 1_700_000_000.0 + i as f64,
+                    }}),
+                )
+            })
+            .collect();
+
+        let session = read_chatgpt_json(
+            &json!({"id": "conv-1", "mapping": mapping, "create_time": 1_700_000_000.0})
+                .to_string(),
+        );
+
+        assert_eq!(session.messages.len(), 3);
+        let roles: Vec<&MessageRole> = session.messages.iter().map(|m| &m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                &MessageRole::System,
+                &MessageRole::User,
+                &MessageRole::Assistant
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------

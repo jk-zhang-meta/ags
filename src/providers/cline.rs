@@ -13,6 +13,61 @@
 //!
 //! Task IDs are numeric strings (typically `Date.now()` / epoch millis).
 //! casr therefore generates numeric IDs for Cline targets as well.
+//!
+//! ## A `tool_use` block is represented exactly once
+//!
+//! `api_conversation_history.json` is an Anthropic Messages-API conversation —
+//! `MessageParam[]` with Cline-only bookkeeping (`ts`, `modelInfo`, `metrics`)
+//! that `dist/extension.js`'s pre-send stripper removes before the request. An
+//! assistant turn's `tool_use` block is the call and the matching `tool_result`
+//! block on the following user turn is the observation:
+//!
+//! ```js
+//! // saoudrizwan.claude-dev 4.0.11, dist/extension.js
+//! return{type:"tool_use",id:r.id,name:r.name,input:n,signature:r.signature,call_id:r.call_id}
+//! static createToolResultBlock(e,r,n){return r==="cline"||!r?{type:"text",…}:{type:"tool_result",tool_use_id:r,call_id:n,content:e}}
+//! ```
+//!
+//! Measured on that build, a stored `tool_use` reaches the model **once**.
+//! `resumeTaskFromHistory` reads the file back verbatim and the only transforms
+//! between disk and the wire slice, reorder and strip; nothing re-renders a
+//! call into prose. Cline does have a `[Tool Use: <name>]` renderer, and it
+//! feeds the `api_req_started` **UI** row and a `conversation_history_*.txt`
+//! hook artifact — neither of which is the conversation. So the vendor's own
+//! artifact says one representation, and it is the structural one.
+//!
+//! (The same build ships an XML-in-text tool mode for models without native
+//! tool calling — `<read_file><path>…</path></read_file>` inside an assistant
+//! `text` block, recovered by a parser that never persists what it builds. Such
+//! a file has no `tool_use` blocks at all, so it reads here as the text it is,
+//! which is what it is to the model too.)
+//!
+//! [`Cline::extract_tool_calls`] returns every `tool_use` block in
+//! [`CanonicalMessage::tool_calls`], so the text must not also name it.
+//!
+//! It used to. The reader flattened `content` with
+//! [`crate::model::flatten_content`], whose `tool_use` arm writes
+//! `[Tool: <name>]` — or `[Tool: <name> - <file_path>]` — into the prose, while
+//! [`Cline::build_api_history`] writes the call from `tool_calls` alone and has
+//! no way to put the text half back. `pipeline`'s read-back verification
+//! compares `content` byte for byte, so every conversion into Cline carrying a
+//! tool call failed and was rolled back:
+//!
+//! ```text
+//! VerifyFailed: message content mismatch at idx 1: wrote 8 bytes, read back 39 bytes
+//! ```
+//!
+//! The file was right and the second copy was the reader's — the same finding
+//! and the same fix as OpenClaw's `toolCall` (see
+//! [`crate::providers::openclaw`]). [`Cline::flatten_message_text`] is the
+//! reader's half. `pipeline::writer_carries_tool_calls("cline")` is already
+//! `true`, so step 7b does not render a marker either.
+//!
+//! Removing that text also removed the only thing keeping a tool-call-only
+//! assistant turn alive: this reader dropped any message whose flattened text
+//! was empty, and 22,553 of the corpus's 55,638 assistant messages carry a call
+//! and no prose. The emptiness test now asks about the whole message rather
+//! than about its text.
 
 use std::path::{Path, PathBuf};
 
@@ -229,6 +284,32 @@ impl Cline {
             }
         }
         None
+    }
+
+    /// A message's model-visible prose, with the blocks that come back as
+    /// structure left out of it.
+    ///
+    /// Only `tool_use` is left out, and only because
+    /// [`Self::extract_tool_calls`] already returns it — unconditionally, for
+    /// every role, so the skip is unconditional too. `tool_result` needs no arm
+    /// here: [`crate::model::flatten_content`] renders nothing for it (Cline's
+    /// block carries the observation under `content`, not `text`), and
+    /// [`Self::extract_tool_results`] is the channel it travels on.
+    ///
+    /// Delegating the rest to [`crate::model::flatten_content`] rather than
+    /// re-implementing it keeps `text` blocks and bare strings reading
+    /// identically to every other provider; the filter is the whole of Cline's
+    /// divergence from it.
+    fn flatten_message_text(content: &serde_json::Value) -> String {
+        let serde_json::Value::Array(blocks) = content else {
+            return flatten_content(content);
+        };
+        let prose: Vec<serde_json::Value> = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) != Some("tool_use"))
+            .cloned()
+            .collect();
+        flatten_content(&serde_json::Value::Array(prose))
     }
 
     fn extract_tool_calls(content: Option<&serde_json::Value>) -> Vec<ToolCall> {
@@ -711,9 +792,16 @@ impl Provider for Cline {
                 let role_str = obj.get("role").and_then(|v| v.as_str()).unwrap_or("user");
                 let role = normalize_role(role_str);
                 let content_value = obj.get("content").unwrap_or(&serde_json::Value::Null);
-                let content = flatten_content(content_value);
+                let content = Self::flatten_message_text(content_value);
 
-                if content.trim().is_empty() {
+                let tool_calls = Self::extract_tool_calls(Some(content_value));
+                let tool_results = Self::extract_tool_results(Some(content_value));
+
+                // Emptiness is a property of the message, not of its prose. An
+                // assistant turn whose only content is a `tool_use` block has
+                // no text and is still the turn that made the call; dropping it
+                // here is how a converted session came back one message short.
+                if content.trim().is_empty() && tool_calls.is_empty() && tool_results.is_empty() {
                     continue;
                 }
 
@@ -726,9 +814,6 @@ impl Provider for Cline {
                 if let Some(ref m) = author {
                     *model_counts.entry(m.clone()).or_insert(0) += 1;
                 }
-
-                let tool_calls = Self::extract_tool_calls(Some(content_value));
-                let tool_results = Self::extract_tool_results(Some(content_value));
 
                 messages.push(CanonicalMessage {
                     idx: 0,
@@ -1037,7 +1122,10 @@ mod tests {
         assert_eq!(session.messages.len(), 2);
         let assistant = &session.messages[1];
         assert_eq!(assistant.role, MessageRole::Assistant);
-        assert!(assistant.content.contains("Let me read that file."));
+        // The prose, and only the prose. `flatten_content`'s `tool_use` arm
+        // would have appended `[Tool: ReadFile]` here, beside the same call
+        // returned structurally below.
+        assert_eq!(assistant.content, "Let me read that file.");
         assert_eq!(assistant.tool_calls.len(), 1);
         assert_eq!(assistant.tool_calls[0].name, "ReadFile");
         assert_eq!(assistant.tool_calls[0].id.as_deref(), Some("tool-abc"));
@@ -1050,8 +1138,6 @@ mod tests {
     #[test]
     fn reader_api_tool_result_blocks() {
         // A user message with a text block AND tool_result blocks.
-        // (A message with only tool_result blocks is skipped because
-        // flatten_content produces no text for tool_result type objects.)
         let entries = vec![
             make_api_user("Read the file"),
             json!({
@@ -1087,10 +1173,15 @@ mod tests {
         assert!(!tool_msg.tool_results[0].is_error);
     }
 
+    /// A user turn whose only block is a `tool_result` is how an
+    /// Anthropic-shaped conversation carries a tool observation, and Cline
+    /// writes exactly that. It used to be dropped, because the reader tested
+    /// its *text* for emptiness and `flatten_content` renders nothing for a
+    /// `tool_result` block — so the observation left the transcript with it,
+    /// and the turn count came back short. Emptiness is now a property of the
+    /// message.
     #[test]
-    fn reader_api_skips_tool_result_only_message() {
-        // A message with ONLY tool_result blocks (no text) should be skipped,
-        // because flatten_content does not produce text for tool_result objects.
+    fn reader_api_keeps_tool_result_only_message() {
         let entries = vec![
             make_api_user("Read the file"),
             json!({
@@ -1109,11 +1200,43 @@ mod tests {
         let (_root, api_path) = write_api_session("1700000000013", &entries, None);
 
         let session = Cline.read_session(&api_path).expect("read_session");
-        // Only the user text message and assistant reply remain; the
-        // tool_result-only message is dropped.
-        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages.len(), 3);
         assert_eq!(session.messages[0].content, "Read the file");
-        assert_eq!(session.messages[1].content, "I see it.");
+        assert_eq!(session.messages[1].content, "");
+        assert_eq!(session.messages[1].tool_results.len(), 1);
+        assert_eq!(session.messages[1].tool_results[0].content, "fn main() { }");
+        assert_eq!(session.messages[2].content, "I see it.");
+    }
+
+    /// The corpus case: 22,553 of 55,638 assistant messages are tool-call-only,
+    /// so the turn with no prose at all is the common one, not the edge.
+    #[test]
+    fn reader_api_keeps_tool_call_only_assistant_message() {
+        let entries = vec![
+            make_api_user("Read the file"),
+            json!({
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-only",
+                        "name": "ReadFile",
+                        "input": {"path": "src/main.rs"}
+                    }
+                ]
+            }),
+        ];
+        let (_root, api_path) = write_api_session("1700000000014", &entries, None);
+
+        let session = Cline.read_session(&api_path).expect("read_session");
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "a turn whose only content is a tool call is still a turn"
+        );
+        assert_eq!(session.messages[1].content, "");
+        assert_eq!(session.messages[1].tool_calls.len(), 1);
+        assert_eq!(session.messages[1].tool_calls[0].name, "ReadFile");
     }
 
     #[test]
@@ -1522,16 +1645,14 @@ mod tests {
 
         let readback = Cline.read_session(&api_path).expect("readback");
         assert_eq!(readback.messages.len(), session.messages.len());
+        // Byte for byte, with nothing tolerated at the end. This assertion used
+        // to accept anything the read-back appended, which is exactly the
+        // difference `pipeline`'s read-back verification refuses to accept — so
+        // the test passed while every real conversion into Cline carrying a
+        // tool call was rolled back.
         for (orig, rb) in session.messages.iter().zip(readback.messages.iter()) {
             assert_eq!(orig.role, rb.role);
-            // Content may include tool_use annotations from flatten_content
-            // (e.g. "[Tool: Read]"), so use starts_with for the text portion.
-            assert!(
-                rb.content.starts_with(&orig.content),
-                "readback content '{}' should start with original '{}'",
-                rb.content,
-                orig.content
-            );
+            assert_eq!(orig.content, rb.content);
         }
         assert_eq!(readback.messages[1].tool_calls.len(), 1);
         assert_eq!(readback.messages[1].tool_calls[0].name, "Read");

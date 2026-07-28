@@ -70,6 +70,50 @@
 //! The thread JSON format is Amp-internal but resembles Anthropic-style message
 //! blocks: messages have a `role` and an array `content` with blocks like
 //! `{type:"text", text:"..."}`, `{type:"tool_use", ...}`, `{type:"tool_result", ...}`.
+//!
+//! ## A `tool_use` block is represented exactly once
+//!
+//! Measured on `sourcegraph.amp` 0.0.1772799397, `dist/extension.cjs`: the
+//! function that turns a stored thread into the request the model sees maps a
+//! `tool_use` block straight through, and adds nothing to the text beside it.
+//!
+//! ```js
+//! if(D.type==="tool_use")return{type:"tool_use",id:D.id,name:D.name,input:D.input};
+//! return{type:"text",text:D.text}
+//! ```
+//!
+//! Amp does double-represent two other block types on purpose — an `image`
+//! gets an `<attached_image path="…">` text marker *plus* the image block, and
+//! so does `manual_bash_invocation` — which is what makes the absence of one
+//! for `tool_use` a decision rather than an omission. Its UI agrees: one
+//! `Tool_use_step` widget per call, with the paired `tool_result` folded into
+//! it. (The clipboard "copy thread as markdown" exporter does emit
+//! `**Tool Use:** \`<name>\``, but that is not the conversation.)
+//!
+//! casr had it both ways. [`Amp::extract_tool_calls`] returns every `tool_use`
+//! block in [`CanonicalMessage::tool_calls`], *and* the reader flattened
+//! `content` with [`crate::model::flatten_content`], whose `tool_use` arm
+//! writes `[Tool: <name>]` — or `[Tool: <name> - <path>]` — into the prose.
+//! [`Self::build_amp_message`] writes the call from `tool_calls` alone and had
+//! no way to put the text half back, and read-back verification compares
+//! `content` byte for byte, so **every** conversion into Amp carrying a tool
+//! call failed and was rolled back:
+//!
+//! ```text
+//! VerifyFailed: message content mismatch at idx 1: wrote 8 bytes, read back 39 bytes
+//! ```
+//!
+//! The file was right and the second copy was the reader's — the same finding
+//! and the same fix as OpenClaw's `toolCall` (see
+//! [`crate::providers::openclaw`]). [`Self::flatten_message_text`] is the
+//! reader's half. `pipeline::writer_carries_tool_calls("amp")` is already
+//! `true`, so step 7b does not render a marker either, and the one
+//! representation is the structural one Amp itself stores.
+//!
+//! `server_tool_use` is deliberately not treated as a call. Amp's own
+//! converter drops it before the request (`if(D.type==="server_tool_use")
+//! return!1`) and its UI declines to draw it, so a block casr represents
+//! nowhere is a block the model never saw either.
 
 use std::path::{Path, PathBuf};
 
@@ -338,6 +382,33 @@ impl Amp {
         }
 
         None
+    }
+
+    /// A message's model-visible prose, with the blocks that come back as
+    /// structure left out of it.
+    ///
+    /// Only `tool_use` is left out, and only because
+    /// [`Self::extract_tool_calls`] already returns it — unconditionally, for
+    /// every role, which is why the skip is unconditional too rather than
+    /// gated on the assistant turn. `tool_result` needs no arm here:
+    /// [`crate::model::flatten_content`] renders nothing for it (Amp's block
+    /// carries the observation under `run`, not `text`), and
+    /// [`Self::extract_tool_results`] is the channel it travels on.
+    ///
+    /// Delegating the rest to [`crate::model::flatten_content`] rather than
+    /// re-implementing it keeps `text` blocks, bare strings and the
+    /// `{parts: […]}` object shape reading identically to every other
+    /// provider; the filter is the whole of Amp's divergence from it.
+    fn flatten_message_text(content: &serde_json::Value) -> String {
+        let serde_json::Value::Array(blocks) = content else {
+            return flatten_content(content);
+        };
+        let prose: Vec<serde_json::Value> = blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) != Some("tool_use"))
+            .cloned()
+            .collect();
+        flatten_content(&serde_json::Value::Array(prose))
     }
 
     fn extract_tool_calls(content: &serde_json::Value) -> Vec<ToolCall> {
@@ -768,16 +839,54 @@ impl Provider for Amp {
             .as_object()
             .context("Amp thread JSON should be an object")?;
 
-        let session_id = thread_obj
-            .get("id")
-            .and_then(|v| v.as_str())
+        // The filename, not the `id` inside it.
+        //
+        // # There is no vendor answer to copy
+        //
+        // Amp is split down the middle on this, and measurably so. Its storage
+        // layer knows only the filename: `keys()` is one `readdir` with
+        // `.slice(0,-5)` on the basename, and `get`/`set`/`delete` all resolve
+        // through `joinPath(root, `${key}.json`)` — the field is never consulted
+        // to locate a file. Its *product* layer knows only the field:
+        // `ThreadHistoryService` builds each list entry as `{id: thread.id, …}`
+        // and throws the storage key away, `prune` re-keys its map by
+        // `thread.id`, and `ThreadService.delete` enumerates filenames, loads
+        // each thread and then deletes by `thread.id`.
+        //
+        // The two agree for every thread Amp mints, because `newEmptyThread` is
+        // `{v:0, id: <key>, …}` — but nothing enforces it. `set()` serializes
+        // whatever object it is handed with no check, and `ThreadSyncService`'s
+        // `download` writes the server's thread verbatim under the server's
+        // separate `action.id`. On a file where the two disagree Amp is broken
+        // in exactly the way casr was: it lists the thread under the inner id,
+        // `storage.get(<inner id>)` misses, and it silently creates a *new*
+        // empty thread there, orphaning the file. Following Amp here would mean
+        // reproducing that.
+        //
+        // # So the decision is casr's own contract
+        //
+        // `session_id` is not a display name. It is the key `casr info <id>`
+        // and `casr resume <target> <id>` look up, and the only key that
+        // resolves: [`Provider::is_session_path`] lists any `.json` in a
+        // threads root and [`Self::thread_path_in`] opens `<root>/<id>.json`.
+        // Reporting `.id` for a file whose name disagrees printed an id in
+        // `casr list` that `casr info` then refused as unknown — a session casr
+        // could see and could not open.
+        //
+        // Nothing is lost by the flip: [`Self::thread_metadata`] already
+        // publishes the file's own `id`, so `casr info --json` shows both and
+        // the disagreement is reported rather than resolved in silence.
+        let session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
             .map(str::to_string)
             .or_else(|| {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
+                thread_obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
                     .map(str::to_string)
             })
-            .context("Amp thread missing id and filename has no stem")?;
+            .context("Amp thread filename has no stem and the thread has no id")?;
 
         let created = thread_obj.get("created").and_then(|v| v.as_i64());
         let title = thread_obj
@@ -814,7 +923,7 @@ impl Provider for Amp {
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
 
-            let mut content = flatten_content(&content_val);
+            let mut content = Self::flatten_message_text(&content_val);
             if content.trim().is_empty()
                 && let Some(summary_text) = Self::extract_info_summary_text(msg)
             {
@@ -966,15 +1075,24 @@ mod tests {
     use super::Amp;
     use crate::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
     use crate::providers::Provider;
-    use std::io::Write;
     use std::path::PathBuf;
 
+    /// Write the thread to `<tmpdir>/<thread.id>.json` and read it back.
+    ///
+    /// The name matters: a thread's id is the name of its file, so a helper
+    /// that wrote to a random temporary name would be reading a thread whose
+    /// identity it had just changed.
     fn read_thread(json: serde_json::Value) -> CanonicalSession {
-        let mut tmp = tempfile::NamedTempFile::with_suffix(".json").expect("tmp thread file");
+        let id = json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .expect("read_thread needs an id to name the file after")
+            .to_string();
+        let dir = tempfile::tempdir().expect("tmp thread dir");
+        let path = dir.path().join(format!("{id}.json"));
         let bytes = serde_json::to_vec_pretty(&json).expect("serialize thread json");
-        tmp.write_all(&bytes).expect("write thread json");
-        tmp.flush().expect("flush thread json");
-        Amp.read_session(tmp.path())
+        std::fs::write(&path, &bytes).expect("write thread json");
+        Amp.read_session(&path)
             .expect("read_session should succeed")
     }
 
@@ -1043,7 +1161,10 @@ mod tests {
         assert_eq!(session.messages[0].timestamp, Some(created));
 
         assert_eq!(session.messages[1].role, MessageRole::Assistant);
-        assert_eq!(session.messages[1].content, "Hi\n[Tool: Read]");
+        // The prose, and only the prose: the `tool_use` block comes back below
+        // in `tool_calls`, and a `[Tool: Read]` line here would be the same
+        // call a second time.
+        assert_eq!(session.messages[1].content, "Hi");
         assert_eq!(session.messages[1].tool_calls.len(), 1);
         assert_eq!(
             session.messages[1].tool_calls[0].id.as_deref(),
@@ -1153,7 +1274,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_session_id_falls_back_to_filename_stem_when_missing() {
+    fn reader_session_id_is_the_filename_stem_when_the_thread_has_no_id() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let path = tmp.path().join("thread-stem.json");
         let json = serde_json::json!({
@@ -1166,6 +1287,45 @@ mod tests {
 
         let session = Amp.read_session(&path).expect("read_session");
         assert_eq!(session.session_id, "thread-stem");
+    }
+
+    /// The residual the id-vs-filename flip settles. A file whose name and
+    /// whose `id` disagree has to be listed under the name, because the name is
+    /// the only key [`Amp::owns_session`] — and Amp's own `get()` — can open.
+    /// The `id` is kept, in `metadata`, so the disagreement is reported rather
+    /// than erased.
+    #[test]
+    fn reader_reports_the_key_that_resolves_and_keeps_the_id_that_does_not() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let root = dir.path().join("threads");
+        std::fs::create_dir_all(&root).expect("threads root");
+        let stem = "T-11111111-1111-1111-1111-111111111111";
+        let inner = "T-99999999-9999-9999-9999-999999999999";
+        let path = root.join(format!("{stem}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "v": 0,
+                "id": inner,
+                "created": 1_700_000_000_000_i64,
+                "messages": [user_msg("Hello", 1_700_000_000_000_i64)]
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+
+        let session = Amp.read_session(&path).expect("read_session");
+        assert_eq!(session.session_id, stem);
+        assert_eq!(
+            session.metadata["id"].as_str(),
+            Some(inner),
+            "the thread's own id is reported, not discarded"
+        );
+        assert_eq!(
+            Amp::owns_session_in_roots(&session.session_id, std::slice::from_ref(&root)).as_deref(),
+            Some(path.as_path()),
+            "every id casr reports for a thread must be one it can resolve"
+        );
     }
 
     /// The minter has to keep matching Amp's own `rz` validator: `T-` plus a
@@ -1294,19 +1454,105 @@ mod tests {
             Some(PathBuf::from("/data/projects/ws_roundtrip"))
         );
         assert_eq!(readback.messages.len(), session.messages.len());
-        fn strip_tool_lines(s: &str) -> String {
-            s.lines()
-                .filter(|line| !line.trim_start().starts_with("[Tool:"))
-                .collect::<Vec<&str>>()
-                .join("\n")
-        }
-
+        // Byte for byte, with nothing stripped. This assertion used to filter
+        // `[Tool: …]` lines out of the read-back before comparing, which is
+        // exactly the difference `pipeline`'s read-back verification refuses to
+        // filter — so the test passed while every real conversion into Amp
+        // carrying a tool call was rolled back.
         for (orig, rb) in session.messages.iter().zip(readback.messages.iter()) {
             assert_eq!(orig.role, rb.role);
-            assert_eq!(orig.content, strip_tool_lines(&rb.content));
+            assert_eq!(orig.content, rb.content);
         }
         assert_eq!(readback.messages[1].tool_calls.len(), 1);
         assert_eq!(readback.messages[1].tool_results.len(), 1);
+    }
+
+    /// The corpus case: 22,553 of 55,638 assistant messages are tool-call-only,
+    /// so the turn with no prose at all is the common one, not the edge.
+    ///
+    /// Two things have to hold at once. The message must survive — an empty
+    /// `content` is not an empty message once `tool_calls` is populated — and
+    /// its `content` must stay empty, because that is what the writer wrote.
+    #[test]
+    fn writer_tool_call_only_assistant_turn_survives_read_back_unchanged() {
+        let thread_id = "T-550e8400-e29b-41d4-a716-446655440006";
+        let created = 1_700_000_000_000_i64;
+        let session = CanonicalSession {
+            session_id: "source".to_string(),
+            provider_slug: "test".to_string(),
+            workspace: None,
+            title: Some("Tool-call-only".to_string()),
+            started_at: Some(created),
+            ended_at: Some(created + 1),
+            messages: vec![
+                CanonicalMessage {
+                    idx: 0,
+                    role: MessageRole::User,
+                    content: "read it".to_string(),
+                    timestamp: Some(created),
+                    author: None,
+                    tool_calls: vec![],
+                    tool_results: vec![],
+                    extra: serde_json::Value::Null,
+                },
+                CanonicalMessage {
+                    idx: 1,
+                    role: MessageRole::Assistant,
+                    content: String::new(),
+                    timestamp: Some(created + 1),
+                    author: None,
+                    tool_calls: vec![ToolCall {
+                        id: Some("toolu_1".to_string()),
+                        name: "Read".to_string(),
+                        arguments: serde_json::json!({"file_path":"/data/a.rs"}),
+                    }],
+                    tool_results: vec![],
+                    extra: serde_json::Value::Null,
+                },
+            ],
+            metadata: serde_json::Value::Null,
+            source_path: PathBuf::from("/tmp/source.jsonl"),
+            model_name: None,
+        };
+
+        let readback = read_thread(Amp::build_thread_json(&session, thread_id, created));
+        assert_eq!(
+            readback.messages.len(),
+            2,
+            "a turn whose only content is a tool call is still a turn"
+        );
+        assert_eq!(readback.messages[1].content, "");
+        assert_eq!(readback.messages[1].tool_calls.len(), 1);
+        assert_eq!(readback.messages[1].tool_calls[0].name, "Read");
+    }
+
+    /// `flatten_content`'s `tool_use` arm appends the input's `file_path` or
+    /// `description` to the marker, so the duplicate was not even a fixed
+    /// string — it was 39 bytes where 8 were written. Pinned on the shape that
+    /// produced the widest divergence.
+    #[test]
+    fn reader_does_not_render_tool_use_into_the_text() {
+        let created = 1_700_000_000_000_i64;
+        let mut thread = base_thread("T-550e8400-e29b-41d4-a716-446655440007", created);
+        thread["messages"] = serde_json::Value::Array(vec![assistant_msg(
+            vec![
+                serde_json::json!({"type":"text","text":"Reading."}),
+                serde_json::json!({
+                    "type":"tool_use","id":"toolu_1","name":"Read",
+                    "input":{"file_path":"/data/proj/a.rs","description":"read a file"}
+                }),
+            ],
+            created,
+        )]);
+
+        let session = read_thread(thread);
+        assert_eq!(session.messages[0].content, "Reading.");
+        assert!(
+            !session.messages[0].content.contains("[Tool:"),
+            "the structural call must not also be prose: {}",
+            session.messages[0].content
+        );
+        assert_eq!(session.messages[0].tool_calls.len(), 1);
     }
 
     /// The id has to be the command's argument, not text inside `--execute`'s
