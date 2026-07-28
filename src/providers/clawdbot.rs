@@ -13,11 +13,12 @@
 //! package's `SessionManager` — `dist/agents/pi-embedded-runner.js` calls
 //! `SessionManager.open(params.sessionFile)`, and
 //! `dist/config/sessions/transcript.js` writes the header and appends through
-//! `sessionManager.appendMessage(...)`. Every published version of the package,
-//! from `clawdbot@2026.1.4` to `clawdbot@2026.1.24-3`, writes that envelope:
+//! `sessionManager.appendMessage(...)`. The current verified package,
+//! `clawdbot@2026.1.24-3`, embeds `pi-coding-agent@0.49.3`, whose
+//! `CURRENT_SESSION_VERSION` is 3:
 //!
 //! ```json
-//! {"type":"session","version":2,"id":"…","timestamp":"…","cwd":"/home/u/p"}
+//! {"type":"session","version":3,"id":"…","timestamp":"…","cwd":"/home/u/p"}
 //! {"type":"message","id":"5c4f098c","parentId":null,"timestamp":"…","message":{"role":"user","content":"…"}}
 //! ```
 //!
@@ -475,12 +476,12 @@ impl ClawdBot {
 
         // Session header, as ClawdBot writes it in
         // `dist/config/sessions/transcript.js: ensureSessionHeader`. `version`
-        // is `CURRENT_SESSION_VERSION` = 2; writing 2 with real `id`/`parentId`
+        // is `CURRENT_SESSION_VERSION` = 3; writing 3 with real `id`/`parentId`
         // links means `SessionManager` loads the file as-is instead of running
         // `migrateSessionEntries` and rewriting it under the user.
         let header = serde_json::json!({
             "type": "session",
-            "version": 2,
+            "version": 3,
             "id": session_id,
             "timestamp": session.started_at
                 .and_then(chrono::DateTime::from_timestamp_millis)
@@ -932,7 +933,7 @@ mod tests {
 
         assert_eq!(lines.len(), 3, "header plus one entry per message");
         assert_eq!(lines[0]["type"], "session");
-        assert_eq!(lines[0]["version"], 2);
+        assert_eq!(lines[0]["version"], 3);
         assert_eq!(lines[0]["id"], "roundtrip-test");
         assert_eq!(lines[0]["cwd"], "/home/u/proj");
 

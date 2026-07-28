@@ -455,3 +455,56 @@ fn source_path_hint_without_root_match_selects_best_effort_provider() {
     assert_eq!(resolved.provider.slug(), "codex");
     assert_eq!(resolved.path, orphan_path);
 }
+
+#[test]
+fn source_path_hint_without_root_match_rejects_multiple_plausible_parsers() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let orphan_path = tmp.path().join("orphan.wat");
+    std::fs::write(&orphan_path, "{}").expect("seed orphan file");
+
+    let cc = MockProvider::new(
+        "Claude Code",
+        "claude-code",
+        "cc",
+        true,
+        vec![tmp.path().join("cc-root")],
+    )
+    .with_orphan_path_read_support();
+    let cod = MockProvider::new(
+        "Codex",
+        "codex",
+        "cod",
+        true,
+        vec![tmp.path().join("cod-root")],
+    )
+    .with_orphan_path_read_support();
+    let registry = ProviderRegistry::new(vec![Box::new(cc), Box::new(cod)]);
+
+    let hint = SourceHint::Path(orphan_path.clone());
+    let err = registry
+        .resolve_session("ignored", Some(&hint))
+        .expect_err("multiple successful parsers must not be used as an ownership oracle");
+
+    match err {
+        CasrError::AmbiguousSessionId {
+            session_id,
+            candidates,
+        } => {
+            assert_eq!(session_id, "ignored");
+            assert_eq!(candidates.len(), 2);
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.provider == "claude-code"
+                        && candidate.path == orphan_path)
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .any(|candidate| candidate.provider == "codex"
+                        && candidate.path == orphan_path)
+            );
+        }
+        other => panic!("expected AmbiguousSessionId, got {other:?}"),
+    }
+}

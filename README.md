@@ -540,7 +540,11 @@ Path mode has additional fallback logic when a file is outside known provider ro
 
 1. Try extension and file-signature heuristics.
 2. If heuristics fail, ask each provider parser to read the file.
-3. Rank successful parses by plausibility and message count.
+3. If any successful parse is plausible, discard non-plausible successes;
+   otherwise retain every non-empty success.
+4. Accept the parser only when exactly one candidate remains. Multiple
+   candidates return `AmbiguousSessionId`; message count and provider name
+   never break the tie because neither proves ownership.
 
 Plausibility currently requires at least one user message and one assistant message.
 

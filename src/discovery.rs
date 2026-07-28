@@ -267,7 +267,7 @@ impl ProviderRegistry {
         // This can happen when users move/copy session files for archival or sharing.
         //
         // First, try lightweight file signature inference. If that fails, probe all
-        // providers and pick the most plausible parser.
+        // providers and accept a parser only when its ownership claim is unique.
         if let Some(provider) = self.infer_provider_for_path(path) {
             info!(
                 provider = provider.name(),
@@ -280,7 +280,7 @@ impl ProviderRegistry {
             });
         }
 
-        let mut best: Option<(&dyn Provider, usize, bool)> = None;
+        let mut parsed_candidates: Vec<(&dyn Provider, bool)> = Vec::new();
         let mut providers_tried: Vec<String> = Vec::new();
 
         for provider in &self.providers {
@@ -295,18 +295,36 @@ impl ProviderRegistry {
             }
 
             let plausible = is_plausible_session(&session);
-
-            let is_better = best.is_none_or(|(best_provider, best_len, best_plausible)| {
-                (plausible, session.messages.len(), provider.slug())
-                    > (best_plausible, best_len, best_provider.slug())
-            });
-
-            if is_better {
-                best = Some((provider.as_ref(), session.messages.len(), plausible));
-            }
+            parsed_candidates.push((provider.as_ref(), plausible));
         }
 
-        if let Some((provider, _len, plausible)) = best {
+        let has_plausible_candidate = parsed_candidates.iter().any(|(_, plausible)| *plausible);
+        let finalists: Vec<(&dyn Provider, bool)> = parsed_candidates
+            .into_iter()
+            .filter(|(_, plausible)| !has_plausible_candidate || *plausible)
+            .collect();
+
+        if finalists.len() > 1 {
+            let candidates = finalists
+                .iter()
+                .map(|(provider, _)| Candidate {
+                    provider: provider.slug().to_string(),
+                    path: path.to_path_buf(),
+                })
+                .collect::<Vec<_>>();
+            warn!(
+                session_id,
+                path = %path.display(),
+                candidate_count = candidates.len(),
+                "ambiguous explicit path — multiple providers parsed the same file"
+            );
+            return Err(CasrError::AmbiguousSessionId {
+                session_id: session_id.to_string(),
+                candidates,
+            });
+        }
+
+        if let Some((provider, plausible)) = finalists.into_iter().next() {
             if !plausible {
                 warn!(
                     provider = provider.name(),
@@ -567,39 +585,34 @@ impl ProviderRegistry {
     /// function replaced — was never OpenClaw's signature. It was the family's,
     /// and OpenClaw was claiming all three.
     ///
-    /// # What is left to go on
+    /// # What the filename can and cannot prove
     ///
-    /// The filename, which the three do not share. ClawdBot names a transcript
-    /// `<sessionId>.jsonl`, or `<sessionId>-topic-<topicId>.jsonl` for a topic
+    /// Ordinary filenames differ. ClawdBot's `resolveSessionTranscriptPath`
+    /// uses `<sessionId>.jsonl` (or a topic suffix), while `pi` and OpenClaw
+    /// normally use `<ISO-timestamp>_<sessionId>.jsonl`
+    /// (`session-manager.js:502`, `session-manager-BC-U4J87.js:1535`).
+    /// ClawdBot can also create the timestamped form when forking a parent
     /// session (`clawdbot@2026.1.24-3`,
-    /// `dist/config/sessions/paths.js: resolveSessionTranscriptPath`); it never
-    /// prefixes a timestamp. `pi` and OpenClaw both name theirs
-    /// `<ISO-timestamp>_<sessionId>.jsonl` (`session-manager.js:502`,
-    /// `session-manager-BC-U4J87.js:1535`), so the underscore separates
-    /// ClawdBot from the other two and cannot separate those two from each
-    /// other.
+    /// `dist/auto-reply/reply/session.js:14-40,241-252`), so an underscore
+    /// does not identify or exclude any member of the family.
     ///
-    /// # The remaining case stays where it already was
-    ///
-    /// A timestamped name leaves `pi` and OpenClaw genuinely indistinguishable,
-    /// and this function answers `pi-agent` — not because that is measured, but
-    /// because it is the answer the rule this replaced already gave for exactly
-    /// this filename, and moving it would be a preference invented here.
-    ///
-    /// Returning `None` and letting [`Self::resolve_from_path`] fall through to
-    /// its probe loop was tried and is worse: with several readers recovering
-    /// the same three messages the loop's `(plausible, message count, slug)`
-    /// ordering decides on the slug, and a real OpenClaw transcript came back
-    /// as `vibe`, whose reader took the session id from the *directory* name.
-    /// A tie-break on a provider's name is not evidence about a file.
+    /// Therefore a name without the observed timestamp prefix identifies
+    /// ClawdBot, while an actual timestamped name returns `None`. The generic
+    /// probe is safe for that unresolved case because it reports multiple
+    /// successful parsers as ambiguity instead of breaking the tie by message
+    /// count or provider name.
     ///
     /// Only files outside every provider's session roots reach any of this;
     /// `resolve_from_path` matches roots first, and a session sitting in
     /// `~/.clawdbot/agents/<id>/sessions/` was never ambiguous.
     fn pi_family_provider(&self, path: &Path) -> Option<&dyn Provider> {
         let stem = path.file_stem().and_then(|s| s.to_str())?;
-        if stem.contains('_') {
-            return self.find_by_slug("pi-agent");
+        let has_timestamp_prefix = stem.split_once('_').is_some_and(|(prefix, session_id)| {
+            !session_id.is_empty()
+                && chrono::NaiveDateTime::parse_from_str(prefix, "%Y-%m-%dT%H-%M-%S-%3fZ").is_ok()
+        });
+        if has_timestamp_prefix {
+            return None;
         }
         self.find_by_slug("clawdbot")
     }
@@ -671,9 +684,18 @@ impl ProviderRegistry {
                     if record_type == Some("message") && value.get("message").is_some() {
                         pi_family = true;
                     }
+                    // Claude Code usually carries `cwd`, but a transcript can
+                    // omit it. Its conversational records still have the DAG
+                    // envelope (`parentUuid` + `isSidechain`) around `message`;
+                    // requiring that whole shape is stronger than treating any
+                    // successful generic parser as ownership evidence.
+                    let claude_dag_message = matches!(record_type, Some("user" | "assistant"))
+                        && value.get("message").is_some()
+                        && value.get("parentUuid").is_some()
+                        && value.get("isSidechain").and_then(|v| v.as_bool()).is_some();
                     if value.get("sessionId").is_some()
                         && value.get("uuid").is_some()
-                        && value.get("cwd").is_some()
+                        && (value.get("cwd").is_some() || claude_dag_message)
                     {
                         return self.find_by_slug("claude-code");
                     }
@@ -845,6 +867,7 @@ pub fn repo_name_from_path(workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{ProviderRegistry, SourceHint, is_plausible_session};
+    use crate::error::CasrError;
     use crate::model::{CanonicalMessage, CanonicalSession, MessageRole};
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -987,6 +1010,20 @@ mod tests {
     }
 
     #[test]
+    fn infer_provider_for_path_jsonl_claude_code_without_cwd() {
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".jsonl").expect("tmp");
+        tmp.write_all(
+            br#"{"sessionId":"s1","uuid":"u1","parentUuid":null,"isSidechain":false,"type":"user","message":{"role":"user","content":"hi"}}"#,
+        )
+        .expect("write");
+        tmp.flush().expect("flush");
+        assert_eq!(
+            infer_slug_for_file(tmp.path()).as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
     fn infer_provider_for_path_jsonl_clawdbot_bare_role_content() {
         let mut tmp = tempfile::NamedTempFile::with_suffix(".jsonl").expect("tmp");
         tmp.write_all(br#"{"role":"user","content":"hi"}"#)
@@ -1028,18 +1065,50 @@ mod tests {
         assert_eq!(infer_slug_for_file(&path).as_deref(), Some("clawdbot"));
     }
 
-    /// `pi` and OpenClaw both name a transcript `<ISO-timestamp>_<id>.jsonl`
-    /// (`session-manager.js:502`, `session-manager-BC-U4J87.js:1535`), so the
-    /// name cannot separate those two. The answer stays where the previous rule
-    /// already put this shape.
+    /// ClawdBot accepts an explicit session id and interpolates it unchanged
+    /// into `<sessionId>.jsonl`; an underscore alone is not a timestamp.
     #[test]
-    fn a_timestamped_pi_family_name_stays_with_pi_agent() {
+    fn a_clawdbot_session_id_with_an_underscore_is_still_clawdbot() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("my_session.jsonl");
+        std::fs::write(&path, PI_FAMILY_TRANSCRIPT).expect("write");
+        assert_eq!(infer_slug_for_file(&path).as_deref(), Some("clawdbot"));
+    }
+
+    /// `pi`, OpenClaw, and ClawdBot parent-session forks can all name a
+    /// transcript `<ISO-timestamp>_<id>.jsonl`, so the resolver must not guess.
+    #[test]
+    fn a_timestamped_shared_envelope_is_reported_as_ambiguous() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir
             .path()
             .join("2026-07-28T05-51-33-015Z_986ecf9a-883a-445d-aea5-7592ccfcc05d.jsonl");
         std::fs::write(&path, PI_FAMILY_TRANSCRIPT).expect("write");
-        assert_eq!(infer_slug_for_file(&path).as_deref(), Some("pi-agent"));
+        assert_eq!(infer_slug_for_file(&path), None);
+
+        let registry = ProviderRegistry::default_registry();
+        let hint = SourceHint::Path(path);
+        let error = registry
+            .resolve_session("shared-pi-family", Some(&hint))
+            .expect_err("an indistinguishable Pi/OpenClaw transcript must not be guessed");
+        let CasrError::AmbiguousSessionId { candidates, .. } = error else {
+            panic!("expected AmbiguousSessionId, got {error:?}");
+        };
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.provider == "pi-agent")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.provider == "openclaw")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.provider == "clawdbot")
+        );
     }
 
     /// A `leaf` record settles it wherever it appears and whatever the file is
