@@ -375,12 +375,11 @@ fn finish_hops(tier: &str, report: &HopReport) {
 // owes, checked by running every writer — and because a provider author looking
 // for "what must my writer do" should find all of it in one place.
 
-/// Every provider-specific root that has no home-relative default of its own.
+/// Provider-specific roots with no home-relative default of their own.
 ///
-/// `HOME` covers the rest. Both of these fail their write outright when unset
-/// ("cannot determine ChatGPT home directory", "Cline storage not found"), and
-/// a requirement that silently skipped two of its fifteen subjects would be
-/// measuring what it could reach rather than what it claims.
+/// Their target paths currently refuse before touching these roots. Keeping
+/// explicit sandbox values means a future capability change cannot make this
+/// conformance test inspect or write a developer's real store.
 const EXTRA_ROOTS: [&str; 2] = ["CHATGPT_HOME", "CLINE_HOME"];
 
 /// Like [`sandboxed`], but for the flat writers: every root inside one scratch
@@ -479,10 +478,10 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 ///
 /// # The requirement
 ///
-/// Seven writable flat targets have no slot for a system turn and send it
-/// somewhere else — Claude Code, Cline and Vibe to a plain user record, Amp to
-/// `info`, Cursor to a human bubble, Kiro to `Prompt`, and Aider to a
-/// blockquote. Each of those mappings is right:
+/// Six writable flat targets have no slot for a system turn and send it
+/// somewhere else — Claude Code and Vibe to a plain user record, Amp to `info`,
+/// Cursor to a human bubble, Kiro to `Prompt`, and Aider to a blockquote. Each
+/// of those mappings is right:
 /// the alternative is a row the target deletes on its next rewrite. What was
 /// wrong is that a conversion performing one reported `conversation_only` with
 /// an empty `losses` list, so the person resuming the session could not tell a
@@ -505,7 +504,14 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 /// artifact and the read-back agree about.
 #[test]
 fn no_writer_folds_a_role_without_declaring_it() {
-    const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode", "openclaw"];
+    const REFUSES: &[&str] = &[
+        "antigravity",
+        "chatgpt",
+        "cline",
+        "grok",
+        "opencode",
+        "openclaw",
+    ];
     let probed = [
         MessageRole::System,
         MessageRole::Tool,

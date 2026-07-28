@@ -89,7 +89,7 @@ claude --resume <new-session-id>
 | Antigravity | `agy` | Yes | No | `agy --conversation <uuid>` |
 | Gemini CLI | `gmi` | Yes | Yes | `gemini --resume <session-id>` |
 | Cursor | `cur` | Yes | Yes | `cursor .` |
-| Cline | `cln` | Yes | Yes | `code .` |
+| Cline | `cln` | Yes | No | `code .` |
 | Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
 | Amp | `amp` | Yes | Yes | `amp threads continue <session-id>` |
 | OpenCode | `opc` | Yes | No | `opencode --session <session-id>` |
@@ -114,6 +114,10 @@ Notes:
   updates only in-process. Directly editing `sessions.json` can overwrite an
   active gateway update; target imports remain disabled until casr can use the
   authenticated gateway lifecycle.
+- Cline is read/resume-only because `taskHistory.json` has no cross-process
+  transaction or shared writer lock. A direct read-modify-write can overwrite
+  active Cline history; target imports remain disabled until casr can use a
+  vendor-authoritative lifecycle.
 
 ## Installation
 

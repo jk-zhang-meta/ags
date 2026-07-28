@@ -84,7 +84,6 @@ const CONTAINS: &[&str] = &[
     "codex",
     "gemini",
     "cursor",
-    "cline",
     "aider",
     "amp",
     "kiro",
@@ -100,7 +99,14 @@ const ESCAPES: &[&str] = &[];
 
 /// Providers that refuse to write at all, and say so rather than emitting a
 /// stub their tool would reject.
-const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode", "openclaw"];
+const REFUSES: &[&str] = &[
+    "antigravity",
+    "chatgpt",
+    "cline",
+    "grok",
+    "opencode",
+    "openclaw",
+];
 
 // ---------------------------------------------------------------------------
 // Environment sandbox

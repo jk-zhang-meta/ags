@@ -34,6 +34,7 @@ use casr::{
     providers::antigravity::Antigravity,
     providers::chatgpt::ChatGpt,
     providers::claude_code::ClaudeCode,
+    providers::cline::Cline,
     providers::codex::Codex,
     providers::gemini::Gemini,
     providers::grok::Grok,
@@ -602,6 +603,7 @@ fn every_read_only_target_refuses_normal_force_and_dry_run() {
     let targets: Vec<Box<dyn Provider>> = vec![
         Box::new(Antigravity),
         Box::new(ChatGpt),
+        Box::new(Cline),
         Box::new(Grok),
         Box::new(OpenCode),
     ];
@@ -1369,6 +1371,135 @@ fn pipeline_rejects_tool_to_assistant_fold_for_non_cursor_targets() {
         !written_path.exists(),
         "unverified output should be removed on verify failure"
     );
+}
+
+#[test]
+fn pipeline_does_not_duplicate_native_structural_tool_results() {
+    for target_slug in ["amp", "kiro"] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let src_root = tmp.path().join("src");
+        let dst_root = tmp.path().join(target_slug);
+        fs::create_dir_all(&src_root).expect("create src root");
+        fs::create_dir_all(&dst_root).expect("create target root");
+
+        let src = MockProvider::new("Source", "src", "src", vec![src_root.clone()]);
+        let dst = MockProvider::new(
+            target_slug,
+            target_slug,
+            target_slug,
+            vec![dst_root.clone()],
+        );
+        let session_id = format!("sid-{target_slug}-tool-result");
+        let source_path = src_root.join(format!("{session_id}.json"));
+        let written_path = dst_root.join("out.json");
+        let mut canonical = valid_session_with_id(&session_id);
+        canonical.messages[2].role = MessageRole::Tool;
+        canonical.messages[2].content.clear();
+        canonical.messages[2].tool_results = vec![ToolResult {
+            call_id: Some("call-1".to_string()),
+            content: "native observation".to_string(),
+            is_error: false,
+        }];
+
+        src.set_owned_session(&session_id, source_path.clone());
+        src.set_read_session(source_path, canonical.clone());
+        dst.set_write_success(WrittenSession {
+            paths: vec![written_path.clone()],
+            session_id: format!("target-{session_id}"),
+            resume_command: format!("{target_slug} --resume target-{session_id}"),
+            backups: Vec::new(),
+            warnings: Vec::new(),
+        });
+        dst.set_read_session(written_path, canonical);
+
+        let pipeline = ConversionPipeline {
+            registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
+            store: None,
+        };
+        pipeline
+            .convert(target_slug, &session_id, options(false, None))
+            .unwrap_or_else(|error| {
+                panic!("{target_slug} structural tool result should not be duplicated: {error:#}")
+            });
+
+        let projected = dst.last_written().expect("target captured the projection");
+        assert_eq!(
+            projected.messages[2].content, "",
+            "{target_slug} carries the observation structurally; a text marker would show it twice"
+        );
+        assert_eq!(projected.messages[2].tool_results.len(), 1);
+    }
+}
+
+#[test]
+fn pipeline_does_not_mistake_a_short_result_for_an_incidental_substring() {
+    let session_id = "sid-short-result";
+    let (src, dst, pipeline) = pair_with_target_slug(session_id, "factory");
+    let mut canonical = valid_session_with_id(session_id);
+    canonical.messages[1].content = "I took a look.".to_string();
+    canonical.messages[1].tool_results = vec![ToolResult {
+        call_id: Some("call-1".to_string()),
+        content: "ok".to_string(),
+        is_error: false,
+    }];
+    src.set_read_session(
+        PathBuf::from(format!("/tmp/src-root/{session_id}.json")),
+        canonical,
+    );
+    dst.set_read_echo();
+
+    let result = pipeline
+        .convert("tgt", session_id, options(false, None))
+        .expect("the short observation should receive a text fallback");
+    let projected = dst.last_written().expect("target projection");
+    assert_eq!(
+        projected.messages[1].content,
+        "I took a look.\n[Tool Output] ok"
+    );
+    assert!(
+        result
+            .losses
+            .iter()
+            .any(|loss| loss.kind == LossKind::ToolProtocol && loss.events == 1)
+    );
+}
+
+#[test]
+fn pipeline_does_not_mistake_a_marker_prefix_for_the_exact_result() {
+    for (session_id, existing, result, expected) in [
+        (
+            "sid-marker-prefix",
+            "literal [Tool Output] okay",
+            "ok",
+            "literal [Tool Output] okay\n[Tool Output] ok",
+        ),
+        (
+            "sid-result-whitespace",
+            "ok",
+            " ok ",
+            "ok\n[Tool Output]  ok ",
+        ),
+    ] {
+        let (src, dst, pipeline) = pair_with_target_slug(session_id, "factory");
+        let mut canonical = valid_session_with_id(session_id);
+        canonical.messages[1].content = existing.to_string();
+        canonical.messages[1].tool_results = vec![ToolResult {
+            call_id: Some("call-1".to_string()),
+            content: result.to_string(),
+            is_error: false,
+        }];
+        src.set_read_session(
+            PathBuf::from(format!("/tmp/src-root/{session_id}.json")),
+            canonical,
+        );
+        dst.set_read_echo();
+
+        pipeline
+            .convert("tgt", session_id, options(false, None))
+            .expect("the exact observation should receive its own text block");
+        let projected = dst.last_written().expect("target projection");
+        assert_eq!(projected.messages[1].content, expected);
+    }
 }
 
 #[test]
@@ -2520,9 +2651,9 @@ fn enrichment_reaches_the_file_the_output_claims_it_reached() {
 
 #[test]
 fn rollback_restores_each_backup_onto_the_file_it_came_from() {
-    // Cline's shape, which is the one the old rollback got wrong: three session
-    // files, plus a backup of a shared index that is not one of them. Pairing the
-    // backup with `paths[0]` moved the task index on top of the API history.
+    // Cline's former shape is what exposed the old rollback bug: three session
+    // files, plus a backup of a shared index that was not one of them. Pairing
+    // the backup with `paths[0]` moved the index on top of the API history.
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let api = tmp.path().join("api_conversation_history.json");
     let ui = tmp.path().join("ui_messages.json");

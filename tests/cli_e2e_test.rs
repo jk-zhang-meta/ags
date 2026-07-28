@@ -172,6 +172,26 @@ fn setup_chatgpt_fixture(tmp: &TempDir) -> &'static str {
     "chatgpt-conv-001"
 }
 
+fn setup_cline_fixture(tmp: &TempDir) -> &'static str {
+    const SESSION_ID: &str = "1700001234567";
+    let source = fixtures_dir().join("cline");
+    let task_dir = tmp.path().join("cline/tasks").join(SESSION_ID);
+    let state_dir = tmp.path().join("cline/state");
+    fs::create_dir_all(&task_dir).expect("create Cline task directory");
+    fs::create_dir_all(&state_dir).expect("create Cline state directory");
+    fs::copy(
+        source.join(format!("tasks/{SESSION_ID}/api_conversation_history.json")),
+        task_dir.join("api_conversation_history.json"),
+    )
+    .expect("copy Cline API fixture");
+    fs::copy(
+        source.join("state/taskHistory.json"),
+        state_dir.join("taskHistory.json"),
+    )
+    .expect("copy Cline history fixture");
+    SESSION_ID
+}
+
 fn setup_openclaw_fixture(tmp: &TempDir) -> &'static str {
     const SESSION_ID: &str = "019c19ee-b400-74dd-a9e3-2c89278287ae";
     let source = fixtures_dir().join("openclaw/openclaw_simple.jsonl");
@@ -1290,66 +1310,39 @@ fn cli_resume_cursor_to_cc_works_with_source_hint() {
 }
 
 #[test]
-fn cli_resume_cc_to_cline_works_and_is_discoverable() {
+fn cli_resume_cc_to_cline_refuses_real_and_dry_run_without_state() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
-        .args(["--json", "resume", "cln", &session_id])
-        .output()
-        .expect("resume should run");
+    for dry_run in [false, true] {
+        let mut args = vec!["--json", "resume", "cln", session_id.as_str()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = casr_cmd(&tmp)
+            .args(args)
+            .output()
+            .expect("resume should run");
+        assert!(!output.status.success(), "Cline target must refuse");
+        let error = parse_json_error(&output.stderr);
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("taskHistory.json")),
+            "unexpected refusal: {error}"
+        );
+    }
     assert!(
-        output.status.success(),
-        "CC→Cline conversion should succeed"
+        !tmp.path().join("cline").exists(),
+        "real and dry-run refusals must not create Cline state"
     );
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("resume --json output should parse");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["target_provider"].as_str().unwrap(), "cline");
-    let cline_session_id = parsed["target_session_id"]
-        .as_str()
-        .expect("target_session_id should be present for non-dry-run");
-
-    let cline_api = tmp
-        .path()
-        .join("cline/tasks")
-        .join(cline_session_id)
-        .join("api_conversation_history.json");
-    assert!(
-        cline_api.exists(),
-        "Cline task API history should exist after CC→Cline conversion"
-    );
-
-    casr_cmd(&tmp)
-        .args([
-            "--json",
-            "resume",
-            "cc",
-            cline_session_id,
-            "--source",
-            "cln",
-            "--dry-run",
-        ])
-        .assert()
-        .success();
 }
 
 #[test]
 fn cli_resume_cline_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
-    let source_id = setup_cc_fixture(&tmp, "cc_simple");
-
-    let cline_result = casr_cmd(&tmp)
-        .args(["--json", "resume", "cln", &source_id])
-        .output()
-        .expect("CC→Cline seed conversion should run");
-    assert!(cline_result.status.success());
-    let cline_json: serde_json::Value =
-        serde_json::from_slice(&cline_result.stdout).expect("seed conversion JSON should parse");
-    let cline_session_id = cline_json["target_session_id"]
-        .as_str()
-        .expect("cline target_session_id should be present");
+    let cline_session_id = setup_cline_fixture(&tmp);
 
     casr_cmd(&tmp)
         .args(["resume", "cc", cline_session_id, "--source", "cln"])

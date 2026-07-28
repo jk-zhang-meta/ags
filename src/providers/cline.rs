@@ -1,4 +1,4 @@
-//! Cline provider — reads/writes sessions from VS Code-style `globalStorage`.
+//! Cline provider — reads sessions from VS Code-style `globalStorage`.
 //!
 //! Cline is the VS Code extension published as `saoudrizwan.claude-dev`.
 //! Its session artifacts are stored under the editor's `User/globalStorage`:
@@ -9,10 +9,16 @@
 //!
 //! Where `<HOST_CONFIG>` can be VS Code (`Code`, `Code - Insiders`, `VSCodium`) or Cursor.
 //!
+//! Cline's resume picker is driven by the shared `taskHistory.json`. Cline
+//! 4.0.11 updates that file with an unsynchronised read-modify-write; its atomic
+//! rename prevents torn JSON, but cannot prevent Cline and casr from replacing
+//! one another's concurrent history rows. Until Cline exposes a
+//! vendor-authoritative import lifecycle, casr is therefore read/resume-only
+//! for this provider.
+//!
 //! ## Session IDs
 //!
 //! Task IDs are numeric strings (typically `Date.now()` / epoch millis).
-//! casr therefore generates numeric IDs for Cline targets as well.
 //!
 //! ## A `tool_use` block is represented exactly once
 //!
@@ -48,10 +54,10 @@
 //! It used to. The reader flattened `content` with
 //! [`crate::model::flatten_content`], whose `tool_use` arm writes
 //! `[Tool: <name>]` — or `[Tool: <name> - <file_path>]` — into the prose, while
-//! [`Cline::build_api_history`] writes the call from `tool_calls` alone and has
-//! no way to put the text half back. `pipeline`'s read-back verification
-//! compares `content` byte for byte, so every conversion into Cline carrying a
-//! tool call failed and was rolled back:
+//! the candidate serializer writes the call from `tool_calls` alone and has no
+//! way to put the text half back. The pipeline's read-back verification
+//! compared `content` byte for byte, so every attempted conversion into Cline
+//! carrying a tool call failed and was rolled back:
 //!
 //! ```text
 //! VerifyFailed: message content mismatch at idx 1: wrote 8 bytes, read back 39 bytes
@@ -60,8 +66,8 @@
 //! The file was right and the second copy was the reader's — the same finding
 //! and the same fix as OpenClaw's `toolCall` (see
 //! [`crate::providers::openclaw`]). [`Cline::flatten_message_text`] is the
-//! reader's half. `pipeline::writer_carries_tool_calls("cline")` is already
-//! `true`, so step 7b does not render a marker either.
+//! reader's half. Test-only candidate serializers retain the structural form
+//! so this invariant stays executable without advertising a safe target path.
 //!
 //! Removing that text also removed the only thing keeping a tool-call-only
 //! assistant turn alive: this reader dropped any message whose flattened text
@@ -87,8 +93,12 @@ const CLINE_EXTENSION_ID: &str = "saoudrizwan.claude-dev";
 const FILE_API_HISTORY: &str = "api_conversation_history.json";
 const FILE_UI_MESSAGES: &str = "ui_messages.json";
 const FILE_UI_MESSAGES_OLD: &str = "claude_messages.json";
-const FILE_TASK_METADATA: &str = "task_metadata.json";
 const FILE_TASK_HISTORY: &str = "taskHistory.json";
+
+const CLINE_WRITE_REFUSAL: &str = "Cline is read/resume-only: state/taskHistory.json has no \
+cross-process transaction or shared lock, so direct read-modify-write can lose concurrent Cline \
+or casr updates. A safe import needs a vendor-authoritative lifecycle; use Cline as a conversion \
+source, not a target.";
 
 /// Cline provider implementation.
 pub struct Cline;
@@ -141,10 +151,10 @@ impl Cline {
             .filter(|p| p.is_dir())
             .collect();
 
-        // Appended, not prepended: `pick_storage_root_for_write` writes to the
-        // first root, and the editor's globalStorage stays the default target.
-        // Only directories that already exist are listed, so `detect` still
-        // reports Cline as absent on a machine that has never run it.
+        // Appended after editor stores so discovery resolves an extension task
+        // first when the same id exists in both layouts. Only directories that
+        // already exist are listed, so `detect` still reports Cline as absent
+        // on a machine that has never run it.
         roots.extend(Self::sdk_data_dir().filter(|p| p.is_dir()));
         roots
     }
@@ -366,15 +376,11 @@ impl Cline {
             .collect()
     }
 
-    fn pick_storage_root_for_write() -> anyhow::Result<PathBuf> {
-        let roots = Self::storage_roots();
-        roots.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cline storage not found. Set CLINE_HOME to the extension globalStorage directory."
-            )
-        })
-    }
-
+    // These serializers remain test-only format probes. They let the reader's
+    // structural invariants be checked against a plausible vendor artifact,
+    // but they are not a supported write path: publishing one still requires a
+    // safe vendor-authoritative task-history transaction.
+    #[cfg(test)]
     fn generate_task_id(storage_root: &Path) -> String {
         let tasks_root = Self::tasks_root(storage_root);
         let mut candidate: i64 = chrono::Utc::now().timestamp_millis();
@@ -387,6 +393,7 @@ impl Cline {
         }
     }
 
+    #[cfg(test)]
     fn build_api_history(session: &CanonicalSession) -> Vec<serde_json::Value> {
         let mut out = Vec::new();
 
@@ -443,6 +450,7 @@ impl Cline {
         out
     }
 
+    #[cfg(test)]
     fn build_ui_messages(session: &CanonicalSession) -> Vec<serde_json::Value> {
         let now = chrono::Utc::now().timestamp_millis();
         let mut cursor_ts = session.started_at.unwrap_or(now);
@@ -487,6 +495,7 @@ impl Cline {
         out
     }
 
+    #[cfg(test)]
     fn update_task_history(
         storage_root: &Path,
         task_id: &str,
@@ -495,28 +504,54 @@ impl Cline {
     ) -> anyhow::Result<Option<crate::providers::Displaced>> {
         let history_path = Self::task_history_path(storage_root);
 
-        let mut items: Vec<serde_json::Value> = match Self::read_json(&history_path) {
-            Ok(serde_json::Value::Array(arr)) => arr,
-            _ => Vec::new(),
+        // Missing state means a first task. Anything else unreadable or
+        // malformed is existing user state we cannot safely reconstruct, so
+        // fail closed instead of replacing it with a one-row array.
+        let mut items: Vec<serde_json::Value> = match history_path
+            .try_exists()
+            .with_context(|| format!("failed to inspect {}", history_path.display()))?
+        {
+            false => Vec::new(),
+            true => match Self::read_json(&history_path)? {
+                serde_json::Value::Array(arr) => {
+                    if arr.iter().any(|item| !item.is_object()) {
+                        anyhow::bail!(
+                            "Cline taskHistory.json contains a non-object item: {}",
+                            history_path.display()
+                        );
+                    }
+                    arr
+                }
+                _ => anyhow::bail!(
+                    "Cline taskHistory.json is not an array: {}",
+                    history_path.display()
+                ),
+            },
         };
 
         // Remove any existing entry with the same id (defensive).
         items.retain(|v| v.get("id").and_then(|x| x.as_str()) != Some(task_id));
 
+        // Cline 4.0.11 filters every picker with `item.ts && item.task`.
+        // Whitespace-only titles are just as unusable to a person, and a zero
+        // timestamp is false in that predicate, so neither may reach the row.
         let title = session
             .title
             .clone()
+            .filter(|title| !title.trim().is_empty())
             .or_else(|| {
                 session
                     .messages
                     .iter()
                     .find(|m| m.role == MessageRole::User)
                     .map(|m| truncate_title(&m.content, 100))
+                    .filter(|title| !title.trim().is_empty())
             })
             .unwrap_or_else(|| "Untitled Task".to_string());
 
         let ts = session
             .started_at
+            .filter(|ts| *ts != 0)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
         let mut obj = serde_json::Map::new();
@@ -553,15 +588,9 @@ impl Cline {
         let bytes = serde_json::to_vec_pretty(&serde_json::Value::Array(items))
             .context("failed to serialize taskHistory.json")?;
 
-        // `taskHistory.json` is a shared state file; we must overwrite it even when
-        // `--force` is not used for the session itself. We still do an atomic write
-        // with a `.bak` backup for safety.
-        //
-        // The backup is returned paired with the file it restores, because the
-        // file it restores is *not* one of the session's own outputs — it is the
-        // workspace-wide task index. Handed back bare it was restored onto
-        // `api_conversation_history.json` instead, which destroyed the index and
-        // corrupted the API history in one move.
+        // Format probe only. Atomic replacement prevents torn JSON, but cannot
+        // make this read-modify-write safe against Cline's independent writer;
+        // production therefore refuses before reaching any of these helpers.
         let outcome = crate::pipeline::atomic_write(&history_path, &bytes, true, provider_slug)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -928,73 +957,14 @@ impl Provider for Cline {
 
     fn write_session(
         &self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
+        _session: &CanonicalSession,
+        _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let storage_root = Self::pick_storage_root_for_write()?;
+        Err(anyhow::anyhow!(CLINE_WRITE_REFUSAL))
+    }
 
-        let target_task_id = Self::generate_task_id(&storage_root);
-        let task_dir = Self::tasks_root(&storage_root).join(&target_task_id);
-        std::fs::create_dir_all(&task_dir)
-            .with_context(|| format!("failed to create {}", task_dir.display()))?;
-
-        let mut backups = Vec::new();
-
-        // 1) api_conversation_history.json
-        let api_history = Self::build_api_history(session);
-        let api_bytes =
-            serde_json::to_vec(&api_history).context("failed to serialize api history")?;
-        let api_path = task_dir.join(FILE_API_HISTORY);
-        let api_outcome =
-            crate::pipeline::atomic_write(&api_path, &api_bytes, opts.force, self.slug())?;
-        backups.extend(api_outcome.displaced());
-
-        // 2) ui_messages.json
-        let ui_messages = Self::build_ui_messages(session);
-        let ui_bytes =
-            serde_json::to_vec(&ui_messages).context("failed to serialize ui messages")?;
-        let ui_path = task_dir.join(FILE_UI_MESSAGES);
-        let ui_outcome =
-            crate::pipeline::atomic_write(&ui_path, &ui_bytes, opts.force, self.slug())?;
-        backups.extend(ui_outcome.displaced());
-
-        // 3) task_metadata.json (minimal)
-        let metadata_path = task_dir.join(FILE_TASK_METADATA);
-        let metadata_bytes = serde_json::to_vec_pretty(&serde_json::json!({
-            "files_in_context": [],
-            "model_usage": [],
-            "environment_history": [],
-        }))
-        .context("failed to serialize task metadata")?;
-        let metadata_outcome = crate::pipeline::atomic_write(
-            &metadata_path,
-            &metadata_bytes,
-            opts.force,
-            self.slug(),
-        )?;
-        backups.extend(metadata_outcome.displaced());
-
-        // 4) state/taskHistory.json (best-effort, but needed for Cline to list tasks)
-        backups.extend(Self::update_task_history(
-            &storage_root,
-            &target_task_id,
-            session,
-            self.slug(),
-        )?);
-
-        debug!(
-            task_id = target_task_id,
-            api = %api_path.display(),
-            "Cline session written"
-        );
-
-        Ok(WrittenSession {
-            paths: vec![api_path, ui_path, metadata_path],
-            session_id: target_task_id.clone(),
-            resume_command: self.resume_command(&target_task_id),
-            backups,
-            warnings: Vec::new(),
-        })
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(CLINE_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, _session_id: &str) -> String {
@@ -1816,6 +1786,84 @@ mod tests {
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["id"].as_str(), Some("1700000099999"));
         assert_eq!(content[0]["task"].as_str(), Some("Test Session"));
+    }
+
+    #[test]
+    fn writer_task_history_rows_remain_visible_when_source_fields_are_empty() {
+        let root = tempfile::tempdir().expect("tmpdir");
+        let mut session = make_canonical_session(vec![CanonicalMessage {
+            idx: 0,
+            role: MessageRole::User,
+            content: "Fallback task".to_string(),
+            timestamp: None,
+            author: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            extra: serde_json::Value::Null,
+        }]);
+        session.title = Some("   ".to_string());
+        session.started_at = Some(0);
+
+        Cline::update_task_history(root.path(), "1700000099998", &session, "cline")
+            .expect("update visible task history row");
+
+        let history_path = Cline::task_history_path(root.path());
+        let content: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
+        assert_eq!(content[0]["task"].as_str(), Some("Fallback task"));
+        assert!(
+            content[0]["ts"].as_i64().is_some_and(|ts| ts != 0),
+            "Cline filters zero timestamps out of every history picker"
+        );
+
+        session.messages[0].content = "  ".to_string();
+        Cline::update_task_history(root.path(), "1700000099999", &session, "cline")
+            .expect("update row with untitled fallback");
+        let content: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
+        let row = content
+            .iter()
+            .find(|row| row["id"] == "1700000099999")
+            .expect("second history row");
+        assert_eq!(row["task"].as_str(), Some("Untitled Task"));
+    }
+
+    #[test]
+    fn writer_refuses_to_replace_an_invalid_existing_task_history() {
+        for invalid in [
+            b"{not-json".as_slice(),
+            b"{\"task\":\"not an array\"}".as_slice(),
+            b"[null]".as_slice(),
+            b"[[]]".as_slice(),
+        ] {
+            let root = tempfile::tempdir().expect("tmpdir");
+            let history_path = Cline::task_history_path(root.path());
+            std::fs::create_dir_all(history_path.parent().unwrap()).expect("create state dir");
+            std::fs::write(&history_path, invalid).expect("seed invalid task history");
+
+            let session = make_canonical_session(vec![CanonicalMessage {
+                idx: 0,
+                role: MessageRole::User,
+                content: "Must not replace the index".to_string(),
+                timestamp: None,
+                author: None,
+                tool_calls: vec![],
+                tool_results: vec![],
+                extra: serde_json::Value::Null,
+            }]);
+            let error = Cline::update_task_history(root.path(), "1700000099999", &session, "cline")
+                .expect_err("existing invalid state must fail closed");
+
+            assert!(
+                error.to_string().contains("taskHistory"),
+                "error should identify the shared state file: {error:#}"
+            );
+            assert_eq!(
+                std::fs::read(&history_path).unwrap(),
+                invalid,
+                "a malformed shared index must remain recoverable in place"
+            );
+        }
     }
 
     #[test]

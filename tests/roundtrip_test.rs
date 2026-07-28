@@ -2,8 +2,8 @@
 //!
 //! Writable targets follow: read source fixture → canonical → write to target
 //! (temp dir) → read back → compare canonical fields against original.
-//! ChatGPT, OpenCode and OpenClaw targets instead must refuse without creating
-//! state.
+//! ChatGPT, Cline, OpenCode and OpenClaw targets instead must refuse without
+//! creating state.
 //!
 //! Tests verify: `read_T(write_T(read_S(source))) ≈ read_S(source)` where
 //! S = source provider, T = target provider.
@@ -132,6 +132,16 @@ fn read_chatgpt_fixture() -> CanonicalSession {
     ChatGpt
         .read_session(&fixtures_dir().join("chatgpt/chatgpt_simple.json"))
         .expect("Failed to read ChatGPT fixture")
+}
+
+/// Read a native Cline task. Publishing a new task also requires a safe update
+/// to Cline's shared `taskHistory.json`, so a writer cannot seed this source.
+fn read_cline_fixture() -> CanonicalSession {
+    Cline
+        .read_session(
+            &fixtures_dir().join("cline/tasks/1700001234567/api_conversation_history.json"),
+        )
+        .expect("Failed to read Cline fixture")
 }
 
 /// Read a native OpenClaw transcript. OpenClaw target imports require its
@@ -385,44 +395,27 @@ fn roundtrip_opencode_to_cc() {
 }
 
 // ===========================================================================
-// Additional provider paths: Cline and Amp
+// Additional provider paths: Cline source/refusal and Amp
 // ===========================================================================
 
 #[test]
-fn roundtrip_cc_to_cline() {
+fn cline_refuses_cc_as_a_target() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
 
     let original = read_cc_fixture("cc_simple");
-    let written = Cline
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("CC→Cln: write should succeed");
-
-    let readback = Cline
-        .read_session(&written.paths[0])
-        .expect("CC→Cln: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "CC→Cln");
-    assert_new_session_id(&readback, "CC→Cln");
+    assert_target_refuses(&Cline, &original, "taskHistory.json", "CC→Cline");
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "Cline refusal created target-store state"
+    );
 }
 
 #[test]
 fn roundtrip_cline_to_cc() {
-    let cline_canonical = {
-        let _cline_lock = CLINE_ENV.lock().unwrap();
-        let cline_tmp = tempfile::TempDir::new().unwrap();
-        let _cline_env = EnvGuard::set("CLINE_HOME", cline_tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written_cline = Cline
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Cln write should succeed");
-
-        Cline
-            .read_session(&written_cline.paths[0])
-            .expect("seed Cln read-back should succeed")
-    };
+    let cline_canonical = read_cline_fixture();
 
     let _cc_lock = CC_ENV.lock().unwrap();
     let cc_tmp = tempfile::TempDir::new().unwrap();
@@ -1145,17 +1138,7 @@ fn roundtrip_cursor_to_codex() {
 
 #[test]
 fn roundtrip_cline_to_codex() {
-    let cline_session = {
-        let _lock = CLINE_ENV.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("CLINE_HOME", tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written = Cline
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Cline");
-        Cline.read_session(&written.paths[0]).expect("read Cline")
-    };
+    let cline_session = read_cline_fixture();
 
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1423,22 +1406,18 @@ fn roundtrip_codex_to_cursor() {
 }
 
 #[test]
-fn roundtrip_codex_to_cline() {
+fn cline_refuses_codex_as_a_target() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    let written = Cline
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Cod→Cline: write should succeed");
-
-    let readback = Cline
-        .read_session(&written.paths[0])
-        .expect("Cod→Cline: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Cod→Cline");
-    assert_new_session_id(&readback, "Cod→Cline");
+    assert_target_refuses(&Cline, &original, "taskHistory.json", "Codex→Cline");
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "Cline refusal created target-store state"
+    );
 }
 
 #[test]
@@ -1689,22 +1668,18 @@ fn roundtrip_gemini_to_cursor() {
 }
 
 #[test]
-fn roundtrip_gemini_to_cline() {
+fn cline_refuses_gemini_as_a_target() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
 
     let original = read_gemini_fixture("gmi_simple");
-    let written = Cline
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Gmi→Cline: write should succeed");
-
-    let readback = Cline
-        .read_session(&written.paths[0])
-        .expect("Gmi→Cline: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Gmi→Cline");
-    assert_new_session_id(&readback, "Gmi→Cline");
+    assert_target_refuses(&Cline, &original, "taskHistory.json", "Gemini→Cline");
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "Cline refusal created target-store state"
+    );
 }
 
 #[test]
@@ -1881,6 +1856,7 @@ fn cross_provider_roundtrip(
 ) {
     let source_session = match source.slug() {
         "chatgpt" => read_chatgpt_fixture(),
+        "cline" => read_cline_fixture(),
         "opencode" => read_opencode_fixture(),
         "openclaw" => read_openclaw_fixture(),
         _ => {

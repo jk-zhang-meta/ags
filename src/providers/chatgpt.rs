@@ -60,12 +60,12 @@
 //! reader reports the role the file states and lets the ordinary
 //! empty-content rule discard wordless hidden nodes.
 //!
-//! Two adjacent read gaps this deliberately does *not* close, named so they are
-//! not mistaken for handled. Custom instructions arrive in two shapes — an
-//! older `role: "system"` node whose text lives in
-//! `metadata.user_context_message_data.about_model_message`, and a newer
+//! Custom instructions arrive in two shapes — an older `role: "system"` node
+//! whose text lives in `metadata.user_context_message_data`, and a newer
 //! `role: "user"` node with `content_type: "user_editable_context"` and **no
-//! `parts` key at all**. Both are read as empty here and dropped.
+//! `parts` key at all**. [`ChatGpt::message_text`] falls back to those explicit
+//! context fields only when ordinary message content is empty, preserving the
+//! declared role without duplicating a node that already has visible text.
 //!
 //! ## Resume
 //!
@@ -99,6 +99,56 @@ source, not a target.";
 pub struct ChatGpt;
 
 impl ChatGpt {
+    /// Extract the text ChatGPT sends for one mapping node.
+    ///
+    /// Exported custom instructions do not use the ordinary `parts` field.
+    /// Their profile and instruction strings are already model-facing prose,
+    /// so preserve them byte-for-byte and in vendor field order.
+    fn message_text(message: &serde_json::Value) -> String {
+        fn push_field(
+            context: &mut Vec<String>,
+            object: Option<&serde_json::Map<String, serde_json::Value>>,
+            key: &str,
+        ) {
+            let Some(text) = object
+                .and_then(|value| value.get(key))
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.trim().is_empty())
+            else {
+                return;
+            };
+            context.push(text.to_string());
+        }
+
+        let content = message.get("content");
+        let ordinary = content.map(flatten_content).unwrap_or_default();
+        if !ordinary.trim().is_empty() {
+            return ordinary;
+        }
+
+        let mut context = Vec::new();
+        let content_object = content.and_then(|value| value.as_object());
+        if content_object
+            .and_then(|value| value.get("content_type"))
+            .and_then(|value| value.as_str())
+            == Some("user_editable_context")
+        {
+            push_field(&mut context, content_object, "user_profile");
+            push_field(&mut context, content_object, "user_instructions");
+        }
+
+        if context.is_empty() {
+            let legacy = message
+                .get("metadata")
+                .and_then(|value| value.get("user_context_message_data"))
+                .and_then(|value| value.as_object());
+            push_field(&mut context, legacy, "about_user_message");
+            push_field(&mut context, legacy, "about_model_message");
+        }
+
+        context.join("\n")
+    }
+
     /// Root directory for ChatGPT app data.
     ///
     /// `CHATGPT_HOME` is casr's own override — the desktop app honours no such
@@ -431,22 +481,7 @@ impl Provider for ChatGpt {
 
                 let role = normalize_role(role_str);
 
-                // Content: prefer "parts" array, then "text" field.
-                let content_val = msg.get("content");
-                let text = if let Some(parts) = content_val
-                    .and_then(|c| c.get("parts"))
-                    .and_then(|p| p.as_array())
-                {
-                    parts
-                        .iter()
-                        .filter_map(|p| p.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else if let Some(content) = content_val {
-                    flatten_content(content)
-                } else {
-                    continue;
-                };
+                let text = Self::message_text(msg);
 
                 if text.trim().is_empty() {
                     continue;
@@ -490,7 +525,7 @@ impl Provider for ChatGpt {
 
                 let role = normalize_role(role_str);
 
-                let text = msg.get("content").map(flatten_content).unwrap_or_default();
+                let text = Self::message_text(msg);
 
                 if text.trim().is_empty() {
                     continue;
@@ -776,6 +811,90 @@ mod tests {
         assert_eq!(session.messages[0].role, MessageRole::System);
         assert_eq!(session.messages[0].content, "You are helpful.");
         assert_eq!(session.messages[1].role, MessageRole::User);
+    }
+
+    #[test]
+    fn reader_mapping_keeps_legacy_custom_instructions_from_metadata() {
+        let session = read_chatgpt_json(
+            &json!({
+                "mapping": {
+                    "context": {
+                        "message": {
+                            "author": {"role": "system"},
+                            "content": {"content_type": "text", "parts": [""]},
+                            "metadata": {
+                                "user_context_message_data": {
+                                    "about_user_message": "The user works on compilers.",
+                                    "about_model_message": "Answer with precise examples."
+                                }
+                            },
+                            "create_time": 1700000000.0
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, MessageRole::System);
+        assert_eq!(
+            session.messages[0].content,
+            "The user works on compilers.\nAnswer with precise examples."
+        );
+    }
+
+    #[test]
+    fn reader_mapping_keeps_user_editable_context_without_parts() {
+        let session = read_chatgpt_json(
+            &json!({
+                "mapping": {
+                    "context": {
+                        "message": {
+                            "author": {"role": "user"},
+                            "content": {
+                                "content_type": "user_editable_context",
+                                "user_profile": "The user works on compilers.",
+                                "user_instructions": "Answer with precise examples."
+                            },
+                            "create_time": 1700000000.0
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, MessageRole::User);
+        assert_eq!(
+            session.messages[0].content,
+            "The user works on compilers.\nAnswer with precise examples."
+        );
+    }
+
+    #[test]
+    fn reader_mapping_keeps_equal_custom_instruction_fields_as_distinct_fields() {
+        let session = read_chatgpt_json(
+            &json!({
+                "mapping": {
+                    "context": {
+                        "message": {
+                            "author": {"role": "user"},
+                            "content": {
+                                "content_type": "user_editable_context",
+                                "user_profile": "same",
+                                "user_instructions": "same"
+                            }
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "same\nsame");
     }
 
     /// The hidden system node a real conversation opens with. It is dropped, but

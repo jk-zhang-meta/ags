@@ -76,7 +76,7 @@ pub struct LaunchSpec {
     /// The session this command actually names, when it names one.
     ///
     /// See [`SessionTargeting`]. Set by [`LaunchSpec::targeting_session`]
-    /// rather than assumed, because for three providers in the registry it is
+    /// rather than assumed, because for two writable providers in the registry it is
     /// genuinely `None`.
     pub targets: Option<String>,
 }
@@ -84,11 +84,11 @@ pub struct LaunchSpec {
 /// Whether launching this spec resumes the session that was just written.
 ///
 /// Not a detail. The promise of a launcher is "we start you where you left
-/// off", and for part of the registry that promise cannot be kept: Cursor's
-/// IDE composer (`cursor .`) and Cline (`code .`) open an editor without
-/// naming the converted session, while Aider's `--restore-chat-history`
-/// restores whichever chat was last rather than a named one. The conversion
-/// still writes a correct file — the agent simply will not be pointed at it.
+/// off", and for part of the writable registry that promise cannot be kept:
+/// Cursor's IDE composer (`cursor .`) opens an editor without naming the
+/// converted session, while Aider's `--restore-chat-history` restores whichever
+/// chat was last rather than a named one. The conversion still writes a correct
+/// file — the agent simply will not be pointed at it.
 ///
 /// Modelling this means the caller has to decide what to tell the user, which
 /// is the point. The alternative is launching the agent, having it open

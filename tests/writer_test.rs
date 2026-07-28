@@ -1190,73 +1190,30 @@ fn writer_codex_default_workspace_uses_tmp() {
 }
 
 // ===========================================================================
-// Cline writer tests
+// Cline target refusal tests
 // ===========================================================================
 
 #[test]
-fn writer_cline_roundtrip() {
+fn writer_cline_refuses_normal_and_force_without_creating_state() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
 
     let session = simple_session();
-    let written = Cline
-        .write_session(&session, &WriteOptions { force: false })
-        .expect("Cline write_session should succeed");
+    let reason = Cline
+        .write_refusal()
+        .expect("Cline must declare its target refusal");
 
-    assert_eq!(written.paths.len(), 3, "Cline should write 3 task files");
-    assert!(
-        written.session_id.chars().all(|c| c.is_ascii_digit()),
-        "Cline task ids should be numeric"
-    );
-    assert_eq!(written.resume_command, "code .");
-
-    // The shared task history state file should include the new task id.
-    let history_path = tmp.path().join("state/taskHistory.json");
-    assert!(
-        history_path.is_file(),
-        "Cline should write taskHistory.json"
-    );
-    let history_json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&history_path).unwrap()).unwrap();
-    let items = history_json
-        .as_array()
-        .expect("taskHistory.json should be an array");
-    assert!(
-        items
-            .iter()
-            .any(|v| v.get("id").and_then(|x| x.as_str()) == Some(&written.session_id)),
-        "taskHistory.json should include the written task id"
-    );
-
-    let readback = Cline
-        .read_session(&written.paths[0])
-        .expect("Cline read_session should parse written output");
-
-    assert_eq!(
-        readback.messages.len(),
-        session.messages.len(),
-        "Cline roundtrip: message count"
-    );
-    for (i, (orig, rb)) in session
-        .messages
-        .iter()
-        .zip(readback.messages.iter())
-        .enumerate()
-    {
-        assert_eq!(orig.role, rb.role, "Cline roundtrip msg {i}: role mismatch");
-        assert_eq!(
-            orig.content, rb.content,
-            "Cline roundtrip msg {i}: content mismatch"
-        );
+    for force in [false, true] {
+        let error = Cline
+            .write_session(&session, &WriteOptions { force })
+            .expect_err("Cline target writes must fail closed");
+        assert_eq!(error.to_string(), reason);
     }
-    assert_eq!(
-        readback.workspace, session.workspace,
-        "Cline roundtrip: workspace"
-    );
-    assert_eq!(
-        readback.model_name, session.model_name,
-        "Cline roundtrip: model_name should survive via taskHistory.json"
+
+    assert!(
+        !tmp.path().join("tasks").exists() && !tmp.path().join("state").exists(),
+        "refusing a Cline import must not create any provider state"
     );
 }
 

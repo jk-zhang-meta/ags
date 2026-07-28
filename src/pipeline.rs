@@ -841,19 +841,16 @@ but resume may fail until the CLI is installed.",
         // not already name — so a reader that renders and a reader that does
         // not both arrive at exactly one copy.
         //
-        // Tool *results* keep the empty-content rule they have always had.
-        // Widening them is a separate question with a different answer: a
-        // `toolResult` message normally carries the observation in `content`
-        // already, and OpenClaw's native record construction takes the
-        // observation text from `content` rather than from `tool_results`, so
-        // a target moved off this path would lose the observation outright
-        // rather than gain a duplicate.
+        // Tool *results* have an independent structural channel. Claude Code,
+        // Amp and Kiro write them natively. Adding a text marker beside a native
+        // block makes the resumed model see the same observation twice. Other
+        // writable shapes still need a marker when they have no structural
+        // place for it.
         //
         // What is left behind either way — the call's arguments and its id —
         // is declared by [`tool_calls_rendered_as_text`], not dropped in
         // silence.
         let carries_tool_calls = writer_carries_tool_calls(target_provider.slug());
-        let carries_tool_results = target_provider.slug() == "claude-code";
         for msg in &mut canonical.messages {
             let mut parts: Vec<String> = Vec::new();
 
@@ -868,14 +865,26 @@ but resume may fail until the CLI is installed.",
                 }
             }
 
-            // Results: unchanged, gate and all. Only a message with no text of
-            // its own, and only the one target excluded before.
-            if !carries_tool_results && msg.content.trim().is_empty() {
+            // A reader commonly puts the observation in `content` already, so
+            // do not add a marker when the complete result text is visible
+            // there. Otherwise every result for which this exact record has no
+            // native channel needs a fallback, including a result beside other
+            // prose. Restricting this to empty messages silently lost the
+            // observation in that mixed shape.
+            let carries_tool_results = writer_carries_tool_results(target_provider.slug());
+            if !carries_tool_results {
                 for tr in &msg.tool_results {
-                    if tr.is_error {
-                        parts.push(format!("[Tool Error] {}", tr.content));
+                    let marker = if tr.is_error {
+                        format!("[Tool Error] {}", tr.content)
                     } else {
-                        parts.push(format!("[Tool Output] {}", tr.content));
+                        format!("[Tool Output] {}", tr.content)
+                    };
+                    let observation_is_already_text =
+                        !tr.content.trim().is_empty() && msg.content == tr.content;
+                    if !observation_is_already_text
+                        && !contains_exact_text_block(&msg.content, &marker)
+                    {
+                        parts.push(marker);
                     }
                 }
             }
@@ -1510,6 +1519,27 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
         }
     }
 
+    let results: usize = canonical
+        .messages
+        .iter()
+        .filter(|_| !writer_carries_tool_results(target_slug))
+        .map(|message| message.tool_results.len())
+        .sum();
+    if results > 0 {
+        losses.push(Loss {
+            kind: LossKind::ToolProtocol,
+            events: results,
+            capsules: 0,
+            bytes: 0,
+            grade: Fidelity::ConversationOnly,
+            note: format!(
+                "{results} tool result(s) had no native result channel in {target_slug} and were \
+                 kept as message text; the observation survives, but its structured call link \
+                 and success/error flag do not."
+            ),
+        });
+    }
+
     losses
 }
 
@@ -1549,12 +1579,12 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str> {
     match role {
         MessageRole::User | MessageRole::Assistant => None,
-        // `claude_code.rs:703`, `cline.rs:316`, `amp.rs:418`,
-        // `cursor.rs:1113`, `kiro.rs:1541`, `aider.rs:594`,
+        // `claude_code.rs:703`, `amp.rs:418`, `cursor.rs:1113`,
+        // `kiro.rs:1541`, `aider.rs:594`,
         // Vibe persists both as plain user rows because its loader drops
         // system rows and rejects unknown roles.
         MessageRole::System => match target_slug {
-            "claude-code" | "cline" | "vibe" => Some("plain user turns"),
+            "claude-code" | "vibe" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
@@ -1563,7 +1593,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
         },
         // Same writers, and the source's own name for the turn goes with it.
         MessageRole::Other(_) => match target_slug {
-            "claude-code" | "cline" | "vibe" => Some("plain user turns"),
+            "claude-code" | "vibe" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
@@ -1582,7 +1612,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
         // is the system and unrecognised turns above, sharing that channel, that
         // arrive as something they are not.
         MessageRole::Tool => match target_slug {
-            "claude-code" | "cline" => Some("plain user turns"),
+            "claude-code" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("assistant bubbles"),
             _ => None,
@@ -1599,10 +1629,10 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 ///
 /// Measured by writing one session holding an assistant turn with a tool call
 /// through each writer and reading the artifact: Claude Code, Codex and Gemini
-/// emit `tool_use`, Amp emits `tool_use`, Cline emits a tool block, and Kiro
-/// emits `toolUse`. Cursor, Aider, ClawdBot, Vibe, Factory and Pi-Agent write
-/// the message text and nothing else. ChatGPT, OpenCode and OpenClaw refuse
-/// target writes before fidelity is calculated.
+/// emit `tool_use`, Amp emits `tool_use`, and Kiro emits `toolUse`. Cursor,
+/// Aider, ClawdBot, Vibe, Factory and Pi-Agent write the message text and
+/// nothing else. ChatGPT, Cline, OpenCode and OpenClaw refuse target writes
+/// before fidelity is calculated.
 ///
 /// `false` for an unknown slug, which is both the conservative answer — a
 /// rendered marker is redundant where the call survives, and the only record of
@@ -1611,8 +1641,36 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 pub fn writer_carries_tool_calls(target_slug: &str) -> bool {
     matches!(
         target_slug,
-        "claude-code" | "codex" | "gemini" | "cline" | "amp" | "kiro"
+        "claude-code" | "codex" | "gemini" | "amp" | "kiro"
     )
+}
+
+/// Whether the target writer preserves canonical tool observations in a
+/// native structural result block.
+///
+/// This is deliberately separate from [`writer_carries_tool_calls`]: formats
+/// can represent one half without the other.
+fn writer_carries_tool_results(target_slug: &str) -> bool {
+    matches!(target_slug, "claude-code" | "amp" | "kiro")
+}
+
+/// Whether `block` already appears as one complete newline-delimited text
+/// block, rather than merely as a prefix inside unrelated prose.
+///
+/// Tool output may itself be multiline, so splitting into lines would destroy
+/// the boundary being checked. Match the whole byte string and inspect only
+/// the bytes immediately around it.
+fn contains_exact_text_block(text: &str, block: &str) -> bool {
+    !block.is_empty()
+        && text.match_indices(block).any(|(start, _)| {
+            let end = start + block.len();
+            let starts_at_boundary = start == 0 || text.as_bytes()[start - 1] == b'\n';
+            let ends_at_boundary = end == text.len()
+                || block.ends_with('\n')
+                || text.as_bytes()[end] == b'\n'
+                || text.as_bytes()[end..].starts_with(b"\r\n");
+            starts_at_boundary && ends_at_boundary
+        })
 }
 
 fn flat_fidelity(ir: Result<Option<&SessionIr>, &str>, target_slug: &str) -> (Fidelity, Vec<Loss>) {
@@ -2082,14 +2140,14 @@ fn remove_if_present(path: &Path, provider_slug: &str, what: &str) -> Result<(),
 ///
 /// This used to restore [`WrittenSession::backups`]' single predecessor —
 /// a bare `backup_path` — onto `paths[0]`, which assumed the one backup a write
-/// took was a backup *of its first output*. Cline breaks that assumption
-/// completely: its only backup is of `state/taskHistory.json`, the shared task
-/// index, while `paths[0]` is `api_conversation_history.json`. The rollback
-/// therefore deleted the new API history, moved the old global index into its
-/// place, left the modified index installed, and reported that it had succeeded
-/// — three files wrong, no error. Kiro broke it more quietly: it writes two or
+/// took was a backup *of its first output*. Cline's former writer broke that
+/// assumption completely: its only backup was of `state/taskHistory.json`, the
+/// shared task index, while `paths[0]` was `api_conversation_history.json`.
+/// Rollback therefore deleted the new API history, moved the old global index
+/// into its place, left the modified index installed, and reported success —
+/// three files wrong, no error. Kiro broke it more quietly: it writes two or
 /// three files under `--force` and could only ever hand back the first one's
-/// backup, so a rollback left the others' predecessors sitting in `.bak` files
+/// backup, so rollback left the others' predecessors sitting in `.bak` files
 /// nothing would ever restore.
 ///
 /// Each [`Displaced`] now names the file it restores, so neither provider has to

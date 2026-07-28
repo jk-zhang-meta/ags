@@ -402,10 +402,11 @@ pub struct WriteOptions {
 /// The pair is the point. It replaced a bare `backup_path: Option<PathBuf>`
 /// that the rollback in [`crate::pipeline`] paired with `paths[0]` by
 /// assumption — true for the eleven providers that write one file, and false
-/// for the two that do not. Cline's only backup is of `state/taskHistory.json`,
-/// a *shared* index that is not in `paths` at all, so a rollback moved the
-/// global task index on top of `api_conversation_history.json` and reported
-/// success. A backup that does not say what it restores is not a backup.
+/// for the two that do not. The bug was exposed by Cline's former write shape:
+/// its only backup was of `state/taskHistory.json`, a *shared* index not in
+/// `paths` at all, so rollback moved the index on top of
+/// `api_conversation_history.json` and reported success. A backup that does not
+/// say what it restores is not a backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Displaced {
     /// The file that was overwritten, and where the backup goes back to.

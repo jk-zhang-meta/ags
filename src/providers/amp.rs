@@ -395,6 +395,14 @@ impl Amp {
     /// carries the observation under `run`, not `text`), and
     /// [`Self::extract_tool_results`] is the channel it travels on.
     ///
+    /// Amp's thinking blocks are the other provider-local shapes:
+    /// `ThinkingBlock.thinking` carries the prose, while the shared flattener
+    /// only knows text under `.text`. The flat canonical model has no separate
+    /// reasoning slot, so keep the established `[Thinking] …` representation
+    /// used by the other pi-shaped readers. A `redacted_thinking` block carries
+    /// only vendor-sealed `.data`; preserve its position with Amp's fixed
+    /// marker, never by copying that opaque payload into model-visible text.
+    ///
     /// Delegating the rest to [`crate::model::flatten_content`] rather than
     /// re-implementing it keeps `text` blocks, bare strings and the
     /// `{parts: […]}` object shape reading identically to every other
@@ -405,8 +413,20 @@ impl Amp {
         };
         let prose: Vec<serde_json::Value> = blocks
             .iter()
-            .filter(|block| block.get("type").and_then(|t| t.as_str()) != Some("tool_use"))
-            .cloned()
+            .filter_map(
+                |block| match block.get("type").and_then(|value| value.as_str()) {
+                    Some("tool_use") => None,
+                    Some("thinking") => block
+                        .get("thinking")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|text| serde_json::Value::String(format!("[Thinking] {text}"))),
+                    Some("redacted_thinking") => block
+                        .get("data")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|_| serde_json::Value::String("[Redacted thinking]".to_string())),
+                    _ => Some(block.clone()),
+                },
+            )
             .collect();
         flatten_content(&serde_json::Value::Array(prose))
     }
@@ -1185,6 +1205,53 @@ mod tests {
         );
         assert_eq!(session.messages[2].tool_results[0].content, "ok");
         assert!(!session.messages[2].tool_results[0].is_error);
+    }
+
+    #[test]
+    fn reader_preserves_amp_thinking_without_leaking_opaque_fields() {
+        let id = "T-550e8400-e29b-41d4-a716-446655440010";
+        let created = 1_700_000_000_000_i64;
+        let mut thread = base_thread(id, created);
+        thread["messages"] = serde_json::Value::Array(vec![
+            assistant_msg(
+                vec![serde_json::json!({
+                    "type": "thinking",
+                    "thinking": "check invariants",
+                    "signature": "opaque-signature"
+                })],
+                created,
+            ),
+            assistant_msg(
+                vec![
+                    serde_json::json!({
+                        "type": "thinking",
+                        "thinking": "form conclusion",
+                        "signature": "another-opaque-signature"
+                    }),
+                    serde_json::json!({
+                        "type": "redacted_thinking",
+                        "data": "opaque-redacted-data"
+                    }),
+                    serde_json::json!({"type": "text", "text": "final answer"}),
+                ],
+                created + 1,
+            ),
+        ]);
+
+        let session = read_thread(thread);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "[Thinking] check invariants");
+        assert_eq!(
+            session.messages[1].content,
+            "[Thinking] form conclusion\n[Redacted thinking]\nfinal answer"
+        );
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("opaque")),
+            "vendor-sealed signatures and redacted payloads must not leak into flat text"
+        );
     }
 
     #[test]
