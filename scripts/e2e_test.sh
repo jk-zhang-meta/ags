@@ -467,6 +467,16 @@ setup_chatgpt_fixture() {
     echo "$session_id"
 }
 
+setup_openclaw_fixture() {
+    local src="$FIXTURES_DIR/openclaw/openclaw_simple.jsonl"
+    local session_id
+    session_id=$(head -1 "$src" | jq -r '.id')
+    local target_dir="$OPENCLAW_HOME/.openclaw/agents/main/sessions"
+    mkdir -p "$target_dir"
+    cp "$src" "$target_dir/${session_id}.jsonl"
+    echo "$session_id"
+}
+
 # Stage an Antigravity (agy) conversation under the shared GEMINI_HOME.
 # agy and gmi share the ~/.gemini parent: agy lives under antigravity-cli/.
 # Copies the conversations/<uuid>.db + brain/<uuid>/.../transcript.jsonl tree
@@ -972,18 +982,15 @@ assert_stdout_contains "factory→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → OpenClaw"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->ocl" --json resume ocl "$cc_sid"
-assert_exit_ok "CC→OpenClaw write succeeds"
-assert_valid_json "CC→OpenClaw JSON is valid"
-ocl_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-if [[ -n "$ocl_sid" ]]; then
-    pass "CC→OpenClaw JSON includes target_session_id"
-else
-    fail "CC→OpenClaw JSON includes target_session_id" "non-empty id" "<empty>"
-fi
-assert_file_exists "OpenClaw JSONL exists after conversion" "$OPENCLAW_HOME/.openclaw/agents/main/sessions/${ocl_sid}.jsonl"
+EXPECT_FAIL=1 run_casr "resume cc->ocl refused" --json resume ocl "$cc_sid" || true
+assert_exit_fail "CC→OpenClaw write is refused"
+assert_json_error_envelope "CC→OpenClaw refusal is JSON"
+assert_stderr_contains "CC→OpenClaw explains gateway boundary" "gateway"
+assert_file_count "CC→OpenClaw refusal writes no state" "$OPENCLAW_HOME" 0
 
 log "TEST: Resume OpenClaw → CC"
+reset_env
+ocl_sid=$(setup_openclaw_fixture)
 run_casr "resume ocl->cc" resume cc "$ocl_sid" --source ocl
 assert_exit_ok "OpenClaw→CC write succeeds"
 assert_stdout_contains "openclaw→cc shows claude-code" "claude-code"
@@ -1267,9 +1274,9 @@ assert_file_count "enrich dry-run writes no files" "$CODEX_HOME/sessions" 0
 # TEST: Full 14x14 source/target behavior matrix (bd-1bh.29)
 # ===========================================================================
 # Tests every directed (source, target) provider pair — 14 sources × 13
-# targets = 182 behaviors. OpenCode and ChatGPT are fixture-backed sources and
-# expected-refusal targets. CC, Codex, and Gemini also load native fixtures;
-# the other nine providers are seeded via CC → provider.
+# targets = 182 behaviors. OpenCode, ChatGPT and OpenClaw are fixture-backed
+# sources and expected-refusal targets. CC, Codex, and Gemini also load native
+# fixtures; the other eight providers are seeded via CC → provider.
 # Each source is set up once and reused across all 13 targets.
 
 ALL_ALIASES=(cc cod gmi cur cln aid amp opc gpt cwb vib fac ocl pi)
@@ -1284,6 +1291,7 @@ setup_source_session() {
         gmi) setup_gemini_fixture "gmi_simple" ;;
         opc) setup_opencode_fixture ;;
         gpt) setup_chatgpt_fixture ;;
+        ocl) setup_openclaw_fixture ;;
         *)
             # Seed: set up CC fixture, convert CC→source, return target sid.
             local _cc_sid _json_out _target_sid
@@ -1317,13 +1325,16 @@ for source in "${ALL_ALIASES[@]}"; do
         MATRIX_PAIRS=$((MATRIX_PAIRS + 1))
         local_pair="${source}->${target}"
 
-        if [[ "$target" == "opc" || "$target" == "gpt" ]]; then
+        if [[ "$target" == "opc" || "$target" == "gpt" || "$target" == "ocl" ]]; then
             if [[ "$target" == "opc" ]]; then
                 refusal_text="OpenCode is read/resume-only"
                 refusal_home="$OPENCODE_HOME"
-            else
+            elif [[ "$target" == "gpt" ]]; then
                 refusal_text="no supported session import path"
                 refusal_home="$CHATGPT_HOME"
+            else
+                refusal_text="gateway"
+                refusal_home="$OPENCLAW_HOME"
             fi
 
             EXPECT_FAIL=1 run_casr "matrix:${local_pair}:refused" \

@@ -582,8 +582,9 @@ impl Provider for Aider {
             match msg.role {
                 MessageRole::User => {
                     // Multi-line user messages: each line gets #### prefix.
+                    output.push('\n');
                     for line in msg.content.lines() {
-                        output.push_str(&format!("\n#### {line}  \n"));
+                        output.push_str(&format!("#### {line}  \n"));
                     }
                 }
                 MessageRole::Assistant => {

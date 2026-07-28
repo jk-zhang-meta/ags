@@ -399,22 +399,23 @@ mod atomic_write_integration {
     }
 
     #[test]
-    fn openclaw_write_then_read_preserves_messages() {
+    fn openclaw_write_refuses_without_creating_state() {
         let _lock = OPENCLAW_ENV.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+        let state_dir = tmp.path().join("openclaw-state");
+        let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
 
         let session = make_session("/tmp");
-        let written = OpenClaw
+        let error = OpenClaw
             .write_session(&session, &WriteOptions { force: false })
-            .expect("OpenClaw write");
-        let readback = OpenClaw
-            .read_session(&written.paths[0])
-            .expect("OpenClaw readback");
-        assert_eq!(
-            readback.messages.len(),
-            session.messages.len(),
-            "OpenClaw: message count should match after write→read"
+            .expect_err("OpenClaw target writes require a gateway-backed import");
+        assert!(
+            error.to_string().contains("gateway"),
+            "refusal should identify the safe import boundary: {error:#}"
+        );
+        assert!(
+            !state_dir.exists(),
+            "OpenClaw refusal must happen before creating provider state"
         );
     }
 

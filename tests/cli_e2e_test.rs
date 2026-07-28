@@ -172,6 +172,15 @@ fn setup_chatgpt_fixture(tmp: &TempDir) -> &'static str {
     "chatgpt-conv-001"
 }
 
+fn setup_openclaw_fixture(tmp: &TempDir) -> &'static str {
+    const SESSION_ID: &str = "019c19ee-b400-74dd-a9e3-2c89278287ae";
+    let source = fixtures_dir().join("openclaw/openclaw_simple.jsonl");
+    let dir = tmp.path().join("openclaw/.openclaw/agents/main/sessions");
+    fs::create_dir_all(&dir).expect("create OpenClaw fixture directory");
+    fs::copy(source, dir.join(format!("{SESSION_ID}.jsonl"))).expect("copy OpenClaw fixture");
+    SESSION_ID
+}
+
 fn parse_json_error(stderr: &[u8]) -> serde_json::Value {
     let stderr = String::from_utf8_lossy(stderr);
     let json_start = stderr
@@ -1764,49 +1773,40 @@ fn cli_resume_factory_to_cc_works_with_source_hint() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_resume_cc_to_openclaw_works_and_is_discoverable() {
+fn cli_resume_cc_to_openclaw_refuses_real_and_dry_run_without_state() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
-        .args(["--json", "resume", "ocl", &session_id])
-        .output()
-        .expect("resume should run");
+    for dry_run in [false, true] {
+        let mut args = vec!["--json", "resume", "ocl", session_id.as_str()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = casr_cmd(&tmp)
+            .args(args)
+            .output()
+            .expect("resume should run");
+        assert!(!output.status.success(), "OpenClaw target must refuse");
+        let error = parse_json_error(&output.stderr);
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("gateway")),
+            "unexpected refusal: {error}"
+        );
+    }
     assert!(
-        output.status.success(),
-        "CC→OpenClaw conversion should succeed"
+        !tmp.path().join("openclaw").exists(),
+        "real and dry-run refusals must not create OpenClaw state"
     );
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("resume --json output should parse");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["target_provider"].as_str().unwrap(), "openclaw");
-    assert!(parsed["target_session_id"].as_str().is_some());
-
-    // Verify written file exists on disk.
-    let written_paths = parsed["written_paths"].as_array().unwrap();
-    assert!(!written_paths.is_empty(), "should have written paths");
-    let path = std::path::Path::new(written_paths[0].as_str().unwrap());
-    assert!(path.exists(), "OpenClaw output file should exist on disk");
 }
 
 #[test]
 fn cli_resume_openclaw_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
-    let source_id = setup_cc_fixture(&tmp, "cc_simple");
+    let openclaw_session_id = setup_openclaw_fixture(&tmp);
 
-    let openclaw_result = casr_cmd(&tmp)
-        .args(["--json", "resume", "ocl", &source_id])
-        .output()
-        .expect("CC→OpenClaw seed conversion should run");
-    assert!(openclaw_result.status.success());
-    let openclaw_json: serde_json::Value =
-        serde_json::from_slice(&openclaw_result.stdout).expect("seed conversion JSON should parse");
-    let openclaw_session_id = openclaw_json["target_session_id"]
-        .as_str()
-        .expect("openclaw target_session_id should be present");
-
-    // Use --force since the session ID may match the source CC session.
     casr_cmd(&tmp)
         .args([
             "resume",

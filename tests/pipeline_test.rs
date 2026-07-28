@@ -77,6 +77,8 @@ struct MockState {
     /// structured writer, so the pipeline must fall back to the flat path.
     structured_grade: Option<Fidelity>,
     structured_write_calls: usize,
+    finalize_calls: usize,
+    finalize_error: Option<String>,
 }
 
 #[derive(Clone)]
@@ -157,6 +159,10 @@ impl MockProvider {
         self.state.lock().expect("mock state lock").structured_grade = Some(grade);
     }
 
+    fn set_finalize_error(&self, message: &str) {
+        self.state.lock().expect("mock state lock").finalize_error = Some(message.to_string());
+    }
+
     fn write_calls(&self) -> usize {
         self.state.lock().expect("mock state lock").write_calls
     }
@@ -166,6 +172,10 @@ impl MockProvider {
             .lock()
             .expect("mock state lock")
             .structured_write_calls
+    }
+
+    fn finalize_calls(&self) -> usize {
+        self.state.lock().expect("mock state lock").finalize_calls
     }
 
     fn last_written(&self) -> Option<CanonicalSession> {
@@ -261,6 +271,19 @@ impl Provider for MockProvider {
                 warnings: Vec::new(),
             }),
         }
+    }
+
+    fn finalize_write(
+        &self,
+        _written: &mut WrittenSession,
+        _opts: &WriteOptions,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().expect("mock state lock");
+        state.finalize_calls += 1;
+        if let Some(message) = state.finalize_error.as_ref() {
+            anyhow::bail!("{message}");
+        }
+        Ok(())
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -486,6 +509,11 @@ fn pipeline_convert_happy_path_writes_and_verifies() {
     assert!(result.written.is_some(), "write result should be present");
     assert!(result.warnings.is_empty(), "happy path should not warn");
     assert_eq!(dst.write_calls(), 1, "target write should run once");
+    assert_eq!(
+        dst.finalize_calls(),
+        1,
+        "provider shared state is finalized after read-back verification"
+    );
     assert_eq!(
         dst.last_written()
             .expect("target should capture written session")
@@ -982,7 +1010,7 @@ fn pipeline_warns_when_target_cli_missing_but_write_succeeds() {
     );
 
     let pipeline = ConversionPipeline {
-        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
         store: None,
     };
 
@@ -1244,6 +1272,106 @@ fn pipeline_readback_mismatch_fails_and_removes_unverified_output() {
 }
 
 #[test]
+fn pipeline_accepts_cursors_declared_tool_to_assistant_fold() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let src_root = tmp.path().join("src");
+    let dst_root = tmp.path().join("cursor");
+    fs::create_dir_all(&src_root).expect("create src root");
+    fs::create_dir_all(&dst_root).expect("create target root");
+
+    let src = MockProvider::new("Source", "src", "src", vec![src_root.clone()]);
+    let dst = MockProvider::new("Cursor", "cursor", "cur", vec![dst_root.clone()]);
+    let source_path = src_root.join("session-cursor-tool-fold.json");
+    let written_path = dst_root.join("out-cursor-tool-fold.json");
+    let mut canonical = valid_session_with_id("sid-cursor-tool-fold");
+    canonical.messages[2].role = MessageRole::Tool;
+    let mut readback = canonical.clone();
+    readback.messages[2].role = MessageRole::Assistant;
+
+    src.set_owned_session("sid-cursor-tool-fold", source_path.clone());
+    src.set_read_session(source_path, canonical);
+    dst.set_write_success(WrittenSession {
+        paths: vec![written_path.clone()],
+        session_id: "target-cursor-tool-fold".to_string(),
+        resume_command: "cursor .".to_string(),
+        backups: Vec::new(),
+        warnings: Vec::new(),
+    });
+    dst.set_read_session(written_path, readback);
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
+        store: None,
+    };
+    let result = pipeline
+        .convert("cur", "sid-cursor-tool-fold", options(false, None))
+        .expect("Cursor's declared Tool→Assistant fold should pass read-back verification");
+
+    assert!(
+        result.losses.iter().any(|loss| {
+            loss.note
+                .contains("1 message(s) were written as assistant bubbles")
+        }),
+        "the accepted fold must still be reported as a projection loss: {:?}",
+        result.losses
+    );
+    assert_eq!(dst.finalize_calls(), 1);
+}
+
+#[test]
+fn pipeline_rejects_tool_to_assistant_fold_for_non_cursor_targets() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let src_root = tmp.path().join("src");
+    let dst_root = tmp.path().join("other");
+    fs::create_dir_all(&src_root).expect("create src root");
+    fs::create_dir_all(&dst_root).expect("create target root");
+
+    let src = MockProvider::new("Source", "src", "src", vec![src_root.clone()]);
+    let dst = MockProvider::new("Other", "other", "oth", vec![dst_root.clone()]);
+    let source_path = src_root.join("session-other-tool-fold.json");
+    let written_path = dst_root.join("out-other-tool-fold.json");
+    let mut canonical = valid_session_with_id("sid-other-tool-fold");
+    canonical.messages[2].role = MessageRole::Tool;
+    let mut readback = canonical.clone();
+    readback.messages[2].role = MessageRole::Assistant;
+
+    src.set_owned_session("sid-other-tool-fold", source_path.clone());
+    src.set_read_session(source_path, canonical);
+    dst.set_write_success(WrittenSession {
+        paths: vec![written_path.clone()],
+        session_id: "target-other-tool-fold".to_string(),
+        resume_command: "other --resume target-other-tool-fold".to_string(),
+        backups: Vec::new(),
+        warnings: Vec::new(),
+    });
+    dst.set_read_session(written_path.clone(), readback);
+    fs::write(&written_path, "unverified-output").expect("seed unverified output");
+
+    let pipeline = ConversionPipeline {
+        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
+        store: None,
+    };
+    let err = pipeline
+        .convert("oth", "sid-other-tool-fold", options(false, None))
+        .expect_err("other targets must not inherit Cursor's declared role fold");
+
+    match err.downcast_ref::<CasrError>() {
+        Some(CasrError::VerifyFailed { detail, .. }) => {
+            assert!(
+                detail.contains("message role mismatch at idx 2"),
+                "unexpected verify detail: {detail}"
+            );
+        }
+        other => panic!("expected VerifyFailed, got {other:?}"),
+    }
+    assert_eq!(dst.finalize_calls(), 0);
+    assert!(
+        !written_path.exists(),
+        "unverified output should be removed on verify failure"
+    );
+}
+
+#[test]
 fn pipeline_readback_content_mismatch_fails_and_removes_unverified_output() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let src_root = tmp.path().join("src");
@@ -1330,7 +1458,7 @@ fn pipeline_readback_error_restores_backup_and_returns_verify_failed() {
     fs::write(&backup_path, "restorable-original-content").expect("seed backup");
 
     let pipeline = ConversionPipeline {
-        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst)]),
+        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
         store: None,
     };
     let err = pipeline
@@ -1352,6 +1480,33 @@ fn pipeline_readback_error_restores_backup_and_returns_verify_failed() {
     assert!(
         !backup_path.exists(),
         "backup should be consumed during restore"
+    );
+    assert_eq!(
+        dst.finalize_calls(),
+        0,
+        "a failed read-back must never touch provider shared state"
+    );
+}
+
+#[test]
+fn pipeline_rolls_back_staged_outputs_when_postverify_finalization_fails() {
+    let (_src, dst, pipeline) = flat_pair("sid-finalize-error");
+    dst.set_finalize_error("shared index rejected");
+
+    let error = pipeline
+        .convert("tgt", "sid-finalize-error", options(false, None))
+        .expect_err("a failed shared-state commit must fail the conversion");
+
+    assert_eq!(
+        dst.finalize_calls(),
+        1,
+        "read-back passed before finalization"
+    );
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("shared index rejected")
+            && detail.contains("staged output rollback succeeded"),
+        "finalization and rollback must both be reported: {detail}"
     );
 }
 

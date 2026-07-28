@@ -1382,22 +1382,50 @@ fn writer_clawdbot_roundtrip() {
     let _env = EnvGuard::set("CLAWDBOT_HOME", tmp.path());
 
     let session = simple_session();
-    let written = ClawdBot
-        .write_session(&session, &WriteOptions { force: false })
+    let opts = WriteOptions { force: false };
+    let mut written = ClawdBot
+        .write_session(&session, &opts)
         .expect("ClawdBot write_session should succeed");
 
     assert_eq!(
         written.paths.len(),
         1,
-        "ClawdBot should produce exactly one file"
+        "the writer stages only the transcript until read-back succeeds"
     );
     assert!(
         written.paths[0].exists(),
         "ClawdBot output file should exist"
     );
     assert!(
+        !tmp.path().join("sessions.json").exists(),
+        "shared state must not change before transcript verification"
+    );
+    ClawdBot
+        .finalize_write(&mut written, &opts)
+        .expect("a verified transcript should be registered");
+    assert_eq!(
+        written.paths.len(),
+        2,
+        "finalization adds the ClawdBot sessions.json row"
+    );
+    assert!(
         written.resume_command.contains("clawdbot"),
         "ClawdBot resume command should reference clawdbot"
+    );
+    assert_eq!(
+        written.resume_command, "clawdbot tui --session agent:main:src-simple",
+        "the explicit main-agent key cannot drift with the user's default agent"
+    );
+
+    let store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&written.paths[1]).unwrap()).unwrap();
+    assert_eq!(
+        store["agent:main:src-simple"]["sessionId"], "src-simple",
+        "the TUI resolves the transcript through the session store"
+    );
+    assert!(
+        store["agent:main:src-simple"]["updatedAt"].is_number(),
+        "the session picker requires an activity timestamp"
     );
 
     let readback = ClawdBot
@@ -1424,6 +1452,198 @@ fn writer_clawdbot_roundtrip() {
             "ClawdBot roundtrip msg {i}: content mismatch"
         );
     }
+}
+
+#[test]
+fn writer_clawdbot_merges_the_session_store_without_clobbering_vendor_fields() {
+    let _lock = CLAWDBOT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAWDBOT_HOME", tmp.path());
+    let store_path = tmp.path().join("sessions.json");
+    std::fs::write(
+        &store_path,
+        br#"{
+  // ClawdBot reads this shared store with JSON5.parse.
+  "agent:main:existing": {sessionId:'existing',updatedAt:7,route:{channel:'test'},},
+  "agent:main:src-simple": {sessionId:'src-simple',updatedAt:9,vendorFuture:{keep:true},},
+}"#,
+    )
+    .unwrap();
+
+    let opts = WriteOptions { force: false };
+    let mut written = ClawdBot
+        .write_session(&simple_session(), &opts)
+        .expect("ClawdBot should merge a pre-existing index");
+    ClawdBot
+        .finalize_write(&mut written, &opts)
+        .expect("verified ClawdBot transcript should merge the index");
+    let store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store_path).unwrap()).unwrap();
+
+    assert_eq!(written.paths[1], store_path);
+    assert_eq!(
+        store["agent:main:existing"]["route"]["channel"], "test",
+        "unrelated sessions must survive"
+    );
+    assert_eq!(
+        store["agent:main:src-simple"]["vendorFuture"]["keep"], true,
+        "unknown fields on the updated row must survive"
+    );
+    assert!(
+        store["agent:main:src-simple"]["updatedAt"]
+            .as_i64()
+            .unwrap()
+            >= 9
+    );
+    assert!(
+        !tmp.path().join("sessions.json.lock").exists(),
+        "the compatible store lock must be released"
+    );
+}
+
+#[test]
+fn writer_clawdbot_lowercases_the_store_key_but_not_the_transcript_id() {
+    let _lock = CLAWDBOT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAWDBOT_HOME", tmp.path());
+    let mut session = simple_session();
+    session.session_id = "Native-ID".to_string();
+    let opts = WriteOptions { force: false };
+
+    let mut written = ClawdBot
+        .write_session(&session, &opts)
+        .expect("stage mixed-case transcript");
+    ClawdBot
+        .finalize_write(&mut written, &opts)
+        .expect("register mixed-case transcript");
+
+    assert_eq!(written.session_id, "Native-ID");
+    assert_eq!(
+        written.paths[0].file_stem().and_then(|stem| stem.to_str()),
+        Some("Native-ID")
+    );
+    assert_eq!(
+        written.resume_command,
+        "clawdbot tui --session agent:main:native-id"
+    );
+    let store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&written.paths[1]).unwrap()).unwrap();
+    assert_eq!(
+        store["agent:main:native-id"]["sessionId"], "Native-ID",
+        "the normalized lookup key must still point at the exact transcript filename"
+    );
+    assert!(
+        store.get("agent:main:Native-ID").is_none(),
+        "the unreachable mixed-case routing key must not be written"
+    );
+}
+
+#[test]
+fn writer_clawdbot_requires_force_to_claim_an_existing_unbound_row() {
+    let _lock = CLAWDBOT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAWDBOT_HOME", tmp.path());
+    let store_path = tmp.path().join("sessions.json");
+    let original = br#"{
+  "agent:main:src-simple": {"updatedAt":9,"vendorFuture":{"keep":true}}
+}"#;
+    std::fs::write(&store_path, original).unwrap();
+
+    let mut written = ClawdBot
+        .write_session(&simple_session(), &WriteOptions { force: false })
+        .expect("stage transcript");
+    let error = ClawdBot
+        .finalize_write(&mut written, &WriteOptions { force: false })
+        .expect_err("an existing row without a matching sessionId is owned by the vendor");
+    assert!(
+        error.to_string().contains("already exists"),
+        "unexpected conflict: {error:#}"
+    );
+    assert_eq!(std::fs::read(&store_path).unwrap(), original);
+    assert_eq!(written.paths.len(), 1, "failure must not mutate outputs");
+
+    ClawdBot
+        .finalize_write(&mut written, &WriteOptions { force: true })
+        .expect("force explicitly authorizes claiming the existing row");
+    let store: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store_path).unwrap()).unwrap();
+    assert_eq!(store["agent:main:src-simple"]["sessionId"], "src-simple");
+    assert_eq!(
+        store["agent:main:src-simple"]["vendorFuture"]["keep"], true,
+        "claiming a row must preserve unknown vendor fields"
+    );
+    assert!(
+        std::fs::read_dir(tmp.path()).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("sessions.json.bak")),
+        "an accepted shared-index merge must not accumulate rollback backups"
+    );
+}
+
+#[test]
+fn writer_clawdbot_recovers_the_vendor_stale_lock() {
+    let _lock = CLAWDBOT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAWDBOT_HOME", tmp.path());
+    let lock_path = tmp.path().join("sessions.json.lock");
+    std::fs::write(&lock_path, br#"{"pid":1,"startedAt":0}"#).unwrap();
+    let stale_time = std::time::SystemTime::now() - std::time::Duration::from_secs(31);
+    std::fs::File::options()
+        .write(true)
+        .open(&lock_path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(stale_time))
+        .unwrap();
+
+    let opts = WriteOptions { force: false };
+    let mut written = ClawdBot
+        .write_session(&simple_session(), &opts)
+        .expect("stage transcript");
+    let started = std::time::Instant::now();
+    ClawdBot
+        .finalize_write(&mut written, &opts)
+        .expect("ClawdBot evicts locks older than its 30-second stale threshold");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a lock already older than the vendor threshold must not wait for timeout"
+    );
+    assert!(!lock_path.exists(), "the acquired lock is released");
+}
+
+#[test]
+fn writer_clawdbot_finalize_refuses_an_invalid_store_without_replacing_it() {
+    let _lock = CLAWDBOT_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CLAWDBOT_HOME", tmp.path());
+    let store_path = tmp.path().join("sessions.json");
+    let invalid = b"{not valid json";
+    std::fs::write(&store_path, invalid).unwrap();
+
+    let opts = WriteOptions { force: false };
+    let mut written = ClawdBot
+        .write_session(&simple_session(), &opts)
+        .expect("the transcript is staged before the shared index is touched");
+    let error = ClawdBot
+        .finalize_write(&mut written, &opts)
+        .expect_err("an invalid shared index must not be replaced");
+
+    assert!(
+        error.to_string().contains("parse session index"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(std::fs::read(&store_path).unwrap(), invalid);
+    assert!(
+        tmp.path().join("src-simple.jsonl").exists(),
+        "the finalizer leaves staged outputs for the pipeline to roll back"
+    );
+    assert_eq!(
+        written.paths.len(),
+        1,
+        "failure must not mutate the write set"
+    );
 }
 
 #[test]
@@ -1904,9 +2124,9 @@ fn writer_factory_roundtrip() {
         written.paths[0].exists(),
         "Factory output file should exist"
     );
-    assert!(
-        written.resume_command.contains("factory"),
-        "Factory resume command should reference factory"
+    assert_eq!(
+        written.resume_command, "droid --resume src-simple",
+        "Factory ships the droid executable"
     );
 
     let readback = Factory
@@ -2107,275 +2327,30 @@ fn writer_factory_message_structure() {
 }
 
 // ===========================================================================
-// OpenClaw writer tests
+// OpenClaw target-refusal tests
 // ===========================================================================
 
 #[test]
-fn writer_openclaw_roundtrip() {
+fn writer_openclaw_refuses_normal_and_force_without_creating_state() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+    let state_dir = tmp.path().join("openclaw-state");
+    let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
 
-    let session = simple_session();
-    let written = OpenClaw
-        .write_session(&session, &WriteOptions { force: false })
-        .expect("OpenClaw write_session should succeed");
-
-    assert_eq!(
-        written.paths.len(),
-        1,
-        "OpenClaw should produce exactly one file"
-    );
-    assert!(
-        written.paths[0].exists(),
-        "OpenClaw output file should exist"
-    );
-    assert!(
-        written.resume_command.contains("openclaw"),
-        "OpenClaw resume command should reference openclaw"
-    );
-
-    let readback = OpenClaw
-        .read_session(&written.paths[0])
-        .expect("OpenClaw read_session should parse written output");
-
-    assert_eq!(
-        readback.messages.len(),
-        session.messages.len(),
-        "OpenClaw roundtrip: message count"
-    );
-    for (i, (orig, rb)) in session
-        .messages
-        .iter()
-        .zip(readback.messages.iter())
-        .enumerate()
-    {
-        assert_eq!(
-            orig.role, rb.role,
-            "OpenClaw roundtrip msg {i}: role mismatch"
-        );
-        assert_eq!(
-            orig.content, rb.content,
-            "OpenClaw roundtrip msg {i}: content mismatch"
-        );
-    }
-    assert_eq!(
-        readback.workspace, session.workspace,
-        "OpenClaw roundtrip: workspace"
-    );
-}
-
-#[test]
-fn writer_openclaw_session_header() {
-    let _lock = OPENCLAW_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
-
-    let written = OpenClaw
-        .write_session(&simple_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let first_line: serde_json::Value =
-        serde_json::from_str(content.lines().next().unwrap()).unwrap();
-
-    assert_eq!(
-        first_line["type"], "session",
-        "OpenClaw first line should be type 'session'"
-    );
-    assert!(
-        first_line["id"].is_string(),
-        "OpenClaw session header should have id"
-    );
-    assert_eq!(first_line["id"], written.session_id);
-    assert!(
-        first_line["timestamp"].is_string(),
-        "OpenClaw session header should have timestamp"
-    );
-    // `CURRENT_SESSION_VERSION` in `@openclaw/ai@2026.7.1-2` is the number 3,
-    // and OpenClaw compares it numerically: `migrateToCurrentVersion` reads
-    // `header.version ?? 1` and returns early on `>= 3`. This used to assert
-    // `is_string()`, which only ever held because casr wrote the string
-    // "0.1.0" — a value that fails that comparison, so OpenClaw treated every
-    // casr-written transcript as needing migration and rewrote it.
-    assert_eq!(
-        first_line["version"], 3,
-        "OpenClaw session header version should be the current schema number"
-    );
-}
-
-#[test]
-fn writer_openclaw_maps_an_unsafe_source_id_to_a_vendor_id() {
-    let _lock = OPENCLAW_ENV.lock().unwrap();
-    let mut session = simple_session();
-    session.session_id = "../../2026/07/27/rollout".to_string();
-
-    let write_once = |root: &std::path::Path| {
-        let _env = EnvGuard::set("OPENCLAW_HOME", root);
-        let written = OpenClaw
-            .write_session(&session, &WriteOptions { force: false })
-            .expect("OpenClaw write_session should map the source id");
-        let header: serde_json::Value = serde_json::from_str(
-            std::fs::read_to_string(&written.paths[0])
-                .unwrap()
-                .lines()
-                .next()
-                .unwrap(),
-        )
-        .unwrap();
-        (written, header)
-    };
-
-    let first = tempfile::TempDir::new().unwrap();
-    let (written, header) = write_once(first.path());
-    let id = written.session_id;
-    assert_eq!(header["id"], id);
-    assert_eq!(
-        written.paths[0].file_stem().and_then(|stem| stem.to_str()),
-        Some(id.as_str())
-    );
-    assert!(
-        (1..=128).contains(&id.len())
-            && id.as_bytes()[0].is_ascii_alphanumeric()
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
-        "OpenClaw session id must satisfy validateSessionId, got {id:?}"
-    );
-    assert!(
-        !id.contains('%'),
-        "OpenClaw's validator rejects percent escapes"
-    );
-    assert!(
-        !written.paths[0]
-            .parent()
-            .unwrap()
-            .join("sessions.json")
-            .exists(),
-        "the writer must not race OpenClaw's mutable sessions index"
-    );
-
-    let second = tempfile::TempDir::new().unwrap();
-    let (again, _) = write_once(second.path());
-    assert_eq!(again.session_id, id, "surrogate ids must be deterministic");
-}
-
-#[test]
-fn writer_openclaw_does_not_reuse_a_reserved_checkpoint_stem() {
-    let _lock = OPENCLAW_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
-    let mut session = simple_session();
-    session.session_id =
-        "primary.checkpoint.aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".to_string();
-
-    let written = OpenClaw
-        .write_session(&session, &WriteOptions { force: false })
-        .unwrap();
-    let header: serde_json::Value = serde_json::from_str(
-        std::fs::read_to_string(&written.paths[0])
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap(),
-    )
-    .unwrap();
-
-    assert_ne!(written.session_id, session.session_id);
-    assert!(written.session_id.starts_with("casr-"));
-    assert_eq!(header["id"], written.session_id);
-}
-
-#[test]
-fn writer_openclaw_output_valid_jsonl() {
-    let _lock = OPENCLAW_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
-
-    let written = OpenClaw
-        .write_session(&simple_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let lines: Vec<&str> = content.lines().collect();
-    // session header + model_change + 4 messages. The `model_change` line is
-    // there because `simple_session()` names a model, and OpenClaw carries the
-    // session model in an entry rather than in the header — its `SessionHeader`
-    // has no `modelId` field to put it in.
-    assert_eq!(
-        lines.len(),
-        6,
-        "OpenClaw should write session header + model_change + 4 message lines"
-    );
-    for (i, line) in lines.iter().enumerate() {
-        if let Err(e) = serde_json::from_str::<serde_json::Value>(line) {
-            panic!("OpenClaw line {i} not valid JSON: {e}\nContent: {line}");
-        }
-    }
-}
-
-#[test]
-fn writer_openclaw_message_ids_are_sequential() {
-    let _lock = OPENCLAW_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
-
-    let written = OpenClaw
-        .write_session(&simple_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let lines: Vec<serde_json::Value> = content
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-
-    // Message IDs are m1, m2, m3, m4. Selected by entry type rather than by
-    // skipping a fixed prefix: the header is not the only non-message line —
-    // a session that names a model also carries a `model_change` entry — and
-    // a positional skip silently starts asserting against the wrong rows when
-    // that changes.
-    let messages: Vec<&serde_json::Value> =
-        lines.iter().filter(|e| e["type"] == "message").collect();
-    assert_eq!(messages.len(), 4, "expected the 4 message lines");
-    for (i, entry) in messages.iter().enumerate() {
-        let expected_id = format!("m{}", i + 1);
-        assert_eq!(
-            entry["id"].as_str().unwrap(),
-            expected_id,
-            "OpenClaw message {i} should have id '{expected_id}'"
-        );
-    }
-}
-
-#[test]
-fn writer_openclaw_tool_calls_in_content() {
-    let _lock = OPENCLAW_ENV.lock().unwrap();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
-
-    let written = OpenClaw
-        .write_session(&tool_call_session(), &WriteOptions { force: false })
-        .unwrap();
-
-    let content = std::fs::read_to_string(&written.paths[0]).unwrap();
-    let lines: Vec<serde_json::Value> = content
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-
-    // Second message (index 1 after header → line 2) is assistant with tool call.
-    let assistant = &lines[2];
-    let msg_content = &assistant["message"]["content"];
-
-    // Content should be array when tool calls exist.
-    if let Some(arr) = msg_content.as_array() {
-        let has_tool = arr.iter().any(|b| b["type"] == "toolCall");
+    for force in [false, true] {
+        let error = OpenClaw
+            .write_session(&simple_session(), &WriteOptions { force })
+            .expect_err("OpenClaw imports must use its gateway, not direct store mutation");
         assert!(
-            has_tool,
-            "OpenClaw assistant with tool calls should have toolCall block"
+            error.to_string().contains("gateway"),
+            "refusal should identify the safe import boundary: {error:#}"
         );
     }
+
+    assert!(
+        !state_dir.exists(),
+        "refusing an OpenClaw import must not create any provider state"
+    );
 }
 
 // ===========================================================================

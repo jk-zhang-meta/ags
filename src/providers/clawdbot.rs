@@ -54,11 +54,13 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{CanonicalSession, MessageRole, truncate_title};
 use crate::providers::pi_session;
 use crate::providers::{
     Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession,
     filename_safe_session_id, read_dir_reporting, walk_entry_reporting,
+    write_clawdbot_session_index,
 };
 
 /// ClawdBot's default agent id (`dist/routing/session-key.js`:
@@ -141,6 +143,24 @@ impl ClawdBot {
     /// failure — `detect`, `session_roots`, `owns_session`, the writer.
     fn session_dirs() -> Vec<PathBuf> {
         Self::session_dirs_reporting(&mut Vec::new())
+    }
+
+    fn session_key(session_id: &str) -> String {
+        // `toAgentStoreSessionKey` lowercases the full request key before it
+        // looks in sessions.json. Keep `sessionId` itself unchanged: that is
+        // still the case-sensitive transcript filename stored in the row.
+        format!("agent:{DEFAULT_AGENT_ID}:{}", session_id.to_lowercase())
+    }
+
+    fn resume_spec(session_id: &str) -> LaunchSpec {
+        LaunchSpec::new(
+            "clawdbot",
+            [
+                "tui".to_string(),
+                "--session".to_string(),
+                Self::session_key(session_id),
+            ],
+        )
     }
 }
 
@@ -381,6 +401,8 @@ impl Provider for ClawdBot {
         );
 
         Ok(WrittenSession {
+            // Shared `sessions.json` is committed by `finalize_write` only
+            // after this transcript has passed pipeline read-back.
             paths: vec![outcome.target_path.clone()],
             session_id: session_id.clone(),
             resume_command: self.resume_command(&session_id),
@@ -389,8 +411,51 @@ impl Provider for ClawdBot {
         })
     }
 
+    fn finalize_write(
+        &self,
+        written: &mut WrittenSession,
+        opts: &WriteOptions,
+    ) -> anyhow::Result<()> {
+        let transcript_path = written
+            .paths
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("ClawdBot write has no transcript to register"))?;
+        let target_dir = transcript_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("ClawdBot transcript has no sessions directory"))?;
+        let store_path = target_dir.join("sessions.json");
+        let session_key = Self::session_key(&written.session_id);
+        let index_outcome = write_clawdbot_session_index(
+            &store_path,
+            &session_key,
+            &written.session_id,
+            opts.force,
+            self.slug(),
+        )?;
+
+        if let Some(backup) = index_outcome.backup_path.as_ref()
+            && let Err(error) = std::fs::remove_file(backup)
+        {
+            written.warnings.push(format!(
+                "registered ClawdBot session, but could not remove internal index backup {}: {error}",
+                backup.display()
+            ));
+        }
+        written.paths.push(index_outcome.target_path);
+        Ok(())
+    }
+
     fn resume_command(&self, session_id: &str) -> String {
-        format!("clawdbot --resume {session_id}")
+        Self::resume_spec(session_id).display()
+    }
+
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        let spec = Self::resume_spec(session_id);
+        if session_id.is_empty() {
+            Some(spec)
+        } else {
+            Some(spec.targeting_session(&Self::session_key(session_id)))
+        }
     }
 }
 
@@ -918,8 +983,8 @@ mod tests {
     #[test]
     fn writer_resume_command() {
         assert_eq!(
-            ClawdBot.resume_command("my-session"),
-            "clawdbot --resume my-session"
+            ClawdBot.resume_command("Native-ID"),
+            "clawdbot tui --session agent:main:native-id"
         );
     }
 

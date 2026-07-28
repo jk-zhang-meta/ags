@@ -24,8 +24,11 @@
 //!
 //! ## Resume mechanism
 //!
-//! Cursor has no CLI `--resume <id>` flag. The resume command opens the
-//! workspace directory in Cursor (`cursor <workspace-path>`).
+//! Cursor's IDE composer store has no verified direct resume command, so the
+//! resume command opens the workspace in Cursor (`cursor <workspace-path>`).
+//! `cursor-agent --resume <id>` does exist, but it addresses the separate
+//! `~/.cursor` agent store described below; it cannot open a composer casr
+//! wrote to the IDE's `state.vscdb`.
 //!
 //! # The second store: `cursor-agent`
 //!
@@ -1177,8 +1180,9 @@ impl Provider for Cursor {
     }
 
     fn resume_command(&self, _session_id: &str) -> String {
-        // Cursor has no session-specific resume mechanism.
-        // Best we can do is open Cursor.
+        // `cursor-agent --resume` targets the separate agent CLI store, not
+        // this writer's IDE composer in state.vscdb. Best we can do for the
+        // composer is open Cursor.
         "cursor .".to_string()
     }
 

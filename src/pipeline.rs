@@ -679,7 +679,7 @@ but resume may fail until the CLI is installed.",
                     });
                 }
             } else if let Some(StructuredWrite {
-                written,
+                mut written,
                 fidelity,
                 losses,
             }) = target_provider.write_session_ir(ir, &write_opts, &budget)?
@@ -689,8 +689,6 @@ but resume may fail until the CLI is installed.",
                     ?fidelity,
                     "session written on the structured track"
                 );
-                all_warnings.extend(written.warnings.iter().cloned());
-
                 // 7a1b. Structural read-back verification.
                 //
                 // The flat verifier cannot be reused here: it compares the target's
@@ -722,7 +720,13 @@ but resume may fail until the CLI is installed.",
                     }
                 }
 
-                // 7a1c. Tell the store what we just wrote.
+                // 7a1c. Commit any provider-owned shared index only after the
+                // transcript passed verification. Until this point rollback
+                // owns only staged, session-local artifacts.
+                finalize_verified_write(target_provider, &mut written, &write_opts)?;
+                all_warnings.extend(written.warnings.iter().cloned());
+
+                // 7a1d. Tell the store what we just wrote.
                 //
                 // After verification, never before it: a record of a conversion is a
                 // measurement of an event that happened, and a write that was rolled
@@ -840,9 +844,10 @@ but resume may fail until the CLI is installed.",
         // Tool *results* keep the empty-content rule they have always had.
         // Widening them is a separate question with a different answer: a
         // `toolResult` message normally carries the observation in `content`
-        // already, and OpenClaw's writer takes the observation text from
-        // `content` rather than from `tool_results`, so a target moved off this
-        // path would lose the observation outright rather than gain a duplicate.
+        // already, and OpenClaw's native record construction takes the
+        // observation text from `content` rather than from `tool_results`, so
+        // a target moved off this path would lose the observation outright
+        // rather than gain a duplicate.
         //
         // What is left behind either way — the call's arguments and its id —
         // is declared by [`tool_calls_rendered_as_text`], not dropped in
@@ -886,16 +891,12 @@ but resume may fail until the CLI is installed.",
         }
 
         // 8. Write to target provider, on the flat track.
-        let written = target_provider.write_session(&canonical, &write_opts)?;
+        let mut written = target_provider.write_session(&canonical, &write_opts)?;
         info!(
             target_session_id = written.session_id,
             resume_command = written.resume_command,
             "session written"
         );
-        // Surface any non-fatal writer warnings (e.g. the target session was
-        // written but could not be registered in the provider's resume index).
-        all_warnings.extend(written.warnings.iter().cloned());
-
         // 9. Read-back verification.
         if let Some(first_path) = written.paths.first() {
             match target_provider.read_session(first_path) {
@@ -905,7 +906,9 @@ but resume may fail until the CLI is installed.",
                         original_messages = canonical.messages.len(),
                         "read-back verification"
                     );
-                    if let Some(detail) = readback_mismatch_detail(&canonical, &readback) {
+                    if let Some(detail) =
+                        readback_mismatch_detail(target_provider.slug(), &canonical, &readback)
+                    {
                         warn!(detail, "read-back verification failed");
                         let rollback_detail =
                             match rollback_written_session(target_provider.slug(), &written) {
@@ -940,6 +943,12 @@ but resume may fail until the CLI is installed.",
                 }
             }
         }
+
+        // 10. Commit provider-owned shared state only after the transcript is
+        // known to round-trip. A later rollback must never restore an old
+        // shared index over another process's intervening update.
+        finalize_verified_write(target_provider, &mut written, &write_opts)?;
+        all_warnings.extend(written.warnings.iter().cloned());
 
         self.record_write(
             selection.as_ref(),
@@ -1540,12 +1549,12 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str> {
     match role {
         MessageRole::User | MessageRole::Assistant => None,
-        // `claude_code.rs:703`, `cline.rs:316`, `openclaw.rs:1293`,
-        // `amp.rs:418`, `cursor.rs:1113`, `kiro.rs:1541`, `aider.rs:594`,
+        // `claude_code.rs:703`, `cline.rs:316`, `amp.rs:418`,
+        // `cursor.rs:1113`, `kiro.rs:1541`, `aider.rs:594`,
         // Vibe persists both as plain user rows because its loader drops
         // system rows and rejects unknown roles.
         MessageRole::System => match target_slug {
-            "claude-code" | "cline" | "openclaw" | "vibe" => Some("plain user turns"),
+            "claude-code" | "cline" | "vibe" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
@@ -1554,7 +1563,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
         },
         // Same writers, and the source's own name for the turn goes with it.
         MessageRole::Other(_) => match target_slug {
-            "claude-code" | "cline" | "openclaw" | "vibe" => Some("plain user turns"),
+            "claude-code" | "cline" | "vibe" => Some("plain user turns"),
             "amp" => Some("`info` records"),
             "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
@@ -1590,10 +1599,10 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 ///
 /// Measured by writing one session holding an assistant turn with a tool call
 /// through each writer and reading the artifact: Claude Code, Codex and Gemini
-/// emit `tool_use`, Amp emits `tool_use`, OpenClaw emits `toolCall`, Cline emits
-/// a tool block, Kiro emits `toolUse`, and OpenCode writes a tool part row.
-/// Cursor, Aider, ChatGPT, ClawdBot, Vibe, Factory and Pi-Agent write the
-/// message text and nothing else.
+/// emit `tool_use`, Amp emits `tool_use`, Cline emits a tool block, and Kiro
+/// emits `toolUse`. Cursor, Aider, ClawdBot, Vibe, Factory and Pi-Agent write
+/// the message text and nothing else. ChatGPT, OpenCode and OpenClaw refuse
+/// target writes before fidelity is calculated.
 ///
 /// `false` for an unknown slug, which is both the conservative answer — a
 /// rendered marker is redundant where the call survives, and the only record of
@@ -1602,7 +1611,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 pub fn writer_carries_tool_calls(target_slug: &str) -> bool {
     matches!(
         target_slug,
-        "claude-code" | "codex" | "gemini" | "cline" | "amp" | "openclaw" | "kiro"
+        "claude-code" | "codex" | "gemini" | "cline" | "amp" | "kiro"
     )
 }
 
@@ -1997,9 +2006,14 @@ turn(s) between the task and the most recent history."
 /// so the conversion says what it changed instead of quietly agreeing with
 /// itself. Widen the bucket here and the declaration there together, or the
 /// next fold is silent again.
-fn readback_role_bucket(role: &MessageRole) -> &'static str {
+fn readback_role_bucket(target_slug: &str, role: &MessageRole) -> &'static str {
     match role {
         MessageRole::Assistant => "assistant",
+        // Cursor has only HUMAN/AI bubbles. Its writer deliberately emits Tool
+        // observations as AI, and `folded_role` reports that projection loss.
+        // Keep this exception target-specific: other writers must not silently
+        // turn a Tool observation into an assistant response.
+        MessageRole::Tool if target_slug == "cursor" => "assistant",
         // Everything else collapses into the "user" bucket because that is
         // the only non-assistant entry type Claude Code (and similar formats)
         // can represent.
@@ -2010,6 +2024,7 @@ fn readback_role_bucket(role: &MessageRole) -> &'static str {
 }
 
 fn readback_mismatch_detail(
+    target_slug: &str,
     canonical: &CanonicalSession,
     readback: &CanonicalSession,
 ) -> Option<String> {
@@ -2027,7 +2042,9 @@ fn readback_mismatch_detail(
         .zip(readback.messages.iter())
         .enumerate()
     {
-        if readback_role_bucket(&orig.role) != readback_role_bucket(&rb.role) {
+        if readback_role_bucket(target_slug, &orig.role)
+            != readback_role_bucket(target_slug, &rb.role)
+        {
             return Some(format!(
                 "message role mismatch at idx {i}: wrote {:?}, read back {:?}",
                 orig.role, rb.role
@@ -2109,6 +2126,26 @@ fn rollback_written_session(
         })?;
     }
 
+    Ok(())
+}
+
+/// Commit provider-owned shared state after read-back, rolling back only the
+/// still-private staged outputs when that commit fails.
+fn finalize_verified_write(
+    provider: &dyn Provider,
+    written: &mut WrittenSession,
+    opts: &WriteOptions,
+) -> anyhow::Result<()> {
+    if let Err(finalize_error) = provider.finalize_write(written, opts) {
+        let rollback_detail = match rollback_written_session(provider.slug(), written) {
+            Ok(()) => "staged output rollback succeeded".to_string(),
+            Err(rollback_error) => format!("staged output rollback failed: {rollback_error}"),
+        };
+        return Err(anyhow::anyhow!(
+            "failed to finalize {} session after read-back verification: {finalize_error}; {rollback_detail}",
+            provider.slug()
+        ));
+    }
     Ok(())
 }
 

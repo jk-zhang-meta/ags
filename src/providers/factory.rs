@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
@@ -38,6 +39,10 @@ use crate::providers::{Provider, WriteOptions, WrittenSession, filename_safe_ses
 pub struct Factory;
 
 impl Factory {
+    fn resume_spec(session_id: &str) -> LaunchSpec {
+        LaunchSpec::new("droid", ["--resume".to_string(), session_id.to_string()])
+    }
+
     /// Root directory for Factory session storage, in precedence order:
     ///
     /// 1. `FACTORY_HOME` — casr's own override, naming the sessions directory
@@ -640,7 +645,11 @@ impl Provider for Factory {
     }
 
     fn resume_command(&self, session_id: &str) -> String {
-        format!("factory --resume {session_id}")
+        Self::resume_spec(session_id).display()
+    }
+
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        Some(Self::resume_spec(session_id).targeting_session(session_id))
     }
 }
 
@@ -1013,7 +1022,7 @@ mod tests {
         let provider = Factory;
         assert_eq!(
             provider.resume_command("my-session"),
-            "factory --resume my-session"
+            "droid --resume my-session"
         );
     }
 

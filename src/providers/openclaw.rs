@@ -1,4 +1,4 @@
-//! OpenClaw provider — reads/writes the `@openclaw/ai` session transcript.
+//! OpenClaw provider — reads and resumes `@openclaw/ai` session transcripts.
 //!
 //! Session files: `~/.openclaw/agents/<agent-id>/sessions/*.jsonl`
 //! Override root: `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw`
@@ -100,17 +100,17 @@
 //! in [`CanonicalMessage::tool_calls`], because that is the record whose writer
 //! emits a real `toolCall` block. Everywhere else it has no structural channel
 //! and is rendered into the text as `[Tool: <name>]`. See [`ToolCallText`]:
-//! doing both on the assistant turn is what made every conversion into OpenClaw
-//! containing a tool call fail read-back verification and roll back.
+//! doing both on the assistant turn duplicates the call in every conversion
+//! sourced from a native OpenClaw transcript.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, normalize_role,
     parse_timestamp, reindex_messages, truncate_title,
@@ -120,9 +120,13 @@ use crate::providers::{
     walk_entry_reporting,
 };
 
-/// OpenClaw's default agent id. Sessions are keyed by agent, and an agent id is
-/// mandatory in the path, so casr writes as the agent OpenClaw itself defaults
-/// to rather than inventing one.
+const OPENCLAW_WRITE_REFUSAL: &str = "OpenClaw is read/resume-only: its session index has no \
+cross-process file lock, so direct transcript and sessions.json writes can lose active gateway \
+updates. A safe import must use OpenClaw's authenticated gateway lifecycle; use OpenClaw as a \
+conversion source, not a target.";
+
+/// OpenClaw's default agent id. Native sessions are keyed by agent, and an
+/// agent id is mandatory when targeting the TUI.
 const DEFAULT_AGENT_ID: &str = "main";
 
 /// `CURRENT_SESSION_VERSION` from `@openclaw/ai@2026.7.1-2`. Written as a
@@ -130,40 +134,8 @@ const DEFAULT_AGENT_ID: &str = "main";
 /// reads `header.version ?? 1` and returns early on `>= 3`. A string version
 /// fails that comparison, and OpenClaw then reports the file as migrated and
 /// rewrites it.
+#[cfg(test)]
 const SESSION_VERSION: u64 = 3;
-
-/// OpenClaw reserves `<session>.checkpoint.<uuid>.jsonl` for compaction
-/// artifacts and rejects the corresponding stem as a primary session id.
-fn is_compaction_checkpoint_id(session_id: &str) -> bool {
-    let Some((primary_id, checkpoint_id)) = session_id.rsplit_once(".checkpoint.") else {
-        return false;
-    };
-    let bytes = checkpoint_id.as_bytes();
-    !primary_id.is_empty()
-        && bytes.len() == 36
-        && matches!(bytes[14], b'1'..=b'5')
-        && matches!(bytes[19], b'8' | b'9' | b'a' | b'A' | b'b' | b'B')
-        && uuid::Uuid::parse_str(checkpoint_id).is_ok()
-}
-
-/// `validateSessionId` in OpenClaw accepts only an ASCII letter or digit
-/// followed by at most 127 ASCII letters, digits, dots, underscores or
-/// hyphens, excluding compaction checkpoint stems. A generic filesystem escape
-/// encoding uses `%`, which is safe as a filename but invalid to
-/// `openclaw agent --session-id`.
-fn native_session_id(source_id: &str) -> String {
-    let bytes = source_id.as_bytes();
-    let valid = (1..=128).contains(&bytes.len())
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'))
-        && !is_compaction_checkpoint_id(source_id);
-    if valid {
-        return source_id.to_string();
-    }
-    format!("casr-{:x}", Sha256::digest(source_id.as_bytes()))
-}
 
 /// The record types `isCanonicalSessionEntryType` accepts
 /// (`src/config/sessions/transcript-tree.ts`). `session` is the header and
@@ -260,15 +232,14 @@ impl Transcript {
 ///
 /// Only the assistant arm of [`entry_message`] also calls
 /// [`extract_tool_calls`], so only there is the call already represented — and
-/// representing it twice is not merely redundant, it makes the format
-/// unwritable. The writer emits an assistant turn as a `text` block plus a
-/// `toolCall` block, which is exactly what `AssistantMessage.content` declares
+/// representing it twice is not merely redundant. A native assistant turn is a
+/// `text` block plus a `toolCall` block, exactly what
+/// `AssistantMessage.content` declares
 /// (`(TextContent | ThinkingContent | ToolCall)[]`,
 /// `dist/types-CFIUY_La.d.ts:206`); a reader that also renders the block into
-/// the text grows another `[Tool: …]` in `content` on every round trip, and
-/// `pipeline`'s read-back verification rejects the write.
+/// the text invents another `[Tool: …]` in canonical content.
 ///
-/// Measured on `openclaw@2026.7.1-2` over the bytes casr writes for one such
+/// Measured on `openclaw@2026.7.1-2` over one native turn:
 /// turn: `readTranscriptFileState` accepts both message rows and `convertToLlm`
 /// yields one assistant message holding one `text` part and one `toolCall`
 /// part. The vendor reads the call once out of that file, so the file is right
@@ -872,22 +843,22 @@ impl OpenClaw {
         home.join(".openclaw")
     }
 
-    /// The sessions directory of one agent: `<state>/agents/<agent-id>/sessions`.
-    ///
-    /// Confirmed against the released package: `docs/concepts/session.md` gives
-    /// "**Transcripts:** `~/.openclaw/agents/<agentId>/sessions/<sessionId>.jsonl`",
-    /// and `dist/diagnostic-DhwkYT4X.js` builds exactly
-    /// `join(resolveStateDir(), "agents", agentId, "sessions", `${runId}.jsonl`)`.
-    fn agent_sessions_dir(agent_id: &str) -> PathBuf {
-        Self::state_dir()
-            .join("agents")
-            .join(agent_id)
-            .join("sessions")
+    fn session_key(session_id: &str) -> String {
+        format!(
+            "agent:{DEFAULT_AGENT_ID}:{}",
+            session_id.to_ascii_lowercase()
+        )
     }
 
-    /// Where casr writes: the default agent's sessions directory.
-    fn home_dir() -> PathBuf {
-        Self::agent_sessions_dir(DEFAULT_AGENT_ID)
+    fn resume_spec(session_id: &str) -> LaunchSpec {
+        LaunchSpec::new(
+            "openclaw",
+            [
+                "tui".to_string(),
+                "--session".to_string(),
+                Self::session_key(session_id),
+            ],
+        )
     }
 
     /// Every agent's sessions directory, so that a session belonging to a
@@ -1177,52 +1148,27 @@ impl Provider for OpenClaw {
 
     fn write_session(
         &self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
+        _session: &CanonicalSession,
+        _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let session_id = if session.session_id.is_empty() {
-            format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
-        } else {
-            session.session_id.clone()
-        };
-        let session_id = native_session_id(&session_id);
+        Err(anyhow::anyhow!(OPENCLAW_WRITE_REFUSAL))
+    }
 
-        let target_dir = Self::home_dir();
-        let target_path = target_dir.join(format!("{session_id}.jsonl"));
-
-        debug!(
-            session_id,
-            path = %target_path.display(),
-            messages = session.messages.len(),
-            "writing OpenClaw session"
-        );
-
-        let file_content = render_session(&session_id, session);
-        let outcome = crate::pipeline::atomic_write(
-            &target_path,
-            file_content.as_bytes(),
-            opts.force,
-            self.slug(),
-        )?;
-
-        info!(
-            session_id,
-            path = %outcome.target_path.display(),
-            messages = session.messages.len(),
-            "OpenClaw session written"
-        );
-
-        Ok(WrittenSession {
-            paths: vec![outcome.target_path.clone()],
-            session_id: session_id.clone(),
-            resume_command: self.resume_command(&session_id),
-            backups: outcome.displaced().into_iter().collect(),
-            warnings: Vec::new(),
-        })
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(OPENCLAW_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, session_id: &str) -> String {
-        format!("openclaw --resume {session_id}")
+        Self::resume_spec(session_id).display()
+    }
+
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        let spec = Self::resume_spec(session_id);
+        if session_id.is_empty() {
+            Some(spec)
+        } else {
+            Some(spec.targeting_session(&Self::session_key(session_id)))
+        }
     }
 }
 
@@ -1230,7 +1176,11 @@ impl Provider for OpenClaw {
 // Write
 // ---------------------------------------------------------------------------
 
-/// Serialise a session as an OpenClaw transcript.
+/// Render a candidate OpenClaw transcript for parser-fidelity tests.
+///
+/// This is deliberately not a supported import path. OpenClaw's resume index
+/// is shared gateway state without a cross-process file lock, so casr refuses
+/// target writes until it can use the authenticated gateway lifecycle.
 ///
 /// The reader's defects had writer twins, and both are fixed here:
 ///
@@ -1258,6 +1208,7 @@ impl Provider for OpenClaw {
 /// them on a persisted row — `isAgentMessage` checks only `content` for an
 /// assistant turn (`dist/transcript-rewrite-BHL7q_3D.js`), and OpenClaw's
 /// consumers guard — so the file stays readable. Filling them would not.
+#[cfg(test)]
 fn render_session(session_id: &str, session: &CanonicalSession) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -1342,12 +1293,10 @@ fn render_session(session_id: &str, session: &CanonicalSession) -> String {
         // reads it back as [`MessageRole::User`], and its `customType` would
         // have to carry a role name OpenClaw itself never writes.
         //
-        // The mapping is right and it is still a loss, so it is declared:
-        // `pipeline::folded_role("openclaw", …)` names it before the write and
-        // the conversion carries a [`crate::ir::Loss`] for it. Change this
-        // match and that table has to change with it —
-        // `conformance_test::no_writer_folds_a_role_without_declaring_it`
-        // drives this writer and fails if the two disagree.
+        // This belongs only to the candidate renderer used by parser-fidelity
+        // tests. It is not a supported import path. A future gateway-backed
+        // writer would also have to declare this role fold before enabling
+        // OpenClaw as a target.
         let role_str = match &msg.role {
             MessageRole::User => "user",
             MessageRole::Assistant => "assistant",
@@ -1779,8 +1728,8 @@ mod tests {
         // assertion was encoding the defect rather than a requirement: an
         // assistant turn's `toolCall` blocks are returned in `tool_calls`, so
         // rendering them into the text as well stated the call twice and made
-        // every conversion into OpenClaw containing one fail read-back
-        // verification. What is real — the call is not lost — is asserted
+        // conversions sourced from OpenClaw duplicate the call in prose.
+        // What is real — the call is not lost — is asserted
         // structurally just below, and `[Tool: …]` is still rendered for the
         // three record types that have no structural channel (see
         // [`ToolCallText`], and the test named
@@ -1964,17 +1913,17 @@ mod tests {
         }
     }
 
-    fn write_and_read_back(session: &CanonicalSession) -> CanonicalSession {
+    fn render_candidate_and_read_back(session: &CanonicalSession) -> CanonicalSession {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join(format!("{}.jsonl", session.session_id));
         std::fs::write(&target, render_session(&session.session_id, session)).unwrap();
         OpenClaw.read_session(&target).unwrap()
     }
 
-    /// The writer's twin of the reader's tree defect: a transcript with no
+    /// The candidate renderer's twin of the reader's tree defect: a transcript with no
     /// `parentId` is only readable through OpenClaw's legacy path.
     #[test]
-    fn writer_links_every_entry_into_the_tree() {
+    fn candidate_renderer_links_every_entry_into_the_tree() {
         let session = sample_session();
         let rendered = render_session("roundtrip-test", &session);
         let lines: Vec<&str> = rendered.lines().collect();
@@ -1995,7 +1944,7 @@ mod tests {
 
     /// `AssistantMessage.content` is declared as a block array, never a string.
     #[test]
-    fn writer_emits_assistant_content_as_blocks() {
+    fn candidate_renderer_emits_assistant_content_as_blocks() {
         let session = sample_session();
         let rendered = render_session("roundtrip-test", &session);
         let assistant: serde_json::Value =
@@ -2010,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_emits_tool_results_as_tool_result_messages() {
+    fn candidate_renderer_emits_tool_results_as_tool_result_messages() {
         let session = sample_session();
         let rendered = render_session("roundtrip-test", &session);
         let tool: serde_json::Value =
@@ -2021,9 +1970,9 @@ mod tests {
     }
 
     #[test]
-    fn writer_roundtrip() {
+    fn candidate_renderer_roundtrip() {
         let original = sample_session();
-        let readback = write_and_read_back(&original);
+        let readback = render_candidate_and_read_back(&original);
         assert_eq!(readback.messages.len(), 3);
         assert_eq!(readback.messages[0].role, MessageRole::User);
         assert_eq!(readback.messages[0].content, "Fix the bug");
@@ -2044,10 +1993,10 @@ mod tests {
     }
 
     #[test]
-    fn writer_resume_command() {
+    fn native_resume_command_uses_the_full_session_key() {
         assert_eq!(
             OpenClaw.resume_command("my-session"),
-            "openclaw --resume my-session"
+            "openclaw tui --session agent:main:my-session"
         );
     }
 
@@ -2061,5 +2010,6 @@ mod tests {
         assert_eq!(provider.name(), "OpenClaw");
         assert_eq!(provider.slug(), "openclaw");
         assert_eq!(provider.cli_alias(), "ocl");
+        assert_eq!(provider.write_refusal(), Some(OPENCLAW_WRITE_REFUSAL));
     }
 }

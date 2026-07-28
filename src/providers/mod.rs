@@ -228,6 +228,168 @@ pub(crate) fn filename_safe_session_id(session_id: &str) -> String {
     urlencoding::encode(session_id).into_owned()
 }
 
+/// Register one verified transcript in ClawdBot's JSON5 session index.
+///
+/// ClawdBot resolves TUI history through `<sessions-dir>/sessions.json` before
+/// it looks at `<sessionId>.jsonl`. A transcript without this row is a valid
+/// file that its own resume UI opens as an empty conversation.
+///
+/// The index is shared mutable state, so this is deliberately a read-modify-
+/// write under ClawdBot's `sessions.json.lock` protocol, after transcript
+/// read-back verification. The caller removes the atomic-write backup before
+/// returning success; it is internal crash recovery, not part of pipeline
+/// rollback.
+pub(crate) fn write_clawdbot_session_index(
+    store_path: &Path,
+    session_key: &str,
+    session_id: &str,
+    force: bool,
+    provider_slug: &str,
+) -> Result<crate::pipeline::AtomicWriteOutcome, crate::error::CasrError> {
+    let _lock = ClawdBotSessionIndexLock::acquire(store_path, provider_slug)?;
+    let write_error = |detail: String| crate::error::CasrError::SessionWriteError {
+        path: store_path.to_path_buf(),
+        provider: provider_slug.to_string(),
+        detail,
+    };
+
+    let mut root = match std::fs::read(store_path) {
+        Ok(bytes) => {
+            let source = std::str::from_utf8(&bytes).map_err(|error| {
+                write_error(format!("failed to parse session index as UTF-8: {error}"))
+            })?;
+            json5::from_str::<serde_json::Value>(source)
+                .map_err(|error| write_error(format!("failed to parse session index: {error}")))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(serde_json::Map::new())
+        }
+        Err(error) => {
+            return Err(write_error(format!(
+                "failed to read session index: {error}"
+            )));
+        }
+    };
+    let store = root.as_object_mut().ok_or_else(|| {
+        write_error("session index root is not a JSON object; refusing to replace it".to_string())
+    })?;
+    let entry_existed = store.contains_key(session_key);
+    let entry = store
+        .entry(session_key.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let row = entry.as_object_mut().ok_or_else(|| {
+        write_error(format!(
+            "session index row `{session_key}` is not a JSON object; refusing to replace it"
+        ))
+    })?;
+
+    let existing_id = row.get("sessionId").and_then(serde_json::Value::as_str);
+    if entry_existed && existing_id != Some(session_id) && !force {
+        return Err(crate::error::CasrError::SessionConflict {
+            session_id: session_id.to_string(),
+            existing_path: store_path.to_path_buf(),
+        });
+    }
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let updated_at = row
+        .get("updatedAt")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        .max(now);
+    row.insert(
+        "sessionId".to_string(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    row.insert(
+        "updatedAt".to_string(),
+        serde_json::Value::Number(updated_at.into()),
+    );
+
+    let bytes = serde_json::to_vec_pretty(&root)
+        .map_err(|error| write_error(format!("failed to serialize session index: {error}")))?;
+    crate::pipeline::atomic_write(store_path, &bytes, true, provider_slug)
+}
+
+/// A cooperative lock compatible with ClawdBot's session-store writer.
+struct ClawdBotSessionIndexLock {
+    path: PathBuf,
+}
+
+impl ClawdBotSessionIndexLock {
+    fn acquire(store_path: &Path, provider_slug: &str) -> Result<Self, crate::error::CasrError> {
+        let write_error = |detail: String| crate::error::CasrError::SessionWriteError {
+            path: store_path.to_path_buf(),
+            provider: provider_slug.to_string(),
+            detail,
+        };
+        if let Some(parent) = store_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                write_error(format!(
+                    "failed to create session index directory before locking: {error}"
+                ))
+            })?;
+        }
+
+        let mut lock_name = store_path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = PathBuf::from(lock_name);
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+                    let metadata = serde_json::json!({
+                        "pid": std::process::id(),
+                        "startedAt": chrono::Utc::now().timestamp_millis(),
+                    });
+                    let _ = file.write_all(metadata.to_string().as_bytes());
+                    return Ok(Self { path: lock_path });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= std::time::Duration::from_secs(10) {
+                        return Err(write_error(format!(
+                            "timed out acquiring session index lock {}",
+                            lock_path.display()
+                        )));
+                    }
+                    let stale = std::fs::metadata(&lock_path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| {
+                            std::time::SystemTime::now().duration_since(modified).ok()
+                        })
+                        .is_some_and(|age| age > std::time::Duration::from_secs(30));
+                    if stale {
+                        match std::fs::remove_file(&lock_path) {
+                            Ok(()) => continue,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                            Err(_) => {}
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => {
+                    return Err(write_error(format!(
+                        "failed to acquire session index lock {}: {error}",
+                        lock_path.display()
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ClawdBotSessionIndexLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Options controlling how a session is written to disk.
 #[derive(Debug, Clone)]
 pub struct WriteOptions {
@@ -341,6 +503,26 @@ pub trait Provider: Send + Sync {
         session: &CanonicalSession,
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession>;
+
+    /// Finish provider-owned shared state after the transcript has passed
+    /// read-back verification.
+    ///
+    /// Most providers write self-contained session artifacts and need no
+    /// second phase. A provider whose native resume UI also requires a shared
+    /// index must update that index here, not in [`Provider::write_session`]:
+    /// verification can roll staged outputs back, while rolling a shared index
+    /// back later could erase another process's intervening update.
+    ///
+    /// Implementations must leave `written` unchanged on failure and append
+    /// any successfully committed paths or warnings only before returning
+    /// `Ok(())`.
+    fn finalize_write(
+        &self,
+        _written: &mut WrittenSession,
+        _opts: &WriteOptions,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Explain why this provider cannot be a conversion target.
     ///

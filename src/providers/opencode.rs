@@ -18,6 +18,7 @@ use rusqlite::{Connection, OpenFlags};
 use tracing::{debug, trace, warn};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
     normalize_role, parse_timestamp, reindex_messages, truncate_title,
@@ -89,6 +90,13 @@ impl Schema {
 }
 
 impl OpenCode {
+    fn resume_spec(session_id: &str) -> LaunchSpec {
+        LaunchSpec::new(
+            "opencode",
+            ["--session".to_string(), session_id.to_string()],
+        )
+    }
+
     /// Parse OPENCODE environment overrides into a target DB path.
     ///
     /// In precedence order:
@@ -845,9 +853,12 @@ impl Provider for OpenCode {
         Some(OPENCODE_WRITE_REFUSAL)
     }
 
-    fn resume_command(&self, _session_id: &str) -> String {
-        // OpenCode has no session-id-specific resume flag.
-        "opencode".to_string()
+    fn resume_command(&self, session_id: &str) -> String {
+        Self::resume_spec(session_id).display()
+    }
+
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        Some(Self::resume_spec(session_id).targeting_session(session_id))
     }
 
     fn list_sessions(&self) -> Option<SessionListing> {
@@ -1186,7 +1197,7 @@ mod tests {
         assert_eq!(provider.cli_alias(), "opc");
         assert_eq!(
             <OpenCode as Provider>::resume_command(&provider, "sid"),
-            "opencode"
+            "opencode --session sid"
         );
         assert_eq!(provider.write_refusal(), Some(OPENCODE_WRITE_REFUSAL));
     }

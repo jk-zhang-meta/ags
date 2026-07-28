@@ -110,10 +110,10 @@ fn session_targeting_is_reported_honestly() {
     untargeted.sort();
     assert_eq!(
         untargeted,
-        ["Aider", "Cline", "Cursor", "OpenCode"],
+        ["Aider", "Cline", "Cursor"],
         "the set of providers that cannot be launched at a specific session changed"
     );
-    assert!(targeted.len() >= 13);
+    assert!(targeted.len() >= 14);
 }
 
 #[test]
@@ -170,6 +170,72 @@ fn a_value_that_needs_quoting_never_yields_a_false_targeting_claim() {
             );
         }
     }
+}
+
+/// Providers whose native resume forms interpolate the id must build argv
+/// directly. This pins the exact vendor commands and proves a space remains
+/// part of one argument rather than becoming an extra word after rendering.
+#[test]
+fn corrected_resume_commands_keep_the_session_id_as_one_argument() {
+    let _lock = ENV.lock().unwrap();
+    const AWKWARD: &str = "id with space";
+    let registry = ProviderRegistry::default_registry();
+    let cases = [
+        ("factory", "droid", vec!["--resume", AWKWARD]),
+        (
+            "clawdbot",
+            "clawdbot",
+            vec!["tui", "--session", "agent:main:id with space"],
+        ),
+        (
+            "openclaw",
+            "openclaw",
+            vec!["tui", "--session", "agent:main:id with space"],
+        ),
+        ("opencode", "opencode", vec!["--session", AWKWARD]),
+    ];
+
+    for (slug, program, args) in cases {
+        let provider = registry
+            .find_by_slug(slug)
+            .unwrap_or_else(|| panic!("{slug}: provider missing"));
+        let spec = provider
+            .launch_spec(AWKWARD)
+            .unwrap_or_else(|| panic!("{slug}: no launch spec"));
+        assert_eq!(spec.program, program, "{slug}: wrong executable");
+        assert_eq!(
+            spec.args,
+            args.into_iter().map(str::to_string).collect::<Vec<_>>(),
+            "{slug}: wrong argv"
+        );
+        assert_eq!(
+            spec.targeting(),
+            SessionTargeting::ById,
+            "{slug}: corrected command must target the written session"
+        );
+        let reparsed = LaunchSpec::from_command_line(&spec.display()).expect("display re-parses");
+        assert_eq!(reparsed.args, spec.args, "{slug}: display changed argv");
+    }
+
+    let clawdbot = registry.find_by_slug("clawdbot").unwrap();
+    let spec = clawdbot
+        .launch_spec("Native-ID")
+        .expect("existing native ClawdBot sessions remain resumable");
+    assert_eq!(
+        spec.args,
+        ["tui", "--session", "agent:main:native-id"].map(str::to_string),
+        "ClawdBot lowercases the full native session key before TUI lookup"
+    );
+
+    let openclaw = registry.find_by_slug("openclaw").unwrap();
+    let spec = openclaw
+        .launch_spec("Native-ID")
+        .expect("existing native OpenClaw sessions remain resumable");
+    assert_eq!(
+        spec.args,
+        ["tui", "--session", "agent:main:native-id"].map(str::to_string),
+        "OpenClaw lowercases the full native session key before TUI lookup"
+    );
 }
 
 /// An empty session id targets nothing.

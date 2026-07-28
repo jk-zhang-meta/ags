@@ -19,7 +19,6 @@
 //! | writer   | target it builds                              |
 //! |----------|-----------------------------------------------|
 //! | ClawdBot | `<home>/{id}.jsonl`                           |
-//! | OpenClaw | `<home>/.openclaw/agents/main/sessions/{id}.jsonl` |
 //! | Factory  | `<home>/{id}.jsonl`                           |
 //! | Vibe     | `<home>/logs/session/session_<utc>_<id8>/messages.jsonl` |
 //! | Pi-Agent | `<home>/sessions/{timestamp}_{id}.jsonl`      |
@@ -92,7 +91,6 @@ const CONTAINS: &[&str] = &[
     "clawdbot",
     "vibe",
     "factory",
-    "openclaw",
     "pi-agent",
 ];
 
@@ -102,7 +100,7 @@ const ESCAPES: &[&str] = &[];
 
 /// Providers that refuse to write at all, and say so rather than emitting a
 /// stub their tool would reject.
-const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode"];
+const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode", "openclaw"];
 
 // ---------------------------------------------------------------------------
 // Environment sandbox
@@ -416,6 +414,37 @@ fn opencode_refuses_a_traversing_id_without_creating_a_database() {
     assert!(
         !root.join("opencode.db").exists(),
         "refusal must not create opencode.db"
+    );
+}
+
+/// A hostile id cannot turn a refused OpenClaw import into a filesystem effect.
+#[test]
+fn openclaw_refuses_a_traversing_id_without_creating_state() {
+    let _lock = ENV.lock().unwrap();
+    let registry = ProviderRegistry::default_registry();
+    let openclaw = registry
+        .find_by_slug("openclaw")
+        .expect("openclaw registered");
+
+    let tmp = tempfile::TempDir::new().expect("temporary store");
+    let root = tmp.path().canonicalize().expect("resolve temporary store");
+    let workspace = root.join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let _guards = sandbox(&root);
+
+    let error = openclaw
+        .write_session(
+            &session(TRAVERSING_ID, &workspace),
+            &WriteOptions { force: true },
+        )
+        .expect_err("OpenClaw target must refuse even with --force");
+    assert!(
+        error.to_string().contains("gateway"),
+        "unexpected refusal: {error:#}"
+    );
+    assert!(
+        !root.join("a/b/c/d/e/f/openclaw_home/.openclaw").exists(),
+        "refusal must not create OpenClaw state"
     );
 }
 

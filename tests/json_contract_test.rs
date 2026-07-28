@@ -1482,9 +1482,10 @@ fn contract_resume_json_reports_an_untargetable_launch_as_false() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    // Cursor has no session-id resume form: the file is written correctly, the
-    // editor just will not be pointed at it. A script has to be able to see
-    // that without parsing prose.
+    // Cursor's IDE composer has no direct resume form. `cursor-agent --resume`
+    // addresses a separate store, so the file written to state.vscdb is
+    // correct but the editor cannot be pointed at it. A script has to be able
+    // to see that without parsing prose.
     let output = casr_cmd(&tmp)
         .args(["--json", "resume", "cur", &session_id, "--launch-dry-run"])
         .output()

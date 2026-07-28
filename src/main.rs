@@ -126,7 +126,7 @@ enum Command {
         /// On Unix this process is replaced by the agent, so it inherits the
         /// terminal and there is no casr left waiting behind it.
         ///
-        /// Four providers — Aider, Cline, Cursor, OpenCode — have no way to be
+        /// Three providers — Aider, Cline, and Cursor — have no way to be
         /// pointed at a specific session. For those the agent is started
         /// plain, with a notice naming the file that was written, because the
         /// converted session will not be the one it opens.

@@ -891,179 +891,24 @@ fn claude_corpus_live_summary_diverges_from_summary() {
 }
 
 // ---------------------------------------------------------------------------
-// Conversions into OpenClaw
+// OpenClaw corpus target boundary
 // ---------------------------------------------------------------------------
 
-/// Every conversion into OpenClaw that contained a tool call failed outright
-/// and was rolled back, and this file never mentioned OpenClaw, so nothing
-/// here saw it. Neither did it see the system-turn failure before that. Both
-/// were single-provider defects on the *write* side of a flat-track provider,
-/// which is the one shape the sections above — read-only, structured-track,
-/// Codex and Claude only — cannot reach by construction.
-///
-/// So this walks the real Claude corpus into OpenClaw and asserts the two
-/// properties [`casr::pipeline`] enforces after every write, because failing
-/// either of them is not a fidelity report, it is `VerifyFailed` and a rollback:
-///
-/// 1. every message survives, and
-/// 2. every message's content and coarse role come back unchanged.
-///
-/// The corpus is only ever read. Writes go to a `tempfile::TempDir` named by
-/// `OPENCLAW_STATE_DIR`, never to a real OpenClaw state directory.
+/// OpenClaw imports now wait for a gateway-backed implementation. This corpus
+/// gate proves the refusal is data-independent: complex real sessions cannot
+/// bypass it, `--force` cannot bypass it, and no state is created.
 mod into_openclaw {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
-    use casr::model::{CanonicalMessage, CanonicalSession, MessageRole};
     use casr::providers::claude_code::ClaudeCode;
     use casr::providers::openclaw::OpenClaw;
     use casr::providers::{Provider, WriteOptions};
 
     use super::{corpus_files, is_claude_transcript};
 
-    /// [`casr::pipeline`]'s own `readback_role_bucket`: a target format that
-    /// has one non-assistant slot reads `System`/`Tool`/`Other` back as `User`,
-    /// and that is expected rather than a mismatch.
-    fn role_bucket(role: &MessageRole) -> &'static str {
-        match role {
-            MessageRole::Assistant => "assistant",
-            MessageRole::User | MessageRole::System | MessageRole::Tool | MessageRole::Other(_) => {
-                "user"
-            }
-        }
-    }
-
-    /// [`casr::pipeline`] step 7b, mirrored.
-    ///
-    /// A message with no text but a tool call or result gets that text
-    /// materialised onto the canonical message *before* the write, so that
-    /// write and read-back agree about it. Skipping it here would report a
-    /// mismatch the pipeline never sees; inventing something else would hide
-    /// one it does. Kept next to the comparison for the same reason the
-    /// pipeline keeps them adjacent: they are one rule.
-    fn normalise_tool_only(msg: &mut CanonicalMessage) {
-        if !msg.content.trim().is_empty() {
-            return;
-        }
-        let mut parts: Vec<String> = Vec::new();
-        for tc in &msg.tool_calls {
-            parts.push(format!("[Tool: {}]", tc.name));
-        }
-        for tr in &msg.tool_results {
-            if tr.is_error {
-                parts.push(format!("[Tool Error] {}", tr.content));
-            } else {
-                parts.push(format!("[Tool Output] {}", tr.content));
-            }
-        }
-        if !parts.is_empty() {
-            msg.content = parts.join("\n");
-        }
-    }
-
-    /// [`casr::pipeline`]'s `readback_mismatch_detail`, mirrored.
-    fn mismatch(canonical: &CanonicalSession, readback: &CanonicalSession) -> Option<String> {
-        if readback.messages.len() != canonical.messages.len() {
-            return Some(format!(
-                "message count mismatch: wrote {} messages, read back {}",
-                canonical.messages.len(),
-                readback.messages.len()
-            ));
-        }
-        for (i, (orig, rb)) in canonical
-            .messages
-            .iter()
-            .zip(readback.messages.iter())
-            .enumerate()
-        {
-            if role_bucket(&orig.role) != role_bucket(&rb.role) {
-                return Some(format!(
-                    "message role mismatch at idx {i}: wrote {:?}, read back {:?}",
-                    orig.role, rb.role
-                ));
-            }
-            if orig.content != rb.content {
-                return Some(format!(
-                    "message content mismatch at idx {i}: wrote {} bytes, read back {} bytes\n\
-                     wrote:     {:?}\n     read back: {:?}",
-                    orig.content.len(),
-                    rb.content.len(),
-                    orig.content,
-                    rb.content
-                ));
-            }
-        }
-        None
-    }
-
-    #[derive(Default)]
-    struct Totals {
-        files: usize,
-        converted: usize,
-        failed: Vec<(PathBuf, String)>,
-        messages: u64,
-        /// Assistant turns carrying both text and a tool call — the exact
-        /// shape the double-representation defect broke. Counted so that a
-        /// green run cannot mean "the corpus had none".
-        text_plus_tool_call: u64,
-        /// Turns whose only content is the tool call, so the mirrored step 7b
-        /// above is what makes them comparable at all.
-        tool_call_only: u64,
-    }
-
-    fn convert(path: &Path, totals: &mut Totals) {
-        let mut canonical = match ClaudeCode.read_session(path) {
-            Ok(session) => session,
-            // A source this reader cannot parse is a different test's problem
-            // (`claude_corpus_parses_without_unknown_events`), not evidence
-            // about the OpenClaw writer.
-            Err(_) => return,
-        };
-        totals.files += 1;
-        totals.messages += canonical.messages.len() as u64;
-        for msg in &mut canonical.messages {
-            if !msg.tool_calls.is_empty() {
-                if msg.content.trim().is_empty() {
-                    totals.tool_call_only += 1;
-                } else {
-                    totals.text_plus_tool_call += 1;
-                }
-            }
-            normalise_tool_only(msg);
-        }
-
-        let written = match OpenClaw.write_session(&canonical, &WriteOptions { force: true }) {
-            Ok(written) => written,
-            Err(error) => {
-                totals
-                    .failed
-                    .push((path.to_path_buf(), format!("write: {error}")));
-                return;
-            }
-        };
-        let Some(target) = written.paths.first() else {
-            totals
-                .failed
-                .push((path.to_path_buf(), "write reported no path".to_string()));
-            return;
-        };
-        let readback = match OpenClaw.read_session(target) {
-            Ok(readback) => readback,
-            Err(error) => {
-                totals
-                    .failed
-                    .push((path.to_path_buf(), format!("read back: {error}")));
-                return;
-            }
-        };
-        match mismatch(&canonical, &readback) {
-            Some(detail) => totals.failed.push((path.to_path_buf(), detail)),
-            None => totals.converted += 1,
-        }
-    }
-
     #[test]
     #[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
-    fn claude_corpus_survives_a_conversion_into_openclaw() {
+    fn claude_corpus_is_refused_without_creating_openclaw_state() {
         let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 1600)
             .into_iter()
             .filter(|path| is_claude_transcript(path))
@@ -1075,50 +920,34 @@ mod into_openclaw {
         }
 
         let tmp = tempfile::tempdir().expect("a temp state dir");
-        // SAFETY: `corpus_test` mutates no other environment variable and its
-        // tests read none, so nothing in this binary races this write. The
-        // variable stays set for the process lifetime on purpose — every write
-        // below must land in `tmp`, and a real OpenClaw state directory must
-        // never be reachable from this test.
-        unsafe { std::env::set_var("OPENCLAW_STATE_DIR", tmp.path()) };
+        let state_dir = tmp.path().join("openclaw-state");
+        // SAFETY: this ignored corpus test is the only test in its binary that
+        // mutates OPENCLAW_STATE_DIR, and the provider must not read it before
+        // returning its static capability refusal.
+        unsafe { std::env::set_var("OPENCLAW_STATE_DIR", &state_dir) };
 
-        let mut totals = Totals::default();
-        for path in &files {
-            convert(path, &mut totals);
+        let mut checked = 0usize;
+        for path in files {
+            let Ok(session) = ClaudeCode.read_session(&path) else {
+                continue;
+            };
+            for force in [false, true] {
+                let error = OpenClaw
+                    .write_session(&session, &WriteOptions { force })
+                    .expect_err("OpenClaw corpus import must refuse");
+                assert!(
+                    error.to_string().contains("gateway"),
+                    "{}: unexpected refusal: {error:#}",
+                    path.display()
+                );
+            }
+            checked += 1;
         }
 
-        println!("openclaw target: {} sessions", totals.files);
-        println!("  round-tripped        {}", totals.converted);
-        println!("  messages             {}", totals.messages);
-        println!("  text + tool call     {}", totals.text_plus_tool_call);
-        println!("  tool call only       {}", totals.tool_call_only);
-        for (path, detail) in totals.failed.iter().take(10) {
-            println!("  FAILED {}: {detail}", path.display());
-        }
-
+        assert!(checked > 0, "no Claude corpus session could be read");
         assert!(
-            totals.failed.is_empty(),
-            "{} of {} sessions could not be written to OpenClaw and read back; \
-             in the real pipeline each of these is a VerifyFailed and a rollback",
-            totals.failed.len(),
-            totals.files
-        );
-
-        // Without this the assertion above passes on a corpus that happens to
-        // contain no tool calls, which is exactly how the defect survived: the
-        // one shape that breaks was the one shape nothing exercised.
-        //
-        // Both classes count, because both broke. Measured on 258 real Claude
-        // sessions (55,119 messages): 22,310 tool-call-only turns and 6 with
-        // text beside the call, and reverting the reader fix failed 252 of the
-        // 258 sessions. The tool-call-only turns reach the same defect through
-        // the pipeline's step 7b, which materialises `[Tool: <name>]` into
-        // their empty content before the write.
-        assert!(
-            totals.text_plus_tool_call + totals.tool_call_only > 0,
-            "no turn in {} sessions carried a tool call, so this test proved \
-             nothing about the shape it exists to cover",
-            totals.files
+            !state_dir.exists(),
+            "corpus refusals must not create OpenClaw state"
         );
     }
 }

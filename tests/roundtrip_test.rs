@@ -2,7 +2,8 @@
 //!
 //! Writable targets follow: read source fixture → canonical → write to target
 //! (temp dir) → read back → compare canonical fields against original.
-//! ChatGPT and OpenCode targets instead must refuse without creating state.
+//! ChatGPT, OpenCode and OpenClaw targets instead must refuse without creating
+//! state.
 //!
 //! Tests verify: `read_T(write_T(read_S(source))) ≈ read_S(source)` where
 //! S = source provider, T = target provider.
@@ -12,7 +13,7 @@
 //! | Field           | Expectation                                        |
 //! |-----------------|----------------------------------------------------|
 //! | message_count   | EXACT                                              |
-//! | message_roles   | EXACT                                              |
+//! | message_roles   | EXACT except explicitly declared target folds      |
 //! | message_content | EXACT (text-only messages)                         |
 //! | session_id      | NEW (generated UUID for target)                    |
 //! | workspace       | EXACT for CC/Cod; BEST-EFFORT for Gemini targets   |
@@ -131,6 +132,14 @@ fn read_chatgpt_fixture() -> CanonicalSession {
     ChatGpt
         .read_session(&fixtures_dir().join("chatgpt/chatgpt_simple.json"))
         .expect("Failed to read ChatGPT fixture")
+}
+
+/// Read a native OpenClaw transcript. OpenClaw target imports require its
+/// gateway, so direct file writes cannot honestly seed this source.
+fn read_openclaw_fixture() -> CanonicalSession {
+    OpenClaw
+        .read_session(&fixtures_dir().join("openclaw/openclaw_simple.jsonl"))
+        .expect("Failed to read OpenClaw fixture")
 }
 
 fn assert_target_refuses(
@@ -1012,40 +1021,27 @@ fn roundtrip_factory_to_cc() {
 // ===========================================================================
 
 #[test]
-fn roundtrip_cc_to_openclaw() {
+fn openclaw_refuses_cc_as_a_target() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+    let _env = EnvGuard::set("OPENCLAW_STATE_DIR", tmp.path());
 
     let original = read_cc_fixture("cc_simple");
-    let written = OpenClaw
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("CC→OpenClaw: write should succeed");
-
-    let readback = OpenClaw
-        .read_session(&written.paths[0])
-        .expect("CC→OpenClaw: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "CC→OpenClaw");
+    assert_target_refuses(&OpenClaw, &original, "gateway", "CC→OpenClaw");
+    assert_eq!(
+        std::fs::read_dir(tmp.path()).unwrap().count(),
+        0,
+        "OpenClaw refusal created target-store state"
+    );
 }
 
 #[test]
 fn roundtrip_openclaw_to_cc() {
-    let _lock_ocl = OPENCLAW_ENV.lock().unwrap();
     let _lock_cc = CC_ENV.lock().unwrap();
-    let tmp_ocl = tempfile::TempDir::new().unwrap();
     let tmp_cc = tempfile::TempDir::new().unwrap();
-    let _env_ocl = EnvGuard::set("OPENCLAW_HOME", tmp_ocl.path());
     let _env_cc = EnvGuard::set("CLAUDE_HOME", tmp_cc.path());
 
-    let original = read_cc_fixture("cc_simple");
-    let written = OpenClaw
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("seed CC→OpenClaw write");
-
-    let ocl_session = OpenClaw
-        .read_session(&written.paths[0])
-        .expect("read OpenClaw");
+    let ocl_session = read_openclaw_fixture();
 
     let cc_written = ClaudeCode
         .write_session(&ocl_session, &WriteOptions { force: false })
@@ -1055,7 +1051,13 @@ fn roundtrip_openclaw_to_cc() {
         .read_session(&cc_written.paths[0])
         .expect("read CC back");
 
-    assert_roundtrip_fidelity(&original, &readback, "OpenClaw→CC");
+    let mut expected = ocl_session.clone();
+    for message in &mut expected.messages {
+        if message.role == MessageRole::Tool {
+            message.role = MessageRole::User;
+        }
+    }
+    assert_roundtrip_fidelity(&expected, &readback, "OpenClaw→CC");
 }
 
 // ===========================================================================
@@ -1351,19 +1353,7 @@ fn roundtrip_factory_to_codex() {
 
 #[test]
 fn roundtrip_openclaw_to_codex() {
-    let openclaw_session = {
-        let _lock = OPENCLAW_ENV.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written = OpenClaw
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→OpenClaw");
-        OpenClaw
-            .read_session(&written.paths[0])
-            .expect("read OpenClaw")
-    };
+    let openclaw_session = read_openclaw_fixture();
 
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1579,22 +1569,14 @@ fn roundtrip_codex_to_factory() {
 }
 
 #[test]
-fn roundtrip_codex_to_openclaw() {
+fn openclaw_refuses_codex_as_a_target() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+    let _env = EnvGuard::set("OPENCLAW_STATE_DIR", tmp.path());
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    let written = OpenClaw
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Cod→OpenClaw: write should succeed");
-
-    let readback = OpenClaw
-        .read_session(&written.paths[0])
-        .expect("Cod→OpenClaw: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Cod→OpenClaw");
-    assert_new_session_id(&readback, "Cod→OpenClaw");
+    assert_target_refuses(&OpenClaw, &original, "gateway", "Cod→OpenClaw");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -1853,22 +1835,14 @@ fn roundtrip_gemini_to_factory() {
 }
 
 #[test]
-fn roundtrip_gemini_to_openclaw() {
+fn openclaw_refuses_gemini_as_a_target() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
-    let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+    let _env = EnvGuard::set("OPENCLAW_STATE_DIR", tmp.path());
 
     let original = read_gemini_fixture("gmi_simple");
-    let written = OpenClaw
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Gmi→OpenClaw: write should succeed");
-
-    let readback = OpenClaw
-        .read_session(&written.paths[0])
-        .expect("Gmi→OpenClaw: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Gmi→OpenClaw");
-    assert_new_session_id(&readback, "Gmi→OpenClaw");
+    assert_target_refuses(&OpenClaw, &original, "gateway", "Gmi→OpenClaw");
+    assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
 #[test]
@@ -1908,6 +1882,7 @@ fn cross_provider_roundtrip(
     let source_session = match source.slug() {
         "chatgpt" => read_chatgpt_fixture(),
         "opencode" => read_opencode_fixture(),
+        "openclaw" => read_openclaw_fixture(),
         _ => {
             let _lock = source_lock.lock().unwrap();
             let tmp = tempfile::TempDir::new().unwrap();
@@ -2056,7 +2031,7 @@ fn roundtrip_vibe_to_factory() {
 }
 
 #[test]
-fn roundtrip_factory_to_openclaw() {
+fn openclaw_refuses_factory_as_a_target() {
     cross_provider_roundtrip(
         &Factory,
         "FACTORY_HOME",
@@ -2138,7 +2113,7 @@ fn roundtrip_amp_to_vibe() {
 }
 
 #[test]
-fn roundtrip_opencode_to_openclaw() {
+fn openclaw_refuses_opencode_as_a_target() {
     cross_provider_roundtrip(
         &OpenCode,
         "OPENCODE_HOME",
@@ -2230,8 +2205,8 @@ fn roundtrip_piagent_to_clawdbot() {
 
 // ===========================================================================
 // Newer-6 pairwise behavior matrix (bd-1bh.39).
-// ChatGPT is a fixture-backed source and a fail-closed target; the other five
-// providers still exercise both write/read directions. Tests above cover 7:
+// ChatGPT, OpenCode and OpenClaw are fixture-backed sources and fail-closed
+// targets; writable pairs still exercise both write/read directions. Tests above cover 7:
 // ChatGPT→ClawdBot, ChatGPT→PiAgent,
 // ClawdBot→Vibe, Vibe→Factory, Factory→OpenClaw, OpenClaw→PiAgent,
 // PiAgent→ClawdBot. Remaining 23 pairs below.
@@ -2264,7 +2239,7 @@ fn roundtrip_chatgpt_to_factory() {
 }
 
 #[test]
-fn roundtrip_chatgpt_to_openclaw() {
+fn openclaw_refuses_chatgpt_as_a_target() {
     cross_provider_roundtrip(
         &ChatGpt,
         "CHATGPT_HOME",
@@ -2303,7 +2278,7 @@ fn roundtrip_clawdbot_to_factory() {
 }
 
 #[test]
-fn roundtrip_clawdbot_to_openclaw() {
+fn openclaw_refuses_clawdbot_as_a_target() {
     cross_provider_roundtrip(
         &ClawdBot,
         "CLAWDBOT_HOME",
@@ -2355,7 +2330,7 @@ fn roundtrip_vibe_to_clawdbot() {
 }
 
 #[test]
-fn roundtrip_vibe_to_openclaw() {
+fn openclaw_refuses_vibe_as_a_target() {
     cross_provider_roundtrip(
         &Vibe,
         "VIBE_HOME",
@@ -2485,6 +2460,52 @@ fn roundtrip_openclaw_to_factory() {
 }
 
 #[test]
+fn roundtrip_openclaw_to_aider() {
+    cross_provider_roundtrip(
+        &OpenClaw,
+        "OPENCLAW_HOME",
+        &OPENCLAW_ENV,
+        &Aider,
+        "AIDER_HOME",
+        &AIDER_ENV,
+        "OpenClaw→Aider",
+    );
+}
+
+#[test]
+fn roundtrip_openclaw_to_cursor() {
+    let source_session = read_openclaw_fixture();
+    let tool_count = source_session
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::Tool)
+        .count();
+    assert!(
+        tool_count > 0,
+        "the native OpenClaw oracle must exercise Cursor's Tool role fold"
+    );
+
+    let _lock = CURSOR_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CURSOR_HOME", tmp.path());
+    let written = Cursor
+        .write_session(&source_session, &WriteOptions { force: false })
+        .expect("OpenClaw→Cursor: target write should succeed");
+    let readback = Cursor
+        .read_session(&written.paths[0])
+        .expect("OpenClaw→Cursor: target read-back should succeed");
+
+    let mut expected_projection = source_session;
+    for message in &mut expected_projection.messages {
+        if message.role == MessageRole::Tool {
+            message.role = MessageRole::Assistant;
+        }
+    }
+    assert_roundtrip_fidelity(&expected_projection, &readback, "OpenClaw→Cursor");
+    assert_new_session_id(&readback, "OpenClaw→Cursor");
+}
+
+#[test]
 fn chatgpt_refuses_piagent_as_a_target() {
     cross_provider_roundtrip(
         &PiAgent,
@@ -2524,7 +2545,7 @@ fn roundtrip_piagent_to_factory() {
 }
 
 #[test]
-fn roundtrip_piagent_to_openclaw() {
+fn openclaw_refuses_piagent_as_a_target() {
     cross_provider_roundtrip(
         &PiAgent,
         "PI_AGENT_HOME",

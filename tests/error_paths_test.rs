@@ -464,12 +464,13 @@ mod unix_error_paths {
     }
 
     #[test]
-    fn write_to_readonly_dir_openclaw() {
+    fn openclaw_refuses_before_touching_a_readonly_store() {
         let _lock = OPENCLAW_ENV.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("OPENCLAW_HOME", tmp.path());
+        let state_dir = tmp.path().join("openclaw-state");
+        let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
 
-        // OpenClaw writes directly under HOME — make home read-only.
+        fs::create_dir_all(&state_dir).unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
         let _guard = PermGuard {
             path: tmp.path().to_path_buf(),
@@ -479,9 +480,14 @@ mod unix_error_paths {
         let session = make_session("/tmp");
         let err = OpenClaw.write_session(&session, &WriteOptions { force: false });
         assert!(
-            err.is_err(),
-            "OpenClaw: writing to read-only dir should fail; got {:?}",
+            err.as_ref()
+                .is_err_and(|error| error.to_string().contains("gateway")),
+            "OpenClaw should report its capability refusal, got {:?}",
             err
+        );
+        assert!(
+            std::fs::read_dir(&state_dir).unwrap().next().is_none(),
+            "OpenClaw refusal must not create store files"
         );
     }
 

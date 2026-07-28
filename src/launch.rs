@@ -84,11 +84,11 @@ pub struct LaunchSpec {
 /// Whether launching this spec resumes the session that was just written.
 ///
 /// Not a detail. The promise of a launcher is "we start you where you left
-/// off", and for part of the registry that promise cannot be kept: Cursor
-/// (`cursor .`) and OpenCode (`opencode`) have no session-id resume mechanism
-/// at all, and Aider's `--restore-chat-history` restores whichever chat was
-/// last rather than a named one. The conversion still writes a correct file —
-/// the agent simply will not be pointed at it.
+/// off", and for part of the registry that promise cannot be kept: Cursor's
+/// IDE composer (`cursor .`) and Cline (`code .`) open an editor without
+/// naming the converted session, while Aider's `--restore-chat-history`
+/// restores whichever chat was last rather than a named one. The conversion
+/// still writes a correct file — the agent simply will not be pointed at it.
 ///
 /// Modelling this means the caller has to decide what to tell the user, which
 /// is the point. The alternative is launching the agent, having it open

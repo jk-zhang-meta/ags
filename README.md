@@ -92,12 +92,12 @@ claude --resume <new-session-id>
 | Cline | `cln` | Yes | Yes | `code .` |
 | Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
 | Amp | `amp` | Yes | Yes | `amp threads continue <session-id>` |
-| OpenCode | `opc` | Yes | No | `opencode` |
+| OpenCode | `opc` | Yes | No | `opencode --session <session-id>` |
 | ChatGPT | `gpt` | Yes | No | `open "https://chatgpt.com/c/<session-id>"` |
-| ClawdBot | `cwb` | Yes | Yes | `clawdbot --resume <session-id>` |
+| ClawdBot | `cwb` | Yes | Yes | `clawdbot tui --session agent:main:<lowercase-session-id>` |
 | Vibe | `vib` | Yes | Yes | `vibe --resume <session-id>` |
-| Factory | `fac` | Yes | Yes | `factory --resume <session-id>` |
-| OpenClaw | `ocl` | Yes | Yes | `openclaw --resume <session-id>` |
+| Factory | `fac` | Yes | Yes | `droid --resume <session-id>` |
+| OpenClaw | `ocl` | Yes | No | `openclaw tui --session agent:main:<lowercase-session-id>` |
 | Pi-Agent | `pi` | Yes | Yes | `pi --session <path-to-session.jsonl>` |
 | Kiro CLI | `kr` | Yes | Yes | `kiro-cli --resume-id <session-id>` |
 | Grok Build | `grk` | Yes | No | `grok --resume <session-id>` |
@@ -110,6 +110,10 @@ Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
 - Additional providers are implemented through the same `Provider` trait model.
 - Grok Build (xAI's official `grok` CLI) is currently read/resume-only: use it as a conversion source; writing into Grok is pending round-trip verification against a live `grok --resume`.
+- OpenClaw is read/resume-only because its live gateway serializes session-index
+  updates only in-process. Directly editing `sessions.json` can overwrite an
+  active gateway update; target imports remain disabled until casr can use the
+  authenticated gateway lifecycle.
 
 ## Installation
 
@@ -406,7 +410,8 @@ something else by them:
   `$OPENCLAW_HOME/.openclaw`. `OPENCLAW_STATE_DIR` names that state directory
   outright and outranks it. Sessions are keyed by agent —
   `<state>/agents/<agent-id>/sessions/` — and casr reads every agent's
-  directory, writing as OpenClaw's default agent `main`.
+  directory. It can resume existing native sessions but does not mutate this
+  shared store.
 
 ## Canonical Session Model
 

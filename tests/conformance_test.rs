@@ -479,10 +479,10 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 ///
 /// # The requirement
 ///
-/// Eight of the thirteen flat writers have no slot for a system turn and send it
-/// somewhere else — Claude Code, Cline and OpenClaw to a plain user record, Amp
-/// to `info`, Cursor to a human bubble, Kiro to `Prompt`, Aider to a
-/// blockquote, and Vibe to a plain user record. Each of those mappings is right:
+/// Seven writable flat targets have no slot for a system turn and send it
+/// somewhere else — Claude Code, Cline and Vibe to a plain user record, Amp to
+/// `info`, Cursor to a human bubble, Kiro to `Prompt`, and Aider to a
+/// blockquote. Each of those mappings is right:
 /// the alternative is a row the target deletes on its next rewrite. What was
 /// wrong is that a conversion performing one reported `conversation_only` with
 /// an empty `losses` list, so the person resuming the session could not tell a
@@ -497,15 +497,15 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 ///
 /// # What is being measured, and what it is not
 ///
-/// The table `folded_role` holds was written from the fifteen written artifacts
-/// — the `"role"` field each writer emits — not from this round trip. Read-back
+/// The table `folded_role` holds was written from the writable providers'
+/// artifacts — the `"role"` field each writer emits — not from this round trip. Read-back
 /// is the drift alarm, not the oracle: it can only report a fold that a reader
 /// can see, and casr's readers normalise. That is why `Other` is probed under a
 /// name no reader rewrites, and why the roles this asserts on are the three the
 /// artifact and the read-back agree about.
 #[test]
 fn no_writer_folds_a_role_without_declaring_it() {
-    const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode"];
+    const REFUSES: &[&str] = &["antigravity", "chatgpt", "grok", "opencode", "openclaw"];
     let probed = [
         MessageRole::System,
         MessageRole::Tool,
