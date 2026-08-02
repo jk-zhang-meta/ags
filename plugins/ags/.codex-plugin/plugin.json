@@ -1,0 +1,26 @@
+{
+  "name": "ags",
+  "version": "0.3.0",
+  "description": "Encrypted Codex and Claude checkpoints built into agsx",
+  "author": {
+    "name": "Jingkun Zhang",
+    "url": "https://github.com/jk-zhang-meta"
+  },
+  "homepage": "https://github.com/jk-zhang-meta/agsx-convert",
+  "repository": "https://github.com/jk-zhang-meta/agsx-convert",
+  "license": "MIT",
+  "keywords": ["codex", "claude", "session", "backup", "sftp"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AGS",
+    "shortDescription": "Save and restore encrypted agent sessions",
+    "longDescription": "Save, inspect, restore, delete, and synchronize encrypted Codex or Claude session checkpoints.",
+    "developerName": "Jingkun Zhang",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/jk-zhang-meta/agsx-convert",
+    "defaultPrompt": [
+      "Use AGS to list my encrypted session checkpoints."
+    ]
+  }
+}

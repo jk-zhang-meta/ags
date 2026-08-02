@@ -48,10 +48,10 @@
 //!
 //! ## Write support
 //!
-//! Read-only for now (Antigravity-style): a synthesized session tree has not
-//! yet been round-trip verified against a live `grok --resume`, so
-//! [`Provider::write_session`] returns an actionable error rather than
-//! writing an un-resumable stub.
+//! Writes the two authoritative files documented by Grok (`summary.json` and
+//! `updates.jsonl`) and asks the official CLI to export the new session. The
+//! export is the vendor-side discovery/readability check; derived indexes are
+//! intentionally left to Grok.
 //!
 //! ## Resume
 //!
@@ -59,8 +59,11 @@
 //! grok --resume <session-id>
 //! ```
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
+use anyhow::Context;
 use tracing::{debug, info, trace};
 
 use crate::discovery::DetectionResult;
@@ -74,14 +77,36 @@ use crate::providers::{
 
 /// Provider slug used in canonical metadata.
 const SLUG: &str = "grok";
-const GROK_WRITE_REFUSAL: &str = "Grok Build (grok) is read/resume-only for now: casr cannot yet \
-create a resumable Grok session from another provider's history. Use Grok as a conversion SOURCE \
-(e.g. `casr cc resume <grok-session-id> --source grk`), not a target.";
+const GROK_BIN_ENV: &str = "GROK_BIN";
+const GROK_MODEL: &str = "grok-build";
+const GROK_WRITE_REFUSAL: &str = "Grok Build writes require the official `grok` CLI; \
+set GROK_BIN or put grok in PATH. The native session format is not safely writable without \
+the vendor loader.";
 
 /// Grok Build provider implementation.
 pub struct Grok;
 
 impl Grok {
+    fn binary_path() -> anyhow::Result<PathBuf> {
+        if let Ok(value) = std::env::var(GROK_BIN_ENV) {
+            let path = PathBuf::from(value.trim());
+            if !path.as_os_str().is_empty() && path.is_file() {
+                return Ok(path);
+            }
+            anyhow::bail!("{GROK_BIN_ENV} does not point to an executable grok binary");
+        }
+        if let Ok(path) = which::which("grok") {
+            return Ok(path);
+        }
+        if let Some(home) = Self::home_dir() {
+            let path = home.join("bin").join("grok");
+            if path.is_file() {
+                return Ok(path);
+            }
+        }
+        anyhow::bail!("{GROK_WRITE_REFUSAL}");
+    }
+
     /// Root directory for Grok Build data. Respects the `GROK_HOME` env
     /// override (documented by the CLI), otherwise defaults to `~/.grok`.
     fn home_dir() -> Option<PathBuf> {
@@ -163,6 +188,97 @@ fn decode_group_cwd(group_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(decoded.into_owned()))
+}
+
+fn group_dir_name(cwd: &Path) -> (String, bool) {
+    let encoded = urlencoding::encode(&cwd.to_string_lossy()).into_owned();
+    if encoded.len() <= 255 {
+        return (encoded, false);
+    }
+
+    // Grok keeps a readable final-component slug and disambiguates it with
+    // BLAKE3 over the original path bytes. `.cwd` below makes the mapping
+    // lossless for readers and for paths whose final component is empty.
+    let slug = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("workspace")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || "-_.".contains(ch) {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect::<String>();
+    let digest = blake3::hash(cwd.to_string_lossy().as_bytes());
+    (format!("{slug}-{}", &digest.to_hex()[..16]), true)
+}
+
+fn timestamp_string(timestamp: Option<i64>) -> String {
+    timestamp
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+fn epoch_seconds(timestamp: Option<i64>) -> i64 {
+    timestamp
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+        .div_euclid(1000)
+}
+
+fn ensure_group_cwd(group_dir: &Path, workspace: &Path) -> anyhow::Result<()> {
+    let marker = group_dir.join(".cwd");
+    let workspace_text = workspace.to_string_lossy();
+    match std::fs::read_to_string(&marker) {
+        Ok(existing) if existing.trim() == workspace_text => return Ok(()),
+        Ok(_) => anyhow::bail!(
+            "Grok workspace marker {} belongs to a different path",
+            marker.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read Grok workspace marker {}", marker.display())
+            });
+        }
+    }
+
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(&marker).with_context(|| {
+                format!("failed to read Grok workspace marker {}", marker.display())
+            })?;
+            if existing.trim() == workspace_text {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Grok workspace marker {} belongs to a different path",
+                marker.display()
+            );
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to create Grok workspace marker {}",
+                    marker.display()
+                )
+            });
+        }
+    };
+    file.write_all(workspace_text.as_bytes())
+        .with_context(|| format!("failed to write Grok workspace marker {}", marker.display()))?;
+    file.sync_all()
+        .with_context(|| format!("failed to sync Grok workspace marker {}", marker.display()))
 }
 
 /// The kind of streaming message currently being accumulated.
@@ -256,6 +372,9 @@ struct MessageBuilder {
     last_kind: Option<ChunkKind>,
     /// `toolCallId` → index into `messages` holding that tool call.
     tool_call_owner: std::collections::HashMap<String, usize>,
+    /// Private writer marker → canonical message index. Native Grok sessions
+    /// do not carry this marker and continue using streaming coalescing.
+    imported_messages: std::collections::HashMap<usize, usize>,
 }
 
 impl MessageBuilder {
@@ -266,8 +385,30 @@ impl MessageBuilder {
 
     /// Append a streaming chunk, coalescing with the previous message when it
     /// has the same kind.
-    fn push_chunk(&mut self, kind: ChunkKind, text: &str, ts: Option<i64>, author: Option<String>) {
-        if self.last_kind == Some(kind)
+    fn push_chunk(
+        &mut self,
+        kind: ChunkKind,
+        text: &str,
+        ts: Option<i64>,
+        author: Option<String>,
+        imported_index: Option<usize>,
+    ) {
+        if let Some(imported_index) = imported_index
+            && let Some(&message_index) = self.imported_messages.get(&imported_index)
+        {
+            let message = &mut self.messages[message_index];
+            message.content.push_str(text);
+            if message.timestamp.is_none() {
+                message.timestamp = ts;
+            }
+            if message.author.is_none() {
+                message.author = author;
+            }
+            self.last_kind = Some(kind);
+            return;
+        }
+        if imported_index.is_none()
+            && self.last_kind == Some(kind)
             && let Some(last) = self.messages.last_mut()
         {
             last.content.push_str(text);
@@ -301,11 +442,20 @@ impl MessageBuilder {
                 extra,
             },
         );
+        if let Some(imported_index) = imported_index {
+            self.imported_messages
+                .insert(imported_index, self.messages.len() - 1);
+        }
     }
 
     /// Record a `tool_call` event. Attaches to the in-progress assistant
     /// message when one is open, otherwise starts a new assistant message.
-    fn push_tool_call(&mut self, update: &serde_json::Value, ts: Option<i64>) {
+    fn push_tool_call(
+        &mut self,
+        update: &serde_json::Value,
+        ts: Option<i64>,
+        imported_index: Option<usize>,
+    ) {
         let call = ToolCall {
             id: update
                 .get("toolCallId")
@@ -324,24 +474,39 @@ impl MessageBuilder {
         };
         let call_id = call.id.clone();
 
-        let target_idx = if self.last_kind == Some(ChunkKind::Agent) && !self.messages.is_empty() {
-            self.messages.len() - 1
-        } else {
-            self.push_new(
-                ChunkKind::Agent,
-                CanonicalMessage {
-                    idx: 0,
-                    role: MessageRole::Assistant,
-                    content: String::new(),
-                    timestamp: ts,
-                    author: None,
-                    tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                    extra: serde_json::json!({ "sessionUpdate": "tool_call" }),
-                },
-            );
-            self.messages.len() - 1
-        };
+        let target_idx = imported_index
+            .and_then(|index| self.imported_messages.get(&index).copied())
+            .or_else(|| {
+                if imported_index.is_none()
+                    && self.last_kind == Some(ChunkKind::Agent)
+                    && !self.messages.is_empty()
+                {
+                    Some(self.messages.len() - 1)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                self.push_new(
+                    ChunkKind::Agent,
+                    CanonicalMessage {
+                        idx: 0,
+                        role: MessageRole::Assistant,
+                        content: String::new(),
+                        timestamp: ts,
+                        author: None,
+                        tool_calls: Vec::new(),
+                        tool_results: Vec::new(),
+                        extra: serde_json::json!({ "sessionUpdate": "tool_call" }),
+                    },
+                );
+                self.messages.len() - 1
+            });
+        if let Some(imported_index) = imported_index {
+            self.imported_messages
+                .entry(imported_index)
+                .or_insert(target_idx);
+        }
 
         self.messages[target_idx].tool_calls.push(call);
         if let Some(id) = call_id {
@@ -356,7 +521,12 @@ impl MessageBuilder {
     /// call, and surface output as a tool result when present. Updates for
     /// unknown call ids (e.g. a truncated log) create a fresh tool call so the
     /// activity is not silently dropped.
-    fn push_tool_call_update(&mut self, update: &serde_json::Value, ts: Option<i64>) {
+    fn push_tool_call_update(
+        &mut self,
+        update: &serde_json::Value,
+        ts: Option<i64>,
+        imported_index: Option<usize>,
+    ) {
         let call_id = update.get("toolCallId").and_then(|v| v.as_str());
         let owner = call_id.and_then(|id| self.tool_call_owner.get(id).copied());
         match owner {
@@ -381,7 +551,7 @@ impl MessageBuilder {
                 }
                 self.apply_tool_outcome(idx, update);
             }
-            None => self.push_tool_call(update, ts),
+            None => self.push_tool_call(update, ts, imported_index),
         }
     }
 
@@ -446,6 +616,222 @@ fn resolve_updates_path(path: &Path) -> PathBuf {
     }
 }
 
+fn update_envelope(session_id: &str, update: serde_json::Value, timestamp: Option<i64>) -> String {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    serde_json::json!({
+        "timestamp": epoch_seconds(timestamp),
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": update,
+            "_meta": {
+                "eventId": event_id,
+                "agentTimestampMs": timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis())
+            }
+        }
+    })
+    .to_string()
+}
+
+fn tool_content(text: &str) -> serde_json::Value {
+    serde_json::json!([{
+        "type": "content",
+        "content": {"type": "text", "text": text}
+    }])
+}
+
+fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<Vec<String>> {
+    if session.messages.is_empty() {
+        anyhow::bail!("cannot write an empty Grok session");
+    }
+
+    let model = GROK_MODEL;
+    let mut updates = Vec::new();
+    let mut prompt_index = 0usize;
+    let mut emitted_calls = std::collections::HashSet::new();
+
+    for message in &session.messages {
+        let timestamp = message.timestamp.or(session.started_at);
+        let is_user = matches!(
+            message.role,
+            MessageRole::User | MessageRole::System | MessageRole::Other(_)
+        );
+        let is_reasoning = message.author.as_deref() == Some("reasoning");
+        let kind = if is_user {
+            "user_message_chunk"
+        } else if is_reasoning {
+            "agent_thought_chunk"
+        } else {
+            "agent_message_chunk"
+        };
+        let content_is_structural_result = matches!(message.role, MessageRole::Tool)
+            && message
+                .tool_results
+                .iter()
+                .any(|result| result.content == message.content);
+        if !message.content.is_empty() && !content_is_structural_result {
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                "modelId".into(),
+                serde_json::Value::String(model.to_string()),
+            );
+            meta.insert(
+                "agsxMessageIndex".into(),
+                serde_json::Value::Number((message.idx as u64).into()),
+            );
+            if is_user {
+                meta.insert(
+                    "promptIndex".into(),
+                    serde_json::Value::Number((prompt_index as u64).into()),
+                );
+            } else {
+                meta.insert(
+                    "promptIndex".into(),
+                    serde_json::Value::Number(prompt_index.saturating_sub(1).into()),
+                );
+                meta.insert(
+                    "messageIndex".into(),
+                    serde_json::Value::Number((message.idx as u64).into()),
+                );
+            }
+            updates.push(update_envelope(
+                target_id,
+                serde_json::json!({
+                    "sessionUpdate": kind,
+                    "content": {"type": "text", "text": message.content},
+                    "_meta": meta
+                }),
+                timestamp,
+            ));
+        }
+        if is_user {
+            prompt_index = prompt_index.saturating_add(1);
+        }
+
+        for (call_index, call) in message.tool_calls.iter().enumerate() {
+            let call_id = call
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("agsx-{target_id}-{}-{call_index}", message.idx));
+            emitted_calls.insert(call_id.clone());
+            updates.push(update_envelope(
+                target_id,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": call_id,
+                    "title": call.name,
+                    "kind": "function",
+                    "status": "in_progress",
+                    "rawInput": call.arguments,
+                    "_meta": {"agsxMessageIndex": message.idx}
+                }),
+                timestamp,
+            ));
+        }
+
+        for (result_index, result) in message.tool_results.iter().enumerate() {
+            let call_id = result
+                .call_id
+                .clone()
+                .or_else(|| {
+                    message
+                        .tool_calls
+                        .get(result_index)
+                        .and_then(|call| call.id.clone())
+                })
+                .unwrap_or_else(|| format!("agsx-{target_id}-{}-{result_index}", message.idx));
+            if emitted_calls.insert(call_id.clone()) {
+                updates.push(update_envelope(
+                    target_id,
+                    serde_json::json!({
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": call_id.clone(),
+                        "title": "Imported tool result",
+                        "kind": "function",
+                        "status": "in_progress",
+                        "rawInput": serde_json::Value::Null,
+                        "_meta": {"agsxMessageIndex": message.idx}
+                    }),
+                    timestamp,
+                ));
+            }
+            updates.push(update_envelope(
+                target_id,
+                serde_json::json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": call_id,
+                    "status": if result.is_error { "failed" } else { "completed" },
+                    "content": tool_content(&result.content),
+                    "rawOutput": result.content,
+                    "_meta": {"agsxMessageIndex": message.idx}
+                }),
+                timestamp,
+            ));
+        }
+    }
+    Ok(updates)
+}
+
+fn build_summary(
+    session: &CanonicalSession,
+    target_id: &str,
+    workspace: &Path,
+    update_count: usize,
+) -> serde_json::Value {
+    let title = session
+        .title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            session
+                .messages
+                .iter()
+                .find(|message| matches!(message.role, MessageRole::User))
+                .map(|message| message.content.as_str())
+        })
+        .map(|title| truncate_title(title, 100))
+        .unwrap_or_else(|| "Untitled session".to_string());
+    let created = session.started_at.or_else(|| {
+        session
+            .messages
+            .iter()
+            .filter_map(|message| message.timestamp)
+            .min()
+    });
+    let updated = session
+        .ended_at
+        .or_else(|| {
+            session
+                .messages
+                .iter()
+                .filter_map(|message| message.timestamp)
+                .max()
+        })
+        .or(created);
+    let mut summary = serde_json::json!({
+        "info": {"id": target_id, "cwd": workspace.to_string_lossy()},
+        "session_summary": title,
+        "generated_title": title,
+        "created_at": timestamp_string(created),
+        "updated_at": timestamp_string(updated),
+        "last_active_at": timestamp_string(updated),
+        "num_messages": update_count,
+        "num_chat_messages": session.messages.len(),
+        "current_model_id": GROK_MODEL,
+        "chat_format_version": 1,
+        "agent_name": "grok-build",
+        "sandbox_profile": "off"
+    });
+    if let Some(parent) = session
+        .metadata
+        .get("parent_session_id")
+        .and_then(|value| value.as_str())
+    {
+        summary["parent_session_id"] = serde_json::Value::String(parent.to_string());
+    }
+    summary
+}
+
 impl Provider for Grok {
     fn name(&self) -> &str {
         "Grok Build"
@@ -463,6 +849,13 @@ impl Provider for Grok {
         let mut evidence = Vec::new();
         let mut installed = false;
 
+        if let Ok(value) = std::env::var(GROK_BIN_ENV) {
+            let path = PathBuf::from(value.trim());
+            if path.is_file() {
+                evidence.push(format!("{GROK_BIN_ENV} points to {}", path.display()));
+                installed = true;
+            }
+        }
         if which::which("grok").is_ok() {
             evidence.push("grok binary found in PATH".to_string());
             installed = true;
@@ -619,6 +1012,10 @@ impl Provider for Grok {
                 };
 
                 let ts = line_timestamp(&val, update);
+                let imported_index = update
+                    .pointer("/_meta/agsxMessageIndex")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as usize);
                 if let Some(t) = ts {
                     started_at = Some(started_at.map_or(t, |s: i64| s.min(t)));
                     ended_at = Some(ended_at.map_or(t, |e: i64| e.max(t)));
@@ -648,10 +1045,10 @@ impl Provider for Grok {
                         if text.is_empty() {
                             continue;
                         }
-                        builder.push_chunk(chunk_kind, &text, ts, author);
+                        builder.push_chunk(chunk_kind, &text, ts, author, imported_index);
                     }
-                    "tool_call" => builder.push_tool_call(update, ts),
-                    "tool_call_update" => builder.push_tool_call_update(update, ts),
+                    "tool_call" => builder.push_tool_call(update, ts, imported_index),
+                    "tool_call_update" => builder.push_tool_call_update(update, ts, imported_index),
                     // Known non-conversation kinds (plan/TODO state, hook runs,
                     // retry telemetry) and any future/unknown kinds are skipped.
                     _ => {
@@ -728,13 +1125,13 @@ impl Provider for Grok {
             // whole file — under the comment "preserve the full summary for
             // round-trip fidelity". Both halves of that were wrong.
             //
-            // There is no round-trip. The canonical metadata bag is read back
-            // in exactly three places: `native_name_from_metadata`, the
+            // The canonical metadata bag is read back in exactly three places:
+            // `native_name_from_metadata`, the
             // `InfoResponse` in `main.rs` (which *prints* it), and the
             // per-provider writers, of which only Gemini (`projectHash`), Pi
             // (`provider`) and Kiro (`session_state`/`history`) consult a key
-            // at all. `Grok::write_session` below refuses outright, so a Grok
-            // tree rebuilt by casr does not exist to be faithful to.
+            // at all. Grok's writer below deliberately creates fresh metadata
+            // from canonical fields rather than copying this source summary.
             //
             // And the file is not inert. `summary.json` is 33 fields in grok
             // 0.2.103 — recovered from the session-persistence serializer in
@@ -789,19 +1186,182 @@ impl Provider for Grok {
 
     fn write_session(
         &self,
-        _session: &CanonicalSession,
-        _opts: &WriteOptions,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        // A Grok Build session directory is more than updates.jsonl (the CLI
-        // also maintains chat_history.jsonl, summary.json, signals.json, and a
-        // SQLite search index), and a synthesized tree has not yet been
-        // round-trip verified against a live `grok --resume`. Refuse rather
-        // than write a stub the CLI may reject or mis-restore.
-        Err(anyhow::anyhow!(GROK_WRITE_REFUSAL))
+        let binary = Self::binary_path().map_err(|error| anyhow::anyhow!("{error:#}"))?;
+        let workspace = session
+            .workspace
+            .clone()
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .context("could not determine a Grok workspace")?;
+        let mut warnings = Vec::new();
+        if session
+            .workspace
+            .as_ref()
+            .is_some_and(|path| !path.is_dir())
+        {
+            warnings.push(format!(
+                "The source workspace {} does not exist; Grok will resume in {}.",
+                session.workspace.as_ref().unwrap().display(),
+                workspace.display()
+            ));
+        }
+
+        let root = Self::sessions_root().context("could not determine Grok session store")?;
+        let (group_name, shortened) = group_dir_name(&workspace);
+        let group_dir = root.join(group_name);
+        let target_id = uuid::Uuid::new_v4().to_string();
+        let session_dir = group_dir.join(&target_id);
+        if session_dir.exists() {
+            anyhow::bail!("Grok generated session ID already exists: {target_id}");
+        }
+        std::fs::create_dir_all(&session_dir).with_context(|| {
+            format!(
+                "failed to create Grok session directory {}",
+                session_dir.display()
+            )
+        })?;
+        let cleanup = |error: anyhow::Error| -> anyhow::Result<WrittenSession> {
+            let _ = std::fs::remove_dir_all(&session_dir);
+            Err(error)
+        };
+
+        if shortened && let Err(error) = ensure_group_cwd(&group_dir, &workspace) {
+            return cleanup(error);
+        }
+
+        let updates = match build_updates(session, &target_id) {
+            Ok(updates) => updates,
+            Err(error) => return cleanup(error),
+        };
+        let summary = build_summary(session, &target_id, &workspace, updates.len());
+        let summary_bytes = match serde_json::to_vec_pretty(&summary) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return cleanup(anyhow::anyhow!("failed to serialize Grok summary: {error}"));
+            }
+        };
+        let updates_bytes = format!("{}\n", updates.join("\n")).into_bytes();
+
+        let summary_path = session_dir.join("summary.json");
+        let updates_path = session_dir.join("updates.jsonl");
+        let summary_outcome = match crate::pipeline::atomic_write(
+            &summary_path,
+            &summary_bytes,
+            opts.force,
+            self.slug(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => return cleanup(anyhow::anyhow!("{error}")),
+        };
+        let updates_outcome = match crate::pipeline::atomic_write(
+            &updates_path,
+            &updates_bytes,
+            opts.force,
+            self.slug(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = crate::pipeline::restore_backup(&summary_outcome, self.slug());
+                return cleanup(anyhow::anyhow!("{error}"));
+            }
+        };
+
+        // The CLI is the vendor-side parser and discovery oracle. `export`
+        // reads the newly written authoritative log without invoking a model.
+        let export = Command::new(&binary)
+            .arg("export")
+            .arg(&target_id)
+            .current_dir(&workspace)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("failed to run {}", binary.display()));
+        match export {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                let _ = crate::pipeline::restore_backup(&updates_outcome, self.slug());
+                let _ = crate::pipeline::restore_backup(&summary_outcome, self.slug());
+                return cleanup(anyhow::anyhow!(
+                    "Grok rejected generated session {target_id} during official export (exit {})",
+                    status
+                ));
+            }
+            Err(error) => {
+                let _ = crate::pipeline::restore_backup(&updates_outcome, self.slug());
+                let _ = crate::pipeline::restore_backup(&summary_outcome, self.slug());
+                return cleanup(error);
+            }
+        }
+
+        info!(
+            target_session_id = %target_id,
+            path = %updates_path.display(),
+            messages = session.messages.len(),
+            "Grok session written and accepted by official export"
+        );
+        Ok(WrittenSession {
+            paths: vec![updates_path, summary_path],
+            session_id: target_id.clone(),
+            resume_command: self.resume_command(&target_id),
+            backups: summary_outcome
+                .displaced()
+                .into_iter()
+                .chain(updates_outcome.displaced())
+                .collect(),
+            warnings,
+        })
+    }
+
+    fn rollback_write(&self, written: &WrittenSession) -> anyhow::Result<()> {
+        let updates = written
+            .paths
+            .iter()
+            .find(|path| path.file_name().and_then(|name| name.to_str()) == Some("updates.jsonl"))
+            .context("Grok rollback has no updates.jsonl path")?;
+        let session_dir = updates
+            .parent()
+            .context("Grok rollback cannot determine session directory")?;
+        let id = session_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("Grok rollback session directory has no UTF-8 ID")?;
+        let root = Self::sessions_root().context("Grok rollback cannot determine session store")?;
+        let path_root = session_dir.parent().and_then(Path::parent);
+        if id != written.session_id || path_root != Some(root.as_path()) {
+            anyhow::bail!("Grok rollback path does not match generated session ID");
+        }
+        let binary = Self::binary_path().ok();
+        if let Some(binary) = binary {
+            let output = Command::new(binary)
+                .args(["sessions", "delete", &written.session_id])
+                .output();
+            if let Ok(output) = output
+                && output.status.success()
+                && !session_dir.exists()
+            {
+                return Ok(());
+            }
+        }
+        match std::fs::remove_dir_all(session_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove unverified Grok session {}",
+                        session_dir.display()
+                    )
+                });
+            }
+        }
+        Ok(())
     }
 
     fn write_refusal(&self) -> Option<&'static str> {
-        Some(GROK_WRITE_REFUSAL)
+        Self::binary_path().is_err().then_some(GROK_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -1179,6 +1739,51 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("Echo test session"));
     }
 
+    #[test]
+    fn reader_preserves_imported_boundaries_between_same_role_messages() {
+        let lines = vec![
+            envelope(
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "first"},
+                    "_meta": {"agsxMessageIndex": 0}
+                }),
+                100,
+            ),
+            envelope(
+                json!({
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "second"},
+                    "_meta": {"agsxMessageIndex": 1}
+                }),
+                101,
+            ),
+        ];
+        let (_guard, updates) = make_grok_tree(&lines, None);
+        let session = Grok.read_session(&updates).expect("read");
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0].content, "first");
+        assert_eq!(session.messages[1].content, "second");
+    }
+
+    #[test]
+    fn long_workspace_group_matches_grok_slug_and_blake3_rule() {
+        let workspace = PathBuf::from(format!(
+            "/root/.agent-work/agsx-grok-boundary-probe.ww9QFb/long/{}/{}/{}",
+            "a".repeat(80),
+            "b".repeat(80),
+            "c".repeat(80)
+        ));
+        let (group, shortened) = group_dir_name(&workspace);
+
+        assert!(shortened);
+        assert_eq!(
+            group,
+            "cccccccccccccccccccccccccccccccccccccccc-764bdab3e4f7b6a3"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Enumeration
     // -----------------------------------------------------------------------
@@ -1225,7 +1830,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Provider metadata / writer refusal / resume
+    // Provider metadata / missing-CLI refusal / resume
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1246,7 +1851,7 @@ mod tests {
     }
 
     #[test]
-    fn write_session_is_refused() {
+    fn write_session_is_refused_without_official_cli() {
         let session = CanonicalSession {
             session_id: "x".to_string(),
             provider_slug: "claude-code".to_string(),
@@ -1261,7 +1866,7 @@ mod tests {
         };
         let err = Grok
             .write_session(&session, &WriteOptions { force: false })
-            .expect_err("grok must refuse writes");
+            .expect_err("grok must refuse writes without its official CLI");
         assert_eq!(err.to_string(), GROK_WRITE_REFUSAL);
     }
 }

@@ -29,10 +29,12 @@
 //! **A real DAG.** Every record carries `uuid` and `parentUuid`, so
 //! [`Event::parent`] is read rather than inferred, and `isSidechain` plus
 //! `agentId` give subagent branches their own [`Branch::Sub`]. A DAG needs a
-//! head to be useful, and `last-prompt.leafUuid` is it: that goes onto
+//! head to be useful. Main transcripts record it in `last-prompt.leafUuid`;
+//! subagent transcripts do not, so Claude Code's loader selects their newest
+//! conversational leaf. The reader normalizes either answer onto
 //! [`SessionIr::live_head`], so [`crate::replay::resolve`] can prune abandoned
-//! branches without knowing what a `last-prompt` record is. Codex sets no head
-//! and gets no prune, structurally rather than by an agent check.
+//! branches without knowing either vendor rule. Codex sets no head and gets no
+//! prune, structurally rather than by an agent check.
 //!
 //! **Exact compaction scope.** `compact_boundary` records
 //! `compactMetadata.preservedMessages.allUuids` — precisely which messages
@@ -80,8 +82,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::ir::{
-    Block, Body, Branch, Capsule, CapsuleBinding, CapsuleKind, Event, SessionIr, SourceRef,
-    Role, ToolInput, ToolOutcome, Visibility,
+    Block, Body, Branch, Capsule, CapsuleBinding, CapsuleKind, Event, Role, SessionIr, SourceRef,
+    ToolInput, ToolOutcome, Visibility,
 };
 use crate::model::parse_timestamp;
 
@@ -119,6 +121,14 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
     let mut ir = SessionIr::new("claude-code", String::new());
     ir.origin.provider = Some(ASSUMED_PROVIDER.to_string());
     let mut sink = Sink::new(ir);
+    let mut last_non_sidechain_record = None;
+    let mut last_prompt_leaf = None;
+    let mut last_prompt_is_explicit = false;
+    let mut cleared_to_empty = false;
+    let mut explicit_clear_marker = None;
+    let mut newest_compaction_relinks = false;
+    let mut assistant_responses = Vec::new();
+    let mut tool_result_records = Vec::new();
 
     for (index, line) in reader.lines().enumerate() {
         let line = line
@@ -155,8 +165,83 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
 
         apply_envelope(&mut sink.ir, &value);
         let ctx = RecordContext::from(&value, &source);
+        let native_type = value.get("type").and_then(Value::as_str);
+        let clears_live_history = native_type == Some("last-prompt")
+            && value.get("leafUuid") == Some(&Value::Null)
+            && value.get("explicit").and_then(Value::as_bool) == Some(true);
+        if native_type == Some("assistant")
+            && let Some(message_id) = value.pointer("/message/id").and_then(Value::as_str)
+        {
+            assistant_responses.push((message_id.to_string(), ctx.uuid.clone()));
+        } else if native_type == Some("user")
+            && value
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block.get("type").and_then(Value::as_str) == Some("tool_result")
+                    })
+                })
+        {
+            tool_result_records.push(ctx.uuid.clone());
+        }
+        if matches!(
+            native_type,
+            Some("user" | "assistant" | "attachment" | "system")
+        ) && value.get("isSidechain").and_then(Value::as_bool) != Some(true)
+        {
+            last_non_sidechain_record = Some(ctx.uuid.clone());
+            last_prompt_is_explicit = false;
+            cleared_to_empty = false;
+            explicit_clear_marker = None;
+        }
+        if native_type == Some("system")
+            && value.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
+            // Vendor PBe clears an older `last-prompt` at every boundary.
+            last_prompt_leaf = None;
+            last_prompt_is_explicit = false;
+            newest_compaction_relinks = value
+                .pointer("/compactMetadata/preservedMessages/uuids")
+                .and_then(Value::as_array)
+                .is_some_and(|uuids| !uuids.is_empty())
+                || value
+                    .pointer("/compactMetadata/preservedSegment")
+                    .is_some_and(|segment| !segment.is_null());
+        } else if native_type == Some("last-prompt") {
+            if let Some(leaf) = value
+                .get("leafUuid")
+                .and_then(Value::as_str)
+                .filter(|leaf| !leaf.is_empty())
+            {
+                let same_leaf = last_prompt_leaf.as_deref() == Some(leaf);
+                last_prompt_is_explicit = value.get("explicit").and_then(Value::as_bool)
+                    == Some(true)
+                    || (last_prompt_is_explicit && same_leaf);
+                last_prompt_leaf = Some(leaf.to_string());
+                cleared_to_empty = false;
+                explicit_clear_marker = None;
+            } else if clears_live_history {
+                last_prompt_leaf = None;
+                last_prompt_is_explicit = false;
+                cleared_to_empty = true;
+                explicit_clear_marker = Some(ctx.event(
+                    1,
+                    Visibility::Ui,
+                    Body::Compaction {
+                        context: Vec::new(),
+                        supersedes: sink.live_model.clone(),
+                        note: Some("Claude Code explicitly cleared the replay history".to_string()),
+                        window_from: None,
+                        window_to: None,
+                    },
+                    Vec::new(),
+                ));
+            }
+        }
 
-        match value.get("type").and_then(Value::as_str) {
+        let first_event = sink.ir.events.len();
+        match native_type {
             Some("assistant") => push_assistant(&mut sink, &ctx, &value),
             Some("user") => push_user(&mut sink, &ctx, &value),
             Some("system") => push_system(&mut sink, &ctx, &value),
@@ -173,17 +258,6 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
                 sink.emit(ctx.event(0, Visibility::Ui, body, Vec::new()));
             }
             Some(other) if UI_CONTROL_TYPES.contains(&other) => {
-                // `last-prompt` is chrome to render *and* the one thing in the
-                // file that names the live branch. The record stays a control
-                // event; the fact it carries is lifted onto the session, where
-                // the resolver can read it without knowing what a `last-prompt`
-                // is. Claude rewrites the record on every submit and the file
-                // keeps them all, so the newest wins.
-                if other == "last-prompt"
-                    && let Some(leaf) = value.get("leafUuid").and_then(Value::as_str)
-                {
-                    sink.ir.live_head = Some(leaf.to_string());
-                }
                 let body = Body::Control {
                     control_kind: other.to_string(),
                     data: value.clone(),
@@ -198,8 +272,34 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
                 sink.emit(ctx.event(0, Visibility::Unclassified, body, Vec::new()));
             }
         }
+        sink.attach_compaction_anchor(&ctx.uuid, first_event);
     }
 
+    let inferred_live_head = (!cleared_to_empty)
+        .then(|| {
+            infer_vendor_live_head(
+                &sink.ir,
+                last_non_sidechain_record.as_deref(),
+                newest_compaction_relinks,
+                last_prompt_leaf.as_deref(),
+                last_prompt_is_explicit,
+            )
+        })
+        .flatten();
+    normalize_parallel_responses(
+        &mut sink.ir,
+        &assistant_responses,
+        &tool_result_records,
+        inferred_live_head.as_deref(),
+    );
+    if cleared_to_empty {
+        if let Some(marker) = explicit_clear_marker {
+            sink.emit(marker);
+        }
+        sink.ir.live_head = None;
+    } else {
+        sink.ir.live_head = inferred_live_head;
+    }
     let ir = sink.ir;
     if ir.origin.native_session_id.is_empty() {
         anyhow::bail!(
@@ -208,6 +308,320 @@ pub fn read(path: &Path) -> anyhow::Result<SessionIr> {
         );
     }
     Ok(ir)
+}
+
+/// Make one Anthropic response a continuous graph segment.
+///
+/// Claude streams a single API response as several `assistant` records sharing
+/// `message.id`. Parallel tool results then hang from different records in
+/// that group, which makes them siblings in the raw DAG. Vendor `HB_` restores
+/// every group member and every one of those results after selecting the live
+/// chain. Normalizing the group here gives the provider-neutral fork prune the
+/// same graph without teaching it what an Anthropic message id is.
+fn normalize_parallel_responses(
+    ir: &mut SessionIr,
+    assistant_responses: &[(String, String)],
+    tool_result_records: &[String],
+    live_head: Option<&str>,
+) {
+    #[derive(Clone)]
+    struct RecordInfo {
+        parent: Option<String>,
+        ts: Option<i64>,
+        first_index: usize,
+        conversation: bool,
+    }
+
+    fn record_id(id: &str) -> &str {
+        id.split('#').next().unwrap_or(id)
+    }
+
+    fn set_parent(ir: &mut SessionIr, record: &str, parent: Option<&str>) {
+        for event in &mut ir.events {
+            if record_id(&event.id) == record {
+                event.parent = parent.map(str::to_string);
+            }
+        }
+    }
+
+    fn is_on_live_path(
+        info: &HashMap<String, RecordInfo>,
+        live_head: &str,
+        candidate: &str,
+    ) -> bool {
+        let mut cursor = Some(live_head);
+        let mut seen = HashSet::new();
+        while let Some(id) = cursor {
+            if id == candidate {
+                return true;
+            }
+            if !seen.insert(id) {
+                return false;
+            }
+            cursor = info.get(id).and_then(|record| record.parent.as_deref());
+        }
+        false
+    }
+
+    let mut info: HashMap<String, RecordInfo> = HashMap::new();
+    for (index, event) in ir.events.iter().enumerate() {
+        let id = record_id(&event.id);
+        let conversation =
+            event.visibility == Visibility::Model && !event.body.is_history_directive();
+        info.entry(id.to_string())
+            .and_modify(|record| record.conversation |= conversation)
+            .or_insert_with(|| RecordInfo {
+                parent: event.parent.as_deref().map(record_id).map(str::to_string),
+                ts: event.ts,
+                first_index: index,
+                conversation,
+            });
+    }
+
+    let mut group_order = Vec::new();
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for (message_id, uuid) in assistant_responses {
+        let group = groups.entry(message_id.clone()).or_insert_with(|| {
+            group_order.push(message_id.clone());
+            Vec::new()
+        });
+        if !group.contains(uuid) && info.contains_key(uuid) {
+            group.push(uuid.clone());
+        }
+    }
+
+    for message_id in group_order {
+        let Some(assistants) = groups.get(&message_id) else {
+            continue;
+        };
+        if assistants.is_empty() {
+            continue;
+        }
+        let assistant_set: HashSet<&str> = assistants.iter().map(String::as_str).collect();
+        let mut results: Vec<String> = tool_result_records
+            .iter()
+            .filter(|uuid| {
+                info.get(*uuid)
+                    .and_then(|record| record.parent.as_deref())
+                    .is_some_and(|parent| assistant_set.contains(parent))
+            })
+            .cloned()
+            .collect();
+        results.sort_by_key(|uuid| {
+            let record = &info[uuid];
+            (record.ts.unwrap_or(i64::MAX), record.first_index)
+        });
+
+        let mut sequence = assistants.clone();
+        sequence.extend(results);
+        if sequence.len() < 2 {
+            continue;
+        }
+        let sequence_set: HashSet<&str> = sequence.iter().map(String::as_str).collect();
+
+        let mut parent = info[&sequence[0]].parent.as_deref().map(str::to_string);
+        for uuid in &sequence {
+            set_parent(ir, uuid, parent.as_deref());
+            parent = Some(uuid.clone());
+        }
+        let Some(tail) = parent else {
+            continue;
+        };
+
+        // A live continuation can point at any streamed assistant chunk. Only
+        // the one on the selected raw path belongs after the recovered group;
+        // another child is an abandoned fork, not response context.
+        let continuations: Vec<String> = info
+            .iter()
+            .filter(|(uuid, record)| {
+                record.conversation
+                    && !sequence_set.contains(uuid.as_str())
+                    && record
+                        .parent
+                        .as_deref()
+                        .is_some_and(|parent| assistant_set.contains(parent))
+                    && live_head.is_some_and(|head| is_on_live_path(&info, head, uuid))
+            })
+            .map(|(uuid, _)| uuid.clone())
+            .collect();
+        for continuation in continuations {
+            set_parent(ir, &continuation, Some(&tail));
+        }
+    }
+}
+
+/// Claude Code's fallback when no surviving `last-prompt` names the head.
+///
+/// With no compaction relink, vendor `V` climbs from the last non-sidechain
+/// threaded record. Subagent files have no such record, so `V` enumerates the
+/// conversational leaves and `DBe` selects the newest timestamp. This function
+/// performs only that native normalization; the actual branch pruning remains
+/// in the provider-neutral replay module.
+fn infer_vendor_live_head(
+    ir: &SessionIr,
+    last_non_sidechain: Option<&str>,
+    compaction_relinks: bool,
+    last_prompt_leaf: Option<&str>,
+    last_prompt_is_explicit: bool,
+) -> Option<String> {
+    struct ThreadRecord {
+        id: String,
+        parent: Option<String>,
+        ts: Option<i64>,
+        conversation: bool,
+        sidechain: bool,
+    }
+
+    fn record_id(id: &str) -> &str {
+        id.split('#').next().unwrap_or(id)
+    }
+
+    fn is_thread_record(event: &Event) -> bool {
+        event.visibility == Visibility::Model
+            || matches!(event.body, Body::Attachment { .. })
+            || matches!(
+                &event.body,
+                Body::Control { control_kind, .. } if control_kind.starts_with("system.")
+            )
+            || matches!(
+                &event.body,
+                Body::Unknown {
+                    native_type: Some(native_type),
+                    ..
+                } if native_type.starts_with("system.")
+            )
+    }
+
+    fn nearest_conversation(
+        records: &[ThreadRecord],
+        positions: &HashMap<&str, usize>,
+        start: &str,
+    ) -> Option<String> {
+        let mut cursor = start;
+        let mut seen = HashSet::new();
+        loop {
+            if !seen.insert(cursor.to_string()) {
+                return None;
+            }
+            let record = &records[*positions.get(cursor)?];
+            if record.conversation {
+                return Some(record.id.clone());
+            }
+            cursor = record.parent.as_deref()?;
+        }
+    }
+
+    let mut records: Vec<ThreadRecord> = Vec::new();
+    let mut owned_positions: HashMap<String, usize> = HashMap::new();
+    for event in &ir.events {
+        if !is_thread_record(event) {
+            continue;
+        }
+        let id = record_id(&event.id);
+        let conversation =
+            event.visibility == Visibility::Model && !event.body.is_history_directive();
+        if let Some(index) = owned_positions.get(id).copied() {
+            records[index].conversation |= conversation;
+            continue;
+        }
+        owned_positions.insert(id.to_string(), records.len());
+        records.push(ThreadRecord {
+            id: id.to_string(),
+            parent: event.parent.as_deref().map(record_id).map(str::to_string),
+            ts: event.ts,
+            conversation,
+            sidechain: matches!(event.branch, Branch::Sub(_)),
+        });
+    }
+    let positions: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.id.as_str(), index))
+        .collect();
+
+    let explicit_leaf = last_prompt_is_explicit
+        && last_prompt_leaf.is_some_and(|leaf| {
+            positions
+                .get(leaf)
+                .is_some_and(|index| !records[*index].sidechain)
+        });
+    if !compaction_relinks || explicit_leaf {
+        let mut tail = last_prompt_leaf
+            .filter(|leaf| positions.contains_key(*leaf))
+            .map(str::to_string);
+        if tail.is_some()
+            && !last_prompt_is_explicit
+            && let Some(last) = last_non_sidechain.filter(|last| positions.contains_key(*last))
+            && tail.as_deref() != Some(last)
+        {
+            let recorded = tail.as_deref().expect("checked as present");
+            let mut cursor = Some(last);
+            let mut seen = HashSet::new();
+            while let Some(id) = cursor {
+                if !seen.insert(id) {
+                    break;
+                }
+                if id == recorded {
+                    tail = Some(last.to_string());
+                    break;
+                }
+                cursor = records[*positions.get(id)?].parent.as_deref();
+            }
+        }
+        if !compaction_relinks && tail.is_none() {
+            tail = last_non_sidechain.map(str::to_string);
+        }
+        if let Some(tail) = tail
+            && let Some(head) = nearest_conversation(&records, &positions, &tail)
+        {
+            return Some(head);
+        }
+    }
+
+    let mut parents = HashSet::new();
+    let mut conversation_parents = HashSet::new();
+    for record in &records {
+        if let Some(parent) = &record.parent {
+            parents.insert(parent.as_str());
+            if record.conversation {
+                conversation_parents.insert(parent.as_str());
+            }
+        }
+    }
+
+    let mut candidates = Vec::new();
+    let mut seen_candidates = HashSet::new();
+    for record in &records {
+        if parents.contains(record.id.as_str()) {
+            continue;
+        }
+        let Some(candidate) = nearest_conversation(&records, &positions, &record.id) else {
+            continue;
+        };
+        if !conversation_parents.contains(candidate.as_str())
+            && seen_candidates.insert(candidate.clone())
+        {
+            candidates.push(candidate);
+        }
+    }
+
+    if candidates.len() > 1
+        && let Some(preferred) = last_prompt_leaf
+            .filter(|leaf| seen_candidates.contains(*leaf))
+            .or(last_non_sidechain)
+        && let Some(head) = nearest_conversation(&records, &positions, preferred)
+    {
+        return Some(head);
+    }
+
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let record = &records[*positions.get(candidate.as_str())?];
+            Some((record.ts?, candidate))
+        })
+        .max_by_key(|(timestamp, _)| *timestamp)
+        .map(|(_, candidate)| candidate)
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +687,13 @@ impl RecordContext {
     /// One native record can expand into several events — an assistant turn is
     /// routinely `thinking` + `text` + `tool_use` — so `slot` disambiguates
     /// them while keeping the native uuid recognisable in the id.
-    fn event(&self, slot: usize, visibility: Visibility, body: Body, capsules: Vec<Capsule>) -> Event {
+    fn event(
+        &self,
+        slot: usize,
+        visibility: Visibility,
+        body: Body,
+        capsules: Vec<Capsule>,
+    ) -> Event {
         Event {
             id: if slot == 0 {
                 self.uuid.clone()
@@ -311,6 +731,19 @@ struct Sink {
     live_model: Vec<String>,
     /// Every id emitted so far, to its index in `ir.events`.
     seen: HashMap<String, usize>,
+    /// A compact boundary whose `anchorUuid` has not appeared in the file yet.
+    ///
+    /// Claude writes the summary after the boundary, but its loader relinks
+    /// the preserved tail *behind* that summary. The IR is built in file order,
+    /// so the marker and insertion point are remembered until the anchor
+    /// record arrives.
+    pending_compactions: HashMap<String, PendingCompaction>,
+}
+
+#[derive(Clone, Copy)]
+struct PendingCompaction {
+    marker: usize,
+    live_insert_at: usize,
 }
 
 impl Sink {
@@ -319,6 +752,7 @@ impl Sink {
             ir,
             live_model: Vec::new(),
             seen: HashMap::new(),
+            pending_compactions: HashMap::new(),
         }
     }
 
@@ -340,6 +774,53 @@ impl Sink {
         self.seen.insert(event.id.clone(), self.ir.events.len());
         self.ir.capture.record(&event);
         self.ir.events.push(event);
+    }
+
+    /// Put a late-written compaction anchor before the tail it preserved.
+    ///
+    /// Vendor `rsp` rewrites `preservedMessages.uuids` into a chain whose
+    /// parent is `anchorUuid`. Merely keeping both records is insufficient:
+    /// replaying in file order shows the in-flight message before the summary
+    /// that supplies its history. The compaction context is allowed to name a
+    /// later event — it is a final state assignment by id — and
+    /// `replay::Live` holds the id once, from the marker onward, so the
+    /// anchor's own record adds nothing when file order reaches it.
+    ///
+    /// That last clause named the resolver's *output* dedupe when this was
+    /// written, which deduplicated the replay and left the id in the live set
+    /// twice for every other reader of it — one event, two exclusions, on five
+    /// multi-compaction transcripts of the local corpus. The guarantee now
+    /// lives where the id enters. See `replay::Live`.
+    fn attach_compaction_anchor(&mut self, anchor: &str, first_event: usize) {
+        let Some(pending) = self.pending_compactions.get(anchor).copied() else {
+            return;
+        };
+        let anchor_ids: Vec<String> = self.ir.events[first_event..]
+            .iter()
+            .filter(|event| event.visibility == Visibility::Model)
+            .map(|event| event.id.clone())
+            .collect();
+        if anchor_ids.is_empty() {
+            return;
+        }
+        self.pending_compactions.remove(anchor);
+
+        let Body::Compaction { context, .. } = &mut self.ir.events[pending.marker].body else {
+            return;
+        };
+        for id in anchor_ids.iter().rev() {
+            if !context.contains(id) {
+                context.insert(0, id.clone());
+            }
+        }
+
+        let anchor_set: HashSet<&str> = anchor_ids.iter().map(String::as_str).collect();
+        self.live_model
+            .retain(|id| !anchor_set.contains(id.as_str()));
+        let insert_at = pending.live_insert_at.min(self.live_model.len());
+        for (offset, id) in anchor_ids.into_iter().enumerate() {
+            self.live_model.insert(insert_at + offset, id);
+        }
     }
 
     /// Same id, different content: keep the event, under an id of its own.
@@ -585,9 +1066,7 @@ fn push_assistant(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     // Claude has one calling convention: a JSON object.
-                    input: ToolInput::from_json_field(
-                        item.get("input").unwrap_or(&Value::Null),
-                    ),
+                    input: ToolInput::from_json_field(item.get("input").unwrap_or(&Value::Null)),
                 };
                 sink.emit(ctx.event(slot, Visibility::Model, body, Vec::new()));
                 slot += 1;
@@ -734,8 +1213,10 @@ fn push_system(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
 
     // Claude does not inline a replacement history the way Codex does: the
     // summary arrives afterwards as an ordinary message flagged
-    // `isCompactSummary`. So the post-compaction context is simply the part of
-    // the live set Claude named as preserved, and the rest is what it dropped.
+    // `isCompactSummary`. `preservedMessages.anchorUuid` names that future
+    // record, and vendor `rsp` puts it *before* the preserved tail. The tail is
+    // partitioned here; `Sink::attach_compaction_anchor` prepends the summary
+    // when its record arrives.
     // Ids of split blocks are `<uuid>#<slot>`; the preserved set names the
     // record, so compare on the record part.
     let (context, supersedes): (Vec<String>, Vec<String>) = sink
@@ -755,8 +1236,26 @@ fn push_system(sink: &mut Sink, ctx: &RecordContext, value: &Value) {
             .and_then(Value::as_str)
             .map(str::to_string),
     };
+    let anchor = value
+        .pointer("/compactMetadata/preservedMessages/anchorUuid")
+        .or_else(|| value.pointer("/compactMetadata/preservedSegment/anchorUuid"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
     sink.live_model = context;
+    let live_insert_at = 0;
+    let marker = sink.ir.events.len();
     sink.emit(ctx.event(0, Visibility::Model, body, Vec::new()));
+    if marker < sink.ir.events.len()
+        && let Some(anchor) = anchor
+    {
+        sink.pending_compactions.insert(
+            anchor,
+            PendingCompaction {
+                marker,
+                live_insert_at,
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,8 +1378,14 @@ mod tests {
             reasoning.capsules[0].bound.model.as_deref(),
             Some("claude-opus-4-8")
         );
-        assert_eq!(reasoning.capsules[0].fits("anthropic"), CapsuleFit::SameVendor);
-        assert_eq!(reasoning.capsules[0].fits("openai"), CapsuleFit::ForeignVendor);
+        assert_eq!(
+            reasoning.capsules[0].fits("anthropic"),
+            CapsuleFit::SameVendor
+        );
+        assert_eq!(
+            reasoning.capsules[0].fits("openai"),
+            CapsuleFit::ForeignVendor
+        );
     }
 
     #[test]
@@ -1033,13 +1538,16 @@ mod tests {
         );
     }
 
-    /// A transcript with no `last-prompt` names no head, and the resolver then
-    /// prunes nothing. Same structural no-op Codex gets.
+    /// A transcript with no `last-prompt` still resumes from Claude's fallback.
+    ///
+    /// The vendor climbs from the last non-sidechain threaded record; leaving
+    /// this as `None` tells the provider-neutral resolver to keep every fork,
+    /// which is not what Claude resumes.
     #[test]
-    fn a_transcript_with_no_last_prompt_names_no_head() {
+    fn a_transcript_with_no_last_prompt_uses_the_vendor_fallback_head() {
         let file = transcript(&[user("u1", "", "one")]);
         let ir = read(file.path()).expect("parse");
-        assert_eq!(ir.live_head, None);
+        assert_eq!(ir.live_head.as_deref(), Some("u1"));
     }
 
     // -----------------------------------------------------------------------
@@ -1066,8 +1574,15 @@ mod tests {
         let ir = read(file.path()).expect("parse");
 
         let ids: Vec<&str> = ir.events.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, ["u1", "u2"], "the restatement must not become an event");
-        assert_eq!(ir.capture.restated, 1, "and it must be counted as recognised");
+        assert_eq!(
+            ids,
+            ["u1", "u2"],
+            "the restatement must not become an event"
+        );
+        assert_eq!(
+            ir.capture.restated, 1,
+            "and it must be counted as recognised"
+        );
         assert_eq!(ir.capture.id_collisions, 0, "nothing collided; it restated");
         assert_eq!(
             ir.capture.lines_read, 3,
@@ -1144,7 +1659,11 @@ mod tests {
                 Some((context.clone(), supersedes.clone()))
             })
             .expect("compaction event");
-        assert_eq!(context, ["u2"], "the preserved record is shown once, not twice");
+        assert_eq!(
+            context,
+            ["u2"],
+            "the preserved record is shown once, not twice"
+        );
         assert_eq!(supersedes, ["u1"]);
 
         let plan = crate::replay::resolve(&ir);

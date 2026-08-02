@@ -83,7 +83,6 @@ const CONTAINS: &[&str] = &[
     "claude-code",
     "codex",
     "gemini",
-    "cursor",
     "aider",
     "amp",
     "kiro",
@@ -103,6 +102,7 @@ const REFUSES: &[&str] = &[
     "antigravity",
     "chatgpt",
     "cline",
+    "cursor",
     "grok",
     "opencode",
     "openclaw",
@@ -340,8 +340,12 @@ fn every_writer_reports_an_id_that_resolves_to_what_it_wrote() {
                     written.session_id
                 )
             });
+        let resolves_to_written = written.paths.contains(&owned)
+            || owned
+                .parent()
+                .is_some_and(|parent| written.paths.iter().any(|path| path == parent));
         assert!(
-            written.paths.contains(&owned),
+            resolves_to_written,
             "{}: id {:?} resolves to {:?}, which is not among the paths it wrote {:?}",
             provider.slug(),
             written.session_id,
@@ -423,9 +427,9 @@ fn opencode_refuses_a_traversing_id_without_creating_a_database() {
     );
 }
 
-/// A hostile id cannot turn a refused OpenClaw import into a filesystem effect.
+/// A hostile id cannot turn a missing-CLI OpenClaw import into a filesystem effect.
 #[test]
-fn openclaw_refuses_a_traversing_id_without_creating_state() {
+fn openclaw_missing_cli_rejects_a_traversing_id_without_creating_state() {
     let _lock = ENV.lock().unwrap();
     let registry = ProviderRegistry::default_registry();
     let openclaw = registry
@@ -437,15 +441,16 @@ fn openclaw_refuses_a_traversing_id_without_creating_state() {
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace).expect("workspace");
     let _guards = sandbox(&root);
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &root.join("missing-openclaw"));
 
     let error = openclaw
         .write_session(
             &session(TRAVERSING_ID, &workspace),
             &WriteOptions { force: true },
         )
-        .expect_err("OpenClaw target must refuse even with --force");
+        .expect_err("OpenClaw target requires the official CLI");
     assert!(
-        error.to_string().contains("gateway"),
+        error.to_string().contains("official `openclaw` CLI"),
         "unexpected refusal: {error:#}"
     );
     assert!(

@@ -461,6 +461,52 @@ pub struct StructuredWrite {
     pub losses: Vec<Loss>,
 }
 
+/// Roll back a provider write whose outputs are self-contained files.
+fn rollback_file_write(provider_slug: &str, written: &WrittenSession) -> anyhow::Result<()> {
+    // Outputs first. A displaced file may also be one of them (the ordinary
+    // `--force` case), and removing it after restoration would delete the
+    // predecessor we just put back.
+    for path in &written.paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "{provider_slug}: failed to remove unverified output {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    for displaced in &written.backups {
+        tracing::warn!(
+            backup = %displaced.backup.display(),
+            target = %displaced.target.display(),
+            "restoring backup after verification failure"
+        );
+        match std::fs::remove_file(&displaced.target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "{provider_slug}: failed to remove unverified output {} before restore: {error}",
+                    displaced.target.display()
+                ));
+            }
+        }
+        std::fs::rename(&displaced.backup, &displaced.target).map_err(|error| {
+            anyhow::anyhow!(
+                "{provider_slug}: failed to restore {} from {}: {error}",
+                displaced.target.display(),
+                displaced.backup.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
 /// The core abstraction each provider implements.
 ///
 /// Object-safe so we can store `Box<dyn Provider>` in the registry.
@@ -523,6 +569,17 @@ pub trait Provider: Send + Sync {
         _opts: &WriteOptions,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Undo a write that failed read-back verification.
+    ///
+    /// The default handles providers whose outputs are ordinary files: remove
+    /// every new output, then restore each displaced file from its paired
+    /// backup. Providers backed by shared stores must override this and use the
+    /// vendor's own lifecycle. In particular, a virtual session locator inside
+    /// a database is not a file that can be removed safely.
+    fn rollback_write(&self, written: &WrittenSession) -> anyhow::Result<()> {
+        rollback_file_write(self.slug(), written)
     }
 
     /// Explain why this provider cannot be a conversion target.

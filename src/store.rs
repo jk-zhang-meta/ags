@@ -296,6 +296,19 @@ impl OriginSnapshot {
     }
 }
 
+/// The regular file that physically holds a provider session locator.
+///
+/// Most locators are files themselves. Providers with a shared store use the
+/// existing `<container-file>/<session-id>` convention, where the child cannot
+/// exist as a filesystem entry and the parent is the bytes the provider reads.
+fn session_backing_file(path: &Path) -> Option<&Path> {
+    if path.is_file() {
+        Some(path)
+    } else {
+        path.parent().filter(|parent| parent.is_file())
+    }
+}
+
 /// The three answers a reference can give, all of them reported.
 ///
 /// Exactly the three the design names, because the caller has exactly two
@@ -769,7 +782,16 @@ impl Store {
 
         // Before the lock on purpose: this hashes the session file, and the
         // largest rollout in the corpus is 281 MiB.
-        let mut snapshot = OriginSnapshot::of(path)?;
+        let backing = session_backing_file(path).unwrap_or(path);
+        if matches!(policy, OriginPolicy::Archive) && backing != path {
+            anyhow::bail!(
+                "cannot archive logical session locator {}: its backing file {} is a shared \
+                 provider store, not a single-session artifact",
+                path.display(),
+                backing.display()
+            );
+        }
+        let mut snapshot = OriginSnapshot::of(backing)?;
 
         let mut conn = self.write_index()?;
         let write = locked(&mut conn)?;
@@ -1335,8 +1357,10 @@ impl Store {
     ) -> (PathBuf, Availability, Option<OriginState>) {
         match &inc.role {
             Role::Origin { snapshot } => {
-                let state = snapshot.state(&inc.path);
-                if state.usable() {
+                let backing = session_backing_file(&inc.path).unwrap_or(&inc.path);
+                let logical_locator = backing != inc.path;
+                let state = snapshot.state(backing);
+                if state.usable() || logical_locator {
                     return (inc.path.clone(), Availability::Ready, Some(state));
                 }
                 let archived = snapshot
@@ -1356,7 +1380,7 @@ impl Store {
                 }
             }
             Role::Derived { snapshot, .. } => {
-                if !inc.path.is_file() {
+                if session_backing_file(&inc.path).is_none() {
                     return (
                         inc.path.clone(),
                         Availability::Unavailable {
@@ -2273,6 +2297,71 @@ mod tests {
         let gone = snapshot.state(&path);
         assert!(!gone.usable());
         assert!(format!("{gone:?}").contains("missing"), "got {gone:?}");
+    }
+
+    #[test]
+    fn logical_session_locators_use_but_do_not_archive_their_shared_container() {
+        let (tmp, store) = store();
+        let container = session(tmp.path(), "shared.db", "first database image");
+        let locator = container.join("session-1");
+        let key = SessionKey::new("shared-provider", "session-1");
+        let record = store
+            .ingest_origin(&key, &locator, OriginPolicy::Reference)
+            .expect("ingest logical locator");
+        let origin = record.origin().expect("origin");
+
+        let (resolved, availability, state) = store.locate(&record, origin);
+        assert_eq!(resolved, locator);
+        assert_eq!(availability, Availability::Ready);
+        assert_eq!(state, Some(OriginState::Unchanged { rehashed: false }));
+
+        fs::write(&container, "a different database image").expect("rewrite shared container");
+        let (_, availability, state) = store.locate(&record, origin);
+        assert_eq!(
+            availability,
+            Availability::Ready,
+            "a changed shared container may still hold the logical session"
+        );
+        assert!(
+            matches!(state, Some(OriginState::Unavailable { .. })),
+            "container-wide change must make growth unknown, got {state:?}"
+        );
+
+        let error = store
+            .ingest_origin(&key, &locator, OriginPolicy::Archive)
+            .expect_err("a shared database is not a single-session archive");
+        assert!(error.to_string().contains("shared provider store"));
+    }
+
+    #[test]
+    fn derived_logical_locator_is_available_when_its_container_exists() {
+        let (tmp, store) = store();
+        let source = session(tmp.path(), "source.jsonl", "{}\n");
+        let from = SessionKey::new("codex", "source-1");
+        let record = store
+            .ingest_origin(&from, &source, OriginPolicy::Reference)
+            .expect("ingest source");
+        let container = session(tmp.path(), "shared.db", "database image");
+        let locator = container.join("derived-1");
+        let key = SessionKey::new("shared-provider", "derived-1");
+        let record = store
+            .record_conversion(
+                &record.id,
+                DerivedWrite {
+                    key: key.clone(),
+                    path: locator.clone(),
+                    from,
+                    fidelity: Fidelity::ConversationOnly,
+                    losses: Vec::new(),
+                },
+            )
+            .expect("record logical derivative");
+        let derived = record.find(&key).expect("derived incarnation");
+
+        let (resolved, availability, state) = store.locate(&record, derived);
+        assert_eq!(resolved, locator);
+        assert_eq!(availability, Availability::Ready);
+        assert_eq!(state, None);
     }
 
     #[test]

@@ -4,10 +4,12 @@
 //! provider home misconfiguration, and read errors across all providers.
 
 mod test_env;
+mod test_perms;
 
 #[cfg(unix)]
 mod unix_error_paths {
     use super::test_env;
+    use super::test_perms::{directory_rejects_writes, file_rejects_reads};
 
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -203,6 +205,9 @@ mod unix_error_paths {
             path: target_file.clone(),
             mode: 0o644,
         };
+        if !file_rejects_reads(&target_file) {
+            return;
+        }
 
         let err = ClaudeCode.read_session(&target_file);
         assert!(
@@ -237,6 +242,9 @@ mod unix_error_paths {
             path: target_file.clone(),
             mode: 0o644,
         };
+        if !file_rejects_reads(&target_file) {
+            return;
+        }
 
         let err = Codex.read_session(&target_file);
         assert!(
@@ -267,6 +275,9 @@ mod unix_error_paths {
             path: session_file.clone(),
             mode: 0o644,
         };
+        if !file_rejects_reads(&session_file) {
+            return;
+        }
 
         let err = Gemini.read_session(&session_file);
         assert!(
@@ -387,6 +398,9 @@ mod unix_error_paths {
             path: sessions_dir,
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = Codex.write_session(&session, &WriteOptions { force: false });
@@ -409,6 +423,9 @@ mod unix_error_paths {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = ClawdBot.write_session(&session, &WriteOptions { force: false });
@@ -431,6 +448,9 @@ mod unix_error_paths {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = Vibe.write_session(&session, &WriteOptions { force: false });
@@ -453,6 +473,9 @@ mod unix_error_paths {
             path: tmp.path().to_path_buf(),
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = Factory.write_session(&session, &WriteOptions { force: false });
@@ -464,11 +487,12 @@ mod unix_error_paths {
     }
 
     #[test]
-    fn openclaw_refuses_before_touching_a_readonly_store() {
+    fn openclaw_missing_cli_refuses_before_touching_a_readonly_store() {
         let _lock = OPENCLAW_ENV.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let state_dir = tmp.path().join("openclaw-state");
         let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+        let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
         fs::create_dir_all(&state_dir).unwrap();
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o555)).unwrap();
@@ -481,7 +505,7 @@ mod unix_error_paths {
         let err = OpenClaw.write_session(&session, &WriteOptions { force: false });
         assert!(
             err.as_ref()
-                .is_err_and(|error| error.to_string().contains("gateway")),
+                .is_err_and(|error| error.to_string().contains("official `openclaw` CLI")),
             "OpenClaw should report its capability refusal, got {:?}",
             err
         );
@@ -504,6 +528,9 @@ mod unix_error_paths {
             path: sessions_dir,
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = PiAgent.write_session(&session, &WriteOptions { force: false });

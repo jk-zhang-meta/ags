@@ -894,9 +894,8 @@ fn claude_corpus_live_summary_diverges_from_summary() {
 // OpenClaw corpus target boundary
 // ---------------------------------------------------------------------------
 
-/// OpenClaw imports now wait for a gateway-backed implementation. This corpus
-/// gate proves the refusal is data-independent: complex real sessions cannot
-/// bypass it, `--force` cannot bypass it, and no state is created.
+/// Without the official OpenClaw CLI, the conditional Gateway writer must
+/// refuse every corpus shape before creating state.
 mod into_openclaw {
     use std::path::PathBuf;
 
@@ -922,9 +921,11 @@ mod into_openclaw {
         let tmp = tempfile::tempdir().expect("a temp state dir");
         let state_dir = tmp.path().join("openclaw-state");
         // SAFETY: this ignored corpus test is the only test in its binary that
-        // mutates OPENCLAW_STATE_DIR, and the provider must not read it before
-        // returning its static capability refusal.
-        unsafe { std::env::set_var("OPENCLAW_STATE_DIR", &state_dir) };
+        // mutates these OpenClaw variables.
+        unsafe {
+            std::env::set_var("OPENCLAW_STATE_DIR", &state_dir);
+            std::env::set_var("OPENCLAW_BIN", tmp.path().join("missing-openclaw"));
+        };
 
         let mut checked = 0usize;
         for path in files {
@@ -934,9 +935,9 @@ mod into_openclaw {
             for force in [false, true] {
                 let error = OpenClaw
                     .write_session(&session, &WriteOptions { force })
-                    .expect_err("OpenClaw corpus import must refuse");
+                    .expect_err("OpenClaw corpus import requires the official CLI");
                 assert!(
-                    error.to_string().contains("gateway"),
+                    error.to_string().contains("official `openclaw` CLI"),
                     "{}: unexpected refusal: {error:#}",
                     path.display()
                 );

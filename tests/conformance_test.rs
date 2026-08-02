@@ -380,7 +380,7 @@ fn finish_hops(tier: &str, report: &HopReport) {
 /// Their target paths currently refuse before touching these roots. Keeping
 /// explicit sandbox values means a future capability change cannot make this
 /// conformance test inspect or write a developer's real store.
-const EXTRA_ROOTS: [&str; 2] = ["CHATGPT_HOME", "CLINE_HOME"];
+const EXTRA_ROOTS: [&str; 3] = ["AIDER_HOME", "CHATGPT_HOME", "CLINE_HOME"];
 
 /// Like [`sandboxed`], but for the flat writers: every root inside one scratch
 /// directory, none of them the developer's.
@@ -410,6 +410,8 @@ fn sandboxed_for_flat_writers<T>(body: impl FnOnce(&Path) -> T) -> T {
             EnvGuard::set(key, &root)
         })
         .collect();
+    let _opencode = EnvGuard::set("OPENCODE_BIN", &sandbox.path().join("missing-opencode"));
+    let _cline = EnvGuard::set("CLINE_BIN", &sandbox.path().join("missing-cline"));
 
     body(sandbox.path())
 }
@@ -478,10 +480,10 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 ///
 /// # The requirement
 ///
-/// Six writable flat targets have no slot for a system turn and send it
-/// somewhere else — Claude Code and Vibe to a plain user record, Amp to `info`,
-/// Cursor to a human bubble, Kiro to `Prompt`, and Aider to a blockquote. Each
-/// of those mappings is right:
+/// Writable flat targets with no slot for a system turn send it through their
+/// nearest native channel — Aider, Claude Code and Vibe use plain user records,
+/// Amp uses `info`, OpenCode uses user messages, and Kiro uses `Prompt`.
+/// Each of those mappings is right:
 /// the alternative is a row the target deletes on its next rewrite. What was
 /// wrong is that a conversion performing one reported `conversation_only` with
 /// an empty `losses` list, so the person resuming the session could not tell a
@@ -508,6 +510,7 @@ fn no_writer_folds_a_role_without_declaring_it() {
         "antigravity",
         "chatgpt",
         "cline",
+        "cursor",
         "grok",
         "opencode",
         "openclaw",

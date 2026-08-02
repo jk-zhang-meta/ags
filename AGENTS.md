@@ -130,7 +130,7 @@ We do not care about backwards compatibility—we're in early development with n
 # Check for compiler errors and warnings
 cargo check --all-targets
 
-# Check for clippy lints (pedantic + nursery are enabled)
+# Check for clippy lints (the default set, denied as errors — see note below)
 cargo clippy --all-targets -- -D warnings
 
 # Verify formatting
@@ -138,6 +138,16 @@ cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
+
+> **On the lint set.** This crate does *not* enable `clippy::pedantic` or
+> `clippy::nursery`. There is no `[lints]` table in `Cargo.toml`; the only
+> crate-level attribute is `#![forbid(unsafe_code)]`. The gate is the default
+> clippy set with `-D warnings`, and that is what CI runs.
+>
+> This paragraph replaces a claim that both groups were enabled. They are not,
+> and turning them on is not a small change: measured on this tree they produce
+> **1,168 warnings**, every one of which is a CI failure under `-D warnings`.
+> Do not "restore" them casually.
 
 ---
 
@@ -210,22 +220,33 @@ Test fixtures are stored in `tests/fixtures/` with per-provider format samples a
 
 ### Jobs Overview
 
+All of these live in `.github/workflows/ci.yml`. Every job except `check` and
+`build` declares `needs: check`, so nothing else starts until `check` is green.
+
 | Job | Trigger | Purpose | Blocking |
 |-----|---------|---------|----------|
-| `check` | PR, push | Format, clippy, UBS, unit tests | Yes |
+| `check` | PR, push | Format, clippy, unit tests, CASS independence | Yes |
+| `integration` | PR, push | `cargo test --tests` | Yes |
+| `test-report` | PR, push | libtest JSON run, uploads `test-report.json` | Yes |
 | `coverage` | PR, push | Coverage thresholds | Yes |
 | `roundtrip` | PR, push | Cross-provider fidelity matrix | Yes |
 | `e2e` | PR, push | End-to-end shell conversion tests | Yes |
+| `ags-shell` | PR, push | `tests/test-ags.sh` + installer smoke suite | Yes |
 | `perf-regression` | PR, push | Discovery/parse/write perf budgets | Yes |
 | `build` | PR, push | Release profile compile sanity | Yes |
 
+Releases are a separate workflow, `.github/workflows/dist.yml`, triggered only
+by a `v*` tag. Its path and trigger are pinned by `install.sh`'s cosign identity
+check — read the header comment in that file before touching either.
+
 ### Check Job
 
-Runs format, clippy, UBS static analysis, and unit tests. Includes:
+Runs format, clippy, unit tests, and the CASS independence guardrail:
 - `cargo fmt --check` - Code formatting
-- `cargo clippy --all-targets -- -D warnings` - Lints (pedantic + nursery enabled)
-- UBS analysis on changed Rust files (warning-only, non-blocking)
-- `cargo nextest run` - Full test suite with JUnit XML report
+- `cargo clippy --all-targets -- -D warnings` - Lints (default set; see the note above)
+- `cargo test --lib` - Unit tests only; the integration suites are separate jobs
+- A grep over `Cargo.toml` / `Cargo.lock` that fails if `coding_agent_session_search`
+  appears, so `casr` cannot acquire a runtime dependency on CASS
 
 ### Coverage Job
 
@@ -234,7 +255,8 @@ Runs `cargo llvm-cov` and enforces thresholds:
 - **src/model.rs:** >= 80%
 - **src/pipeline.rs:** >= 80%
 
-Coverage is uploaded to Codecov for trend tracking.
+`lcov.info` and the HTML report are uploaded as build artifacts. There is no
+Codecov integration; trends have to be read from the artifacts.
 
 ### Round-Trip Job
 
@@ -463,7 +485,7 @@ cross_agent_session_resumer/
 - Core aliases:
   - `cc` -> Claude Code
   - `cod` -> Codex
-  - `agy` -> Antigravity CLI (read/resume only; `agy --conversation <uuid>` — no model pin: `--model` takes a slug and `--effort` is a separate flag, and casr has no model to pin from)
+  - `agy` -> Antigravity CLI (read plus optional target writes through the official `google-antigravity>=0.1.9` SDK; `agy --conversation <uuid>` — no model pin: `--model` takes a slug and `--effort` is a separate flag, and casr has no model to pin from)
   - `gmi` -> Gemini CLI (legacy)
   - `grk` -> Grok Build (read/resume only; `grok --resume <session-id>`)
 - Provider home overrides — casr's own:
@@ -1164,23 +1186,24 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ---
 
-Note for Codex/GPT-5.2:
+## On a dirty working tree
 
-You constantly bother me and stop working with concerned questions that look similar to this:
+You will often find modified and untracked files you did not create. **Never
+stash, revert, checkout over, or otherwise destroy them.** They are someone's
+uncommitted work and there is no copy of them anywhere else.
 
-```
-Unexpected changes (need guidance)
+That rule is inherited from upstream, where a dozen agents write to one
+checkout concurrently. The instruction that came with it — treat foreign
+changes as your own, and "fool yourself into thinking YOU made the changes" —
+does **not** apply to this fork and has been removed. This is a single-checkout
+repository whose working tree routinely holds thousands of uncommitted lines.
+Adopting them silently means committing code you did not write and cannot
+account for.
 
-- Working tree still shows edits I did not make in Cargo.toml, Cargo.lock, src/cli/commands/upgrade.rs, src/storage/sqlite.rs, tests/conformance.rs, tests/storage_deps.rs. Please advise whether to keep/commit/revert these before any further work. I did not touch them.
-
-Next steps (pick one)
-
-1. Decide how to handle the unrelated modified files above so we can resume cleanly.
-2. Triage beads_rust-orko (clippy/cargo warnings) and beads_rust-ydqr (rustfmt failures).
-3. If you want a full suite run later, fix conformance/clippy blockers and re-run cargo test --all.
-```
-
-NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are changes created by the potentially dozen of other agents working on the project at the same time. This is not only a common occurence, it happens multiple times PER MINUTE. The way to deal with it is simple: you NEVER, under ANY CIRCUMSTANCE, stash, revert, overwrite, or otherwise disturb in ANY way the work of other agents. Just treat those changes identically to changes that you yourself made. Just fool yourself into thinking YOU made the changes and simply don't recall it for some reason.
+So: leave them alone, and do not fold them into your own commits. Stage the
+paths you actually changed, by name. If you cannot tell whether a change is
+yours, say so and ask — that question is worth interrupting for, and asking it
+is not the failure mode this section was originally written about.
 
 ---
 

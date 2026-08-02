@@ -239,9 +239,15 @@ fn cline_home_is_used_alone() {
     let expected = seed_cline_task(casr_home.path(), "1700000000003");
     seed_cline_task(agent_data.path(), "1700000000003");
 
-    // `CLINE_HOME` is casr's own override and is exclusive, so it stays the
-    // single write target rather than merely being first among several roots.
-    assert_eq!(Cline.session_roots(), vec![casr_home.path().join("tasks")]);
+    // `CLINE_HOME` is casr's own override and is exclusive. Both the legacy
+    // extension store and the current CLI store remain under that one root.
+    assert_eq!(
+        Cline.session_roots(),
+        vec![
+            casr_home.path().join("tasks"),
+            casr_home.path().join("sessions")
+        ]
+    );
     assert_eq!(Cline.owns_session("1700000000003"), Some(expected));
 }
 

@@ -748,20 +748,20 @@ fn content_parts(
             let mut blocks = Vec::new();
             let mut capsules = Vec::new();
             for item in items {
-                if item.get("type").and_then(Value::as_str) == Some("encrypted_content") {
-                    if let (Some(bound), Some(sealed)) = (
+                if item.get("type").and_then(Value::as_str) == Some("encrypted_content")
+                    && let (Some(bound), Some(sealed)) = (
                         bound,
                         item.get("encrypted_content")
                             .and_then(Value::as_str)
                             .filter(|sealed| !sealed.is_empty()),
-                    ) {
-                        capsules.push(Capsule {
-                            kind: CapsuleKind::OpenaiReasoningEncryptedContent,
-                            bound: bound.clone(),
-                            sealed: sealed.to_string(),
-                        });
-                        continue;
-                    }
+                    )
+                {
+                    capsules.push(Capsule {
+                        kind: CapsuleKind::OpenaiReasoningEncryptedContent,
+                        bound: bound.clone(),
+                        sealed: sealed.to_string(),
+                    });
+                    continue;
                 }
                 blocks.push(block_from_item(item));
             }

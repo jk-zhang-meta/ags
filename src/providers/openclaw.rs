@@ -1,4 +1,4 @@
-//! OpenClaw provider — reads and resumes `@openclaw/ai` session transcripts.
+//! OpenClaw provider — reads native transcripts and imports through its Gateway.
 //!
 //! Session files: `~/.openclaw/agents/<agent-id>/sessions/*.jsonl`
 //! Override root: `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw`
@@ -106,7 +106,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
+use anyhow::Context;
 use tracing::{debug, info, trace, warn};
 
 use crate::discovery::DetectionResult;
@@ -120,10 +122,22 @@ use crate::providers::{
     walk_entry_reporting,
 };
 
-const OPENCLAW_WRITE_REFUSAL: &str = "OpenClaw is read/resume-only: its session index has no \
-cross-process file lock, so direct transcript and sessions.json writes can lose active gateway \
-updates. A safe import must use OpenClaw's authenticated gateway lifecycle; use OpenClaw as a \
-conversion source, not a target.";
+const OPENCLAW_BIN_ENV: &str = "OPENCLAW_BIN";
+const OPENCLAW_CLI_REQUIRED: &str = "OpenClaw is read/resume-only on this machine: target writes \
+require the official `openclaw` CLI in PATH (or OPENCLAW_BIN), a running authenticated Gateway \
+granting `operator.admin`, \
+and Gateway RPCs `sessions.create`, `chat.inject`, `chat.history`, `sessions.patch`, and \
+`sessions.delete` (introduced in OpenClaw 2026.7.2). agsx-convert never edits OpenClaw's database \
+or session index directly.";
+const GATEWAY_LOCATOR_DIR: &str = ".agsx-gateway";
+const IMPORT_SESSION_PREFIX: &str = "agent:main:dashboard:agsx-";
+const IMPORT_LABEL_PREFIX: &str = "agsx:v1:";
+const GATEWAY_TIMEOUT_MS: &str = "30000";
+const HISTORY_PAGE_LIMIT: u64 = 1000;
+const LOSSY_IMPORT_WARNING: &str = "OpenClaw stores every imported turn as a native \
+gateway-injected assistant note. Visible `agsx:v1:<role>` labels preserve the source role for \
+agsx-convert read-back, but OpenClaw's model sees assistant-role notes rather than the original \
+user/system/tool role semantics.";
 
 /// OpenClaw's default agent id. Native sessions are keyed by agent, and an
 /// agent id is mandatory when targeting the TUI.
@@ -843,7 +857,284 @@ impl OpenClaw {
         home.join(".openclaw")
     }
 
+    fn absolute_state_dir() -> anyhow::Result<PathBuf> {
+        let state = Self::state_dir();
+        if state.is_absolute() {
+            return Ok(state);
+        }
+        Ok(std::env::current_dir()
+            .context("could not resolve OPENCLAW_STATE_DIR against the current directory")?
+            .join(state))
+    }
+
+    fn binary_path() -> anyhow::Result<PathBuf> {
+        if let Some(path) = std::env::var_os(OPENCLAW_BIN_ENV).filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                std::env::current_dir()
+                    .context("could not resolve OPENCLAW_BIN against the current directory")?
+                    .join(path)
+            };
+            if path.is_file() {
+                return Ok(path);
+            }
+            anyhow::bail!(
+                "{OPENCLAW_BIN_ENV} names {}, but that is not an OpenClaw executable file",
+                path.display()
+            );
+        }
+        which::which("openclaw")
+            .context("OpenClaw writes require the official `openclaw` CLI in PATH or OPENCLAW_BIN")
+    }
+
+    fn gateway_call(
+        binary: &Path,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let params = serde_json::to_string(params)
+            .with_context(|| format!("failed to serialize OpenClaw {method} parameters"))?;
+        let output = Command::new(binary)
+            .args(["gateway", "call", method, "--json", "--timeout"])
+            .arg(GATEWAY_TIMEOUT_MS)
+            .arg("--params")
+            .arg(params)
+            .output()
+            .with_context(|| format!("failed to start {}", binary.display()))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "OpenClaw gateway call {method} failed with {}",
+                output.status
+            );
+        }
+        serde_json::from_slice(&output.stdout)
+            .with_context(|| format!("OpenClaw gateway call {method} returned invalid JSON"))
+    }
+
+    fn generated_session_key() -> String {
+        format!("{IMPORT_SESSION_PREFIX}{}", uuid::Uuid::new_v4().simple())
+    }
+
+    fn gateway_locator_path(
+        state_dir: &Path,
+        session_key: &str,
+        gateway_session_id: &str,
+    ) -> PathBuf {
+        state_dir
+            .join(GATEWAY_LOCATOR_DIR)
+            .join(urlencoding::encode(session_key).as_ref())
+            .join(gateway_session_id)
+    }
+
+    fn parse_gateway_locator(path: &Path) -> Option<(String, String)> {
+        let state_dir = Self::absolute_state_dir().ok()?;
+        let gateway_session_id = path.file_name()?.to_str()?;
+        if !is_uuid(gateway_session_id) {
+            return None;
+        }
+        let encoded_key = path.parent()?.file_name()?.to_str()?;
+        let session_key = urlencoding::decode(encoded_key).ok()?.into_owned();
+        if !is_import_session_key(&session_key) {
+            return None;
+        }
+        let expected = Self::gateway_locator_path(&state_dir, &session_key, gateway_session_id);
+        (path == expected).then(|| (session_key, gateway_session_id.to_string()))
+    }
+
+    fn delete_gateway_session(
+        binary: &Path,
+        session_key: &str,
+        gateway_session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !is_import_session_key(session_key) {
+            anyhow::bail!("refusing to delete a non-agsx OpenClaw session key");
+        }
+        let mut patch = serde_json::json!({
+            "key": session_key,
+            "archived": true,
+        });
+        let mut delete = serde_json::json!({
+            "key": session_key,
+            "archivedOnly": true,
+            "deleteTranscript": true,
+        });
+        if let Some(session_id) = gateway_session_id {
+            patch["expectedSessionId"] = serde_json::Value::String(session_id.to_string());
+            delete["expectedSessionId"] = serde_json::Value::String(session_id.to_string());
+        }
+        Self::gateway_call(binary, "sessions.patch", &patch)
+            .context("failed to archive the imported OpenClaw session before deletion")?;
+        let response = Self::gateway_call(binary, "sessions.delete", &delete)
+            .context("failed to delete the imported OpenClaw session")?;
+        if response.get("deleted").and_then(serde_json::Value::as_bool) != Some(true) {
+            anyhow::bail!("OpenClaw sessions.delete did not confirm deletion");
+        }
+        Ok(())
+    }
+
+    fn gateway_history(
+        binary: &Path,
+        session_key: &str,
+        gateway_session_id: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let mut offset = 0_u64;
+        let mut pages = Vec::new();
+        loop {
+            let mut params = serde_json::json!({
+                "sessionKey": session_key,
+                "limit": HISTORY_PAGE_LIMIT,
+            });
+            if offset > 0 {
+                params["offset"] = serde_json::Value::Number(offset.into());
+            }
+            let response = Self::gateway_call(binary, "chat.history", &params)?;
+            if response
+                .get("sessionKey")
+                .and_then(serde_json::Value::as_str)
+                != Some(session_key)
+            {
+                anyhow::bail!("OpenClaw chat.history returned a different session key");
+            }
+            if response
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                != Some(gateway_session_id)
+            {
+                anyhow::bail!("OpenClaw chat.history returned a different session ID");
+            }
+            let messages = response
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .context("OpenClaw chat.history reply has no messages array")?
+                .clone();
+            let has_more = response
+                .get("hasMore")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let next_offset = response
+                .get("nextOffset")
+                .and_then(serde_json::Value::as_u64);
+            if response.get("hasMore").is_none() && messages.len() >= HISTORY_PAGE_LIMIT as usize {
+                anyhow::bail!(
+                    "OpenClaw chat.history returned a full page without pagination metadata"
+                );
+            }
+            pages.push(messages);
+            if !has_more {
+                break;
+            }
+            let next = next_offset
+                .filter(|next| *next > offset)
+                .context("OpenClaw chat.history returned a non-advancing pagination cursor")?;
+            offset = next;
+        }
+
+        let mut messages = Vec::new();
+        for page in pages.into_iter().rev() {
+            messages.extend(page);
+        }
+        Ok(messages)
+    }
+
+    fn read_gateway_session(
+        binary: &Path,
+        path: &Path,
+        session_key: &str,
+        gateway_session_id: &str,
+    ) -> anyhow::Result<CanonicalSession> {
+        let history = Self::gateway_history(binary, session_key, gateway_session_id)?;
+        let mut transcript = Transcript::default();
+        for (index, value) in history.into_iter().enumerate() {
+            let timestamp = value
+                .get("timestamp")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let entry = Entry {
+                kind: "message".to_string(),
+                id: format!("gateway-{index}"),
+                parent: None,
+                leaf_control: false,
+                side_append: false,
+                value: serde_json::json!({
+                    "type": "message",
+                    "timestamp": timestamp,
+                    "message": value,
+                }),
+            };
+            let Some(mut message) = entry_message(&entry, &mut transcript) else {
+                continue;
+            };
+            let raw_message = entry
+                .value
+                .get("message")
+                .expect("gateway entry always contains message");
+            if message.role == MessageRole::Assistant
+                && let Some((role, content)) = decode_import_marker(raw_message, &message.content)
+            {
+                message.role = role;
+                message.content = content;
+                message.author = None;
+            }
+            if transcript.started_at.is_none() {
+                transcript.started_at = message.timestamp;
+            }
+            if message.timestamp.is_some() {
+                transcript.ended_at = message.timestamp;
+            }
+            transcript.messages.push(message);
+        }
+        reindex_messages(&mut transcript.messages);
+        let title = transcript
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .map(|message| truncate_title(&message.content, 100));
+        let unrepresented = transcript.describe_unrepresented();
+        Ok(CanonicalSession {
+            session_id: session_key.to_string(),
+            provider_slug: "openclaw".to_string(),
+            workspace: None,
+            title,
+            started_at: transcript.started_at,
+            ended_at: transcript.ended_at,
+            messages: transcript.messages,
+            metadata: serde_json::json!({
+                "source": "openclaw",
+                "gateway_session_id": gateway_session_id,
+                "unrepresented": unrepresented,
+            }),
+            source_path: path.to_path_buf(),
+            model_name: None,
+        })
+    }
+
+    fn verify_import(expected: &CanonicalSession, actual: &CanonicalSession) -> anyhow::Result<()> {
+        if expected.messages.len() != actual.messages.len() {
+            anyhow::bail!(
+                "message count changed (wrote {}, read back {})",
+                expected.messages.len(),
+                actual.messages.len()
+            );
+        }
+        for (index, (expected, actual)) in
+            expected.messages.iter().zip(&actual.messages).enumerate()
+        {
+            if import_role_label(&expected.role) != import_role_label(&actual.role) {
+                anyhow::bail!("message role changed at index {index}");
+            }
+            if expected.content != actual.content {
+                anyhow::bail!("message content changed at index {index}");
+            }
+        }
+        Ok(())
+    }
+
     fn session_key(session_id: &str) -> String {
+        if session_id.starts_with("agent:") {
+            return session_id.to_string();
+        }
         format!(
             "agent:{DEFAULT_AGENT_ID}:{}",
             session_id.to_ascii_lowercase()
@@ -947,6 +1238,47 @@ fn is_uuid(candidate: &str) -> bool {
     parts.next().is_none()
 }
 
+fn import_role_label(role: &MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "agsx:v1:user",
+        MessageRole::Assistant => "agsx:v1:assistant",
+        MessageRole::System => "agsx:v1:system",
+        MessageRole::Tool => "agsx:v1:tool",
+        MessageRole::Other(_) => "agsx:v1:other",
+    }
+}
+
+fn decode_import_marker(message: &serde_json::Value, text: &str) -> Option<(MessageRole, String)> {
+    if message.get("provider").and_then(serde_json::Value::as_str) != Some("openclaw")
+        || message.get("model").and_then(serde_json::Value::as_str) != Some("gateway-injected")
+    {
+        return None;
+    }
+
+    let roles = [
+        ("user", MessageRole::User),
+        ("assistant", MessageRole::Assistant),
+        ("system", MessageRole::System),
+        ("tool", MessageRole::Tool),
+        ("other", MessageRole::Other("other".to_string())),
+    ];
+    roles.into_iter().find_map(|(label, role)| {
+        let prefix = format!("[{IMPORT_LABEL_PREFIX}{label}]\n\n");
+        text.strip_prefix(&prefix)
+            .map(|content| (role, content.to_string()))
+    })
+}
+
+fn is_import_session_key(key: &str) -> bool {
+    key.strip_prefix(IMPORT_SESSION_PREFIX)
+        .is_some_and(|suffix| {
+            suffix.len() == 32
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
 impl Provider for OpenClaw {
     fn name(&self) -> &str {
         "OpenClaw"
@@ -966,8 +1298,9 @@ impl Provider for OpenClaw {
         // The state directory existing is enough to call OpenClaw installed:
         // the per-agent sessions directory is only created once a session runs.
         let state_exists = state.is_dir();
-        let installed = !dirs.is_empty() || state_exists;
-        let evidence = if !dirs.is_empty() {
+        let binary = Self::binary_path().ok();
+        let installed = !dirs.is_empty() || state_exists || binary.is_some();
+        let mut evidence = if !dirs.is_empty() {
             dirs.iter()
                 .map(|dir| format!("sessions directory found: {}", dir.display()))
                 .collect()
@@ -979,6 +1312,9 @@ impl Provider for OpenClaw {
         } else {
             vec![]
         };
+        if let Some(binary) = binary {
+            evidence.push(format!("official CLI found: {}", binary.display()));
+        }
         trace!(provider = "openclaw", ?evidence, installed, "detection");
         DetectionResult {
             installed,
@@ -1064,6 +1400,12 @@ impl Provider for OpenClaw {
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
         debug!(path = %path.display(), "reading OpenClaw session");
 
+        if let Some((session_key, gateway_session_id)) = Self::parse_gateway_locator(path) {
+            let binary =
+                Self::binary_path().map_err(|_| anyhow::anyhow!("{OPENCLAW_CLI_REQUIRED}"))?;
+            return Self::read_gateway_session(&binary, path, &session_key, &gateway_session_id);
+        }
+
         let transcript = read_transcript(path)?;
 
         let session_id = path
@@ -1119,14 +1461,146 @@ impl Provider for OpenClaw {
 
     fn write_session(
         &self,
-        _session: &CanonicalSession,
+        session: &CanonicalSession,
         _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        Err(anyhow::anyhow!(OPENCLAW_WRITE_REFUSAL))
+        if session
+            .messages
+            .iter()
+            .any(|message| message.content.is_empty())
+        {
+            anyhow::bail!(
+                "OpenClaw chat.inject rejects empty messages; no provider state was created"
+            );
+        }
+
+        let binary = Self::binary_path().map_err(|_| anyhow::anyhow!("{OPENCLAW_CLI_REQUIRED}"))?;
+        let session_key = Self::generated_session_key();
+        let mut create = serde_json::json!({
+            "key": session_key,
+            "agentId": DEFAULT_AGENT_ID,
+        });
+        if let Some(title) = session
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+        {
+            create["label"] = serde_json::Value::String(truncate_title(title.trim(), 100));
+        }
+
+        let created = match Self::gateway_call(&binary, "sessions.create", &create) {
+            Ok(created) => created,
+            Err(create_error) => {
+                let cleanup = Self::delete_gateway_session(&binary, &session_key, None);
+                return Err(match cleanup {
+                    Ok(()) => anyhow::anyhow!(
+                        "OpenClaw session creation failed: {create_error:#}; rollback succeeded"
+                    ),
+                    Err(cleanup_error) => anyhow::anyhow!(
+                        "OpenClaw session creation failed: {create_error:#}; rollback could not be \
+                         confirmed: {cleanup_error:#}"
+                    ),
+                });
+            }
+        };
+        let identity = created
+            .get("key")
+            .and_then(serde_json::Value::as_str)
+            .zip(created.get("sessionId").and_then(serde_json::Value::as_str));
+        let Some((returned_key, gateway_session_id)) = identity else {
+            let error =
+                anyhow::anyhow!("OpenClaw sessions.create reply has no complete session identity");
+            return Err(
+                match Self::delete_gateway_session(&binary, &session_key, None) {
+                    Ok(()) => anyhow::anyhow!("{error:#}; rollback succeeded"),
+                    Err(cleanup_error) => anyhow::anyhow!(
+                        "{error:#}; rollback could not be confirmed: {cleanup_error:#}"
+                    ),
+                },
+            );
+        };
+        let gateway_session_id = gateway_session_id.to_string();
+        if returned_key != session_key || !is_uuid(&gateway_session_id) {
+            let error =
+                anyhow::anyhow!("OpenClaw sessions.create returned an unexpected session identity");
+            return Err(
+                match Self::delete_gateway_session(&binary, &session_key, None) {
+                    Ok(()) => anyhow::anyhow!("{error:#}; rollback succeeded"),
+                    Err(cleanup_error) => anyhow::anyhow!(
+                        "{error:#}; rollback could not be confirmed: {cleanup_error:#}"
+                    ),
+                },
+            );
+        }
+
+        let imported = (|| -> anyhow::Result<()> {
+            for message in &session.messages {
+                Self::gateway_call(
+                    &binary,
+                    "chat.inject",
+                    &serde_json::json!({
+                        "sessionKey": session_key,
+                        "message": message.content,
+                        "label": import_role_label(&message.role),
+                    }),
+                )
+                .with_context(|| format!("failed to inject message {}", message.idx))?;
+            }
+
+            let state_dir = Self::absolute_state_dir()?;
+            let locator = Self::gateway_locator_path(&state_dir, &session_key, &gateway_session_id);
+            let readback =
+                Self::read_gateway_session(&binary, &locator, &session_key, &gateway_session_id)
+                    .context("official OpenClaw read-back failed")?;
+            Self::verify_import(session, &readback)
+                .context("official OpenClaw read-back changed the imported history")
+        })();
+        if let Err(import_error) = imported {
+            return Err(
+                match Self::delete_gateway_session(&binary, &session_key, Some(&gateway_session_id))
+                {
+                    Ok(()) => anyhow::anyhow!(
+                        "OpenClaw import failed: {import_error:#}; rollback succeeded"
+                    ),
+                    Err(cleanup_error) => anyhow::anyhow!(
+                        "OpenClaw import failed: {import_error:#}; rollback failed: {cleanup_error:#}"
+                    ),
+                },
+            );
+        }
+
+        let state_dir = Self::absolute_state_dir()?;
+        let locator = Self::gateway_locator_path(&state_dir, &session_key, &gateway_session_id);
+        Ok(WrittenSession {
+            paths: vec![locator],
+            session_id: session_key.clone(),
+            resume_command: Self::resume_spec(&session_key).display(),
+            backups: Vec::new(),
+            warnings: vec![LOSSY_IMPORT_WARNING.to_string()],
+        })
+    }
+
+    fn rollback_write(&self, written: &WrittenSession) -> anyhow::Result<()> {
+        let locator = written
+            .paths
+            .first()
+            .context("OpenClaw rollback has no virtual session locator")?;
+        let (session_key, gateway_session_id) = Self::parse_gateway_locator(locator)
+            .context("OpenClaw rollback received an invalid virtual session locator")?;
+        if session_key != written.session_id {
+            anyhow::bail!(
+                "OpenClaw rollback locator names {session_key}, but the write names {}",
+                written.session_id
+            );
+        }
+        let binary = Self::binary_path()?;
+        Self::delete_gateway_session(&binary, &session_key, Some(&gateway_session_id))
     }
 
     fn write_refusal(&self) -> Option<&'static str> {
-        Some(OPENCLAW_WRITE_REFUSAL)
+        Self::binary_path()
+            .is_err()
+            .then_some(OPENCLAW_CLI_REQUIRED)
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -1149,9 +1623,9 @@ impl Provider for OpenClaw {
 
 /// Render a candidate OpenClaw transcript for parser-fidelity tests.
 ///
-/// This is deliberately not a supported import path. OpenClaw's resume index
-/// is shared gateway state without a cross-process file lock, so casr refuses
-/// target writes until it can use the authenticated gateway lifecycle.
+/// This is deliberately not the import path. Target writes use the
+/// authenticated Gateway lifecycle above and never install this candidate
+/// directly into OpenClaw's shared store.
 ///
 /// The reader's defects had writer twins, and both are fixed here:
 ///
@@ -1981,6 +2455,11 @@ mod tests {
         assert_eq!(provider.name(), "OpenClaw");
         assert_eq!(provider.slug(), "openclaw");
         assert_eq!(provider.cli_alias(), "ocl");
-        assert_eq!(provider.write_refusal(), Some(OPENCLAW_WRITE_REFUSAL));
+        assert_eq!(
+            provider.write_refusal(),
+            OpenClaw::binary_path()
+                .is_err()
+                .then_some(OPENCLAW_CLI_REQUIRED)
+        );
     }
 }

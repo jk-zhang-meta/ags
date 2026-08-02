@@ -10,9 +10,58 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 > Commits on `main` since the v0.1.1 tag (`be1ce19`, 2026-03-03). No GitHub Release yet.
 
+### AGS Runtime
+
+- **Mandatory managed terminals**: `ags`, `ags claude`, `ags codex`, and
+  checkpoint resume now use a private RMUX server for detachable live PTYs.
+  Agent argv and environment overrides cross RMUX only in the structured
+  requesting-client payload, never in RMUX's process-list-visible command
+  vector.
+  The installer provisions the verified official RMUX 0.9.1
+  client/daemon/helper layout with crash-recoverable activation, preserves a
+  complete compatible stable 0.9.x installation, and never signals an existing
+  daemon.
+- **Unified checkpoint storage**: local, named Git/GitHub, and
+  SFTP/Neburst modes now have MRU selection, pre-launch reconciliation,
+  automatic save/delete synchronization with durable retry, reversible
+  content-verified merge redirects, and recoverable Git/SFTP retirement.
+  Retry synchronization and acknowledgement are one serialized transaction, so
+  a concurrent failed update cannot lose its replacement retry. Legacy cloud
+  deletion is exact-record and interruption safe: a published tombstone can
+  resume cleanup without deleting a newer checkpoint that reused the same
+  logical ID, and the active encrypted archive remains selectable until every
+  optional sidecar has moved to recoverable trash.
+  Legacy Neburst cloud archives are imported into the unified content revision;
+  password transports use encrypted generation files, obscured rclone
+  environment values, and inherited SSH file descriptors.
+- **Mandatory Context Mode integration**: the installer now provisions the
+  newest AGS-compatible stable `context-mode` release from npm's official
+  `latest` channel. Candidates are exact-version/integrity checked, staged
+  without lifecycle scripts, health-tested, and atomically activated; a failed
+  update restores the previous provider bindings and last-good runtime.
+  `ags init` converges official Claude/Codex plugin registrations, and every
+  managed Agent launch fails closed if the plugin or Codex hooks feature is unavailable. Online
+  initialization runs upstream `doctor`; offline initialization proves a
+  persistent SQLite/FTS round trip with public `index`/`search` commands.
+  npm integrity is supplemented by a SHA-256 manifest over the complete
+  runtime package tree and exact Agent plugin-cache comparisons. Runtimes are keyed by
+  platform, architecture, and Node native ABI, so ABI changes are rebuilt
+  online without weakening offline validation. Claude launches additionally
+  prove the effective hook, MCP, tool, and plugin state in a short-lived real
+  process and reject session-only plugin/tool overrides. Installer and
+  initialization transactions use durable recovery journals and roll back
+  AGS-owned changes or the prior binary after interruption. Codex
+  launches additionally require all six exact Context hooks to report trusted
+  through the official app-server API; `ags context review-codex` opens the
+  official review UI, and AGS never bypasses or synthesizes trust.
+
 ### New Providers
 
-- **Grok Build (read-only)**: new `grok` provider (alias `grk`) for xAI's official `grok` CLI ([#19](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/19)). Reads the ACP session-update stream (`updates.jsonl`) plus `summary.json` metadata under `$GROK_HOME/sessions/<percent-encoded-cwd>/<session-uuid>/`, coalescing streamed message/thought chunks and merging `tool_call`/`tool_call_update` events; unknown update kinds are skipped tolerantly. `write_session` returns an explanatory error (Antigravity-style read/resume-only) pending round-trip verification against a live `grok --resume <session-id>`.
+- **Grok Build (initially read-only)**: new `grok` provider (alias `grk`) for xAI's official `grok` CLI ([#19](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/19)). Reads the ACP session-update stream (`updates.jsonl`) plus `summary.json` metadata under `$GROK_HOME/sessions/<percent-encoded-cwd>/<session-uuid>/`, coalescing streamed message/thought chunks and merging `tool_call`/`tool_call_update` events; unknown update kinds are skipped tolerantly. The provider initially returned an explanatory error for target writes pending round-trip verification against a live `grok --resume <session-id>`.
+
+### Provider Write Support
+
+- **Antigravity**: target writes now use Google's official `google-antigravity>=0.1.9` SDK to create and reopen a native SQLite trajectory before handoff to `agy`. The import preserves complete user/model turns, visibly labels/coalesces roles the public SDK cannot inject directly, refuses unanswered trailing user turns, and rolls back failed imports.
 
 ### Structured Responses and Workspace Enrichment
 

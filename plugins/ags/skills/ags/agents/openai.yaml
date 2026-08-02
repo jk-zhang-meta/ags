@@ -1,0 +1,6 @@
+interface:
+  display_name: "AGS"
+  short_description: "Manage encrypted agent session checkpoints"
+  default_prompt: "Use $ags to list saved checkpoints."
+policy:
+  allow_implicit_invocation: false

@@ -1,10 +1,8 @@
-//! OpenClaw's target safety boundary and native-reader fidelity.
+//! OpenClaw's conditional Gateway target and native-reader fidelity.
 //!
-//! OpenClaw serializes session-index updates only inside its gateway process.
-//! A second process directly replacing `sessions.json` can lose an active
-//! gateway update, so casr remains a source/resume provider and refuses target
-//! imports until it can use the authenticated gateway lifecycle. Native
-//! transcript fixtures still pin tree-walk behavior in the reader.
+//! Target writes require the official CLI and authenticated Gateway lifecycle;
+//! direct transcript/index mutation remains forbidden. Native transcript
+//! fixtures still pin tree-walk behavior in the reader.
 
 mod test_env;
 
@@ -72,11 +70,12 @@ fn session_with(messages: Vec<CanonicalMessage>, model_name: Option<&str>) -> Ca
 }
 
 #[test]
-fn provider_refuses_normal_and_force_imports_without_creating_state() {
+fn provider_refuses_without_official_cli_or_creating_state() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let state_dir = tmp.path().join("openclaw-state");
     let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
     let session = session_with(
         vec![message(0, MessageRole::User, "Keep the live index intact")],
         None,
@@ -85,9 +84,9 @@ fn provider_refuses_normal_and_force_imports_without_creating_state() {
     for force in [false, true] {
         let error = OpenClaw
             .write_session(&session, &WriteOptions { force })
-            .expect_err("direct OpenClaw target writes must refuse");
+            .expect_err("OpenClaw target writes require the official CLI");
         assert!(
-            error.to_string().contains("gateway"),
+            error.to_string().contains("official `openclaw` CLI"),
             "unexpected refusal: {error:#}"
         );
     }
@@ -98,7 +97,7 @@ fn provider_refuses_normal_and_force_imports_without_creating_state() {
 }
 
 #[test]
-fn cli_refuses_imports_before_writing_a_transcript_or_index() {
+fn cli_refuses_without_official_openclaw_before_writing_state() {
     let tmp = tempfile::tempdir().unwrap();
     let clawdbot = tmp.path().join("clawdbot");
     std::fs::create_dir_all(&clawdbot).unwrap();
@@ -130,6 +129,7 @@ fn cli_refuses_imports_before_writing_a_transcript_or_index() {
             .args(args)
             .env("CLAWDBOT_HOME", &clawdbot)
             .env("OPENCLAW_STATE_DIR", &state_dir)
+            .env("OPENCLAW_BIN", tmp.path().join("missing-openclaw"))
             .env("XDG_DATA_HOME", tmp.path().join("xdg-data"))
             .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
             .env("NO_COLOR", "1")
@@ -137,7 +137,7 @@ fn cli_refuses_imports_before_writing_a_transcript_or_index() {
             .expect("casr should run");
         assert!(!output.status.success(), "OpenClaw target must refuse");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("gateway"),
+            String::from_utf8_lossy(&output.stderr).contains("official `openclaw` CLI"),
             "unexpected refusal: {}",
             String::from_utf8_lossy(&output.stderr)
         );

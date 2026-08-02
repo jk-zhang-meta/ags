@@ -729,18 +729,7 @@ impl Codex {
         preview: &str,
         now: &chrono::DateTime<chrono::Utc>,
     ) -> Vec<String> {
-        let Some(db_path) = Self::latest_state_db() else {
-            debug!("no Codex state_*.sqlite found; skipping thread registration");
-            return vec![format!(
-                "Codex thread index (~/.codex/state_*.sqlite) not found, so \
-                 `codex resume {session_id}` may not discover this session. \
-                 The rollout file was written to {}.",
-                rollout_path.display()
-            )];
-        };
-
-        match register_thread_in_db(
-            &db_path,
+        match register_thread_required(
             session_id,
             rollout_path,
             cwd,
@@ -748,23 +737,122 @@ impl Codex {
             first_user_message,
             preview,
             now,
+            None,
         ) {
             Ok(()) => {
-                debug!(db = %db_path.display(), session_id, "registered Codex thread");
+                debug!(session_id, "registered Codex thread");
                 Vec::new()
             }
             Err(e) => {
-                warn!(db = %db_path.display(), error = %e, "failed to register Codex thread");
+                warn!(error = %e, "failed to register Codex thread");
                 vec![format!(
                     "Could not register the session in the Codex thread index \
-                     ({db}): {e}. `codex resume {session_id}` may report \
+                     ({e}). `codex resume {session_id}` may report \
                      \"No saved session found\"; the rollout file is at {path}.",
-                    db = db_path.display(),
                     path = rollout_path.display(),
                 )]
             }
         }
     }
+}
+
+/// Register a checkpoint-restored rollout in the live Codex thread index.
+///
+/// Unlike the normal conversion path, failure is fatal: AGS calls this before
+/// completing its restore transaction and rolls the new rollout back.
+pub fn register_restored_thread(
+    session_id: &str,
+    rollout_path: &Path,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    let sessions_dir =
+        Codex::sessions_dir().ok_or_else(|| anyhow::anyhow!("cannot determine Codex home"))?;
+    let sessions_dir = sessions_dir
+        .canonicalize()
+        .with_context(|| format!("resolve Codex sessions root {}", sessions_dir.display()))?;
+    let rollout_path = rollout_path
+        .canonicalize()
+        .with_context(|| format!("resolve restored rollout {}", rollout_path.display()))?;
+    anyhow::ensure!(
+        rollout_path.starts_with(&sessions_dir),
+        "restored rollout is outside the Codex sessions root"
+    );
+
+    let session = <Codex as Provider>::read_session(&Codex, &rollout_path)?;
+    anyhow::ensure!(
+        session.session_id == session_id,
+        "restored rollout identity does not match {session_id}"
+    );
+    let first_user = session
+        .messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .map(|message| message.content.as_str())
+        .unwrap_or("");
+    let title = session
+        .title
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| {
+            let title = truncate_title(first_user, 100);
+            if title.is_empty() {
+                "Restored checkpoint (via agsx)".to_string()
+            } else {
+                title
+            }
+        });
+    let preview = if first_user.trim().is_empty() {
+        title.as_str()
+    } else {
+        first_user
+    };
+    let model_provider = session_meta_payload(&rollout_path)
+        .and_then(|payload| {
+            payload
+                .get("model_provider")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .ok_or_else(|| anyhow::anyhow!("restored rollout has no model_provider"))?;
+
+    register_thread_required(
+        session_id,
+        &rollout_path,
+        &cwd.to_string_lossy(),
+        &title,
+        first_user,
+        preview,
+        &chrono::Utc::now(),
+        Some(&model_provider),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the Codex thread row fields passed to the schema-aware writer"
+)]
+fn register_thread_required(
+    session_id: &str,
+    rollout_path: &Path,
+    cwd: &str,
+    title: &str,
+    first_user_message: &str,
+    preview: &str,
+    now: &chrono::DateTime<chrono::Utc>,
+    model_provider: Option<&str>,
+) -> anyhow::Result<()> {
+    let db_path = Codex::latest_state_db()
+        .ok_or_else(|| anyhow::anyhow!("Codex thread index (~/.codex/state_*.sqlite) not found"))?;
+    register_thread_in_db(
+        &db_path,
+        session_id,
+        rollout_path,
+        cwd,
+        title,
+        first_user_message,
+        preview,
+        now,
+        model_provider,
+    )
 }
 
 /// Parse the schema version from a Codex state DB filename.
@@ -918,6 +1006,7 @@ fn register_thread_in_db(
     first_user_message: &str,
     preview: &str,
     now: &chrono::DateTime<chrono::Utc>,
+    model_provider: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut conn = Connection::open_with_flags(
         db_path,
@@ -931,7 +1020,10 @@ fn register_thread_in_db(
         anyhow::bail!("`threads` table is absent (unrecognized Codex schema)");
     }
 
-    let env = read_env_template(&conn, &cols);
+    let mut env = read_env_template(&conn, &cols);
+    if let Some(model_provider) = model_provider {
+        env.model_provider = model_provider.to_string();
+    }
 
     // Absolute rollout path (Codex resolves the rollout by this exact value).
     let abs = if rollout_path.is_absolute() {

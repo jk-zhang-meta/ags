@@ -1,7 +1,7 @@
-//! Aider provider — reads/writes Markdown chat history sessions.
+//! Aider provider — reads Markdown chat history sessions.
 //!
 //! Session files: `.aider.chat.history.md` (per-project, in the git repo root)
-//! Resume command: `aider --restore-chat-history`
+//! Resume command: `aider --chat-history-file <path> --restore-chat-history`
 //!
 //! ## Markdown format
 //!
@@ -15,7 +15,8 @@
 //! ## Session ID scheme
 //!
 //! Aider has no native session IDs. casr derives a deterministic ID from the
-//! session start timestamp: `YYYY-MM-DDThh-mm-ss`.
+//! session start timestamp: `YYYY-MM-DDThh-mm-ss`. Histories written by casr
+//! carry an ignored metadata comment with a unique `agsx-<uuid>` ID.
 //!
 //! ## Multi-session files
 //!
@@ -42,18 +43,29 @@
 //! [`Aider::find_history_files`] reproduces that rule instead of approximating
 //! it, so running casr from anywhere inside a repository finds the same file
 //! aider would append to.
+//!
+//! ## Writing
+//!
+//! casr never appends to Aider's shared history. Each conversion gets a
+//! dedicated `.aider.chat.history.agsx-<uuid>.md`, and the launch specification
+//! passes that exact path through `--chat-history-file` together with
+//! `--restore-chat-history`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 use walkdir::WalkDir;
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, reindex_messages, truncate_title,
 };
-use crate::providers::{Provider, SessionListing, WriteOptions, WrittenSession};
+use crate::providers::{
+    Provider, SessionListing, UnreadableSource, WriteOptions, WrittenSession, read_dir_reporting,
+    walk_entry_reporting,
+};
 
 /// Aider provider implementation.
 pub struct Aider;
@@ -61,6 +73,10 @@ pub struct Aider;
 /// The fixed basename aider gives its Markdown chat history
 /// (`aider/args.py:274-287`).
 const HISTORY_FILE_NAME: &str = ".aider.chat.history.md";
+const GENERATED_HISTORY_PREFIX: &str = ".aider.chat.history.agsx-";
+const SESSION_ID_PREFIX: &str = "# agsx-convert session id: ";
+const WORKSPACE_PREFIX: &str = "# agsx-convert workspace: ";
+const MESSAGE_BOUNDARY: &str = "agsx-convert message boundary";
 
 /// Represents a single parsed session within an Aider history file.
 struct ParsedSession {
@@ -96,17 +112,46 @@ impl Aider {
     /// *git work-tree root*, found by walking parents, and falls back to the
     /// working directory only when there is no repository at all.
     fn find_history_files() -> Vec<PathBuf> {
-        Self::history_files_from(std::env::current_dir().ok().as_deref())
+        let mut unreadable = Vec::new();
+        Self::history_files_from(
+            std::env::current_dir().ok().as_deref(),
+            &mut unreadable,
+        )
+    }
+
+    fn is_history_file_name(name: &str) -> bool {
+        name == HISTORY_FILE_NAME
+            || (name.starts_with(GENERATED_HISTORY_PREFIX) && name.ends_with(".md"))
+    }
+
+    fn add_history_files_in(
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+        unreadable: &mut Vec<UnreadableSource>,
+    ) {
+        for entry in read_dir_reporting(dir, unreadable) {
+            let path = entry.path();
+            let is_history = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(Self::is_history_file_name);
+            if path.is_file() && is_history && !files.contains(&path) {
+                files.push(path);
+            }
+        }
     }
 
     /// [`Self::find_history_files`] with the working directory injected, so the
     /// git-root walk is testable without mutating process-global state.
-    fn history_files_from(cwd: Option<&Path>) -> Vec<PathBuf> {
+    fn history_files_from(
+        cwd: Option<&Path>,
+        unreadable: &mut Vec<UnreadableSource>,
+    ) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = Vec::new();
 
         // 1. casr's own override: scan the tree it points at.
         if let Some(home) = Self::home_dir() {
-            Self::scan_for_history_files(&home, &mut files, 4);
+            Self::scan_for_history_files(&home, &mut files, unreadable, 4);
         }
 
         // 2. Aider's own override, which names the file outright.
@@ -123,10 +168,7 @@ impl Aider {
         if let Some(cwd) = cwd {
             let git_root = crate::discovery::find_git_root(cwd);
             for dir in git_root.as_deref().into_iter().chain(std::iter::once(cwd)) {
-                let candidate = dir.join(HISTORY_FILE_NAME);
-                if candidate.is_file() && !files.contains(&candidate) {
-                    files.push(candidate);
-                }
+                Self::add_history_files_in(dir, &mut files, unreadable);
             }
         }
 
@@ -134,16 +176,38 @@ impl Aider {
     }
 
     /// Walk a directory for `.aider.chat.history.md` files.
-    fn scan_for_history_files(dir: &Path, files: &mut Vec<PathBuf>, max_depth: usize) {
-        if !dir.is_dir() {
-            return;
+    fn scan_for_history_files(
+        dir: &Path,
+        files: &mut Vec<PathBuf>,
+        unreadable: &mut Vec<UnreadableSource>,
+        max_depth: usize,
+    ) {
+        match std::fs::metadata(dir) {
+            Ok(metadata) if !metadata.is_dir() => {
+                unreadable.push(UnreadableSource {
+                    path: dir.to_path_buf(),
+                    error: "expected a directory, found a non-directory path".to_string(),
+                });
+                return;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                unreadable.push(UnreadableSource {
+                    path: dir.to_path_buf(),
+                    error: error.to_string(),
+                });
+                return;
+            }
         }
-        for entry in WalkDir::new(dir)
-            .max_depth(max_depth)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if entry.file_name().to_str() == Some(HISTORY_FILE_NAME)
+        for entry in WalkDir::new(dir).max_depth(max_depth) {
+            let Some(entry) = walk_entry_reporting(entry, unreadable) else {
+                continue;
+            };
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(Self::is_history_file_name)
                 && entry.path().is_file()
                 && !files.contains(&entry.path().to_path_buf())
             {
@@ -167,11 +231,11 @@ impl Aider {
         let parent = path.parent()?;
         let filename = path.file_name()?.to_str()?;
 
-        // If the parent path ends with `.aider.chat.history.md`, it's a virtual path.
+        // If the parent is an Aider history file, this is a virtual path.
         if parent
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(HISTORY_FILE_NAME))
+            .is_some_and(Self::is_history_file_name)
         {
             let decoded = urlencoding::decode(filename).ok()?;
             return Some((parent.to_path_buf(), decoded.into_owned()));
@@ -200,6 +264,13 @@ impl Aider {
                 current_timestamp = ts.clone();
                 current_id = timestamp_to_session_id(&ts);
                 current_text = format!("{line}\n");
+            } else if let Some(session_id) = line.strip_prefix(SESSION_ID_PREFIX)
+                && !current_id.is_empty()
+                && !session_id.trim().is_empty()
+            {
+                current_id = session_id.trim().to_string();
+                current_text.push_str(line);
+                current_text.push('\n');
             } else {
                 current_text.push_str(line);
                 current_text.push('\n');
@@ -295,6 +366,15 @@ impl Aider {
         };
 
         for line in session.text.lines() {
+            if let Some(encoded) = line.strip_prefix(WORKSPACE_PREFIX) {
+                if workspace.is_none()
+                    && let Ok(value) = serde_json::from_str::<String>(encoded)
+                {
+                    workspace = Some(PathBuf::from(value));
+                }
+                continue;
+            }
+
             // Skip the session header.
             if line.starts_with("# ") {
                 continue;
@@ -307,6 +387,10 @@ impl Aider {
                 flush_user(&mut user_lines, &mut messages);
 
                 let stripped = rest.trim_end().trim_end_matches("  ");
+                if stripped == MESSAGE_BOUNDARY {
+                    flush_tool(&mut tool_lines, &mut messages);
+                    continue;
+                }
                 let parsed_model = extract_model_from_tool_line(stripped);
                 let parsed_workspace = extract_workspace_from_tool_line(stripped);
                 let is_metadata_only_line = parsed_model.is_some() || parsed_workspace.is_some();
@@ -399,6 +483,155 @@ impl Aider {
             model_name,
         })
     }
+
+    fn write_root() -> anyhow::Result<PathBuf> {
+        if let Some(home) = Self::home_dir() {
+            return Ok(home);
+        }
+        if let Ok(history) = std::env::var("AIDER_CHAT_HISTORY_FILE")
+            && !history.trim().is_empty()
+        {
+            return PathBuf::from(history)
+                .parent()
+                .map(Path::to_path_buf)
+                .context("AIDER_CHAT_HISTORY_FILE has no parent directory");
+        }
+
+        let cwd = std::env::current_dir().context("could not determine Aider write directory")?;
+        Ok(crate::discovery::find_git_root(&cwd).unwrap_or(cwd))
+    }
+
+    fn message_text(message: &CanonicalMessage) -> String {
+        let mut text = message.content.clone();
+        let mut append = |block: String| {
+            if text.contains(&block) {
+                return;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&block);
+        };
+        for call in &message.tool_calls {
+            append(format!("[Tool: {}]", call.name));
+        }
+        for result in &message.tool_results {
+            if !result.content.trim().is_empty() && message.content == result.content {
+                continue;
+            }
+            append(if result.is_error {
+                format!("[Tool Error] {}", result.content)
+            } else {
+                format!("[Tool Output] {}", result.content)
+            });
+        }
+        text
+    }
+
+    fn render_history(
+        session: &CanonicalSession,
+        session_id: &str,
+        workspace: &Path,
+    ) -> anyhow::Result<String> {
+        let started = session
+            .started_at
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|time| time.with_timezone(&chrono::Local))
+            .unwrap_or_else(chrono::Local::now)
+            .format("%Y-%m-%d %H:%M:%S");
+        let workspace_json =
+            serde_json::to_string(&workspace.display().to_string()).expect("string is valid JSON");
+        let mut out = format!(
+            "# aider chat started at {started}\n{SESSION_ID_PREFIX}{session_id}\n\
+             {WORKSPACE_PREFIX}{workspace_json}\n"
+        );
+        let mut previous_user: Option<bool> = None;
+
+        for (index, message) in session.messages.iter().enumerate() {
+            let text = Self::message_text(message);
+            if text.is_empty() {
+                anyhow::bail!(
+                    "Aider cannot restore empty message {index}; refusing to write a session that \
+                     would change its message count"
+                );
+            }
+            if text.trim() != text {
+                anyhow::bail!(
+                    "Aider cannot round-trip leading or trailing whitespace in message {index}; \
+                     refusing instead of silently changing its content"
+                );
+            }
+
+            let as_user = message.role != MessageRole::Assistant;
+            if previous_user == Some(as_user) {
+                // Aider's official splitter discards tool/block-quote messages
+                // during restore. This line therefore flushes the previous
+                // same-role message without adding a model-visible turn.
+                out.push_str("> ");
+                out.push_str(MESSAGE_BOUNDARY);
+                out.push('\n');
+            }
+
+            if as_user {
+                for line in text.split('\n') {
+                    out.push_str("#### ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            } else {
+                if let Some(line) = text.lines().find(|line| {
+                    line.starts_with("# ")
+                        || line.starts_with("#### ")
+                        || line.starts_with("> ")
+                }) {
+                    anyhow::bail!(
+                        "Aider's official history parser treats assistant line {line:?} as \
+                         metadata, user text, or tool output; refusing message {index} because no \
+                         native lossless representation exists"
+                    );
+                }
+                out.push_str(&text);
+                out.push('\n');
+            }
+            previous_user = Some(as_user);
+        }
+
+        Ok(out)
+    }
+
+    fn resume_spec_for_path(
+        session_id: &str,
+        history_path: &Path,
+        workspace: &Path,
+    ) -> LaunchSpec {
+        LaunchSpec::new(
+            "aider",
+            [
+                "--chat-history-file".to_string(),
+                history_path.display().to_string(),
+                "--restore-chat-history".to_string(),
+            ],
+        )
+        .in_dir(workspace)
+        .targeting_session(session_id)
+    }
+
+    fn located_resume_spec(session_id: &str) -> Option<LaunchSpec> {
+        let provider = Self;
+        let locator = provider.owns_session(session_id)?;
+        let (history_path, _) = Self::parse_virtual_path(&locator)?;
+        let workspace = provider
+            .read_session(&locator)
+            .ok()
+            .and_then(|session| session.workspace)
+            .filter(|path| path.is_dir())
+            .or_else(|| history_path.parent().map(Path::to_path_buf))?;
+        Some(Self::resume_spec_for_path(
+            session_id,
+            &history_path,
+            &workspace,
+        ))
+    }
 }
 
 impl Provider for Aider {
@@ -456,25 +689,21 @@ impl Provider for Aider {
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         for history_file in Self::find_history_files() {
-            let file = match std::fs::File::open(&history_file) {
-                Ok(f) => f,
-                Err(_) => continue,
+            let Ok(content) = std::fs::read_to_string(&history_file) else {
+                continue;
             };
-            let reader = std::io::BufReader::new(file);
-            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-                if let Some(ts) = parse_session_header(&line) {
-                    let id = timestamp_to_session_id(&ts);
-                    if id == session_id {
-                        let virtual_path = Self::virtual_session_path(&history_file, session_id);
-                        debug!(
-                            history_file = %history_file.display(),
-                            session_path = %virtual_path.display(),
-                            session_id,
-                            "found Aider session"
-                        );
-                        return Some(virtual_path);
-                    }
-                }
+            if Self::split_sessions(&content)
+                .iter()
+                .any(|session| session.session_id == session_id)
+            {
+                let virtual_path = Self::virtual_session_path(&history_file, session_id);
+                debug!(
+                    history_file = %history_file.display(),
+                    session_path = %virtual_path.display(),
+                    session_id,
+                    "found Aider session"
+                );
+                return Some(virtual_path);
             }
         }
         None
@@ -528,134 +757,89 @@ impl Provider for Aider {
     fn write_session(
         &self,
         session: &CanonicalSession,
-        _opts: &WriteOptions,
+        opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let target_session_id = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S").to_string();
-        let now = chrono::Utc::now();
-        let now_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
-
-        // Determine target path. `AIDER_HOME` is casr's own explicit "write
-        // here" override and is used verbatim. The fallbacks go through the
-        // same git-root rule as discovery, because a history file written into
-        // a subdirectory of a repository is one aider will never read.
-        let target_dir = if let Some(home) = Self::home_dir() {
-            home
-        } else {
-            let dir = session
-                .workspace
-                .clone()
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
-            crate::discovery::find_git_root(&dir).unwrap_or(dir)
-        };
-
-        let target_path = target_dir.join(HISTORY_FILE_NAME);
+        let root = Self::write_root()?;
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("failed to create Aider history directory {}", root.display()))?;
+        let session_id = format!("agsx-{}", uuid::Uuid::new_v4().simple());
+        let target_path = root.join(format!(".aider.chat.history.{session_id}.md"));
+        let workspace = session
+            .workspace
+            .as_deref()
+            .filter(|path| path.is_dir())
+            .unwrap_or(&root);
+        let content = Self::render_history(session, &session_id, workspace)?;
+        let outcome = crate::pipeline::atomic_write(
+            &target_path,
+            content.as_bytes(),
+            opts.force,
+            self.slug(),
+        )?;
+        let spec = Self::resume_spec_for_path(&session_id, &outcome.target_path, workspace);
+        let warnings = session.workspace.as_ref().map_or_else(Vec::new, |source| {
+            if source.is_dir() {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "The source workspace {} does not exist; Aider will start in {}.",
+                    source.display(),
+                    workspace.display()
+                )]
+            }
+        });
 
         debug!(
-            target_session_id,
-            target_path = %target_path.display(),
-            "writing Aider session"
-        );
-
-        // Build the Aider Markdown content.
-        let mut output = String::new();
-
-        // If the file exists, preserve its contents.
-        if target_path.exists()
-            && let Ok(existing_content) = std::fs::read_to_string(&target_path)
-        {
-            output.push_str(&existing_content);
-            if !output.ends_with('\n') {
-                output.push('\n');
-            }
-        }
-
-        output.push_str(&format!("\n# aider chat started at {now_str}\n\n"));
-
-        // Add model info as tool output if available.
-        if let Some(ref model) = session.model_name {
-            output.push_str(&format!("> Model: {model}  \n"));
-        }
-
-        // Write messages.
-        for msg in &session.messages {
-            match msg.role {
-                MessageRole::User => {
-                    // Multi-line user messages: each line gets #### prefix.
-                    output.push('\n');
-                    for line in msg.content.lines() {
-                        output.push_str(&format!("#### {line}  \n"));
-                    }
-                }
-                MessageRole::Assistant => {
-                    output.push('\n');
-                    output.push_str(msg.content.trim());
-                    output.push_str("\n\n");
-                }
-                MessageRole::Tool | MessageRole::System | MessageRole::Other(_) => {
-                    // Tool/system output as blockquotes.
-                    for line in msg.content.lines() {
-                        output.push_str(&format!("> {line}  \n"));
-                    }
-                }
-            }
-        }
-
-        let content_bytes = output.into_bytes();
-
-        // Always force the write because Aider appends to a shared history file.
-        // A pre-existing file is the expected state, not a conflict.
-        let outcome =
-            crate::pipeline::atomic_write(&target_path, &content_bytes, true, self.slug())?;
-
-        info!(
-            target_session_id,
+            session_id,
             path = %outcome.target_path.display(),
             messages = session.messages.len(),
-            "Aider session written"
+            "Aider session written through an independent native history file"
         );
-
-        let virtual_path = Self::virtual_session_path(&outcome.target_path, &target_session_id);
-
         Ok(WrittenSession {
-            paths: vec![virtual_path],
-            session_id: target_session_id.clone(),
-            resume_command: self.resume_command(&target_session_id),
+            paths: vec![outcome.target_path.clone()],
+            session_id,
+            resume_command: spec.display(),
             backups: outcome.displaced().into_iter().collect(),
-            warnings: Vec::new(),
+            warnings,
         })
     }
 
-    fn resume_command(&self, _session_id: &str) -> String {
-        "aider --restore-chat-history".to_string()
+    fn resume_command(&self, session_id: &str) -> String {
+        Self::located_resume_spec(session_id).map_or_else(
+            || "aider --restore-chat-history".to_string(),
+            |spec| spec.display(),
+        )
+    }
+
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        Self::located_resume_spec(session_id).or_else(|| {
+            Some(LaunchSpec::new(
+                "aider",
+                ["--restore-chat-history".to_string()],
+            ))
+        })
     }
 
     fn list_sessions(&self) -> Option<SessionListing> {
         let mut listing = SessionListing::default();
-        for history_file in &Self::find_history_files() {
+        let history_files = Self::history_files_from(
+            std::env::current_dir().ok().as_deref(),
+            &mut listing.unreadable,
+        );
+        for history_file in &history_files {
             // `find_history_files` only returns paths that exist, so a failure
             // to open one is a real refusal and not an absent store.
-            let file = match std::fs::File::open(history_file) {
-                Ok(file) => file,
+            let content = match std::fs::read_to_string(history_file) {
+                Ok(content) => content,
                 Err(error) => {
                     listing.cannot_read(history_file, &error);
                     continue;
                 }
             };
-            let reader = std::io::BufReader::new(file);
-            for line in std::io::BufRead::lines(reader) {
-                let line = match line {
-                    Ok(line) => line,
-                    Err(error) => {
-                        listing.cannot_read(history_file, &error);
-                        break;
-                    }
-                };
-                if let Some(ts) = parse_session_header(&line) {
-                    let id = timestamp_to_session_id(&ts);
-                    let virtual_path = Self::virtual_session_path(history_file, &id);
-                    listing.sessions.push((id, virtual_path));
-                }
+            for session in Self::split_sessions(&content) {
+                let virtual_path =
+                    Self::virtual_session_path(history_file, &session.session_id);
+                listing.sessions.push((session.session_id, virtual_path));
             }
         }
 
@@ -666,7 +850,9 @@ impl Provider for Aider {
     /// here is the virtual `<history file>#<session id>` this provider mints,
     /// never a real file of its own.
     fn is_session_path(&self, path: &Path) -> bool {
-        path.extension().and_then(|e| e.to_str()) == Some("md")
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(Self::is_history_file_name)
     }
 }
 
@@ -1188,7 +1374,7 @@ Hi!
         // aider writes at the git work-tree root and finds it from anywhere
         // inside the repo (`aider/main.py:462` → `search_parent_directories`).
         // casr must resolve the same file, not just the one in the CWD.
-        let found = Aider::history_files_from(Some(&nested));
+        let found = Aider::history_files_from(Some(&nested), &mut Vec::new());
         assert!(
             found.contains(&history),
             "expected {} to be discovered from {}, got {found:?}",
@@ -1203,7 +1389,7 @@ Hi!
         let (nested, history) = repo_with_history(tmp.path());
         let repo = nested.parent().unwrap().parent().unwrap();
 
-        let found = Aider::history_files_from(Some(repo));
+        let found = Aider::history_files_from(Some(repo), &mut Vec::new());
         assert!(found.contains(&history), "got {found:?}");
         // The git-root and CWD candidates are the same path here — it must be
         // reported once, not twice.
@@ -1225,7 +1411,7 @@ Hi!
         std::fs::write(&history, "# aider chat started at 2024-08-05 19:33:02\n")
             .expect("write history file");
 
-        let found = Aider::history_files_from(Some(&plain));
+        let found = Aider::history_files_from(Some(&plain), &mut Vec::new());
         assert!(found.contains(&history), "got {found:?}");
     }
 
@@ -1235,11 +1421,26 @@ Hi!
         let empty = tmp.path().join("empty");
         std::fs::create_dir(&empty).expect("create dir");
 
-        let found = Aider::history_files_from(Some(&empty));
+        let found = Aider::history_files_from(Some(&empty), &mut Vec::new());
         assert!(
             !found.iter().any(|p| p.starts_with(&empty)),
             "must not invent a path that does not exist: {found:?}"
         );
+    }
+
+    #[test]
+    fn history_scan_reports_a_non_directory_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("not-a-directory");
+        std::fs::write(&root, b"not a history tree").expect("write root file");
+        let mut files = Vec::new();
+        let mut unreadable = Vec::new();
+
+        Aider::scan_for_history_files(&root, &mut files, &mut unreadable, 4);
+
+        assert!(files.is_empty());
+        assert_eq!(unreadable.len(), 1);
+        assert_eq!(unreadable[0].path, root);
     }
 
     // -----------------------------------------------------------------------
@@ -1310,8 +1511,7 @@ Response three
     }
 
     #[test]
-    fn writer_produces_valid_aider_markdown() {
-        // Test the Markdown generation logic directly by writing to a workspace.
+    fn independent_history_round_trips_without_touching_the_shared_history() {
         let tmp_dir = tempfile::tempdir().unwrap();
         let session = CanonicalSession {
             session_id: "test-123".to_string(),
@@ -1347,22 +1547,22 @@ Response three
             model_name: Some("claude-3".to_string()),
         };
 
-        let provider = Aider;
-        let opts = WriteOptions { force: false };
-        let result = provider
-            .write_session(&session, &opts)
-            .expect("write should succeed");
+        let session_id = "agsx-test-session";
+        let history = Aider::render_history(&session, session_id, tmp_dir.path())
+            .expect("render independent history");
+        let path = tmp_dir
+            .path()
+            .join(format!(".aider.chat.history.{session_id}.md"));
+        std::fs::write(&path, history).expect("write isolated history");
+        let readback = Aider.read_session(&path).expect("read rendered history");
 
-        assert!(!result.session_id.is_empty());
-        assert_eq!(result.resume_command, "aider --restore-chat-history");
-
-        // Read back the written file and verify content.
-        let written_file = tmp_dir.path().join(".aider.chat.history.md");
-        assert!(written_file.exists());
-        let content = std::fs::read_to_string(&written_file).unwrap();
-        assert!(content.contains("# aider chat started at"));
-        assert!(content.contains("#### Fix the bug"));
-        assert!(content.contains("I'll fix it now."));
-        assert!(content.contains("> Model: claude-3"));
+        assert_eq!(readback.session_id, session_id);
+        assert_eq!(readback.messages.len(), 2);
+        assert_eq!(readback.messages[0].content, "Fix the bug");
+        assert_eq!(readback.messages[1].content, "I'll fix it now.");
+        assert!(
+            !tmp_dir.path().join(HISTORY_FILE_NAME).exists(),
+            "the independent writer must not append to Aider's shared history"
+        );
     }
 }

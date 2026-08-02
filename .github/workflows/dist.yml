@@ -1,0 +1,190 @@
+name: dist
+
+# Release pipeline. `install.sh` is the only consumer, and it pins three things
+# about this file that are not free to change:
+#
+#   1. The path. The installer verifies the signing certificate against
+#      COSIGN_IDENTITY_RE, which defaults to
+#        ^https://github.com/<owner>/<repo>/.github/workflows/dist.yml@refs/tags/.*$
+#      Renaming this workflow silently breaks signature verification for every
+#      user who has cosign installed.
+#   2. The trigger. That same identity ends in `@refs/tags/`, so a
+#      workflow_dispatch or branch-push run would sign with an identity the
+#      installer rejects. Tags only, deliberately — there is no manual trigger.
+#   3. The asset names. The installer builds its URLs itself:
+#        casr-<target>.tar.xz              the archive, binary at the root
+#        casr-<target>.tar.xz.sha256       first whitespace field is the hash
+#        casr-<target>.tar.xz.sigstore.json  cosign --bundle (legacy) format
+#
+# See `set_artifact_url`, `verify_sigstore_bundle`, and the checksum block in
+# install.sh.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # create the release and upload assets
+  id-token: write # keyless cosign signing through GitHub OIDC
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The tag names the directory the installer downloads from; the crate version
+  # is what `casr --version` reports afterwards. When they disagree, the
+  # installer compares an installed version against a target that was never
+  # published and reaches the wrong conclusion about whether an update is
+  # needed. Catch it before anything is built or signed.
+  verify-tag:
+    name: Tag matches crate version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag to Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${crate}"
+            exit 1
+          fi
+          echo "tag ${GITHUB_REF_NAME} matches crate version ${crate}"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify-tag
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `rusqlite` is built with the `bundled` feature and `blake3` uses a
+          # build script, so every target needs a C toolchain *for that target*,
+          # not only a Rust one. `cross` supplies it in a container for the musl
+          # targets. The macOS runner already ships both Apple SDKs, so the
+          # x86_64 slice cross-compiles natively with no extra tooling.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        if: matrix.cross
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }} --bin casr
+          else
+            cargo build --release --locked --target ${{ matrix.target }} --bin casr
+          fi
+
+      # The installer looks for the binary at the archive root first, so put it
+      # there. Its later fallbacks exist for hand-made archives.
+      - name: Package
+        run: |
+          set -euo pipefail
+          tar="casr-${{ matrix.target }}.tar.xz"
+          tar -cJf "$tar" -C "target/${{ matrix.target }}/release" casr
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$tar" > "$tar.sha256"
+          else
+            shasum -a 256 "$tar" > "$tar.sha256"
+          fi
+          cat "$tar.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: casr-${{ matrix.target }}
+          path: |
+            casr-${{ matrix.target }}.tar.xz
+            casr-${{ matrix.target }}.tar.xz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Sign and publish
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: sigstore/cosign-installer@v3
+
+      # `--bundle` writes the legacy bundle format, which is what the
+      # installer's `cosign verify-blob --bundle` reads. Do not switch to
+      # `--new-bundle-format` without changing verify_sigstore_bundle.
+      - name: Sign each archive
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/*.tar.xz)
+          if [ ${#archives[@]} -eq 0 ]; then
+            echo "::error::no archives to sign"
+            exit 1
+          fi
+          for tar in "${archives[@]}"; do
+            cosign sign-blob --bundle "${tar}.sigstore.json" "$tar"
+          done
+
+      - name: Re-verify exactly as the installer will
+        run: |
+          set -euo pipefail
+          identity="^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/dist.yml@refs/tags/.*$"
+          for tar in dist/*.tar.xz; do
+            sha256sum -c "${tar}.sha256" 2>/dev/null ||
+              (cd dist && sha256sum -c "$(basename "$tar").sha256")
+            cosign verify-blob \
+              --bundle "${tar}.sigstore.json" \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$tar"
+          done
+          echo "all archives verify under the identity install.sh pins"
+
+      # Not a prerelease, even for a version with a `-suffix`. The installer
+      # resolves the version through /releases/latest, and GitHub excludes
+      # prereleases from that endpoint — a prerelease is invisible to every
+      # installing user, and `resolve_version` now fails closed rather than
+      # guessing past it.
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --latest \
+            dist/*.tar.xz dist/*.tar.xz.sha256 dist/*.tar.xz.sigstore.json

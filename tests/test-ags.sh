@@ -1,0 +1,6692 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/plugins/ags/scripts/ags}"
+project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+test_platform="$(uname -s)"
+test_tmp_root=/tmp
+[[ "$test_platform" != Darwin ]] || test_tmp_root=/private/tmp
+test_utf8_locale=
+for candidate in C.UTF-8 C.utf8 en_US.UTF-8 UTF-8; do
+    if [[ "$(LC_ALL="$candidate" locale charmap 2>/dev/null || true)" =~ ^UTF-?8$ ]]; then
+        test_utf8_locale="$candidate"
+        break
+    fi
+done
+[[ -n "$test_utf8_locale" ]] || {
+    echo 'tests require an installed UTF-8 locale' >&2
+    exit 1
+}
+tmp="$(mktemp -d "$test_tmp_root/agent-session-test.XXXXXX")"
+declare -A test_child_pids=()
+export FAKE_REAL_NODE_BINARY="$(command -v node)"
+export FAKE_REAL_RM_BINARY="$(command -v rm)"
+export FAKE_REAL_MV_BINARY="$(command -v mv)"
+[[ -x "$FAKE_REAL_NODE_BINARY" ]]
+[[ -x "$FAKE_REAL_RM_BINARY" ]]
+[[ -x "$FAKE_REAL_MV_BINARY" ]]
+export FAKE_CONTEXT_RUNTIME_PLATFORM="$(
+    "$FAKE_REAL_NODE_BINARY" -p 'process.platform'
+)"
+export FAKE_CONTEXT_RUNTIME_ARCH="$(
+    "$FAKE_REAL_NODE_BINARY" -p 'process.arch'
+)"
+export FAKE_CONTEXT_RUNTIME_NODE_ABI="$(
+    "$FAKE_REAL_NODE_BINARY" -p 'process.versions.modules'
+)"
+export FAKE_CONTEXT_RUNTIME_TARGET="$FAKE_CONTEXT_RUNTIME_PLATFORM-$FAKE_CONTEXT_RUNTIME_ARCH-node$FAKE_CONTEXT_RUNTIME_NODE_ABI"
+
+if [[ "$test_platform" == Darwin ]]; then
+    brew_prefix="${HOMEBREW_PREFIX:-$(brew --prefix)}"
+    export PATH="$brew_prefix/opt/coreutils/libexec/gnubin:$brew_prefix/opt/findutils/libexec/gnubin:$brew_prefix/opt/gnu-tar/libexec/gnubin:$brew_prefix/bin:$brew_prefix/opt/util-linux/bin:$PATH"
+fi
+
+cc "$project_root/tests/ags-agent-holder.c" -o "$tmp/codex"
+cp -- "$tmp/codex" "$tmp/claude"
+
+cleanup() {
+    local pid
+    for pid in "${!test_child_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${!test_child_pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf -- "$tmp"
+}
+
+stop_test_process() {
+    local pid="$1"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    unset "test_child_pids[$pid]"
+}
+
+test_process_start_time() {
+    local pid="$1" stat
+    local -a fields=()
+    if [[ -r "/proc/$pid/stat" ]]; then
+        IFS= read -r stat < "/proc/$pid/stat"
+        read -ra fields <<< "${stat##*) }"
+        printf '%s\n' "${fields[19]}"
+    else
+        LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" |
+            sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    fi
+}
+
+test_process_name() {
+    local pid="$1" name
+    if [[ -r "/proc/$pid/status" ]]; then
+        sed -n 's/^Name:[[:space:]]*//p' "/proc/$pid/status"
+    else
+        name="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+        name="${name#"${name%%[![:space:]]*}"}"
+        name="${name%"${name##*[![:space:]]}"}"
+        printf '%s\n' "${name##*/}"
+    fi
+}
+
+test_process_running() {
+    local pid="$1" process_status
+    process_status="$(
+        LC_ALL=C ps -o stat= -p "$pid" 2>/dev/null |
+            sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+    )"
+    [[ -n "$process_status" && "$process_status" != Z* ]]
+}
+
+test_fd9_target() {
+    local pid="$1"
+    if [[ -e "/proc/$pid/fd/9" ]]; then
+        readlink -- "/proc/$pid/fd/9"
+    else
+        lsof -a -p "$pid" -d 9 -Fn 2>/dev/null |
+            sed -n 's/^n//p' | head -n 1
+    fi
+}
+
+test_process_has_fd_target() {
+    local pid="$1" expected="$2" fd target
+    if [[ -d "/proc/$pid/fd" ]]; then
+        for fd in "/proc/$pid/fd"/*; do
+            target="$(readlink -- "$fd" 2>/dev/null || true)"
+            [[ "$target" != "$expected" ]] || return 0
+        done
+        return 1
+    fi
+    lsof -a -p "$pid" -Fn 2>/dev/null |
+        sed -n 's/^n//p' |
+        grep -Fqx "$expected"
+}
+
+start_agent_process() {
+    local agent="$1" open_file="${2:-}" iteration
+    if [[ -n "$open_file" ]]; then
+        "$tmp/$agent" "$open_file" &
+    else
+        "$tmp/$agent" &
+    fi
+    active_test_pid=$!
+    test_child_pids["$active_test_pid"]=1
+    for iteration in {1..100}; do
+        if [[ "$(test_process_name "$active_test_pid")" == "$agent" ]] &&
+           { [[ -z "$open_file" ]] ||
+             [[ "$(test_fd9_target "$active_test_pid")" == \
+                "$open_file" ]]; }; then
+            return
+        fi
+        sleep 0.01
+    done
+    printf 'failed to start the %s test process\n' "$agent" >&2
+    return 1
+}
+
+start_codex_session_process() {
+    local native_home="$1" session_id="$2"
+    local relative="${3:-sessions/2026/07/25/rollout-active-$session_id.jsonl}"
+    active_codex_path="$native_home/$relative"
+    mkdir -p "${active_codex_path%/*}"
+    if [[ ! -e "$active_codex_path" ]]; then
+        printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$session_id" \
+            > "$active_codex_path"
+    fi
+    start_agent_process codex "$active_codex_path"
+}
+
+start_claude_session_process() {
+    local native_home="$1" session_id="$2" stale_start="${3:-0}"
+    local start_time
+    start_agent_process claude
+    start_time="$(test_process_start_time "$active_test_pid")"
+    if (( stale_start == 1 )); then
+        if [[ "$start_time" =~ ^[0-9]+$ ]]; then
+            start_time=$((start_time + 1))
+        else
+            start_time="$start_time stale"
+        fi
+    fi
+    mkdir -p "$native_home/sessions"
+    active_claude_registry="$native_home/sessions/$active_test_pid.json"
+    jq -n --argjson pid "$active_test_pid" --arg session_id "$session_id" \
+        --arg proc_start "$start_time" \
+        '{pid: $pid, sessionId: $session_id, procStart: $proc_start,
+          status: "active", version: "test"}' > "$active_claude_registry"
+    jq -e '(.procStart | type) == "string"' "$active_claude_registry" >/dev/null
+    chmod 600 "$active_claude_registry"
+}
+
+write_codex_profile() {
+    local native_home="$1" profile="$2" provider="${3:-openai}"
+    mkdir -p "$native_home"
+    printf 'model_provider = "%s"\n' "$provider" \
+        > "$native_home/$profile.config.toml"
+    if [[ -n "${context_mode_test_package_root:-}" ]]; then
+        seed_context_mode_agent_cache "$native_home" codex
+    fi
+}
+
+trap cleanup EXIT
+
+test_sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$1" | awk '{print $1}'
+    else
+        shasum -a 256 -- "$1" | awk '{print $1}'
+    fi
+}
+
+context_mode_test_runtime_root() {
+    local runtime_home="$1" version="$2"
+    printf '%s/.local/share/ags/context-mode/runtimes/%s/%s\n' \
+        "$runtime_home" "$FAKE_CONTEXT_RUNTIME_TARGET" "$version"
+}
+
+write_context_mode_test_manifest() {
+    local runtime_root="$1"
+    local package_root="$runtime_root/node_modules/context-mode"
+    local file
+    {
+        printf 'ags-context-tree-v1\n'
+        while IFS= read -r -d '' file; do
+            printf 'f\t%s\t%s\n' \
+                "$(test_sha256_file "$file")" "${file#"$package_root/"}"
+        done < <(
+            find "$package_root" -type f -print0 | LC_ALL=C sort -z
+        )
+    } > "$runtime_root/ags-files.sha256"
+    chmod 600 "$runtime_root/ags-files.sha256"
+    mkdir -p "$runtime_root/ags-pristine"
+    cp -p -- "$package_root/.claude-plugin/plugin.json" \
+        "$runtime_root/ags-pristine/claude-plugin.json"
+    cp -p -- "$package_root/hooks/hooks.json" \
+        "$runtime_root/ags-pristine/claude-hooks.json"
+    chmod 600 "$runtime_root/ags-pristine/claude-plugin.json" \
+        "$runtime_root/ags-pristine/claude-hooks.json"
+}
+
+prepare_context_mode_runtime() {
+    local runtime_home="$1"
+    local version="${2:-1.0.169}"
+    local integrity="${3:-sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ==}"
+    local runtime_root
+    runtime_root="$(context_mode_test_runtime_root "$runtime_home" "$version")"
+    local package_root="$runtime_root/node_modules/context-mode"
+    local hook node_abi
+    node_abi="$("$FAKE_REAL_NODE_BINARY" -p 'process.versions.modules')"
+    mkdir -p "$package_root/.claude-plugin" "$package_root/.codex-plugin" \
+        "$package_root/hooks/codex" "$package_root/scripts" \
+        "$package_root/node_modules/better-sqlite3/build/Release" \
+        "$package_root/node_modules/@modelcontextprotocol/sdk"
+    jq -n --arg version "$version" --arg integrity "$integrity" '{
+      lockfileVersion:3,
+      packages:{
+        "node_modules/context-mode":{
+          version:$version,
+          resolved:("https://registry.npmjs.org/context-mode/-/context-mode-" + $version + ".tgz"),
+          integrity:$integrity
+        }
+      }
+    }' > "$runtime_root/package-lock.json"
+    jq -n --arg version "$version" \
+        '{
+          name:"context-mode",version:$version,license:"Elastic-2.0",
+          dependencies:{
+            "better-sqlite3":"test",
+            "@modelcontextprotocol/sdk":"test"
+          }
+        }' \
+        > "$package_root/package.json"
+    jq -n --arg version "$version" '{
+      name:"context-mode",
+      metadata:{version:$version},
+      plugins:[{name:"context-mode",source:"./",version:$version}]
+    }' > "$package_root/.claude-plugin/marketplace.json"
+    jq -n --arg version "$version" '{
+      name:"context-mode",version:$version,skills:"./skills/",
+      mcpServers:{"context-mode":{
+        command:"node",args:["${CLAUDE_PLUGIN_ROOT}/start.mjs"]
+      }}
+    }' > "$package_root/.claude-plugin/plugin.json"
+    jq -n --arg version "$version" '{
+      name:"context-mode",version:$version,skills:"./skills/",
+      mcpServers:"./.codex-plugin/mcp.json",
+      hooks:"./.codex-plugin/hooks.json"
+    }' > "$package_root/.codex-plugin/plugin.json"
+    jq -n '{
+      mcpServers:{"context-mode":{
+        command:"node",args:["./start.mjs"],cwd:".",
+        env:{CONTEXT_MODE_PLATFORM:"codex"}
+      }}
+    }' > "$package_root/.codex-plugin/mcp.json"
+    jq -n '{
+      hooks:{
+        PreToolUse:[{
+          matcher:"local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__",
+          hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/pretooluse.mjs\""}]
+        }],
+        PostToolUse:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/posttooluse.mjs\""}]}],
+        SessionStart:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/sessionstart.mjs\""}]}],
+        PreCompact:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/precompact.mjs\""}]}],
+        UserPromptSubmit:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/userpromptsubmit.mjs\""}]}],
+        Stop:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/stop.mjs\""}]}]
+      }
+    }' > "$package_root/.codex-plugin/hooks.json"
+    jq -n '{
+      description:"Context Mode test hooks",
+      hooks:{
+        PreToolUse:(
+          ["Bash","WebFetch","Read","Grep","Agent","mcp__"] |
+          map(. as $matcher | {
+            matcher:$matcher,
+            hooks:[{
+              type:"command",
+              command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs\""
+            }]
+          })
+        ),
+        PostToolUse:[{
+          matcher:"",
+          hooks:[{
+            type:"command",
+            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/posttooluse.mjs\""
+          }]
+        }],
+        SessionStart:[{
+          matcher:"",
+          hooks:[{
+            type:"command",
+            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs\""
+          }]
+        }],
+        PreCompact:[{
+          matcher:"",
+          hooks:[{
+            type:"command",
+            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.mjs\""
+          }]
+        }],
+        UserPromptSubmit:[{
+          matcher:"",
+          hooks:[{
+            type:"command",
+            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/userpromptsubmit.mjs\""
+          }]
+        }],
+        Stop:[{
+          matcher:"",
+          hooks:[{
+            type:"command",
+            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.mjs\""
+          }]
+        }]
+      }
+    }' > "$package_root/hooks/hooks.json"
+    printf '// context-mode test entrypoint\n' > "$package_root/cli.bundle.mjs"
+    printf '// context-mode test MCP entrypoint\n' > "$package_root/start.mjs"
+    printf '// context-mode test server\n' > "$package_root/server.bundle.mjs"
+    for hook in pretooluse posttooluse sessionstart precompact userpromptsubmit stop; do
+        printf '// context-mode claude %s hook\n' "$hook" \
+            > "$package_root/hooks/$hook.mjs"
+        printf '// context-mode codex %s hook\n' "$hook" \
+            > "$package_root/hooks/codex/$hook.mjs"
+    done
+    printf '// context-mode codex platform bridge\n' \
+        > "$package_root/hooks/codex/platform.mjs"
+    printf '// context-mode dependency provision test\n' \
+        > "$package_root/hooks/ensure-deps.mjs"
+    printf '// context-mode native healing test\n' \
+        > "$package_root/scripts/heal-better-sqlite3.mjs"
+    cat > "$package_root/node_modules/better-sqlite3/package.json" <<'EOF'
+{"name":"better-sqlite3","version":"0.0.0-test","main":"index.js","dependencies":{}}
+EOF
+    cat > "$package_root/node_modules/better-sqlite3/index.js" <<'EOF'
+class TestDatabase {
+  constructor() {}
+  exec(statement) {
+    if (!statement.includes("fts5")) throw new Error("expected FTS5 probe");
+  }
+  close() {}
+}
+module.exports = TestDatabase;
+EOF
+    cat > "$package_root/node_modules/@modelcontextprotocol/sdk/package.json" <<'EOF'
+{"name":"@modelcontextprotocol/sdk","version":"0.0.0-test","exports":{".":{"import":"./dist/esm/index.js","require":"./dist/cjs/index.js"}},"dependencies":{}}
+EOF
+    printf 'test native binding\n' \
+        > "$package_root/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+    printf 'test ABI binding\n' \
+        > "$package_root/node_modules/better-sqlite3/build/Release/better_sqlite3.abi${node_abi}.node"
+    write_context_mode_test_manifest "$runtime_root"
+}
+
+seed_context_mode_provider_caches() {
+    local package_root="$1" codex_home="$2" claude_home="$3"
+    local version codex_cache claude_cache
+    version="$(jq -r '.version' "$package_root/package.json")"
+    codex_cache="$codex_home/plugins/cache/context-mode/context-mode/$version"
+    claude_cache="$claude_home/plugins/cache/context-mode/context-mode/$version"
+    mkdir -p "$codex_cache" "$claude_cache"
+    cp -a -- "$package_root/." "$codex_cache/"
+    cp -a -- "$package_root/." "$claude_cache/"
+    context_mode_test_package_root="$package_root"
+}
+
+seed_context_mode_agent_cache() {
+    local native_home="$1" agent="$2" version destination
+    [[ "$agent" == codex || "$agent" == claude ]]
+    version="$(jq -r '.version' "$context_mode_test_package_root/package.json")"
+    destination="$native_home/plugins/cache/context-mode/context-mode/$version"
+    mkdir -p "$destination"
+    cp -a -- "$context_mode_test_package_root/." "$destination/"
+}
+
+ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
+mkdir -p "$tmp/home/.local/bin"
+printf '%s\n' '#!/usr/bin/env sh' \
+    'printf '\''%s\n'\'' '\''{"success":true,"ip":"203.0.113.7","country":"Test Country","region":"Test Region","city":"Test City","latitude":1.25,"longitude":2.5}'\''' \
+    > "$tmp/home/.local/bin/curl"
+chmod +x "$tmp/home/.local/bin/curl"
+cat > "$tmp/home/.local/bin/node" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == --version ]]; then
+    printf 'v22.5.0\n'
+    exit
+fi
+script="${1:-}"
+shift || true
+if [[ "$script" == - ]]; then
+    exec "${FAKE_REAL_NODE_BINARY:?}" - "$@"
+fi
+if [[ "$script" == */context-mode/hooks/ensure-deps.mjs ]]; then
+    exit 0
+fi
+[[ "$script" == */context-mode/cli.bundle.mjs ]] || {
+    printf 'unexpected fake node invocation: %s\n' "$script" >&2
+    exit 64
+}
+case "${1:-}" in
+    --help)
+        printf 'context-mode test runtime\n'
+        ;;
+    doctor)
+        log="${FAKE_CONTEXT_LOG:-$HOME/.local/state/ags/context-mode-test.log}"
+        mkdir -p "${log%/*}"
+        printf 'DOCTOR=%s\n' "${CONTEXT_MODE_PLATFORM:-unknown}" >> "$log"
+        if [[ "${FAKE_CONTEXT_DOCTOR_FAIL:-}" == "${CONTEXT_MODE_PLATFORM:-}" ]]; then
+            exit 1
+        fi
+        printf '%s\n' \
+            'Storage session: PASS' \
+            'Storage content: PASS' \
+            'Storage stats: PASS' \
+            'Server test: PASS' \
+            'FTS5 / SQLite: PASS'
+        if [[ "${FAKE_CONTEXT_STANDALONE_PROVIDER_FAIL:-0}" == 1 ]]; then
+            printf '%s\n' \
+                'Plugin enabled: WARN' \
+                'PreToolUse hook: FAIL' \
+                'SessionStart hook: FAIL'
+        elif [[ "${CONTEXT_MODE_PLATFORM:-}" == codex ]]; then
+            printf '%s\n' \
+                'Codex hooks feature flag: PASS' \
+                'Codex plugin root: PASS' \
+                'Plugin enabled: PASS' \
+                'PreToolUse hook: PASS' \
+                'PostToolUse hook: PASS' \
+                'SessionStart hook: PASS' \
+                'PreCompact hook: PASS' \
+                'UserPromptSubmit hook: PASS' \
+                'Stop hook: PASS'
+        else
+            printf '%s\n' \
+                'Plugin enabled: PASS' \
+                'PreToolUse hook: PASS' \
+                'SessionStart hook: PASS'
+        fi
+        ;;
+    index)
+        source_file="${2:?}"
+        shift 2
+        source_label=
+        project=
+        while (( $# > 0 )); do
+            case "$1" in
+                --source) source_label="${2:?}"; shift 2 ;;
+                --project) project="${2:?}"; shift 2 ;;
+                *) exit 64 ;;
+            esac
+        done
+        index_state="${CONTEXT_MODE_DIR:?}/fake-index.json"
+        title="$(sed -n 's/^# //p' "$source_file" | head -n 1)"
+        content="$(sed -n '3p' "$source_file")"
+        jq -n --arg title "$title" --arg content "$content" \
+            --arg source "$source_label" --arg project "$project" \
+            '{title:$title,content:$content,source:$source,project:$project}' \
+            > "$index_state"
+        printf 'Indexed 1 sections from %s\nSource: %s\nProject: %s\n' \
+            "$source_file" "$source_label" "$project"
+        ;;
+    search)
+        query="${2:?}"
+        shift 2
+        source_label=
+        project=
+        while (( $# > 0 )); do
+            case "$1" in
+                --source) source_label="${2:?}"; shift 2 ;;
+                --project) project="${2:?}"; shift 2 ;;
+                --limit) [[ "${2:?}" == 1 ]]; shift 2 ;;
+                *) exit 64 ;;
+            esac
+        done
+        index_state="${CONTEXT_MODE_DIR:?}/fake-index.json"
+        jq -e --arg query "$query" --arg source "$source_label" \
+            --arg project "$project" '
+              .source == $source and .project == $project and
+              (.content | contains($query))
+            ' "$index_state" >/dev/null
+        jq -r '"## 1. " + .title, "Source: " + .source, .content' \
+            "$index_state"
+        ;;
+    *)
+        printf 'unexpected fake context-mode command: %s\n' "${1:-}" >&2
+        exit 64
+        ;;
+esac
+EOF
+chmod +x "$tmp/home/.local/bin/node"
+cat > "$tmp/home/.local/bin/npm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+default_integrity='sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ=='
+printf 'NPM_CONTEXT=%s\n' "$*" >> "${FAKE_CONTEXT_NPM_LOG:-$HOME/.context-mode-npm.log}"
+[[ "${FAKE_CONTEXT_NPM_FORBID:-0}" == 0 ]] || exit 97
+case "${1:-}" in
+    view)
+        [[ "${FAKE_CONTEXT_NPM_VIEW_FAIL:-0}" == 0 ]] || exit 98
+        version="${FAKE_CONTEXT_LATEST_VERSION:-1.0.169}"
+        integrity="${FAKE_CONTEXT_LATEST_INTEGRITY:-$default_integrity}"
+        jq -n --arg version "$version" --arg integrity "$integrity" '{
+          version:$version,
+          "dist.tarball":("https://registry.npmjs.org/context-mode/-/context-mode-" + $version + ".tgz"),
+          "dist.integrity":$integrity,
+          license:"Elastic-2.0"
+        }'
+        ;;
+    install)
+        [[ " $* " == *" --registry=https://registry.npmjs.org "* ]]
+        [[ " $* " == *" --ignore-scripts "* ]]
+        prefix=
+        version=
+        while (( $# > 0 )); do
+            case "$1" in
+                --prefix)
+                    prefix="${2:-}"
+                    shift 2
+                    ;;
+                context-mode@*)
+                    version="${1#context-mode@}"
+                    shift
+                    ;;
+                *) shift ;;
+            esac
+        done
+        [[ -n "$prefix" && -n "$version" ]]
+        source_root="${FAKE_CONTEXT_FIXTURE_HOME:?}/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/$version"
+        [[ -d "$source_root" ]]
+        mkdir -p "$prefix"
+        cp -a -- "$source_root/." "$prefix/"
+        cp -a -- \
+            "$prefix/node_modules/context-mode/node_modules/." \
+            "$prefix/node_modules/"
+        mkdir -p "$prefix/node_modules/.bin"
+        ln -s ../context-mode/cli.bundle.mjs \
+            "$prefix/node_modules/.bin/context-mode"
+        printf '{"lockfileVersion":3}\n' \
+            > "$prefix/node_modules/.package-lock.json"
+        ;;
+    *)
+        printf 'unexpected fake npm invocation\n' >&2
+        exit 64
+        ;;
+esac
+EOF
+chmod +x "$tmp/home/.local/bin/npm"
+cat > "$tmp/home/.local/bin/codex" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+log="${BASH_SOURCE[0]%/*}/../agsx.log"
+state="${FAKE_CONTEXT_PLUGIN_STATE_DIR:-}"
+fake_codex_config_append() {
+    local block="$1" config_home config_file
+    [[ "${FAKE_CODEX_PLUGIN_WRITES_CONFIG:-0}" == 1 ]] || return 0
+    config_home="${CODEX_HOME:-$HOME/.codex}"
+    config_file="$config_home/config.toml"
+    mkdir -p "$config_home"
+    {
+        printf '# fake-codex-%s-begin\n' "$block"
+        case "$block" in
+            marketplace)
+                printf '[marketplaces.context-mode]\n'
+                printf 'source_type = "local"\n'
+                printf 'source = "%s"\n' "$package_root"
+                ;;
+            plugin)
+                printf '[plugins."context-mode@context-mode"]\n'
+                printf 'enabled = true\n'
+                ;;
+            *) exit 64 ;;
+        esac
+        printf '# fake-codex-%s-end\n' "$block"
+    } >> "$config_file"
+    chmod 600 "$config_file"
+}
+fake_codex_config_remove() {
+    local block="$1" config_home config_file temporary
+    [[ "${FAKE_CODEX_PLUGIN_WRITES_CONFIG:-0}" == 1 ]] || return 0
+    config_home="${CODEX_HOME:-$HOME/.codex}"
+    config_file="$config_home/config.toml"
+    [[ -f "$config_file" ]] || return 0
+    temporary="$config_file.fake-codex"
+    awk -v begin="# fake-codex-$block-begin" \
+        -v end="# fake-codex-$block-end" '
+      $0 == begin { skipping = 1; next }
+      $0 == end { skipping = 0; next }
+      !skipping { print }
+    ' "$config_file" > "$temporary"
+    chmod --reference="$config_file" "$temporary"
+    mv -- "$temporary" "$config_file"
+}
+fake_codex_config_set_hooks() {
+    local value="$1" config_home config_file temporary
+    config_home="${CODEX_HOME:-$HOME/.codex}"
+    config_file="$config_home/config.toml"
+    temporary="$config_file.fake-features"
+    mkdir -p "$config_home"
+    if [[ -f "$config_file" ]] &&
+       grep -Eq '^hooks = (true|false)$' "$config_file"; then
+        awk -v value="$value" '
+          /^hooks = (true|false)$/ { print "hooks = " value; next }
+          { print }
+        ' "$config_file" > "$temporary"
+    elif [[ -f "$config_file" ]] &&
+         grep -Fqx '[features]' "$config_file"; then
+        awk -v value="$value" '
+          $0 == "[features]" {
+            print
+            print "hooks = " value
+            next
+          }
+          { print }
+        ' "$config_file" > "$temporary"
+    else
+        if [[ -s "$config_file" ]]; then
+            cp -- "$config_file" "$temporary"
+            printf '\n' >> "$temporary"
+        else
+            : > "$temporary"
+        fi
+        printf '[features]\nhooks = %s\n' "$value" >> "$temporary"
+    fi
+    if [[ -f "$config_file" ]]; then
+        chmod --reference="$config_file" "$temporary"
+    else
+        chmod 600 "$temporary"
+    fi
+    mv -- "$temporary" "$config_file"
+}
+if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
+      -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
+      -n "${RCLONE_SFTP_PASS:-}" ]]; then
+    printf 'CODEX_TRANSPORT_SECRET_LEAK\n' >&2
+    exit 98
+fi
+default_package_root="${FAKE_CONTEXT_PACKAGE_ROOT:-$HOME/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/1.0.169/node_modules/context-mode}"
+package_root="$default_package_root"
+if [[ -n "$state" && -s "$state/codex-plugin-root" ]]; then
+    package_root="$(<"$state/codex-plugin-root")"
+fi
+fake_codex_rewrite_root() {
+    local root="$1" node_binary temporary
+    local partial="${FAKE_CODEX_REWRITE_PARTIAL:-both}"
+    node_binary="${FAKE_CODEX_REWRITE_NODE:-${FAKE_REAL_NODE_BINARY:?}}"
+    if [[ "$partial" == both || "$partial" == plugin ]]; then
+        temporary="$root/.claude-plugin/plugin.json.fake-codex"
+        jq --arg node "$node_binary" --arg root "$root" '
+          .mcpServers["context-mode"].command = $node |
+          .mcpServers["context-mode"].args = [$root + "/start.mjs"]
+        ' "$root/.claude-plugin/plugin.json" > "$temporary"
+        mv -- "$temporary" "$root/.claude-plugin/plugin.json"
+    fi
+    if [[ "$partial" == both || "$partial" == hooks ]]; then
+        temporary="$root/hooks/hooks.json.fake-codex"
+        jq --arg node "$node_binary" --arg root "$root" '
+          .hooks |= with_entries(
+            .value |= map(
+              .hooks |= map(
+                .command |= sub(
+                  "^node \"\\$\\{CLAUDE_PLUGIN_ROOT\\}/";
+                  "\"" + $node + "\" \"" + $root + "/"
+                )
+              )
+            )
+          )
+        ' "$root/hooks/hooks.json" > "$temporary"
+        mv -- "$temporary" "$root/hooks/hooks.json"
+    fi
+}
+if [[ "${1:-}" == --version ]]; then
+    printf 'codex-test 1.0\n'
+    exit
+fi
+profile_before_subcommand=0
+case "${1:-}" in
+    --profile|-p)
+        [[ -n "${2:-}" ]] || exit 64
+        profile_before_subcommand=1
+        shift 2
+        ;;
+    --profile=*|-p?*)
+        profile_before_subcommand=1
+        shift
+        ;;
+esac
+if (( profile_before_subcommand == 1 )) && [[ "${1:-}" == app-server ]]; then
+    printf '%s\n' \
+        'Error: --profile only applies to runtime commands and `codex mcp`.' >&2
+    exit 2
+fi
+if [[ "${1:-}" == app-server ]]; then
+    printf 'CODEX_APP_SERVER=%s\n' "$*" >> "$log"
+    package_version="$(jq -r '.version' "$package_root/package.json")"
+    cache_root="$CODEX_HOME/plugins/cache/context-mode/context-mode/$package_version"
+    source_path="$cache_root/.codex-plugin/hooks.json"
+    while IFS= read -r request; do
+        case "$(jq -r '.method // empty' <<< "$request")" in
+            initialize)
+                printf '{"id":0,"result":{"userAgent":"codex-test","codexHome":"%s","platformFamily":"unix","platformOs":"linux"}}\n' \
+                    "$CODEX_HOME"
+                ;;
+            initialized) ;;
+            config/read)
+                config_file="$CODEX_HOME/config.toml"
+                hooks_enabled=true
+                if [[ -f "$config_file" ]] &&
+                   grep -Eq '^"?hooks"?[[:space:]]*=[[:space:]]*false$' \
+                       "$config_file"; then
+                    hooks_enabled=false
+                fi
+                jq -nc --arg file "$config_file" \
+                    --argjson hooks_enabled "$hooks_enabled" '
+                  {
+                    id:1,
+                    result:{
+                      config:{},
+                      origins:{},
+                      layers:[{
+                        name:{type:"user",file:$file,profile:null},
+                        version:"fake",
+                        config:{features:{hooks:$hooks_enabled}}
+                      }]
+                    }
+                  }'
+                printf '\n'
+                ;;
+            hooks/list)
+                [[ -d "$cache_root" ]]
+                if [[ "${FAKE_CODEX_REWRITES_CACHE:-}" == app-server ]]; then
+                    fake_codex_rewrite_root "$cache_root"
+                fi
+                if [[ "${FAKE_CONTEXT_CORRUPT_CACHE:-0}" == 1 ]]; then
+                    printf '\n ' >> "$source_path"
+                fi
+                if [[ -n "${FAKE_CONTEXT_CORRUPT_CACHE_FILE:-}" ]]; then
+                    printf '\n// changed after plugin caching\n' \
+                        >> "$cache_root/$FAKE_CONTEXT_CORRUPT_CACHE_FILE"
+                fi
+                cwd="$(jq -r '.params.cwds[0]' <<< "$request")"
+                hooks_enabled=true
+                if [[ -f "$CODEX_HOME/config.toml" ]] &&
+                   grep -Eq '^"?hooks"?[[:space:]]*=[[:space:]]*false$' \
+                       "$CODEX_HOME/config.toml"; then
+                    hooks_enabled=false
+                fi
+                jq -nc --arg cwd "$cwd" \
+                    --arg cache_root "$cache_root" \
+                    --arg source_path "$source_path" \
+                    --arg trust "${FAKE_CONTEXT_TRUST_STATUS:-trusted}" \
+                    --argjson hooks_enabled "$hooks_enabled" '
+                  {
+                    id:1,
+                    result:{
+                      data:[{
+                        cwd:$cwd,
+                        warnings:[],
+                        errors:[],
+                        hooks:(if $hooks_enabled then
+                          [
+                            ["preToolUse", "pre_tool_use", "pretooluse.mjs",
+                             "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__"],
+                            ["postToolUse", "post_tool_use", "posttooluse.mjs", null],
+                            ["sessionStart", "session_start", "sessionstart.mjs", null],
+                            ["preCompact", "pre_compact", "precompact.mjs", null],
+                            ["userPromptSubmit", "user_prompt_submit", "userpromptsubmit.mjs", null],
+                            ["stop", "stop", "stop.mjs", null]
+                          ] |
+                          map({
+                            key:("context-mode@context-mode:.codex-plugin/hooks.json:" + .[1] + ":0:0"),
+                            eventName: .[0],
+                            handlerType:"command",
+                            matcher:.[3],
+                            command:("node \"" + $cache_root +
+                              "/hooks/codex/" + .[2] + "\""),
+                            timeoutSec:30,
+                            statusMessage:null,
+                            additionalContextLimit:null,
+                            sourcePath:$source_path,
+                            source:"plugin",
+                            pluginId:"context-mode@context-mode",
+                            displayOrder:0,
+                            enabled:true,
+                            isManaged:false,
+                            currentHash:"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                            trustStatus:$trust
+                          })
+                        else [] end)
+                      }]
+                    }
+                  }'
+                printf '\n'
+                ;;
+        esac
+    done
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == list ]]; then
+    if [[ -z "$state" || -e "$state/codex-marketplace" ]]; then
+        marketplace_root="${FAKE_CODEX_CONTEXT_MARKETPLACE_ROOT:-}"
+        if [[ -z "$marketplace_root" && -n "$state" &&
+              -s "$state/codex-marketplace-root" ]]; then
+            marketplace_root="$(<"$state/codex-marketplace-root")"
+        fi
+        [[ -n "$marketplace_root" ]] || marketplace_root="$default_package_root"
+        jq -n --arg root "$marketplace_root" '{
+          marketplaces:[{
+            name:"context-mode", root:$root,
+            marketplaceSource:{sourceType:"local", source:$root}
+          }]
+        }'
+    else
+        printf '{"marketplaces":[]}\n'
+    fi
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == add ]]; then
+    mkdir -p "$state"
+    : > "$state/codex-marketplace"
+    printf '%s\n' "${4:?}" > "$state/codex-marketplace-root"
+    package_root="${4:?}"
+    fake_codex_config_append marketplace
+    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
+    printf '{"ok":true}\n'
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == remove ]]; then
+    [[ -z "$state" ]] ||
+        rm -f -- "$state/codex-marketplace" "$state/codex-marketplace-root"
+    fake_codex_config_remove marketplace
+    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
+    printf '{"ok":true}\n'
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
+    if [[ -z "$state" || -e "$state/codex-plugin" ]]; then
+        plugin_root="$default_package_root"
+        if [[ -n "$state" && -s "$state/codex-plugin-root" ]]; then
+            plugin_root="$(<"$state/codex-plugin-root")"
+        fi
+        plugin_version="$(jq -r '.version' "$plugin_root/package.json")"
+        if [[ "${FAKE_CODEX_REWRITES_CACHE:-}" == plugin-list ]]; then
+            cache_root="$CODEX_HOME/plugins/cache/context-mode/context-mode/$plugin_version"
+            [[ -d "$cache_root" ]]
+            fake_codex_rewrite_root "$cache_root"
+        fi
+        if [[ "${FAKE_CODEX_REWRITES_PACKAGE:-0}" == 1 ]]; then
+            fake_codex_rewrite_root "$plugin_root"
+        fi
+        if [[ -n "${FAKE_CODEX_TOUCH_ALLOWED_FILE:-}" ]]; then
+            printf ' \n' >> "$CODEX_HOME/plugins/cache/context-mode/context-mode/$plugin_version/$FAKE_CODEX_TOUCH_ALLOWED_FILE"
+        fi
+        jq -n --arg root "$plugin_root" --arg version "$plugin_version" '{
+          installed:[{
+            pluginId:"context-mode@context-mode",
+            name:"context-mode",
+            marketplaceName:"context-mode",
+            version:$version,
+            installed:true,
+            enabled:true,
+            source:{source:"local", path:$root},
+            marketplaceSource:{sourceType:"local",source:$root}
+          }],
+          available:[]
+        }'
+    else
+        printf '{"installed":[],"available":[]}\n'
+    fi
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == add ]]; then
+    mkdir -p "$state"
+    : > "$state/codex-plugin"
+    cp -- "$state/codex-marketplace-root" "$state/codex-plugin-root"
+    package_root="$(<"$state/codex-plugin-root")"
+    package_version="$(jq -r '.version' "$package_root/package.json")"
+    cache_root="$CODEX_HOME/plugins/cache/context-mode/context-mode/$package_version"
+    mkdir -p "$cache_root"
+    cp -a -- "$package_root/." "$cache_root/"
+    fake_codex_config_append plugin
+    if [[ "${FAKE_CONTEXT_FLIP_HOOKS_FALSE_AFTER_PLUGIN_ADD:-0}" == 1 ]]; then
+        fake_codex_config_set_hooks false
+    fi
+    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
+    printf '{"ok":true}\n'
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == remove ]]; then
+    [[ -z "$state" ]] ||
+        rm -f -- "$state/codex-plugin" "$state/codex-plugin-root"
+    fake_codex_config_remove plugin
+    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
+    printf '{"ok":true}\n'
+    exit
+fi
+if [[ "${1:-}" == features && "${2:-}" == list ]]; then
+    config_home="${CODEX_HOME:-$HOME/.codex}"
+    config_file="$config_home/config.toml"
+    if [[ -f "$config_file" ]] &&
+       grep -Fqx 'hooks = false' "$config_file"; then
+        printf 'hooks stable false\n'
+    elif [[ -f "$config_file" ]] &&
+         grep -Fqx 'hooks = true' "$config_file"; then
+        printf 'hooks stable true\n'
+    elif [[ -z "$state" || -e "$state/codex-hooks" ||
+            "${FAKE_CONTEXT_HOOKS_DEFAULT_TRUE:-0}" == 1 ]]; then
+        printf 'hooks stable true\n'
+    else
+        printf 'hooks stable false\n'
+    fi
+    printf 'plugin_hooks removed false\n'
+    exit
+fi
+if [[ "${1:-}" == features && "${2:-}" == enable && "${3:-}" == hooks ]]; then
+    fake_codex_config_set_hooks true
+    if [[ "${AGS_CONTEXT_MODE_CONFIG_PROBE:-0}" == 1 ]]; then
+        exit
+    fi
+    if [[ -n "$state" ]]; then
+        mkdir -p "$state"
+        : > "$state/codex-hooks"
+    fi
+    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
+    if [[ "${FAKE_CONTEXT_CRASH_AFTER_HOOK_ENABLE:-0}" == 1 ]]; then
+        kill -KILL "$PPID"
+        exit 137
+    fi
+    exit
+fi
+if [[ "${1:-}" == features && "${2:-}" == disable && "${3:-}" == hooks ]]; then
+    [[ -z "$state" ]] || rm -f -- "$state/codex-hooks"
+    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+case "${1:-}" in
+    resume) [[ ! -e "/dev/fd/9" ]] || { printf 'FD9_OPEN\n'; exit 99; } ;;
+esac
+printf 'FAKE_CODEX'
+for argument in "$@"; do printf ' <%s>' "$argument"; done
+printf '\nFAKE_PWD=%s\n' "$PWD"
+EOF
+chmod +x "$tmp/home/.local/bin/codex"
+cat > "$tmp/home/.local/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+log="${BASH_SOURCE[0]%/*}/../agsx.log"
+state="${FAKE_CONTEXT_PLUGIN_STATE_DIR:-}"
+if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
+      -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
+      -n "${RCLONE_SFTP_PASS:-}" ]]; then
+    printf 'CLAUDE_TRANSPORT_SECRET_LEAK\n' >&2
+    exit 98
+fi
+default_package_root="${FAKE_CONTEXT_PACKAGE_ROOT:-$HOME/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/1.0.169/node_modules/context-mode}"
+package_root="$default_package_root"
+if [[ -n "$state" && -s "$state/claude-plugin-root" ]]; then
+    package_root="$(<"$state/claude-plugin-root")"
+fi
+fake_claude_rewrite_root() {
+    local root="$1" node_binary temporary
+    node_binary="${FAKE_REAL_NODE_BINARY:?}"
+    temporary="$root/.claude-plugin/plugin.json.fake-claude"
+    jq --arg node "$node_binary" --arg root "$root" '
+      .mcpServers["context-mode"].command = $node |
+      .mcpServers["context-mode"].args = [$root + "/start.mjs"]
+    ' "$root/.claude-plugin/plugin.json" > "$temporary"
+    mv -- "$temporary" "$root/.claude-plugin/plugin.json"
+    temporary="$root/hooks/hooks.json.fake-claude"
+    jq --arg node "$node_binary" --arg root "$root" '
+      .hooks |= with_entries(
+        .value |= map(
+          .hooks |= map(
+            .command |= sub(
+              "^node \"\\$\\{CLAUDE_PLUGIN_ROOT\\}/";
+              "\"" + $node + "\" \"" + $root + "/"
+            )
+          )
+        )
+      )
+    ' "$root/hooks/hooks.json" > "$temporary"
+    mv -- "$temporary" "$root/hooks/hooks.json"
+}
+if [[ "${1:-}" == --version ]]; then
+    printf 'claude-test 1.0\n'
+    exit
+fi
+if [[ " $* " == *" --include-hook-events "* ]]; then
+    printf 'CLAUDE_EFFECTIVE_PROBE\n' >> "$log"
+    if [[ -n "${FAKE_CLAUDE_REPLACE_SETTINGS_WITH:-}" ]]; then
+        cp -- "$FAKE_CLAUDE_REPLACE_SETTINGS_WITH" \
+            "$CLAUDE_CONFIG_DIR/settings.json"
+    fi
+    if [[ "${FAKE_CLAUDE_REWRITES_PACKAGE:-0}" == 1 ]]; then
+        fake_claude_rewrite_root "$package_root"
+        if [[ -n "$state" && -s "$state/claude-marketplace-root" ]]; then
+            marketplace_root="$(<"$state/claude-marketplace-root")"
+            if [[ "$marketplace_root" != "$package_root" ]]; then
+                fake_claude_rewrite_root "$marketplace_root"
+            fi
+        fi
+    fi
+    package_version="$(jq -r '.version' "$package_root/package.json")"
+    if [[ "${FAKE_CONTEXT_EFFECTIVE_FAIL:-}" != hooks ]]; then
+        jq -nc '{
+          type:"system",subtype:"hook_response",
+          hook_event:"SessionStart",outcome:"success",exit_code:0,
+          output:"<context_window_protection>test</context_window_protection>"
+        }'
+    fi
+    if [[ "${FAKE_CONTEXT_EFFECTIVE_FAIL:-}" == mcp ]]; then
+        jq -nc --arg version "$package_version" '{
+          type:"system",subtype:"init",tools:[],mcp_servers:[],
+          plugins:[{
+            source:"context-mode@context-mode",version:$version
+          }]
+        }'
+    else
+        jq -nc --arg version "$package_version" '{
+          type:"system",subtype:"init",
+          tools:[
+            "mcp__plugin_context-mode_context-mode__ctx_execute",
+            "mcp__plugin_context-mode_context-mode__ctx_search"
+          ],
+          mcp_servers:[{
+            name:"plugin:context-mode:context-mode",status:"connected"
+          }],
+          plugins:[{
+            source:"context-mode@context-mode",version:$version
+          }]
+        }'
+    fi
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == list ]]; then
+    if [[ -z "$state" || -e "$state/claude-marketplace" ]]; then
+        marketplace_root="${FAKE_CLAUDE_CONTEXT_MARKETPLACE_ROOT:-}"
+        if [[ -z "$marketplace_root" && -n "$state" &&
+              -s "$state/claude-marketplace-root" ]]; then
+            marketplace_root="$(<"$state/claude-marketplace-root")"
+        fi
+        [[ -n "$marketplace_root" ]] || marketplace_root="$default_package_root"
+        jq -n --arg root "$marketplace_root" \
+            '[{name:"context-mode", source:"directory", path:$root, installLocation:$root}]'
+    else
+        printf '[]\n'
+    fi
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == add ]]; then
+    mkdir -p "$state"
+    : > "$state/claude-marketplace"
+    printf '%s\n' "${4:?}" > "$state/claude-marketplace-root"
+    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == remove ]]; then
+    [[ -z "$state" ]] ||
+        rm -f -- "$state/claude-marketplace" "$state/claude-marketplace-root"
+    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
+    if [[ -z "$state" || -e "$state/claude-plugin" ]]; then
+        enabled=true
+        [[ -z "$state" || ! -e "$state/claude-plugin-disabled" ]] || enabled=false
+        package_version="$(jq -r '.version' "$package_root/package.json")"
+        default_cache_root="$CLAUDE_CONFIG_DIR/plugins/cache/context-mode/context-mode/$package_version"
+        plugin_root="$default_cache_root"
+        [[ -d "$plugin_root" ]] || plugin_root="$default_package_root"
+        if [[ -n "$state" && -s "$state/claude-plugin-root" ]]; then
+            plugin_root="$(<"$state/claude-plugin-root")"
+        fi
+        plugin_version="$(jq -r '.version' "$plugin_root/package.json")"
+        jq -n --arg root "$plugin_root" --arg version "$plugin_version" \
+            --argjson enabled "$enabled" '[{
+          id:"context-mode@context-mode",
+          version:$version,
+          scope:"user",
+          enabled:$enabled,
+          installPath:$root
+        }]'
+    else
+        printf '[]\n'
+    fi
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == install ]]; then
+    mkdir -p "$state"
+    : > "$state/claude-plugin"
+    package_root="$(<"$state/claude-marketplace-root")"
+    package_version="$(jq -r '.version' "$package_root/package.json")"
+    cache_root="$CLAUDE_CONFIG_DIR/plugins/cache/context-mode/context-mode/$package_version"
+    mkdir -p "$cache_root"
+    cp -a -- "$package_root/." "$cache_root/"
+    printf '%s\n' "$cache_root" > "$state/claude-plugin-root"
+    rm -f -- "$state/claude-plugin-disabled"
+    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == enable ]]; then
+    mkdir -p "$state"
+    : > "$state/claude-plugin"
+    rm -f -- "$state/claude-plugin-disabled"
+    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == disable ]]; then
+    mkdir -p "$state"
+    : > "$state/claude-plugin"
+    : > "$state/claude-plugin-disabled"
+    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+if [[ "${1:-}" == plugin && "${2:-}" == uninstall ]]; then
+    [[ -z "$state" ]] ||
+        rm -f -- "$state/claude-plugin" "$state/claude-plugin-disabled" \
+            "$state/claude-plugin-root"
+    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
+    exit
+fi
+case "${1:-}" in
+    --resume) [[ ! -e "/dev/fd/9" ]] || { printf 'FD9_OPEN\n'; exit 99; } ;;
+esac
+printf 'FAKE_CLAUDE'
+for argument in "$@"; do printf ' <%s>' "$argument"; done
+printf '\nFAKE_PWD=%s\n' "$PWD"
+EOF
+chmod +x "$tmp/home/.local/bin/claude"
+prepare_context_mode_runtime "$tmp/home"
+seed_context_mode_provider_caches \
+    "$tmp/home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode" \
+    "$tmp/source/codex" "$tmp/source/claude"
+seed_context_mode_provider_caches \
+    "$tmp/home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode" \
+    "$tmp/target/codex" "$tmp/target/claude"
+cat > "$tmp/home/.local/bin/casr" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+log="${BASH_SOURCE[0]%/*}/../agsx.log"
+if [[ "${1:-}" == --version ]]; then
+    printf 'casr 0.3.0-test\n'
+    exit
+fi
+[[ ! -e "/dev/fd/9" ]]
+
+if [[ "${1:-}" == checkpoint-register-codex ]]; then
+    [[ $# == 4 && -f "$3" && "$4" == /* ]]
+    printf 'REGISTER=%s\t%s\t%s\n' "$2" "$3" "$4" >> "$log"
+    [[ "${AGSX_REGISTER_FAIL:-0}" == 0 ]]
+    exit
+fi
+
+if [[ "${1:-}" == terminal-name ]]; then
+    [[ $# == 2 ]]
+    printf 'ags-%s\n' "$(printf '%s' "$2" | sha256sum | cut -c1-20)"
+    exit
+fi
+
+if [[ "${1:-}" == terminal-launch ]]; then
+    [[ $# -ge 4 && "${3:-}" == -- ]]
+    runtime_key="$2"
+    shift 3
+    printf 'TERMINAL=%s\t%s\n' "$runtime_key" "$*" >> "$log"
+    exec "$@"
+fi
+
+if [[ "${1:-}" == terminal-attach ]]; then
+    [[ $# == 2 ]]
+    if [[ -n "${FAKE_TERMINAL_ATTACH_AFTER:-}" ]]; then
+        count_file="${FAKE_TERMINAL_ATTACH_COUNT_FILE:?}"
+        count=0
+        [[ ! -f "$count_file" ]] || count="$(<"$count_file")"
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$count_file"
+        if (( count > FAKE_TERMINAL_ATTACH_AFTER )); then
+            printf 'ATTACH_PROBE=%s\n' "$2" >> "$log"
+            printf 'FAKE_TERMINAL_ATTACHED %s\n' "$2"
+            exit 0
+        fi
+        exit 3
+    fi
+    if [[ "${FAKE_TERMINAL_ATTACH:-0}" == 1 ]]; then
+        printf 'ATTACH_PROBE=%s\n' "$2" >> "$log"
+        printf 'FAKE_TERMINAL_ATTACHED %s\n' "$2"
+        exit 0
+    fi
+    exit 3
+fi
+
+[[ "${1:-}" == --json ]]
+shift
+[[ -z "${OPENAI_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]
+case "${1:-}" in
+    resume)
+        target="${2:-}"
+        source_id="${3:-}"
+        shift 3
+        source=
+        force=0
+        no_store=0
+        while (( $# )); do
+            case "$1" in
+                --source) source="$2"; shift 2 ;;
+                --force) force=1; shift ;;
+                --no-store) no_store=1; shift ;;
+                *) exit 64 ;;
+            esac
+        done
+        [[ -f "$source" && "$force" == 1 && "$no_store" == 1 ]]
+        case "$target" in
+            cc)
+                source_format=codex
+                target_format=claude-code
+                id=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff
+                path="$CLAUDE_CONFIG_DIR/projects/-untrusted-source-path/$id.jsonl"
+                mkdir -p "${path%/*}"
+                printf '%s\n' \
+                    '{"parentUuid":null,"isSidechain":false,"cwd":"/source","type":"user","message":{"role":"user","content":[{"type":"text","text":"converted user"}]},"uuid":"11111111-1111-4111-8111-111111111111","sessionId":"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"}' \
+                    '{"parentUuid":"11111111-1111-4111-8111-111111111111","isSidechain":false,"cwd":"/source","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"converted reasoning summary"}]},"uuid":"22222222-2222-4222-8222-222222222222","sessionId":"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"}' \
+                    > "$path"
+                ;;
+            cod)
+                source_format=claude-code
+                target_format=codex
+                id=01999999-aaaa-7bbb-8ccc-dddddddddddd
+                path="$CODEX_HOME/sessions/2026/07/25/rollout-test-$id.jsonl"
+                mkdir -p "${path%/*}"
+                printf '%s\n' \
+                    '{"timestamp":"2026-07-25T00:00:00Z","type":"session_meta","payload":{"id":"01999999-aaaa-7bbb-8ccc-dddddddddddd","cwd":"/source","model_provider":"openai"}}' \
+                    '{"timestamp":"2026-07-25T00:00:01Z","type":"turn_context","payload":{"workspace_roots":["/source"]}}' \
+                    '{"timestamp":"2026-07-25T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"converted user"}]}}' \
+                    > "$path"
+                ;;
+            *) exit 64 ;;
+        esac
+        printf 'CONVERT=%s\t%s\t%s\n' "$source_format" "$target_format" "$source" >> "$log"
+        printf 'HOME=%s\nCODEX_HOME=%s\nCLAUDE_CONFIG_DIR=%s\nNO_STORE=%s\n' \
+            "$HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$no_store" >> "$log"
+        jq -n --arg source "$source_format" --arg target "$target_format" \
+            --arg source_id "$source_id" --arg id "$id" --arg path "$path" '{
+              ok: true, source_provider: $source, target_provider: $target,
+              source_session_id: $source_id, target_session_id: $id,
+              written_paths: [$path], resume_command: "unused", dry_run: false,
+              fidelity: "conversation_only", verified_fidelity: null,
+              losses: [{kind:"reasoning", note:"provider-bound reasoning was summarized"}],
+              warnings: ["test conversion warning"]
+            }'
+        ;;
+    info)
+        path="${2:-}"
+        shift 2
+        [[ "${1:-}" == --from && -f "$path" ]]
+        format="$2"
+        case "$format" in
+            cc)
+                detected=claude-code
+                id="$(jq -sr '.[0].sessionId' "$path")"
+                ;;
+            cod)
+                detected=codex
+                id="$(jq -sr 'map(select(.type == "session_meta"))[0].payload.id' "$path")"
+                ;;
+            *) exit 64 ;;
+        esac
+        jq -n --arg id "$id" --arg detected "$detected" \
+            '{session_id:$id, detected_format:$detected}'
+        ;;
+    *) exit 64 ;;
+esac
+EOF
+chmod +x "$tmp/home/.local/bin/casr"
+cat > "$tmp/home/.local/bin/rmux" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == -V ]]; then
+    printf 'rmux %s\n' "${FAKE_RMUX_VERSION:-0.9.1}"
+    exit
+fi
+if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
+      -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
+      -n "${RCLONE_SFTP_PASS:-}" ]]; then
+    printf 'RMUX_TRANSPORT_SECRET_LEAK\n' >&2
+    exit 98
+fi
+printf 'RMUX=%s\n' "$*" >> "${BASH_SOURCE[0]%/*}/../agsx.log"
+target=
+previous=
+for argument in "$@"; do
+    if [[ "$previous" == -t ]]; then
+        target="$argument"
+        break
+    fi
+    previous="$argument"
+done
+case " $* " in
+    *" list-sessions "*)
+        if [[ "${FAKE_RMUX_LIST_ERROR:-0}" == 1 ]]; then
+            printf 'rmux: synthetic protocol failure\n' >&2
+            exit 64
+        fi
+        if [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" ]]; then
+            [[ -f "$FAKE_RMUX_SESSIONS_FILE" ]] && cut -f1 "$FAKE_RMUX_SESSIONS_FILE"
+        elif [[ -n "${FAKE_RMUX_LIVE_SESSION:-}" ]]; then
+            printf '%s\n' "$FAKE_RMUX_LIVE_SESSION"
+        fi
+        ;;
+    *" display-message "*)
+        [[ -n "$target" ]]
+        [[ "$target" != "${FAKE_RMUX_STALE_SESSION:-}" ]] || exit 1
+        if [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" ]]; then
+            awk -F '\t' -v target="$target" '
+                $1 == target { print $2 "\t" $3; found=1; exit }
+                END { if (!found) exit 1 }
+            ' "$FAKE_RMUX_SESSIONS_FILE"
+        else
+            printf 'codex\t/test/workspace\n'
+        fi
+        ;;
+    *" attach-session "*)
+        [[ -n "$target" ]]
+        [[ "${FAKE_RMUX_ATTACH_FAIL:-0}" == 0 ]]
+        if [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" ]]; then
+            awk -F '\t' -v target="$target" '$1 == target { found=1 } END { exit !found }' \
+                "$FAKE_RMUX_SESSIONS_FILE"
+        fi
+        printf 'FAKE_RMUX_ATTACHED %s\n' "$*"
+        ;;
+    *" kill-session "*)
+        [[ -n "$target" ]]
+        [[ "${FAKE_RMUX_KILL_FAIL:-0}" == 0 ]]
+        [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" && -f "$FAKE_RMUX_SESSIONS_FILE" ]]
+        awk -F '\t' -v target="$target" '
+            $1 == target { found=1; next }
+            { print }
+            END { if (!found) exit 1 }
+        ' "$FAKE_RMUX_SESSIONS_FILE" > "$FAKE_RMUX_SESSIONS_FILE.tmp"
+        mv -f -- "$FAKE_RMUX_SESSIONS_FILE.tmp" "$FAKE_RMUX_SESSIONS_FILE"
+        ;;
+    *) exit 64 ;;
+esac
+EOF
+chmod +x "$tmp/home/.local/bin/rmux"
+cat > "$tmp/home/.local/bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${FAKE_RM_PENDING_HOLD_DIR:-}" ]]; then
+    for argument in "$@"; do
+        case "$argument" in
+            */pending-sync/*.json)
+                mkdir -p "$FAKE_RM_PENDING_HOLD_DIR"
+                : > "$FAKE_RM_PENDING_HOLD_DIR/ready"
+                released=0
+                for _ in {1..1000}; do
+                    if [[ -e "$FAKE_RM_PENDING_HOLD_DIR/release" ]]; then
+                        released=1
+                        break
+                    fi
+                    sleep 0.01
+                done
+                (( released == 1 )) || {
+                    printf 'fake pending removal hold timed out\n' >&2
+                    exit 3
+                }
+                break
+                ;;
+        esac
+    done
+fi
+exec "$FAKE_REAL_RM_BINARY" "$@"
+EOF
+chmod +x "$tmp/home/.local/bin/rm"
+cat > "$tmp/home/.local/bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source_path=
+destination_path=
+for argument in "$@"; do
+    [[ "$argument" == -- ]] && continue
+    if [[ -z "$source_path" ]]; then
+        source_path="$argument"
+    else
+        destination_path="$argument"
+    fi
+done
+if [[ -n "${FAKE_MV_DELETE_ARCHIVE_ONCE:-}" &&
+      "$source_path" == *.checkpoint.tar.gz.age &&
+      "$destination_path" == */trash/local/*/*.checkpoint.tar.gz.age.deleted.* &&
+      ! -e "$FAKE_MV_DELETE_ARCHIVE_ONCE" ]]; then
+    : > "$FAKE_MV_DELETE_ARCHIVE_ONCE"
+    exit 1
+fi
+if [[ -n "${FAKE_MV_PENDING_SYNC_ONCE:-}" &&
+      "$source_path" == */pending-sync/*.json.tmp.* &&
+      "$destination_path" == */pending-sync/*.json &&
+      ! -e "$FAKE_MV_PENDING_SYNC_ONCE" ]]; then
+    : > "$FAKE_MV_PENDING_SYNC_ONCE"
+    exit 1
+fi
+exec "$FAKE_REAL_MV_BINARY" "$@"
+EOF
+chmod +x "$tmp/home/.local/bin/mv"
+printf '%s\n' '#!/usr/bin/env sh' \
+    'case " $* " in *" -dc "*) eval "last=\${$#}"; cat -- "$last";; *) exit 0;; esac' \
+    > "$tmp/home/.local/bin/zstd"
+chmod +x "$tmp/home/.local/bin/zstd"
+if [[ "$test_platform" == Darwin ]]; then
+    printf '%s\n' '#!/usr/bin/env sh' 'exec /usr/bin/pgrep "$@"' \
+        > "$tmp/home/.local/bin/pgrep"
+else
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 1' > "$tmp/home/.local/bin/pgrep"
+fi
+chmod +x "$tmp/home/.local/bin/pgrep"
+mkdir -p "$tmp/home/.ssh" "$tmp/remote"
+read -r host_key_type host_key_data _ < "$tmp/key.pub"
+printf '[127.0.0.1]:2222 %s %s\n' "$host_key_type" "$host_key_data" \
+    > "$tmp/home/.ssh/known_hosts"
+cat > "$tmp/home/.local/bin/rclone" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+map_path() {
+    case "$1" in
+        :sftp,*:/*) printf '%s%s\n' "$FAKE_RCLONE_ROOT" "${1##*:}" ;;
+        *) printf '%s\n' "$1" ;;
+    esac
+}
+
+while (( $# > 0 )); do
+    case "$1" in
+        --config|--log-level)
+            (( $# >= 2 )) || exit 64
+            shift 2
+            ;;
+        --ask-password=false)
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+command="$1"
+shift
+if [[ -n "${FAKE_RCLONE_LOG:-}" ]]; then
+    printf '%s' "$command" >> "$FAKE_RCLONE_LOG"
+    for argument in "$@"; do printf '\t%s' "$argument" >> "$FAKE_RCLONE_LOG"; done
+    if [[ -n "${RCLONE_SFTP_PASS:-}" ]]; then
+        printf '\tAUTH_ENV=1' >> "$FAKE_RCLONE_LOG"
+    fi
+    printf '\n' >> "$FAKE_RCLONE_LOG"
+fi
+case "$command" in
+    obscure)
+        if [[ "${1:-}" == - ]]; then
+            IFS= read -r password
+        else
+            password="${1:-}"
+        fi
+        printf 'obscured:%s\n' "$(printf '%s' "$password" | sha256sum | cut -c1-16)"
+        unset password
+        ;;
+    copyto)
+        if [[ -n "${FAKE_RCLONE_FAIL_RETIRE_READBACK_ONCE:-}" &&
+              "$1" == */.ags-retired/ags-v1.retired &&
+              ! -e "$FAKE_RCLONE_FAIL_RETIRE_READBACK_ONCE" ]]; then
+            : > "$FAKE_RCLONE_FAIL_RETIRE_READBACK_ONCE"
+            exit 1
+        fi
+        source="$(map_path "$1")"
+        destination="$(map_path "$2")"
+        mkdir -p "$(dirname "$destination")"
+        cp -- "$source" "$destination"
+        ;;
+    mkdir) mkdir -p "$(map_path "$1")" ;;
+    deletefile)
+        target="$(map_path "$1")"
+        if [[ -n "${FAKE_RCLONE_FAIL_ARCHIVE_DELETE_ONCE:-}" &&
+              "$target" == *.checkpoint.tar.gz.age &&
+              ! -e "$FAKE_RCLONE_FAIL_ARCHIVE_DELETE_ONCE" ]]; then
+            mkdir -p "$(dirname "$FAKE_RCLONE_FAIL_ARCHIVE_DELETE_ONCE")"
+            : > "$FAKE_RCLONE_FAIL_ARCHIVE_DELETE_ONCE"
+            exit 1
+        fi
+        rm -f -- "$target"
+        ;;
+    moveto)
+        source="$(map_path "$1")"
+        destination="$(map_path "$2")"
+        mkdir -p "$(dirname "$destination")"
+        if [[ "$destination" == */records/*/*.record ]]; then
+            object="$(cut -f6 "$source")"
+            store_root="${destination%%/records/*}"
+            [[ -f "$store_root/$object" ]] || {
+                printf 'record marker published before object: %s\n' "$destination" >&2
+                exit 4
+            }
+        fi
+        manifest_failure_marker=
+        if [[ -n "${FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE:-}" &&
+              "$destination" == *.manifest.age ]]; then
+            manifest_failure_marker="$FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE"
+            [[ "$manifest_failure_marker" != 1 ]] ||
+                manifest_failure_marker="$FAKE_RCLONE_ROOT/.manifest-move-failed"
+            if [[ ! -e "$manifest_failure_marker" ]]; then
+                mkdir -p "$(dirname "$manifest_failure_marker")"
+                : > "$manifest_failure_marker"
+                exit 1
+            fi
+        fi
+        if [[ -n "${FAKE_RCLONE_FAIL_LEGACY_TRASH_MANIFEST_ONCE:-}" &&
+              "$source" == */codex/*.manifest.age &&
+              "$destination" == */trash/codex/*.manifest.age.deleted.* &&
+              ! -e "$FAKE_RCLONE_FAIL_LEGACY_TRASH_MANIFEST_ONCE" ]]; then
+            : > "$FAKE_RCLONE_FAIL_LEGACY_TRASH_MANIFEST_ONCE"
+            exit 1
+        fi
+        if [[ -n "${FAKE_RCLONE_FAIL_LEGACY_TRASH_ARCHIVE_ONCE:-}" &&
+              "$source" == */codex/*.checkpoint.tar.gz.age &&
+              "$destination" == */trash/codex/*.checkpoint.tar.gz.age.deleted.* &&
+              ! -e "$FAKE_RCLONE_FAIL_LEGACY_TRASH_ARCHIVE_ONCE" ]]; then
+            : > "$FAKE_RCLONE_FAIL_LEGACY_TRASH_ARCHIVE_ONCE"
+            exit 1
+        fi
+        manifest_post_move_failure=
+        if [[ -n "${FAKE_RCLONE_FAIL_MANIFEST_AFTER_MOVE_ONCE:-}" &&
+              "$destination" == *.manifest.age &&
+              ! -e "$FAKE_RCLONE_FAIL_MANIFEST_AFTER_MOVE_ONCE" ]]; then
+            manifest_post_move_failure="$FAKE_RCLONE_FAIL_MANIFEST_AFTER_MOVE_ONCE"
+        fi
+        if [[ "${3:-}" == --immutable ]]; then
+            ln -- "$source" "$destination" 2>/dev/null || exit 1
+            rm -f -- "$source"
+        else
+            mv -- "$source" "$destination"
+        fi
+        if [[ -n "$manifest_post_move_failure" ]]; then
+            mkdir -p "$(dirname "$manifest_post_move_failure")"
+            : > "$manifest_post_move_failure"
+            exit 1
+        fi
+        ;;
+    lsf)
+        remote="${*: -1}"
+        root="$(map_path "$remote")"
+        if [[ -n "${FAKE_RCLONE_FAIL_LSF_AT:-}" ]]; then
+            counter_file="${FAKE_RCLONE_LSF_COUNTER_FILE:?}"
+            counter=0
+            [[ ! -f "$counter_file" ]] || counter="$(<"$counter_file")"
+            counter=$((counter + 1))
+            printf '%s\n' "$counter" > "$counter_file"
+            if (( counter == FAKE_RCLONE_FAIL_LSF_AT )); then
+                exit 1
+            fi
+        fi
+        if [[ -n "${FAKE_RCLONE_LSF_HOLD_DIR:-}" ]]; then
+            mkdir -p "$FAKE_RCLONE_LSF_HOLD_DIR"
+            : > "$FAKE_RCLONE_LSF_HOLD_DIR/ready"
+            released=0
+            for _ in {1..1000}; do
+                if [[ -e "$FAKE_RCLONE_LSF_HOLD_DIR/release" ]]; then
+                    released=1
+                    break
+                fi
+                sleep 0.01
+            done
+            (( released == 1 )) || {
+                printf 'fake rclone hold timed out\n' >&2
+                exit 3
+            }
+        fi
+        if [[ -n "${FAKE_RCLONE_LSF_BARRIER:-}" ]]; then
+            mkdir -p "$FAKE_RCLONE_LSF_BARRIER"
+            touch "$FAKE_RCLONE_LSF_BARRIER/ready.$$"
+            ready=0
+            for _ in {1..500}; do
+                ready="$(find "$FAKE_RCLONE_LSF_BARRIER" -type f -name 'ready.*' | wc -l)"
+                (( ready >= 2 )) && break
+                sleep 0.01
+            done
+            (( ready >= 2 )) || {
+                printf 'fake rclone barrier timed out\n' >&2
+                exit 3
+            }
+        fi
+        [[ -d "$root" ]] && find "$root" -type f -printf '%P\n' | sort
+        ;;
+    *) printf 'unsupported fake rclone command: %s\n' "$command" >&2; exit 2 ;;
+esac
+EOF
+chmod +x "$tmp/home/.local/bin/rclone"
+cat > "$tmp/home/.local/bin/ssh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote_command="${*: -1}"
+IFS= read -r remote_root || {
+    printf 'fake ssh expected a remote root on stdin\n' >&2
+    exit 2
+}
+mapfile -t remote_input
+if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
+    printf 'ssh' >> "$FAKE_SSH_LOG"
+    for argument in "$@"; do
+        printf '\t%s' "$argument" >> "$FAKE_SSH_LOG"
+    done
+    [[ -z "${AGENT_SESSION_REMOTE_PASSWORD:-}" ]] ||
+        printf '\tPLAINTEXT_ENV_LEAK=1' >> "$FAKE_SSH_LOG"
+    [[ -z "${AGENT_SESSION_CLOUD_PASSWORD:-}" ]] ||
+        printf '\tCLOUD_PASSWORD_ENV_LEAK=1' >> "$FAKE_SSH_LOG"
+    [[ -z "${RCLONE_SFTP_PASS:-}" ]] ||
+        printf '\tRCLONE_PASSWORD_ENV_LEAK=1' >> "$FAKE_SSH_LOG"
+    printf '\tSTDIN=%s' "$remote_root" >> "$FAKE_SSH_LOG"
+    for input in "${remote_input[@]}"; do
+        printf '\tSTDIN=%s' "$input" >> "$FAKE_SSH_LOG"
+    done
+    printf '\n' >> "$FAKE_SSH_LOG"
+fi
+if [[ -n "${FAKE_SSH_FAIL_RETIRE_ONCE_MARKER:-}" &&
+      "$remote_command" == *'pending="$retired_root/ags-v1.retiring"'* &&
+      ! -e "$FAKE_SSH_FAIL_RETIRE_ONCE_MARKER" ]]; then
+    : > "$FAKE_SSH_FAIL_RETIRE_ONCE_MARKER"
+    exit 70
+fi
+[[ "$remote_root" == /* && "$remote_root" != *$'\n'* &&
+   "$remote_root" != *$'\r'* ]] || exit 64
+{
+    printf '%s%s\n' "${FAKE_RCLONE_ROOT:?}" "$remote_root"
+    for input in "${remote_input[@]}"; do
+        printf '%s\n' "$input"
+    done
+} | /usr/bin/env bash -c "$remote_command"
+EOF
+chmod +x "$tmp/home/.local/bin/ssh"
+cat > "$tmp/home/.local/bin/sshpass" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "${1:-}" == -d && "${2:-}" =~ ^[0-9]+$ ]] || exit 64
+password_fd="$2"
+shift 2
+IFS= read -r password <&"$password_fd" || true
+if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
+    printf 'sshpass\tPASSWORD_FD=1\tPASSWORD_SHA256=%s\n' \
+        "$(printf '%s' "$password" | sha256sum | cut -d' ' -f1)" \
+        >> "$FAKE_SSH_LOG"
+fi
+unset password
+exec "$@"
+EOF
+chmod +x "$tmp/home/.local/bin/sshpass"
+mkdir -p "$tmp/source/codex/sessions/2026/01/01" "$tmp/source/claude/projects/-work-demo"
+printf '%s\n' '{"turn":1}' > "$tmp/source/codex/sessions/2026/01/01/test.jsonl"
+printf '%s\n' '{"turn":1}' > "$tmp/source/claude/projects/-work-demo/test.jsonl"
+
+source_env=(
+    HOME="$tmp/home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$tmp/source/codex"
+    CLAUDE_CONFIG_DIR="$tmp/source/claude"
+    CODEX_THREAD_ID=
+    CLAUDE_CODE_SESSION_ID=
+    AGENT_SESSION_DIR="$tmp/store"
+    AGENT_SESSION_STATE_DIR="$tmp/state"
+    AGENT_SESSION_SSH_KEY="$tmp/key"
+    AGSX_CONVERTER_BINARY="$tmp/home/.local/bin/casr"
+    AGSX_CONVERTER_VERSION=0.3.0-test
+    FAKE_RCLONE_ROOT="$tmp/remote"
+)
+
+printf '{malformed hook input\n' | \
+    env "${source_env[@]}" "$tool" hook \
+    >"$tmp/malformed-hook.out" 2>"$tmp/malformed-hook.err"
+grep -Fq 'warning: hook processing failed; pending work was left for retry' \
+    "$tmp/malformed-hook.err"
+
+mkdir -p "$tmp/hook-lock-failure-bin" "$tmp/state/pending-sync"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$tmp/hook-lock-failure-bin/flock"
+chmod +x "$tmp/hook-lock-failure-bin/flock"
+jq -n '{
+  schema:1,
+  storage_mode:"remote:neburst",
+  reason:"hook lock failure regression",
+  created_utc:"2026-07-31T00:00:00.000Z"
+}' > "$tmp/state/pending-sync/hook-lock-failure.json"
+printf '%s\n' '{"hook_event_name":"SessionStart"}' | \
+    env "${source_env[@]}" \
+    PATH="$tmp/hook-lock-failure-bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    "$tool" hook >"$tmp/hook-lock-failure.out" \
+    2>"$tmp/hook-lock-failure.err"
+grep -Fq 'cannot acquire storage consolidation lock' \
+    "$tmp/hook-lock-failure.err"
+grep -Fq 'warning: hook processing failed; pending work was left for retry' \
+    "$tmp/hook-lock-failure.err"
+[[ -f "$tmp/state/pending-sync/hook-lock-failure.json" ]]
+if env "${source_env[@]}" \
+    PATH="$tmp/hook-lock-failure-bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    "$tool" flush >"$tmp/flush-lock-failure.out" \
+    2>"$tmp/flush-lock-failure.err"; then
+    echo 'direct flush ignored a storage lock failure' >&2
+    exit 1
+fi
+grep -Fq 'cannot acquire storage consolidation lock' \
+    "$tmp/flush-lock-failure.err"
+rm -f -- "$tmp/state/pending-sync/hook-lock-failure.json"
+
+target_env=(
+    HOME="$tmp/home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$tmp/target/codex"
+    CLAUDE_CONFIG_DIR="$tmp/target/claude"
+    CODEX_THREAD_ID=
+    CLAUDE_CODE_SESSION_ID=
+    AGENT_SESSION_DIR="$tmp/store"
+    AGENT_SESSION_STATE_DIR="$tmp/state"
+    AGENT_SESSION_SSH_KEY="$tmp/key"
+    FAKE_RCLONE_ROOT="$tmp/remote"
+)
+mkdir -p "$tmp/managed-local-checkpoints"
+managed_env=(
+    "${source_env[@]}"
+    AGENT_SESSION_LOCAL_DIR="$tmp/managed-local-checkpoints"
+)
+context_runtime_base_root="$(
+    context_mode_test_runtime_root "$tmp/home" 1.0.169
+)"
+context_runtime_root="$context_runtime_base_root/node_modules/context-mode"
+context_files_sha256="$(
+    test_sha256_file "$context_runtime_base_root/ags-files.sha256"
+)"
+mkdir -p "$tmp/state"
+jq -n --arg root "$context_runtime_root" \
+    --arg files_sha256 "$context_files_sha256" \
+    --arg platform "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
+    --arg arch "$FAKE_CONTEXT_RUNTIME_ARCH" \
+    --argjson node_abi "$FAKE_CONTEXT_RUNTIME_NODE_ABI" \
+    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" '
+  {
+    schema:2,
+    managed_by:"ags",
+    activation_id:"ags-test-active",
+    version:"1.0.169",
+    runtime:{
+      platform:$platform,arch:$arch,node_abi:$node_abi,target:$target
+    },
+    source:{
+      type:"npm",
+      package:"context-mode",
+      integrity:"sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ==",
+      files_sha256:$files_sha256
+    },
+    package_root:$root,
+    health:{mode:"doctor",status:"passed"},
+    providers:{
+      claude:{
+        configured:true,
+        plugin_owned:true,
+        marketplace_owned:true
+      },
+      codex:{
+        configured:true,
+        plugin_owned:true,
+        marketplace_owned:true,
+        hooks_enabled_by_ags:true,
+        trust:"official-review-required"
+      }
+    }
+  }
+' > "$tmp/state/context-mode.json"
+converted_claude_id=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff
+converted_codex_id=01999999-aaaa-7bbb-8ccc-dddddddddddd
+
+terminal_count_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+if env "${managed_env[@]}" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$tmp/missing-context-plugin" \
+    "$tool" codex > "$tmp/missing-context-plugin.out" \
+    2> "$tmp/missing-context-plugin.err"; then
+    echo 'managed Codex launch ignored a missing mandatory Context Mode plugin' >&2
+    exit 1
+fi
+if ! grep -Fq 'Context Mode is not enabled for Codex; run ags init' \
+    "$tmp/missing-context-plugin.err"; then
+    sed -n '1,120p' "$tmp/missing-context-plugin.err" >&2
+    exit 1
+fi
+terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+
+fresh_codex="$(
+    env "${managed_env[@]}" "$tool" codex --model o3 \
+        2> "$tmp/fresh-codex.err"
+)"
+grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$fresh_codex"
+[[ ! -s "$tmp/fresh-codex.err" ]]
+mkdir -p "$tmp/source/codex"
+printf '%s\n' 'model_provider = "sub2api"' \
+    > "$tmp/source/codex/sub2api.config.toml"
+assert_fresh_codex_profile() {
+    local expected="$1" output
+    shift
+    output="$(env "${managed_env[@]}" "$tool" codex "$@")"
+    grep -Fqx "$expected" <<< "$output"
+}
+assert_fresh_codex_profile \
+    'FAKE_CODEX <--yolo> <--profile> <sub2api>' \
+    --yolo --profile sub2api
+assert_fresh_codex_profile \
+    'FAKE_CODEX <--yolo> <--profile=sub2api>' \
+    --yolo --profile=sub2api
+assert_fresh_codex_profile \
+    'FAKE_CODEX <--yolo> <-p> <sub2api>' \
+    --yolo -p sub2api
+assert_fresh_codex_profile \
+    'FAKE_CODEX <--yolo> <-psub2api>' \
+    --yolo -psub2api
+described_codex="$(
+    env "${managed_env[@]}" "$tool" \
+        --description 'Profile investigation' \
+        codex --yolo --profile sub2api
+)"
+grep -Fqx 'FAKE_CODEX <--yolo> <--profile> <sub2api>' <<< "$described_codex"
+described_runtime="$(
+    grep '^TERMINAL=fresh/codex/' "$tmp/home/.local/agsx.log" | tail -n 1
+)"
+described_runtime="${described_runtime#TERMINAL=}"
+described_runtime="${described_runtime%%$'\t'*}"
+described_session="$(
+    "$tmp/home/.local/bin/casr" terminal-name "$described_runtime"
+)"
+described_metadata="$tmp/state/live-sessions/$described_session.json"
+jq -e '
+    .schema == 1 and .session_name == $session and
+    .description == "Profile investigation" and
+    .agent == "codex" and .source == "fresh" and
+    (.cwd | startswith("/"))
+' --arg session "$described_session" "$described_metadata" >/dev/null
+[[ "$(stat -c %a "$tmp/state/live-sessions")" == 700 ]]
+[[ "$(stat -c %a "$described_metadata")" == 600 ]]
+
+agent_owned_description="$(
+    env "${managed_env[@]}" "$tool" codex --description native-description
+)"
+grep -Fqx 'FAKE_CODEX <--description> <native-description>' \
+    <<< "$agent_owned_description"
+long_live_basename="$(printf '界%.0s' {1..60})$(printf 'x%.0s' {1..35})"
+long_live_cwd="$tmp/$long_live_basename"
+mkdir -p "$long_live_cwd"
+for default_agent in codex claude; do
+    case "$default_agent" in
+        codex)
+            default_suffix=' - Codex'
+            default_output='FAKE_CODEX <--model> <long-default-description>'
+            ;;
+        claude)
+            default_suffix=' - Claude'
+            default_output='FAKE_CLAUDE <--model> <long-default-description>'
+            ;;
+    esac
+    long_default_output="$(
+        cd "$long_live_cwd"
+        env "${managed_env[@]}" LC_ALL=C "$tool" "$default_agent" \
+            --model long-default-description
+    )"
+    grep -Fqx "$default_output" <<< "$long_default_output"
+    long_default_runtime="$(
+        grep "^TERMINAL=fresh/$default_agent/" \
+            "$tmp/home/.local/agsx.log" | tail -n 1
+    )"
+    long_default_runtime="${long_default_runtime#TERMINAL=}"
+    long_default_runtime="${long_default_runtime%%$'\t'*}"
+    long_default_session="$(
+        "$tmp/home/.local/bin/casr" terminal-name "$long_default_runtime"
+    )"
+    expected_default_description="$(
+        printf '%s' "$long_live_basename" | jq -Rsr --arg suffix "$default_suffix" '
+            .[0:(80 - ($suffix | length))] + $suffix
+        '
+    )"
+    jq -e --arg description "$expected_default_description" \
+        --arg cwd "$long_live_cwd" --arg agent "$default_agent" '
+          .description == $description and (.description | length) == 80 and
+          .cwd == $cwd and .agent == $agent and .source == "fresh"
+        ' "$tmp/state/live-sessions/$long_default_session.json" >/dev/null
+done
+terminal_count_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+for invalid_description in '' $'line\nbreak' "$(printf 'x%.0s' {1..81})"; do
+    if env "${managed_env[@]}" "$tool" \
+        --description "$invalid_description" codex \
+        > "$tmp/invalid-live-description.out" \
+        2> "$tmp/invalid-live-description.err"; then
+        echo 'managed Codex accepted an invalid live description' >&2
+        exit 1
+    fi
+done
+terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+if grep -Eq '^CODEX_APP_SERVER=.*(^|[[:space:]])(-p|--profile)' \
+    "$tmp/home/.local/agsx.log"; then
+    echo 'managed Codex leaked a runtime profile into app-server' >&2
+    exit 1
+fi
+printf '%s\n' '[features]' 'hooks = false' \
+    > "$tmp/source/codex/hooks-off.config.toml"
+terminal_count_before="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+if env "${managed_env[@]}" "$tool" codex --profile hooks-off \
+    > "$tmp/codex-profile-hooks-off.out" \
+    2> "$tmp/codex-profile-hooks-off.err"; then
+    echo 'managed Codex accepted a profile that disables hooks' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode hook source or shape does not match' \
+    "$tmp/codex-profile-hooks-off.err"
+terminal_count_after="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+scrubbed_codex="$(
+    env "${managed_env[@]}" \
+        AGENT_SESSION_REMOTE_PASSWORD=remote-secret \
+        AGENT_SESSION_CLOUD_PASSWORD=cloud-secret \
+        RCLONE_SFTP_PASS=rclone-secret \
+        "$tool" codex --model scrubbed
+)"
+grep -Fqx 'FAKE_CODEX <--model> <scrubbed>' <<< "$scrubbed_codex"
+grep -Eq '^TERMINAL=fresh/codex/[^[:space:]]+[[:space:]].*/codex --model o3$' \
+    "$tmp/home/.local/agsx.log"
+fresh_codex_owned_args="$(
+    env "${managed_env[@]}" "$tool" codex --to claude --model o3
+)"
+grep -Fqx \
+    'FAKE_CODEX <--to> <claude> <--model> <o3>' \
+    <<< "$fresh_codex_owned_args"
+fresh_codex_literal_option="$(
+    env "${managed_env[@]}" "$tool" codex -- --profile native
+)"
+grep -Fqx \
+    'FAKE_CODEX <--> <--profile> <native>' \
+    <<< "$fresh_codex_literal_option"
+
+fresh_claude="$(
+    env "${managed_env[@]}" "$tool" claude --model sonnet
+)"
+grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$fresh_claude"
+grep -Eq '^TERMINAL=fresh/claude/[^[:space:]]+[[:space:]].*/claude --model sonnet$' \
+    "$tmp/home/.local/agsx.log"
+fresh_claude_owned_args="$(
+    env "${managed_env[@]}" "$tool" claude --to codex --model sonnet
+)"
+grep -Fqx \
+    'FAKE_CLAUDE <--to> <codex> <--model> <sonnet>' \
+    <<< "$fresh_claude_owned_args"
+fresh_claude_literal_option="$(
+    env "${managed_env[@]}" "$tool" claude -- --settings
+)"
+grep -Fqx \
+    'FAKE_CLAUDE <--> <--settings>' \
+    <<< "$fresh_claude_literal_option"
+safe_claude_settings="$tmp/safe-claude.settings.json"
+jq -n '{
+  env:{
+    ANTHROPIC_BASE_URL:"https://provider.example.test",
+    ANTHROPIC_API_KEY:"",
+    ANTHROPIC_AUTH_TOKEN:""
+  },
+  apiKeyHelper:"/usr/bin/printenv TEST_CLAUDE_API_KEY",
+  model:"provider-model",
+  effortLevel:"high"
+}' > "$safe_claude_settings"
+safe_claude_settings_output="$(
+    env "${managed_env[@]}" "$tool" claude \
+        --settings "$safe_claude_settings" --model sonnet
+)"
+grep -Fqx \
+    "FAKE_CLAUDE <--settings> <$safe_claude_settings> <--model> <sonnet>" \
+    <<< "$safe_claude_settings_output"
+dash_claude_settings="$tmp/--safe-claude.settings.json"
+cp -- "$safe_claude_settings" "$dash_claude_settings"
+dash_claude_settings_output="$(
+    cd -- "$tmp"
+    env "${managed_env[@]}" "$tool" claude \
+        --settings --safe-claude.settings.json --model opus
+)"
+grep -Fqx \
+    'FAKE_CLAUDE <--settings> <--safe-claude.settings.json> <--model> <opus>' \
+    <<< "$dash_claude_settings_output"
+inline_claude_settings='{"env":{"ANTHROPIC_BASE_URL":"https://provider.example.test"}}'
+inline_claude_settings_output="$(
+    env "${managed_env[@]}" "$tool" claude \
+        "--settings=$inline_claude_settings" --model haiku
+)"
+grep -Fqx \
+    "FAKE_CLAUDE <--settings=$inline_claude_settings> <--model> <haiku>" \
+    <<< "$inline_claude_settings_output"
+unsafe_claude_settings="$tmp/unsafe-claude.settings.json"
+jq -n '{enabledPlugins:{"context-mode@context-mode":false}}' \
+    > "$unsafe_claude_settings"
+terminal_count_before="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+if env "${managed_env[@]}" "$tool" claude \
+    --settings "$unsafe_claude_settings" \
+    >"$tmp/unsafe-claude-settings.out" \
+    2>"$tmp/unsafe-claude-settings.err"; then
+    echo 'managed Claude accepted settings that disable Context Mode' >&2
+    exit 1
+fi
+grep -Fq 'Claude --settings may contain only' \
+    "$tmp/unsafe-claude-settings.err"
+terminal_count_after="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+
+assert_managed_claude_settings_rejected() {
+    local label="$1" settings="$2" expected="$3" forbidden="${4:-}"
+    terminal_count_before="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    if env "${managed_env[@]}" "$tool" claude --settings "$settings" \
+        >"$tmp/claude-settings-$label.out" \
+        2>"$tmp/claude-settings-$label.err"; then
+        echo "managed Claude accepted unsafe settings: $label" >&2
+        exit 1
+    fi
+    grep -Fq "$expected" "$tmp/claude-settings-$label.err"
+    if [[ -n "$forbidden" ]] &&
+       grep -Fq "$forbidden" "$tmp/claude-settings-$label.err"; then
+        echo "managed Claude leaked rejected settings: $label" >&2
+        exit 1
+    fi
+    terminal_count_after="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+}
+
+multi_document_claude_settings="$tmp/multi-document-claude.settings.json"
+printf '%s\n%s\n' \
+    '{"enabledPlugins":{"context-mode@context-mode":false}}' \
+    '{"env":{}}' > "$multi_document_claude_settings"
+assert_managed_claude_settings_rejected \
+    multiple-json-documents "$multi_document_claude_settings" \
+    'Claude --settings may contain only'
+null_claude_settings="$tmp/null-claude.settings.json"
+printf '%s\n' '{"apiKeyHelper":null}' > "$null_claude_settings"
+assert_managed_claude_settings_rejected \
+    null-helper "$null_claude_settings" \
+    'Claude --settings may contain only'
+false_claude_settings="$tmp/false-claude.settings.json"
+printf '%s\n' '{"apiKeyHelper":false}' > "$false_claude_settings"
+assert_managed_claude_settings_rejected \
+    false-helper "$false_claude_settings" \
+    'Claude --settings may contain only'
+extra_env_claude_settings="$tmp/extra-env-claude.settings.json"
+printf '%s\n' '{"env":{"CLAUDE_CODE_SIMPLE":"1"}}' \
+    > "$extra_env_claude_settings"
+assert_managed_claude_settings_rejected \
+    extra-env "$extra_env_claude_settings" \
+    'Claude --settings may contain only'
+symlink_claude_settings="$tmp/symlink-claude.settings.json"
+ln -s -- "$safe_claude_settings" "$symlink_claude_settings"
+assert_managed_claude_settings_rejected \
+    symlink "$symlink_claude_settings" \
+    'Claude --settings cannot be a symbolic link'
+inline_claude_secret='AGS_REJECTED_SETTINGS_SECRET_71C9'
+assert_managed_claude_settings_rejected \
+    inline-permissions \
+    "{\"env\":{\"ANTHROPIC_API_KEY\":\"$inline_claude_secret\"},\"permissions\":{}}" \
+    'Claude --settings must be a readable JSON file or inline JSON' \
+    "$inline_claude_secret"
+unsafe_helper_claude_settings="$tmp/unsafe-helper-claude.settings.json"
+helper_side_effect="$tmp/helper-side-effect"
+jq -n --arg command "touch $helper_side_effect; /usr/bin/printenv TEST_CLAUDE_API_KEY" \
+    '{apiKeyHelper:$command}' > "$unsafe_helper_claude_settings"
+assert_managed_claude_settings_rejected \
+    unsafe-helper "$unsafe_helper_claude_settings" \
+    'Claude --settings may contain only'
+[[ ! -e "$helper_side_effect" ]]
+
+assert_managed_claude_source_settings_rejected() {
+    local label="$1" workdir="$2" expected="$3" forbidden="${4:-}"
+    terminal_count_before="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    if (
+        cd -- "$workdir"
+        env "${managed_env[@]}" "$tool" claude --model source-settings-test
+    ) >"$tmp/claude-source-settings-$label.out" \
+      2>"$tmp/claude-source-settings-$label.err"; then
+        echo "managed Claude accepted unsafe source settings: $label" >&2
+        exit 1
+    fi
+    grep -Fq "$expected" "$tmp/claude-source-settings-$label.err"
+    if [[ -n "$forbidden" ]] &&
+       grep -Fq "$forbidden" "$tmp/claude-source-settings-$label.err"; then
+        echo "managed Claude leaked rejected source settings: $label" >&2
+        exit 1
+    fi
+    terminal_count_after="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+}
+
+claude_settings_repo="$tmp/claude-settings-repo"
+mkdir -p "$claude_settings_repo/subdir" "$claude_settings_repo/.claude"
+git -C "$claude_settings_repo" init -q -b main
+git -C "$claude_settings_repo" -c user.name=AGS \
+    -c user.email=ags@example.invalid commit --allow-empty -qm initial
+base_helper_side_effect="$tmp/base-helper-side-effect"
+base_helper_secret='AGS_BASE_HELPER_SECRET_4EF2'
+jq -n --arg command \
+    "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then :; else touch $base_helper_side_effect; fi; printf '%s' $base_helper_secret" \
+    '{apiKeyHelper:$command}' > "$tmp/source/claude/settings.json"
+assert_managed_claude_source_settings_rejected \
+    conditional-user-helper "$claude_settings_repo/subdir" \
+    'Claude user settings must be one JSON object and apiKeyHelper' \
+    "$base_helper_secret"
+[[ ! -e "$base_helper_side_effect" ]]
+rm -f -- "$tmp/source/claude/settings.json"
+
+jq -n --arg command "touch $base_helper_side_effect" \
+    '{apiKeyHelper:$command}' \
+    > "$claude_settings_repo/.claude/settings.json"
+assert_managed_claude_source_settings_rejected \
+    project-helper "$claude_settings_repo/subdir" \
+    'Claude project settings must be one JSON object and apiKeyHelper'
+[[ ! -e "$base_helper_side_effect" ]]
+rm -f -- "$claude_settings_repo/.claude/settings.json"
+
+printf '%s\n' '{"apiKeyHelper":null}' \
+    > "$claude_settings_repo/.claude/settings.local.json"
+assert_managed_claude_source_settings_rejected \
+    local-null-helper "$claude_settings_repo/subdir" \
+    'Claude local settings must be one JSON object and apiKeyHelper'
+rm -f -- "$claude_settings_repo/.claude/settings.local.json"
+
+mkdir -p "$claude_settings_repo/subdir/.claude"
+jq -n --arg command "touch $base_helper_side_effect" \
+    '{apiKeyHelper:$command}' \
+    > "$claude_settings_repo/subdir/.claude/settings.local.json"
+assert_managed_claude_source_settings_rejected \
+    legacy-local-helper "$claude_settings_repo/subdir" \
+    'Claude legacy local settings must be one JSON object and apiKeyHelper'
+[[ ! -e "$base_helper_side_effect" ]]
+rm -f -- "$claude_settings_repo/subdir/.claude/settings.local.json"
+
+claude_settings_worktree="$tmp/claude-settings-worktree"
+git -C "$claude_settings_repo" worktree add -q \
+    -b settings-worktree "$claude_settings_worktree"
+jq -n --arg command "touch $base_helper_side_effect" \
+    '{apiKeyHelper:$command}' \
+    > "$claude_settings_repo/.claude/settings.local.json"
+assert_managed_claude_source_settings_rejected \
+    main-worktree-local-helper "$claude_settings_worktree" \
+    'Claude main-worktree local settings must be one JSON object and apiKeyHelper'
+[[ ! -e "$base_helper_side_effect" ]]
+rm -f -- "$claude_settings_repo/.claude/settings.local.json"
+
+managed_settings_fixture="$tmp/managed-claude.settings.json"
+managed_settings_tool="$tmp/ags-managed-settings-test"
+managed_helper_side_effect="$tmp/managed-helper-side-effect"
+managed_path_occurrences="$(
+    grep -Fo '"/etc/claude-code/managed-settings.json"' "$tool" |
+        wc -l | tr -d '[:space:]'
+)"
+[[ "$managed_path_occurrences" == 1 ]]
+jq -n --arg command "touch $managed_helper_side_effect" \
+    '{apiKeyHelper:$command}' > "$managed_settings_fixture"
+sed "s|\"/etc/claude-code/managed-settings.json\"|\"$managed_settings_fixture\"|" \
+    "$tool" > "$managed_settings_tool"
+chmod +x "$managed_settings_tool"
+terminal_count_before="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+if (
+    cd -- "$claude_settings_repo/subdir"
+    env "${managed_env[@]}" "$managed_settings_tool" claude \
+        --model managed-settings-test
+) > "$tmp/claude-source-settings-managed.out" \
+  2> "$tmp/claude-source-settings-managed.err"; then
+    echo 'managed Claude accepted unsafe managed settings' >&2
+    exit 1
+fi
+grep -Fq 'Claude managed settings must be one JSON object and apiKeyHelper' \
+    "$tmp/claude-source-settings-managed.err"
+terminal_count_after="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+[[ ! -e "$managed_helper_side_effect" ]]
+
+printf '%s\n%s\n' '{}' '{}' > "$tmp/source/claude/settings.json"
+assert_managed_claude_source_settings_rejected \
+    user-multiple-json "$claude_settings_repo/subdir" \
+    'Claude user settings must be one JSON object and apiKeyHelper'
+rm -f -- "$tmp/source/claude/settings.json"
+
+ln -s -- "$safe_claude_settings" "$tmp/source/claude/settings.json"
+assert_managed_claude_source_settings_rejected \
+    user-symlink "$claude_settings_repo/subdir" \
+    'Claude user settings cannot be a symbolic link'
+rm -f -- "$tmp/source/claude/settings.json"
+
+jq -n '{
+  permissions:{deny:["Read(./secret)"]},
+  enabledPlugins:{"other-plugin@example":true},
+  apiKeyHelper:"/usr/bin/printenv TEST_CLAUDE_API_KEY"
+}' > "$tmp/source/claude/settings.json"
+safe_source_settings_output="$(
+    cd -- "$claude_settings_repo/subdir"
+    env "${managed_env[@]}" "$tool" claude --model safe-source-settings
+)"
+grep -Fqx 'FAKE_CLAUDE <--model> <safe-source-settings>' \
+    <<< "$safe_source_settings_output"
+rm -f -- "$tmp/source/claude/settings.json"
+
+replacement_claude_settings="$tmp/replacement-claude.settings.json"
+replacement_helper_side_effect="$tmp/replacement-helper-side-effect"
+jq -n --arg command "touch $replacement_helper_side_effect" \
+    '{apiKeyHelper:$command}' > "$replacement_claude_settings"
+terminal_count_before="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+claude_probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
+    "$tmp/home/.local/agsx.log" || true)"
+if env "${managed_env[@]}" \
+    FAKE_CLAUDE_REPLACE_SETTINGS_WITH="$replacement_claude_settings" \
+    "$tool" claude --model replacement-race \
+    > "$tmp/claude-replacement-race.out" \
+    2> "$tmp/claude-replacement-race.err"; then
+    echo 'managed Claude accepted settings replaced during its probe' >&2
+    exit 1
+fi
+grep -Fq 'Claude user settings must be one JSON object and apiKeyHelper' \
+    "$tmp/claude-replacement-race.err"
+terminal_count_after="$(grep -c '^TERMINAL=' \
+    "$tmp/home/.local/agsx.log" || true)"
+claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
+    "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+[[ "$claude_probe_count_after" == $((claude_probe_count_before + 1)) ]]
+[[ ! -e "$replacement_helper_side_effect" ]]
+rm -f -- "$tmp/source/claude/settings.json"
+
+assert_managed_claude_arg_rejected() {
+    local label="$1" expected="$2"
+    shift 2
+    terminal_count_before="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    if env "${managed_env[@]}" "$tool" claude "$@" \
+        >"$tmp/claude-arg-$label.out" \
+        2>"$tmp/claude-arg-$label.err"; then
+        echo "managed Claude accepted Context Mode bypass: $label" >&2
+        exit 1
+    fi
+    grep -Fq "Claude $expected cannot be forwarded" \
+        "$tmp/claude-arg-$label.err"
+    terminal_count_after="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+}
+
+assert_managed_claude_arg_rejected \
+    plugin-dir --plugin-dir --plugin-dir "$tmp/context-shadow"
+assert_managed_claude_arg_rejected \
+    plugin-dir-equals --plugin-dir "--plugin-dir=$tmp/context-shadow"
+assert_managed_claude_arg_rejected \
+    plugin-url --plugin-url --plugin-url https://example.invalid/plugin.zip
+assert_managed_claude_arg_rejected \
+    plugin-url-equals --plugin-url \
+    --plugin-url=https://example.invalid/plugin.zip
+assert_managed_claude_arg_rejected \
+    disallowed-tools --disallowedTools \
+    --disallowedTools mcp__plugin_context-mode_context-mode__ctx_execute
+assert_managed_claude_arg_rejected \
+    disallowed-tools-kebab-equals --disallowed-tools \
+    --disallowed-tools=mcp__plugin_context-mode_context-mode__ctx_search
+assert_managed_claude_arg_rejected \
+    agent --agent --agent restricted
+assert_managed_claude_arg_rejected \
+    agent-equals --agent --agent=restricted
+assert_managed_claude_arg_rejected \
+    agents --agents --agents '{"restricted":{"tools":["Bash"]}}'
+assert_managed_claude_arg_rejected \
+    agents-equals --agents '--agents={"restricted":{"tools":["Bash"]}}'
+assert_managed_claude_arg_rejected tmux --tmux --tmux
+assert_managed_claude_arg_rejected \
+    tmux-equals --tmux --tmux=classic
+assert_managed_claude_arg_rejected \
+    no-session-persistence --no-session-persistence --no-session-persistence
+assert_managed_claude_arg_rejected \
+    no-session-persistence-equals --no-session-persistence \
+    --no-session-persistence=true
+
+for effective_failure in hooks mcp; do
+    terminal_count_before="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    if env "${managed_env[@]}" \
+        FAKE_CONTEXT_EFFECTIVE_FAIL="$effective_failure" \
+        "$tool" claude >"$tmp/claude-effective-$effective_failure.out" \
+        2>"$tmp/claude-effective-$effective_failure.err"; then
+        echo "managed Claude ignored ineffective Context Mode $effective_failure" >&2
+        exit 1
+    fi
+    grep -Fq 'Context Mode is not enabled for Claude; run ags init' \
+        "$tmp/claude-effective-$effective_failure.err"
+    terminal_count_after="$(
+        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    )"
+    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+done
+
+terminal_count_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+if env "${managed_env[@]}" FAKE_CONTEXT_TRUST_STATUS=untrusted "$tool" codex \
+    > "$tmp/untrusted-context.out" 2> "$tmp/untrusted-context.err"; then
+    echo 'managed Codex launch ignored untrusted Context Mode hooks' >&2
+    exit 1
+fi
+grep -Fq "Context Mode hooks are not trusted for this workspace" \
+    "$tmp/untrusted-context.err"
+terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+
+if env "${managed_env[@]}" FAKE_CONTEXT_CORRUPT_CACHE=1 "$tool" codex \
+    > "$tmp/corrupt-context.out" 2> "$tmp/corrupt-context.err"; then
+    echo 'managed Codex launch accepted a changed Context Mode cache manifest' >&2
+    exit 1
+fi
+grep -Fq "Context Mode hook verification failed for this workspace" \
+    "$tmp/corrupt-context.err"
+terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+cp -- "$context_runtime_root/.codex-plugin/hooks.json" \
+    "$tmp/source/codex/plugins/cache/context-mode/context-mode/1.0.169/.codex-plugin/hooks.json"
+
+if env "${managed_env[@]}" \
+    FAKE_CONTEXT_CORRUPT_CACHE_FILE=server.bundle.mjs "$tool" codex \
+    > "$tmp/corrupt-context-server.out" \
+    2> "$tmp/corrupt-context-server.err"; then
+    echo 'managed Codex launch accepted changed Context Mode executable bytes' >&2
+    exit 1
+fi
+grep -Fq "Context Mode hook verification failed for this workspace" \
+    "$tmp/corrupt-context-server.err"
+terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+[[ "$terminal_count_after" == "$terminal_count_before" ]]
+cp -- "$context_runtime_root/server.bundle.mjs" \
+    "$tmp/source/codex/plugins/cache/context-mode/context-mode/1.0.169/server.bundle.mjs"
+
+bare_attach="$(
+    env "${managed_env[@]}" \
+        AGENT_SESSION_REMOTE_PASSWORD=remote-secret \
+        AGENT_SESSION_CLOUD_PASSWORD=cloud-secret \
+        RCLONE_SFTP_PASS=rclone-secret \
+        FAKE_RMUX_LIVE_SESSION=$'manual-user-session\nags-0123456789abcdefabcd' \
+        "$tool"
+)"
+grep -Fq 'FAKE_RMUX_ATTACHED -L ags -f /dev/null attach-session -t ags-0123456789abcdefabcd' \
+    <<< "$bare_attach"
+[[ "$bare_attach" != *manual-user-session* ]]
+bare_list_call="$(
+    grep '^RMUX=.* list-sessions ' "$tmp/home/.local/agsx.log" | tail -1
+)"
+[[ "$bare_list_call" == *" -O activity "* && "$bare_list_call" != *" -r "* ]]
+
+if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
+    live_one=ags-11111111111111111111
+    live_two=ags-22222222222222222222
+    live_sessions_file="$tmp/live-rmux.tsv"
+    printf '%s\tcodex\t/test/one\n%s\tclaude\t/test/two\n' \
+        "$live_one" "$live_two" > "$live_sessions_file"
+    mkdir -p "$tmp/state/live-sessions"
+    chmod 700 "$tmp/state/live-sessions"
+    write_fake_live_metadata() {
+        local session_name="$1" description="$2" agent="$3" cwd="$4"
+        jq -n --arg session_name "$session_name" \
+            --arg description "$description" --arg agent "$agent" \
+            --arg cwd "$cwd" '{
+              schema:1,session_name:$session_name,description:$description,
+              agent:$agent,cwd:$cwd,source:"fresh",
+              created_utc:"2026-08-01T00:00:00.000Z"
+            }' > "$tmp/state/live-sessions/$session_name.json"
+        chmod 600 "$tmp/state/live-sessions/$session_name.json"
+    }
+    write_fake_live_metadata "$live_one" 'Codex investigation' codex /test/one
+    write_fake_live_metadata "$live_two" 'Claude review' claude /test/two
+    write_fake_live_metadata \
+        ags-33333333333333333333 'Stale metadata' codex /test/stale
+
+    live_table="$(
+        env "${managed_env[@]}" \
+            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
+            "$tool" sessions
+    )"
+    grep -Fq "$live_one" <<< "$live_table"
+    grep -Fq 'Codex investigation' <<< "$live_table"
+    grep -Fq "$live_two" <<< "$live_table"
+    grep -Fq 'Claude review' <<< "$live_table"
+    [[ "$live_table" != *'Stale metadata'* ]]
+
+    prefix_attach="$(
+        env "${managed_env[@]}" \
+            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
+            "$tool" attach 1111
+    )"
+    grep -Fq "attach-session -t $live_one" <<< "$prefix_attach"
+    described_live="$(
+        env "${managed_env[@]}" \
+            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
+            "$tool" describe 1111 'Renamed Codex session'
+    )"
+    grep -Fqx 'status=described' <<< "$described_live"
+    jq -e '.description == "Renamed Codex session" and .source == "fresh"' \
+        "$tmp/state/live-sessions/$live_one.json" >/dev/null
+    [[ "$(stat -c %a "$tmp/state/live-sessions/$live_one.json")" == 600 ]]
+
+    ambiguous_sessions_file="$tmp/live-rmux-ambiguous.tsv"
+    printf '%s\tcodex\t/test/a\n%s\tclaude\t/test/b\n' \
+        ags-abcd0000000000000000 ags-abcd1111111111111111 \
+        > "$ambiguous_sessions_file"
+    if env "${managed_env[@]}" \
+        FAKE_RMUX_SESSIONS_FILE="$ambiguous_sessions_file" \
+        "$tool" attach abcd > "$tmp/live-ambiguous.out" \
+        2> "$tmp/live-ambiguous.err"; then
+        echo 'live attach accepted an ambiguous ID prefix' >&2
+        exit 1
+    fi
+    grep -Fq 'expected one live session matching abcd; found 2' \
+        "$tmp/live-ambiguous.err"
+
+    cat > "$tmp/stty-guard" <<'EOF'
+#!/usr/bin/env bash
+set -u
+before="$(stty -g)"
+"$@"
+child_status=$?
+after="$(stty -g)"
+[[ "$before" == "$after" ]] || exit 90
+printf 'STTY_UNCHANGED\n'
+exit "$child_status"
+EOF
+    chmod +x "$tmp/stty-guard"
+    run_live_pty() {
+        local input="$1" output="$2" pty_command
+        shift 2
+        printf -v pty_command '%q ' \
+            env "${managed_env[@]}" \
+            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" "$@"
+        printf '%s' "$input" | \
+            SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
+                > "$output" 2>&1
+    }
+
+    run_live_pty $'\033[B\n' "$tmp/live-down-enter.out" \
+        "$tmp/stty-guard" "$tool"
+    grep -Fq "attach-session -t $live_two" "$tmp/live-down-enter.out"
+    grep -Fq 'STTY_UNCHANGED' "$tmp/live-down-enter.out"
+
+    live_state_before="$(sha256sum "$live_sessions_file")"
+    run_live_pty $'\033' "$tmp/live-escape.out" \
+        "$tmp/stty-guard" "$tool"
+    [[ "$live_state_before" == "$(sha256sum "$live_sessions_file")" ]]
+    [[ "$(<"$tmp/live-escape.out")" != *FAKE_RMUX_ATTACHED* ]]
+    run_live_pty $'\177\033' "$tmp/live-backspace.out" \
+        "$tmp/stty-guard" "$tool"
+    [[ "$live_state_before" == "$(sha256sum "$live_sessions_file")" ]]
+    run_live_pty $'\033[3~n\033' "$tmp/live-delete-no.out" \
+        "$tmp/stty-guard" "$tool"
+    [[ "$live_state_before" == "$(sha256sum "$live_sessions_file")" ]]
+
+    cp -- "$tmp/state/live-sessions/$live_one.json" "$tmp/live-one-metadata.json"
+    run_live_pty $'\033[3~y\033' "$tmp/live-delete-yes.out" \
+        "$tmp/stty-guard" "$tool"
+    ! grep -Fq "$live_one" "$live_sessions_file"
+    grep -Fq "$live_two" "$live_sessions_file"
+    [[ ! -e "$tmp/state/live-sessions/$live_one.json" ]]
+    [[ -f "$tmp/state/live-sessions/$live_two.json" ]]
+
+    printf '%s\tcodex\t/test/one\n%s\tclaude\t/test/two\n' \
+        "$live_one" "$live_two" > "$live_sessions_file"
+    cp -- "$tmp/live-one-metadata.json" \
+        "$tmp/state/live-sessions/$live_one.json"
+    chmod 600 "$tmp/state/live-sessions/$live_one.json"
+    run_live_pty $'\033[3~y\033' "$tmp/live-delete-fail.out" \
+        FAKE_RMUX_KILL_FAIL=1 "$tmp/stty-guard" "$tool"
+    grep -Fq "$live_one" "$live_sessions_file"
+    [[ -f "$tmp/state/live-sessions/$live_one.json" ]]
+
+    stale_attach="$(
+        env "${managed_env[@]}" \
+            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
+            FAKE_RMUX_STALE_SESSION="$live_one" "$tool"
+    )"
+    grep -Fq "attach-session -t $live_two" <<< "$stale_attach"
+
+    live_sessions_file="$tmp/live-rmux-single.tsv"
+    printf '%s\tclaude\t/test/two\n' "$live_two" > "$live_sessions_file"
+    run_live_pty $'\033[3~y' "$tmp/live-sessions-delete-one.out" \
+        "$tmp/stty-guard" "$tool" sessions
+    [[ ! -s "$live_sessions_file" ]]
+    [[ ! -e "$tmp/state/live-sessions/$live_two.json" ]]
+    grep -Fq 'STTY_UNCHANGED' "$tmp/live-sessions-delete-one.out"
+fi
+
+if env "${managed_env[@]}" FAKE_RMUX_LIST_ERROR=1 "$tool" \
+    >"$tmp/rmux-list-error.out" 2>"$tmp/rmux-list-error.err"; then
+    echo 'bare ags ignored an RMUX list failure' >&2
+    exit 1
+fi
+grep -Fq 'cannot query live RMUX sessions: rmux: synthetic protocol failure' \
+    "$tmp/rmux-list-error.err"
+
+if env "${managed_env[@]}" FAKE_RMUX_VERSION=0.9.0 "$tool" \
+    >"$tmp/rmux-version.out" 2>"$tmp/rmux-version.err"; then
+    echo 'bare ags accepted an unsupported RMUX version' >&2
+    exit 1
+fi
+grep -Fq 'compatible RMUX 0.9.x release (0.9.1 or newer) is required; found rmux 0.9.0' \
+    "$tmp/rmux-version.err"
+for unsupported_rmux in 0.10.0 1.0.0; do
+    if env "${managed_env[@]}" FAKE_RMUX_VERSION="$unsupported_rmux" "$tool" \
+        >"$tmp/rmux-version-$unsupported_rmux.out" \
+        2>"$tmp/rmux-version-$unsupported_rmux.err"; then
+        echo "bare ags accepted unsupported RMUX $unsupported_rmux" >&2
+        exit 1
+    fi
+    grep -Fq "found rmux $unsupported_rmux" \
+        "$tmp/rmux-version-$unsupported_rmux.err"
+done
+
+extract_checkpoint() {
+    local archive="$1" destination="$2"
+    rm -rf -- "$destination"
+    mkdir -p "$destination"
+    age -d -i "$tmp/key" "$archive" | tar -xzf - -C "$destination"
+}
+
+assert_format4_archive() {
+    local archive="$1" destination="$2"
+    local expected_count expected_size expected_index count=0 size=0
+    local digest artifact_size relative mode mtime extra artifact
+    extract_checkpoint "$archive" "$destination"
+    grep -Fqx 'format=4' "$destination/manifest"
+    grep -Fqx 'capture_fidelity=full' "$destination/manifest"
+    grep -Fqx 'artifact_metadata=mode-mtime-v1' "$destination/manifest"
+    for field in binary_invoked_path binary_real_path binary_version binary_sha256 \
+        binary_os binary_arch artifact_count artifact_size artifact_index_sha256; do
+        grep -Eq "^$field=.+$" "$destination/manifest"
+    done
+    expected_count="$(sed -n 's/^artifact_count=//p' "$destination/manifest")"
+    expected_size="$(sed -n 's/^artifact_size=//p' "$destination/manifest")"
+    expected_index="$(sed -n 's/^artifact_index_sha256=//p' "$destination/manifest")"
+    [[ "$expected_index" == "$(sha256sum "$destination/artifacts.tsv" | cut -d' ' -f1)" ]]
+    while IFS=$'\t' read -r digest artifact_size relative mode mtime extra; do
+        [[ "$digest" =~ ^[0-9a-f]{64}$ && "$artifact_size" =~ ^[0-9]+$ ]]
+        [[ -n "$relative" && "$mode" =~ ^[0-7]{3}$ &&
+           "$mtime" =~ ^(0|[1-9][0-9]{0,11})$ && -z "$extra" ]]
+        artifact="$destination/artifacts/$relative"
+        [[ -f "$artifact" ]]
+        [[ "$artifact_size" == "$(stat -c %s "$artifact")" ]]
+        [[ "$digest" == "$(sha256sum "$artifact" | cut -d' ' -f1)" ]]
+        count=$((count + 1))
+        size=$((size + 10#$artifact_size))
+    done < "$destination/artifacts.tsv"
+    [[ "$count" == "$expected_count" && "$size" == "$expected_size" ]]
+    [[ "$(find "$destination/artifacts" -type f | wc -l)" == "$expected_count" ]]
+}
+
+reference_ascii_claude_project_key() {
+    local input="$1" sanitized= character code index
+    local hash=0 signed_hash absolute_hash suffix= digit
+    local alphabet=0123456789abcdefghijklmnopqrstuvwxyz
+    local LC_ALL=C
+    for ((index = 0; index < ${#input}; index++)); do
+        character="${input:index:1}"
+        case "$character" in
+            [A-Za-z0-9]) sanitized+="$character" ;;
+            *) sanitized+=- ;;
+        esac
+        printf -v code '%d' "'$character"
+        hash=$(((hash * 31 + code) & 4294967295))
+    done
+    if (( ${#sanitized} <= 200 )); then
+        printf '%s\n' "$sanitized"
+        return
+    fi
+    if (( hash >= 2147483648 )); then
+        signed_hash=$((hash - 4294967296))
+    else
+        signed_hash="$hash"
+    fi
+    if (( signed_hash < 0 )); then
+        absolute_hash=$((-signed_hash))
+    else
+        absolute_hash="$signed_hash"
+    fi
+    if (( absolute_hash == 0 )); then
+        suffix=0
+    else
+        while (( absolute_hash > 0 )); do
+            digit=$((absolute_hash % 36))
+            suffix="${alphabet:digit:1}$suffix"
+            absolute_hash=$((absolute_hash / 36))
+        done
+    fi
+    printf '%s-%s\n' "${sanitized:0:200}" "$suffix"
+}
+
+run_clean_init() {
+    local init_home="$1"
+    shift
+    prepare_context_mode_runtime "$init_home"
+    env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+        -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+        -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
+        HOME="$init_home" \
+        CODEX_HOME="$init_home/.codex" \
+        CLAUDE_CONFIG_DIR="$init_home/.claude" \
+        PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+        FAKE_CONTEXT_PLUGIN_STATE_DIR="$init_home/.context-mode-provider-state" \
+        "$tool" init "$@"
+}
+
+context_fixture_home="$tmp/context-fixtures"
+prepare_context_mode_runtime "$context_fixture_home"
+
+assert_context_command_rejects_unsafe_claude_settings() {
+    local label="$1" command_name="$2" unsafe_home side_effect
+    local probe_count_before probe_count_after
+    unsafe_home="$tmp/context-unsafe-$label"
+    side_effect="$tmp/context-unsafe-$label-side-effect"
+    prepare_context_mode_runtime "$unsafe_home"
+    mkdir -p "$unsafe_home/.claude"
+    jq -n --arg command \
+        "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then touch $side_effect; fi; /usr/bin/printenv TEST_CLAUDE_API_KEY" \
+        '{apiKeyHelper:$command}' > "$unsafe_home/.claude/settings.json"
+    probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
+        "$tmp/home/.local/agsx.log" || true)"
+    if env HOME="$unsafe_home" \
+        PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        CODEX_HOME="$unsafe_home/.codex" \
+        CLAUDE_CONFIG_DIR="$unsafe_home/.claude" \
+        FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+        FAKE_CONTEXT_PLUGIN_STATE_DIR="$unsafe_home/.context-mode-provider-state" \
+        "$tool" "$command_name" \
+        > "$tmp/context-unsafe-$label.out" \
+        2> "$tmp/context-unsafe-$label.err"; then
+        echo "$command_name accepted an unsafe Claude helper" >&2
+        exit 1
+    fi
+    grep -Fq \
+        'Claude user settings must be one JSON object and apiKeyHelper' \
+        "$tmp/context-unsafe-$label.err"
+    probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
+        "$tmp/home/.local/agsx.log" || true)"
+    [[ "$probe_count_after" == "$probe_count_before" ]]
+    [[ ! -e "$side_effect" ]]
+    [[ ! -e "$unsafe_home/.local/state/ags/context-mode.json" ]]
+}
+
+assert_context_command_rejects_unsafe_claude_settings init init
+assert_context_command_rejects_unsafe_claude_settings \
+    context-init context-init
+
+standalone_context_home="$tmp/context-standalone-home"
+standalone_context_bin="$tmp/context-standalone-bin"
+mkdir -p "$standalone_context_home" "$standalone_context_bin"
+ln -s "$tmp/home/.local/bin/node" "$standalone_context_bin/node"
+ln -s "$tmp/home/.local/bin/npm" "$standalone_context_bin/npm"
+env HOME="$standalone_context_home" \
+    PATH="$standalone_context_bin:/usr/bin:/bin" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_STANDALONE_PROVIDER_FAIL=1 \
+    "$tool" context-init > "$tmp/context-standalone.out" \
+    2> "$tmp/context-standalone.err"
+grep -Fqx 'status=context-mode-initialized' "$tmp/context-standalone.out"
+jq -e '
+  .schema == 2 and
+  .health == {mode:"doctor",status:"passed"} and
+  .providers == {}
+' "$standalone_context_home/.local/state/ags/context-mode.json" >/dev/null
+init_home="$tmp/init-home"
+init_vault="$init_home/.local/share/ags/checkpoints"
+init_identity="$init_home/.config/ags/identity.agekey"
+init_config="$init_home/.local/state/ags/storage.json"
+mkdir -p "$init_home"
+(
+    umask 000
+    run_clean_init "$init_home"
+) > "$tmp/init.out" 2> "$tmp/init.err"
+grep -Fqx 'status=initialized' "$tmp/init.out"
+grep -Fqx "vault=$init_vault" "$tmp/init.out"
+grep -Fqx "identity=$init_identity" "$tmp/init.out"
+grep -Fqx "recipient=$(age-keygen -y "$init_identity")" "$tmp/init.out"
+grep -Fq 'Back up this identity separately' "$tmp/init.err"
+grep -Fqx 'DOCTOR=claude-code' \
+    "$init_home/.local/state/ags/context-mode-test.log"
+grep -Fqx 'DOCTOR=codex' \
+    "$init_home/.local/state/ags/context-mode-test.log"
+if grep -Fq 'AGE-SECRET-KEY-' "$tmp/init.out" "$tmp/init.err"; then
+    echo 'init printed the secret identity' >&2
+    exit 1
+fi
+[[ -d "$init_vault" && -f "$init_identity" && -f "$init_config" ]]
+[[ "$(stat -c %a "$init_home/.config/ags")" == 700 ]]
+[[ "$(stat -c %a "$init_home/.local/state/ags")" == 700 ]]
+[[ "$(stat -c %a "$init_vault")" == 700 ]]
+[[ "$(stat -c %a "$init_identity")" == 600 ]]
+[[ "$(stat -c %a "$init_config")" == 600 ]]
+jq -e --arg vault "$init_vault" --arg identity "$init_identity" '
+    .version == 4 and .local_path == $vault and
+    .encryption == {type:"age-x25519", identity_file:$identity}
+' "$init_config" >/dev/null
+init_identity_sha="$(sha256sum "$init_identity" | cut -d' ' -f1)"
+run_clean_init "$init_home" > "$tmp/init-again.out" 2> "$tmp/init-again.err"
+[[ "$init_identity_sha" == "$(sha256sum "$init_identity" | cut -d' ' -f1)" ]]
+grep -Fqx 'status=initialized' "$tmp/init-again.out"
+
+context_init_home="$tmp/context-init-home"
+context_plugin_state="$tmp/context-plugin-state"
+context_root_169="$(
+    context_mode_test_runtime_root "$context_init_home" 1.0.169
+)"
+context_package_root="$context_root_169/node_modules/context-mode"
+claude_market_before="$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
+    "$tmp/home/.local/agsx.log" || true)"
+claude_plugin_before="$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
+    "$tmp/home/.local/agsx.log" || true)"
+codex_market_before="$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
+    "$tmp/home/.local/agsx.log" || true)"
+codex_plugin_before="$(grep -c '^CODEX_CONTEXT=plugin add ' \
+    "$tmp/home/.local/agsx.log" || true)"
+codex_hooks_before="$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
+    "$tmp/home/.local/agsx.log" || true)"
+prepare_context_mode_runtime "$context_init_home"
+context_init_env=(
+    HOME="$context_init_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$context_init_home/.codex"
+    CLAUDE_CONFIG_DIR="$context_init_home/.claude"
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_plugin_state"
+    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1
+    FAKE_CLAUDE_REWRITES_PACKAGE=1
+    FAKE_CONTEXT_PACKAGE_ROOT="$context_package_root"
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
+)
+env "${context_init_env[@]}" "$tool" init \
+    > "$tmp/context-init.out" 2> "$tmp/context-init.err"
+grep -Fqx 'status=initialized' "$tmp/context-init.out"
+[[ "$(grep -c '^NPM_CONTEXT=install ' \
+    "$context_init_home/.context-mode-npm.log")" == 1 ]]
+grep -Fqx 'DOCTOR=claude-code' \
+    "$context_init_home/.local/state/ags/context-mode-test.log"
+grep -Fqx 'DOCTOR=codex' \
+    "$context_init_home/.local/state/ags/context-mode-test.log"
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin \
+    codex-hooks; do
+    [[ -f "$context_plugin_state/$marker" ]]
+done
+grep -Fqx 'hooks = true' "$context_init_home/.codex/config.toml"
+grep -Fqx '[marketplaces.context-mode]' \
+    "$context_init_home/.codex/config.toml"
+grep -Fqx '[plugins."context-mode@context-mode"]' \
+    "$context_init_home/.codex/config.toml"
+cmp "$context_fixture_home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode/.claude-plugin/plugin.json" \
+    "$context_package_root/.claude-plugin/plugin.json"
+cmp "$context_fixture_home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode/hooks/hooks.json" \
+    "$context_package_root/hooks/hooks.json"
+context_manifest="$context_init_home/.local/state/ags/context-mode.json"
+jq -e --arg root "$context_package_root" \
+    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
+    --arg files_sha256 "$(
+        test_sha256_file "$context_root_169/ags-files.sha256"
+    )" '
+    .schema == 2 and .version == "1.0.169" and
+    .runtime.target == $target and
+    .package_root == $root and
+    .source.files_sha256 == $files_sha256 and
+    .health == {mode:"doctor",status:"passed"} and
+    .providers.claude == {
+      configured:true, plugin_owned:true, marketplace_owned:true
+    } and
+    .providers.codex == {
+      configured:true, plugin_owned:true, marketplace_owned:true,
+      hooks_enabled_by_ags:true, trust:"official-review-required"
+    }
+' "$context_manifest" >/dev/null
+env "${context_init_env[@]}" "$tool" init \
+    > "$tmp/context-init-again.out" 2> "$tmp/context-init-again.err"
+[[ "$(grep -c '^NPM_CONTEXT=install ' \
+    "$context_init_home/.context-mode-npm.log")" == 1 ]]
+[[ "$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
+    "$tmp/home/.local/agsx.log")" == $((claude_market_before + 1)) ]]
+[[ "$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
+    "$tmp/home/.local/agsx.log")" == $((claude_plugin_before + 1)) ]]
+[[ "$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
+    "$tmp/home/.local/agsx.log")" == $((codex_market_before + 1)) ]]
+[[ "$(grep -c '^CODEX_CONTEXT=plugin add ' \
+    "$tmp/home/.local/agsx.log")" == $((codex_plugin_before + 1)) ]]
+[[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
+    "$tmp/home/.local/agsx.log")" == $((codex_hooks_before + 1)) ]]
+if grep -Fq -- '--dangerously-bypass-hook-trust' \
+    "$tmp/home/.local/agsx.log" "$tmp/context-init.out" "$tmp/context-init.err"; then
+    echo 'Context Mode integration bypassed Codex hook trust' >&2
+    exit 1
+fi
+context_check_helper_side_effect="$tmp/context-check-helper-side-effect"
+jq -n --arg command \
+    "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then touch $context_check_helper_side_effect; fi; /usr/bin/printenv TEST_CLAUDE_API_KEY" \
+    '{apiKeyHelper:$command}' \
+    > "$context_init_home/.claude/settings.json"
+claude_probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
+    "$tmp/home/.local/agsx.log" || true)"
+if env "${context_init_env[@]}" \
+    "$tool" context-check claude "$tmp/home/.local/bin/claude" \
+    > "$tmp/context-claude-unsafe-helper.out" \
+    2> "$tmp/context-claude-unsafe-helper.err"; then
+    echo 'Claude context-check accepted an unsafe helper' >&2
+    exit 1
+fi
+grep -Fq 'Claude user settings must be one JSON object and apiKeyHelper' \
+    "$tmp/context-claude-unsafe-helper.err"
+claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
+    "$tmp/home/.local/agsx.log" || true)"
+[[ "$claude_probe_count_after" == "$claude_probe_count_before" ]]
+[[ ! -e "$context_check_helper_side_effect" ]]
+rm -f -- "$context_init_home/.claude/settings.json"
+codex_context_cache="$context_init_home/.codex/plugins/cache/context-mode/context-mode/1.0.169"
+if ! env "${context_init_env[@]}" \
+    FAKE_CODEX_REWRITES_CACHE=plugin-list \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-codex-cache-rewrite.out" \
+    2> "$tmp/context-codex-cache-rewrite.err"; then
+    sed -n '1,160p' "$tmp/context-codex-cache-rewrite.err" >&2
+    exit 1
+fi
+for relative in .claude-plugin/plugin.json hooks/hooks.json; do
+    cmp "$context_package_root/$relative" "$codex_context_cache/$relative"
+done
+if ! env "${context_init_env[@]}" \
+    FAKE_CODEX_REWRITES_CACHE=app-server \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-codex-app-server-rewrite.out" \
+    2> "$tmp/context-codex-app-server-rewrite.err"; then
+    sed -n '1,160p' "$tmp/context-codex-app-server-rewrite.err" >&2
+    exit 1
+fi
+for relative in .claude-plugin/plugin.json hooks/hooks.json; do
+    cmp "$context_package_root/$relative" "$codex_context_cache/$relative"
+done
+if env "${context_init_env[@]}" \
+    FAKE_CODEX_REWRITES_CACHE=plugin-list \
+    FAKE_CODEX_REWRITE_NODE=/tmp/not-the-active-node \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-codex-wrong-node.out" \
+    2> "$tmp/context-codex-wrong-node.err"; then
+    echo 'Codex cache repair accepted an unrelated absolute Node path' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode is not enabled for Codex' \
+    "$tmp/context-codex-wrong-node.err"
+! cmp -s "$context_package_root/.claude-plugin/plugin.json" \
+    "$codex_context_cache/.claude-plugin/plugin.json"
+for relative in .claude-plugin/plugin.json hooks/hooks.json; do
+    cp -p -- "$context_package_root/$relative" "$codex_context_cache/$relative"
+done
+if env "${context_init_env[@]}" \
+    FAKE_CODEX_REWRITES_CACHE=plugin-list \
+    FAKE_CODEX_REWRITE_PARTIAL=plugin \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-codex-partial-rewrite.out" \
+    2> "$tmp/context-codex-partial-rewrite.err"; then
+    echo 'Codex cache repair accepted a one-file partial rewrite' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode is not enabled for Codex' \
+    "$tmp/context-codex-partial-rewrite.err"
+! cmp -s "$context_package_root/.claude-plugin/plugin.json" \
+    "$codex_context_cache/.claude-plugin/plugin.json"
+for relative in .claude-plugin/plugin.json hooks/hooks.json; do
+    cp -p -- "$context_package_root/$relative" "$codex_context_cache/$relative"
+done
+if env "${context_init_env[@]}" \
+    FAKE_CODEX_REWRITES_PACKAGE=1 \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-codex-package-rewrite.out" \
+    2> "$tmp/context-codex-package-rewrite.err"; then
+    echo 'Codex cache repair accepted a canonical package rewrite' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode is not enabled for Codex' \
+    "$tmp/context-codex-package-rewrite.err"
+! cmp -s "$context_root_169/ags-pristine/claude-plugin.json" \
+    "$context_package_root/.claude-plugin/plugin.json"
+cp -p -- "$context_root_169/ags-pristine/claude-plugin.json" \
+    "$context_package_root/.claude-plugin/plugin.json"
+cp -p -- "$context_root_169/ags-pristine/claude-hooks.json" \
+    "$context_package_root/hooks/hooks.json"
+if env "${context_init_env[@]}" \
+    FAKE_CODEX_TOUCH_ALLOWED_FILE=.claude-plugin/plugin.json \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-codex-allowed-file-tamper.out" \
+    2> "$tmp/context-codex-allowed-file-tamper.err"; then
+    echo 'Codex cache repair accepted a non-official allowed-file edit' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode is not enabled for Codex' \
+    "$tmp/context-codex-allowed-file-tamper.err"
+! cmp -s "$context_package_root/.claude-plugin/plugin.json" \
+    "$codex_context_cache/.claude-plugin/plugin.json"
+cp -p -- "$context_package_root/.claude-plugin/plugin.json" \
+    "$codex_context_cache/.claude-plugin/plugin.json"
+
+context_crash_home="$tmp/context-crash-home"
+context_crash_state="$tmp/context-crash-provider-state"
+context_crash_package_root="$(
+    context_mode_test_runtime_root "$context_crash_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$context_crash_home"
+context_crash_env=(
+    HOME="$context_crash_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$context_crash_home/.codex"
+    CLAUDE_CONFIG_DIR="$context_crash_home/.claude"
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_crash_state"
+    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1
+    FAKE_CONTEXT_PACKAGE_ROOT="$context_crash_package_root"
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
+)
+if env "${context_crash_env[@]}" \
+    FAKE_CONTEXT_CRASH_AFTER_HOOK_ENABLE=1 \
+    "$tool" init > "$tmp/context-crash.out" \
+    2> "$tmp/context-crash.err"; then
+    echo 'Context Mode hook configuration crash fixture unexpectedly passed' >&2
+    exit 1
+fi
+context_crash_pending="$context_crash_home/.local/state/ags/context-mode.pending.json"
+context_crash_config="$context_crash_home/.codex/config.toml"
+[[ -f "$context_crash_pending" && -f "$context_crash_config" ]]
+jq -e '
+  .schema == 4 and
+  .kind == "bootstrap" and
+  .codex_hooks_config.before_state == "implicit-true" and
+  .codex_hooks_config.before_present == false and
+  .codex_hooks_config.before_sha256 == null and
+  (.codex_hooks_config.enabled_sha256 | test("^[0-9a-f]{64}$"))
+' "$context_crash_pending" >/dev/null
+[[ -f "$context_crash_home/.local/state/ags/context-mode.codex-config.enabled" ]]
+context_crash_quarantine="$(jq -er \
+    '.codex_hooks_config.quarantine_path' "$context_crash_pending")"
+context_crash_restore="$(jq -er \
+    '.codex_hooks_config.restore_path' "$context_crash_pending")"
+mv -- "$context_crash_config" "$context_crash_quarantine"
+printf 'interrupted restore candidate\n' > "$context_crash_restore"
+if env "${context_crash_env[@]}" \
+    FAKE_CONTEXT_DOCTOR_FAIL=codex \
+    "$tool" init > "$tmp/context-crash-recovery.out" \
+    2> "$tmp/context-crash-recovery.err"; then
+    echo 'Context Mode recovery ignored the forced Codex doctor failure' >&2
+    exit 1
+fi
+[[ ! -e "$context_crash_config" && ! -e "$context_crash_pending" ]]
+[[ ! -e "$context_crash_quarantine" && ! -e "$context_crash_restore" ]]
+for snapshot in context-mode.codex-config.before \
+    context-mode.codex-config.enabled .context-mode-codex-config-probe; do
+    [[ ! -e "$context_crash_home/.local/state/ags/$snapshot" ]]
+done
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
+    [[ ! -e "$context_crash_state/$marker" ]]
+done
+
+context_race_home="$tmp/context-race-home"
+context_race_state="$tmp/context-race-provider-state"
+context_race_bin="$tmp/context-race-bin"
+context_race_root="$(
+    context_mode_test_runtime_root "$context_race_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$context_race_home"
+mkdir -p "$context_race_bin"
+cat > "$context_race_bin/mv" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source_path="${@: -2:1}"
+destination_path="${@: -1}"
+"${FAKE_REAL_MV_BINARY:?}" "$@"
+if [[ "${FAKE_CONTEXT_CONCURRENT_CONFIG_WRITE:-0}" == 1 &&
+      "$destination_path" == *.ags-context-mode-quarantine &&
+      ! -e "$source_path" ]]; then
+    printf 'model = "concurrent-user-write"\n' > "$source_path"
+fi
+EOF
+chmod +x "$context_race_bin/mv"
+context_race_env=(
+    HOME="$context_race_home"
+    PATH="$context_race_bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$context_race_home/.codex"
+    CLAUDE_CONFIG_DIR="$context_race_home/.claude"
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_race_state"
+    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1
+    FAKE_CONTEXT_PACKAGE_ROOT="$context_race_root"
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
+    FAKE_REAL_MV_BINARY="$(command -v mv)"
+    FAKE_CONTEXT_CONCURRENT_CONFIG_WRITE=1
+    FAKE_CONTEXT_DOCTOR_FAIL=codex
+)
+if env "${context_race_env[@]}" "$tool" init \
+    > "$tmp/context-race.out" 2> "$tmp/context-race.err"; then
+    echo 'Context Mode concurrent config fixture unexpectedly passed' >&2
+    exit 1
+fi
+grep -Fq 'provider state could not be restored' "$tmp/context-race.err"
+grep -Fqx 'model = "concurrent-user-write"' \
+    "$context_race_home/.codex/config.toml"
+context_race_pending="$context_race_home/.local/state/ags/context-mode.pending.json"
+[[ -f "$context_race_pending" ]]
+context_race_quarantine="$(jq -er \
+    '.codex_hooks_config.quarantine_path' "$context_race_pending")"
+context_race_restore="$(jq -er \
+    '.codex_hooks_config.restore_path' "$context_race_pending")"
+[[ ! -e "$context_race_quarantine" && ! -e "$context_race_restore" ]]
+
+claude_context_cache="$context_init_home/.claude/plugins/cache/context-mode/context-mode/1.0.169"
+printf '\n// damaged AGS-owned cache\n' \
+    >> "$claude_context_cache/server.bundle.mjs"
+if ! env "${context_init_env[@]}" "$tool" init \
+    > "$tmp/context-cache-repair.out" 2> "$tmp/context-cache-repair.err"; then
+    sed -n '1,160p' "$tmp/context-cache-repair.err" >&2
+    exit 1
+fi
+cmp "$context_package_root/server.bundle.mjs" \
+    "$claude_context_cache/server.bundle.mjs"
+if env "${context_init_env[@]}" FAKE_CONTEXT_DOCTOR_FAIL=codex "$tool" init \
+    > "$tmp/context-reinit-fail.out" 2> "$tmp/context-reinit-fail.err"; then
+    echo 'repeat init ignored a mandatory Context Mode diagnostic failure' >&2
+    exit 1
+fi
+jq -e '.health == {mode:"doctor",status:"passed"}' \
+    "$context_manifest" >/dev/null
+env "${context_init_env[@]}" "$tool" init \
+    > "$tmp/context-reinit-recover.out" 2> "$tmp/context-reinit-recover.err"
+jq -e '.health == {mode:"doctor",status:"passed"}' \
+    "$context_manifest" >/dev/null
+
+context_integrity_170="sha512-$(printf 'A%.0s' {1..86})=="
+context_integrity_171="sha512-$(printf 'B%.0s' {1..86})=="
+prepare_context_mode_runtime \
+    "$context_fixture_home" 1.0.170 "$context_integrity_170"
+prepare_context_mode_runtime \
+    "$context_fixture_home" 1.0.171 "$context_integrity_171"
+
+standalone_upgrade_state="$tmp/context-standalone-upgrade-state"
+standalone_upgrade_root_169="$(
+    context_mode_test_runtime_root "$standalone_context_home" 1.0.169
+)/node_modules/context-mode"
+if env HOME="$standalone_context_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$standalone_context_home/.codex" \
+    CLAUDE_CONFIG_DIR="$standalone_context_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$standalone_upgrade_state" \
+    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1 \
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
+    FAKE_CONTEXT_PACKAGE_ROOT="$standalone_upgrade_root_169" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    FAKE_CONTEXT_DOCTOR_FAIL=codex \
+    "$tool" context-init > "$tmp/context-first-binding-upgrade.out" \
+    2> "$tmp/context-first-binding-upgrade.err"; then
+    echo 'Context Mode accepted a failed upgrade with an unconfigured Codex provider' >&2
+    exit 1
+fi
+grep -Fq 'no configured previous integration exists' \
+    "$tmp/context-first-binding-upgrade.err"
+jq -e '
+  .version == "1.0.169" and
+  .health.status == "passed" and
+  .providers == {}
+' "$standalone_context_home/.local/state/ags/context-mode.json" >/dev/null
+[[ ! -e "$standalone_context_home/.codex/config.toml" ]]
+[[ ! -e "$standalone_context_home/.local/state/ags/context-mode.pending.json" ]]
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
+    [[ ! -e "$standalone_upgrade_state/$marker" ]]
+done
+
+standalone_candidate_root_170="$(
+    context_mode_test_runtime_root "$standalone_context_home" 1.0.170
+)/node_modules/context-mode"
+standalone_candidate_claude_cache_170="$standalone_context_home/.claude/plugins/cache/context-mode/context-mode/1.0.170"
+standalone_saved_test_package_root="$context_mode_test_package_root"
+seed_context_mode_provider_caches \
+    "$standalone_candidate_root_170" \
+    "$standalone_context_home/.codex" \
+    "$standalone_context_home/.claude"
+context_mode_test_package_root="$standalone_saved_test_package_root"
+mkdir -p "$standalone_upgrade_state"
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
+    : > "$standalone_upgrade_state/$marker"
+done
+printf '%s\n' "$standalone_candidate_root_170" \
+    > "$standalone_upgrade_state/claude-marketplace-root"
+printf '%s\n' "$standalone_candidate_claude_cache_170" \
+    > "$standalone_upgrade_state/claude-plugin-root"
+printf '%s\n' "$standalone_candidate_root_170" \
+    > "$standalone_upgrade_state/codex-marketplace-root"
+printf '%s\n' "$standalone_candidate_root_170" \
+    > "$standalone_upgrade_state/codex-plugin-root"
+cp -a -- "$standalone_upgrade_state" \
+    "$tmp/context-standalone-upgrade-state.before"
+if env HOME="$standalone_context_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$standalone_context_home/.codex" \
+    CLAUDE_CONFIG_DIR="$standalone_context_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$standalone_upgrade_state" \
+    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1 \
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
+    FAKE_CONTEXT_PACKAGE_ROOT="$standalone_upgrade_root_169" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    FAKE_CONTEXT_DOCTOR_FAIL=codex \
+    "$tool" context-init > "$tmp/context-prebound-upgrade.out" \
+    2> "$tmp/context-prebound-upgrade.err"; then
+    echo 'Context Mode accepted a failed upgrade with preexisting candidate bindings' >&2
+    exit 1
+fi
+grep -Fq 'no configured previous integration exists' \
+    "$tmp/context-prebound-upgrade.err"
+diff -ru "$tmp/context-standalone-upgrade-state.before" \
+    "$standalone_upgrade_state"
+jq -e '
+  .version == "1.0.169" and
+  .health.status == "passed" and
+  .providers == {}
+' "$standalone_context_home/.local/state/ags/context-mode.json" >/dev/null
+[[ ! -e "$standalone_context_home/.codex/config.toml" ]]
+[[ ! -e "$standalone_context_home/.local/state/ags/context-mode.pending.json" ]]
+
+context_codex_config="$context_init_home/.codex/config.toml"
+awk '
+  $0 == "[features]" { saw_features = 1; next }
+  saw_features && $0 == "hooks = true" { saw_features = 0; next }
+  { saw_features = 0; print }
+' "$context_codex_config" > "$context_codex_config.implicit"
+chmod --reference="$context_codex_config" \
+    "$context_codex_config.implicit"
+mv -- "$context_codex_config.implicit" "$context_codex_config"
+! grep -Eq '^hooks = (true|false)$' "$context_codex_config"
+context_prejournal_bin="$tmp/context-prejournal-bin"
+context_prejournal_marker="$tmp/context-prejournal-flipped"
+mkdir -p "$context_prejournal_bin"
+cat > "$context_prejournal_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+"${FAKE_REAL_RM_BINARY:?}" "$@"
+for argument in "$@"; do
+    if [[ "${FAKE_CONTEXT_FLIP_AFTER_CONVERGENCE:-0}" == 1 &&
+          "$argument" == "${FAKE_CONTEXT_ENABLED_SNAPSHOT:?}" &&
+          ! -e "${FAKE_CONTEXT_FLIP_MARKER:?}" ]]; then
+        config_file="${FAKE_CONTEXT_LIVE_CONFIG:?}"
+        temporary="$config_file.concurrent-false"
+        awk '
+          $0 == "hooks = true" { print "hooks = false"; next }
+          { print }
+        ' "$config_file" > "$temporary"
+        chmod --reference="$config_file" "$temporary"
+        mv -- "$temporary" "$config_file"
+        : > "$FAKE_CONTEXT_FLIP_MARKER"
+    fi
+done
+EOF
+chmod +x "$context_prejournal_bin/rm"
+env "${context_init_env[@]}" \
+    PATH="$context_prejournal_bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    FAKE_REAL_RM_BINARY="$(command -v rm)" \
+    FAKE_CONTEXT_FLIP_AFTER_CONVERGENCE=1 \
+    FAKE_CONTEXT_ENABLED_SNAPSHOT="$context_init_home/.local/state/ags/context-mode.codex-config.enabled" \
+    FAKE_CONTEXT_FLIP_MARKER="$context_prejournal_marker" \
+    FAKE_CONTEXT_LIVE_CONFIG="$context_codex_config" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    "$tool" init > "$tmp/context-prejournal-race.out" \
+    2> "$tmp/context-prejournal-race.err"
+[[ -e "$context_prejournal_marker" ]]
+grep -Fq 'last-good version remains active' \
+    "$tmp/context-prejournal-race.err"
+grep -Fqx 'hooks = false' "$context_codex_config"
+jq -e '.version == "1.0.169" and .health.status == "passed"' \
+    "$context_manifest" >/dev/null
+[[ "$(<"$context_plugin_state/claude-marketplace-root")" == \
+    "$context_package_root" ]]
+[[ "$(<"$context_plugin_state/codex-marketplace-root")" == \
+    "$context_package_root" ]]
+for transaction_file in context-mode.pending.json \
+    context-mode.codex-hooks-convergence.json \
+    context-mode.codex-config.before \
+    context-mode.codex-config.enabled; do
+    [[ ! -e "$context_init_home/.local/state/ags/$transaction_file" ]]
+done
+awk '
+  $0 == "[features]" { saw_features = 1; next }
+  saw_features && $0 == "hooks = false" { saw_features = 0; next }
+  { saw_features = 0; print }
+' "$context_codex_config" > "$context_codex_config.implicit"
+chmod --reference="$context_codex_config" \
+    "$context_codex_config.implicit"
+mv -- "$context_codex_config.implicit" "$context_codex_config"
+context_hooks_before_implicit_upgrade="$(
+    grep -c '^CODEX_CONTEXT=features enable hooks$' \
+        "$tmp/home/.local/agsx.log"
+)"
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    "$tool" init > "$tmp/context-upgrade.out" \
+    2> "$tmp/context-upgrade.err"
+context_root_170="$(
+    context_mode_test_runtime_root "$context_init_home" 1.0.170
+)"
+context_package_root_170="$context_root_170/node_modules/context-mode"
+context_claude_cache_root_170="$context_init_home/.claude/plugins/cache/context-mode/context-mode/1.0.170"
+jq -e --arg root "$context_package_root_170" \
+    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
+    --arg integrity "$context_integrity_170" '
+    .schema == 2 and
+    .version == "1.0.170" and
+    .runtime.target == $target and
+    .source.integrity == $integrity and
+    .package_root == $root and
+    .health == {mode:"doctor",status:"passed"}
+' "$context_manifest" >/dev/null
+[[ -d "$context_root_169" ]]
+[[ -d "$context_root_170" ]]
+[[ ! -e "$context_init_home/.local/state/ags/context-mode.pending.json" ]]
+[[ "$(<"$context_plugin_state/claude-marketplace-root")" == \
+    "$context_package_root_170" ]]
+[[ "$(<"$context_plugin_state/codex-marketplace-root")" == \
+    "$context_package_root_170" ]]
+grep -Fqx 'hooks = true' "$context_codex_config"
+[[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
+    "$tmp/home/.local/agsx.log")" == \
+    $((context_hooks_before_implicit_upgrade + 1)) ]]
+grep -Fq -- '--registry=https://registry.npmjs.org' \
+    "$context_init_home/.context-mode-npm.log"
+grep -Fq -- '--ignore-scripts' \
+    "$context_init_home/.context-mode-npm.log"
+context_install_count="$(
+    grep -c '^NPM_CONTEXT=install ' \
+        "$context_init_home/.context-mode-npm.log"
+)"
+context_republished_integrity="sha512-$(printf 'R%.0s' {1..86})=="
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_republished_integrity" \
+    "$tool" init > "$tmp/context-integrity-drift.out" \
+    2> "$tmp/context-integrity-drift.err"
+grep -Fq 'npm changed the integrity of published Context Mode 1.0.170' \
+    "$tmp/context-integrity-drift.err"
+jq -e --arg integrity "$context_integrity_170" '
+  .version == "1.0.170" and
+  .source.integrity == $integrity and
+  .health.status == "passed"
+' "$context_manifest" >/dev/null
+[[ "$context_install_count" == "$(
+    grep -c '^NPM_CONTEXT=install ' \
+        "$context_init_home/.context-mode-npm.log"
+)" ]]
+context_old_target="$FAKE_CONTEXT_RUNTIME_PLATFORM-$FAKE_CONTEXT_RUNTIME_ARCH-node999"
+context_old_root="$context_init_home/.local/share/ags/context-mode/runtimes/$context_old_target/1.0.170"
+context_old_package_root="$context_old_root/node_modules/context-mode"
+mkdir -p "${context_old_root%/1.0.170}"
+mv -- "$context_root_170" "$context_old_root"
+jq --arg target "$context_old_target" \
+    --arg root "$context_old_package_root" '
+      .runtime.node_abi = 999 |
+      .runtime.target = $target |
+      .package_root = $root
+    ' "$context_manifest" > "$context_manifest.abi-old"
+mv -- "$context_manifest.abi-old" "$context_manifest"
+chmod 600 "$context_manifest"
+for provider in claude codex; do
+    printf '%s\n' "$context_old_package_root" \
+        > "$context_plugin_state/$provider-marketplace-root"
+    printf '%s\n' "$context_old_package_root" \
+        > "$context_plugin_state/$provider-plugin-root"
+done
+context_install_count="$(
+    grep -c '^NPM_CONTEXT=install ' \
+        "$context_init_home/.context-mode-npm.log"
+)"
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    "$tool" init > "$tmp/context-abi-upgrade.out" \
+    2> "$tmp/context-abi-upgrade.err"
+[[ -d "$context_root_170" && -d "$context_old_root" ]]
+jq -e --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
+    --arg root "$context_package_root_170" '
+      .schema == 2 and
+      .runtime.target == $target and
+      .package_root == $root
+    ' "$context_manifest" >/dev/null
+[[ "$((context_install_count + 1))" == "$(
+    grep -c '^NPM_CONTEXT=install ' \
+        "$context_init_home/.context-mode-npm.log"
+)" ]]
+if env "${context_init_env[@]}" \
+    FAKE_CONTEXT_TRUST_STATUS=untrusted \
+    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
+    > "$tmp/context-upgrade-trust.out" \
+    2> "$tmp/context-upgrade-trust.err"; then
+    echo 'upgraded Context Mode inherited old Codex hook trust' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode hooks are not trusted' \
+    "$tmp/context-upgrade-trust.err"
+
+awk '
+  $0 == "hooks = true" { print "hooks = false"; next }
+  { print }
+' "$context_codex_config" > "$context_codex_config.crash-disabled"
+chmod --reference="$context_codex_config" \
+    "$context_codex_config.crash-disabled"
+mv -- "$context_codex_config.crash-disabled" "$context_codex_config"
+context_convergence_journal="$context_init_home/.local/state/ags/context-mode.codex-hooks-convergence.json"
+if env "${context_init_env[@]}" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    FAKE_CONTEXT_CRASH_AFTER_HOOK_ENABLE=1 \
+    "$tool" init > "$tmp/context-convergence-crash.out" \
+    2> "$tmp/context-convergence-crash.err"; then
+    echo 'active Codex hooks convergence crash fixture unexpectedly passed' >&2
+    exit 1
+fi
+[[ -f "$context_convergence_journal" ]]
+[[ -f "$context_init_home/.local/state/ags/context-mode.codex-config.before" ]]
+[[ -f "$context_init_home/.local/state/ags/context-mode.codex-config.enabled" ]]
+[[ ! -e "$context_init_home/.local/state/ags/context-mode.pending.json" ]]
+grep -Fqx 'hooks = true' "$context_codex_config"
+jq -e '
+  .schema == 1 and
+  .managed_by == "ags" and
+  .kind == "codex-hooks-convergence" and
+  .before_state == "disabled" and
+  .before_present == true and
+  (.before_sha256 | test("^[0-9a-f]{64}$")) and
+  (.enabled_sha256 | test("^[0-9a-f]{64}$"))
+' "$context_convergence_journal" >/dev/null
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    "$tool" init > "$tmp/context-convergence-recovery.out" \
+    2> "$tmp/context-convergence-recovery.err"
+for transaction_file in context-mode.codex-hooks-convergence.json \
+    context-mode.codex-config.before \
+    context-mode.codex-config.enabled; do
+    [[ ! -e "$context_init_home/.local/state/ags/$transaction_file" ]]
+done
+grep -Fqx 'hooks = true' "$context_codex_config"
+jq -e '.version == "1.0.170" and .health.status == "passed"' \
+    "$context_manifest" >/dev/null
+
+awk '
+  $0 == "hooks = true" { print "hooks = false"; next }
+  { print }
+' "$context_codex_config" > "$context_codex_config.disabled"
+chmod --reference="$context_codex_config" \
+    "$context_codex_config.disabled"
+mv -- "$context_codex_config.disabled" "$context_codex_config"
+grep -Fqx 'hooks = false' "$context_codex_config"
+context_hooks_before_disabled_upgrade="$(
+    grep -c '^CODEX_CONTEXT=features enable hooks$' \
+        "$tmp/home/.local/agsx.log"
+)"
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.171 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_171" \
+    FAKE_CONTEXT_DOCTOR_FAIL=codex \
+    "$tool" init > "$tmp/context-upgrade-health-fail.out" \
+    2> "$tmp/context-upgrade-health-fail.err"
+jq -e '.version == "1.0.170" and .health.status == "passed"' \
+    "$context_manifest" >/dev/null
+[[ "$(<"$context_plugin_state/claude-marketplace-root")" == \
+    "$context_package_root_170" ]]
+[[ "$(<"$context_plugin_state/codex-marketplace-root")" == \
+    "$context_package_root_170" ]]
+[[ ! -e "$context_init_home/.local/state/ags/context-mode.pending.json" ]]
+grep -Fq '1.0.170 remains active' "$tmp/context-upgrade-health-fail.err"
+grep -Fqx 'hooks = true' "$context_codex_config"
+! grep -Fqx 'hooks = false' "$context_codex_config"
+[[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
+    "$tmp/home/.local/agsx.log")" == \
+    $((context_hooks_before_disabled_upgrade + 1)) ]]
+
+context_concurrent_hooks_pending="$context_init_home/.local/state/ags/context-mode.pending.json"
+if env "${context_init_env[@]}" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.171 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_171" \
+    FAKE_CONTEXT_FLIP_HOOKS_FALSE_AFTER_PLUGIN_ADD=1 \
+    "$tool" init > "$tmp/context-concurrent-hooks.out" \
+    2> "$tmp/context-concurrent-hooks.err"; then
+    echo 'Context Mode ignored a concurrent Codex hooks disable' >&2
+    exit 1
+fi
+grep -Fq 'mandatory Context Mode configuration failed for Codex' \
+    "$tmp/context-concurrent-hooks.err"
+grep -Fqx 'hooks = false' "$context_codex_config"
+jq -e '
+  .schema == 4 and
+  .kind == "upgrade" and
+  .codex_hooks_config.before_state == "explicit-true"
+' "$context_concurrent_hooks_pending" >/dev/null
+jq -e '.version == "1.0.170" and .health.status == "passed"' \
+    "$context_manifest" >/dev/null
+awk '
+  $0 == "hooks = false" { print "hooks = true"; next }
+  { print }
+' "$context_codex_config" > "$context_codex_config.reenabled"
+chmod --reference="$context_codex_config" \
+    "$context_codex_config.reenabled"
+mv -- "$context_codex_config.reenabled" "$context_codex_config"
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    "$tool" init > "$tmp/context-concurrent-hooks-recovery.out" \
+    2> "$tmp/context-concurrent-hooks-recovery.err"
+[[ ! -e "$context_concurrent_hooks_pending" ]]
+grep -Fqx 'hooks = true' "$context_codex_config"
+jq -e '.version == "1.0.170" and .health.status == "passed"' \
+    "$context_manifest" >/dev/null
+
+context_pending="$context_init_home/.local/state/ags/context-mode.pending.json"
+context_package_root_171="$(
+    context_mode_test_runtime_root "$context_init_home" 1.0.171
+)/node_modules/context-mode"
+jq --arg candidate_root "$context_package_root_171" \
+    --arg candidate_integrity "$context_integrity_171" \
+    --arg platform "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
+    --arg arch "$FAKE_CONTEXT_RUNTIME_ARCH" \
+    --argjson node_abi "$FAKE_CONTEXT_RUNTIME_NODE_ABI" \
+    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" '{
+      schema:3,
+      managed_by:"ags",
+      activation_id:"ags-test-pending-upgrade",
+      kind:"upgrade",
+      previous:{
+        version:.version,
+        runtime:.runtime,
+        source:.source,
+        package_root:.package_root,
+        providers:.providers
+      },
+      candidate:{
+        version:"1.0.171",
+        runtime:{
+          platform:$platform,arch:$arch,node_abi:$node_abi,target:$target
+        },
+        source:{
+          type:"npm",
+          package:"context-mode",
+          integrity:$candidate_integrity
+        },
+        package_root:$candidate_root
+      },
+      attempted_providers:{claude:true,codex:true},
+      provider_before:{
+        claude:{
+          marketplace_present:false,
+          plugin_present:false,
+          plugin_enabled:false
+        },
+        codex:{
+          marketplace_present:false,
+          plugin_present:false
+        }
+      },
+      codex_hooks_was_enabled:true
+    }' "$context_manifest" > "$context_pending"
+chmod 600 "$context_pending"
+for provider in claude codex; do
+    printf '%s\n' "$context_package_root_171" \
+        > "$context_plugin_state/$provider-marketplace-root"
+    printf '%s\n' "$context_package_root_171" \
+        > "$context_plugin_state/$provider-plugin-root"
+done
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
+    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
+    "$tool" init > "$tmp/context-upgrade-recovery.out" \
+    2> "$tmp/context-upgrade-recovery.err"
+[[ ! -e "$context_pending" ]]
+[[ "$(<"$context_plugin_state/claude-plugin-root")" == \
+    "$context_claude_cache_root_170" ]]
+[[ "$(<"$context_plugin_state/codex-plugin-root")" == \
+    "$context_package_root_170" ]]
+
+env "${context_init_env[@]}" \
+    FAKE_CONTEXT_NPM_VIEW_FAIL=1 \
+    "$tool" init > "$tmp/context-registry-fallback.out" \
+    2> "$tmp/context-registry-fallback.err"
+jq -e '
+    .version == "1.0.170" and
+    .health == {mode:"offline-index-search",status:"passed"}
+' "$context_manifest" >/dev/null
+grep -Fq 'retaining validated Context Mode 1.0.170' \
+    "$tmp/context-registry-fallback.err"
+env "${context_init_env[@]}" \
+    AGS_CONTEXT_MODE_OFFLINE=1 \
+    FAKE_CONTEXT_NPM_FORBID=1 \
+    "$tool" init > "$tmp/context-offline-last-good.out" \
+    2> "$tmp/context-offline-last-good.err"
+jq -e '.version == "1.0.170" and .health.status == "passed"' \
+    "$context_manifest" >/dev/null
+
+context_fail_home="$tmp/context-fail-home"
+context_fail_state="$tmp/context-fail-state"
+context_fail_root="$(
+    context_mode_test_runtime_root "$context_fail_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$context_fail_home"
+if env HOME="$context_fail_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$context_fail_home/.codex" \
+    CLAUDE_CONFIG_DIR="$context_fail_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_fail_state" \
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
+    FAKE_CONTEXT_PACKAGE_ROOT="$context_fail_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_DOCTOR_FAIL=codex \
+    "$tool" init > "$tmp/context-fail.out" 2> "$tmp/context-fail.err"; then
+    echo 'init ignored a mandatory Context Mode diagnostic failure' >&2
+    exit 1
+fi
+grep -Fq 'Context Mode initialization failed for codex' \
+    "$tmp/context-fail.err"
+[[ ! -e "$context_fail_home/.config/ags/identity.agekey" ]]
+[[ ! -e "$context_fail_home/.local/state/ags/storage.json" ]]
+[[ ! -e "$context_fail_home/.local/state/ags/context-mode.json" ]]
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
+    [[ ! -e "$context_fail_state/$marker" ]]
+done
+[[ ! -e "$context_fail_home/.codex/config.toml" ]]
+[[ ! -e "$context_fail_home/.local/state/ags/context-mode.pending.json" ]]
+
+disabled_home="$tmp/context-disabled-home"
+disabled_state="$tmp/context-disabled-state"
+disabled_root="$(
+    context_mode_test_runtime_root "$disabled_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$disabled_home"
+mkdir -p "$disabled_state"
+: > "$disabled_state/claude-marketplace"
+: > "$disabled_state/claude-plugin"
+: > "$disabled_state/claude-plugin-disabled"
+if env HOME="$disabled_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$disabled_home/.codex" \
+    CLAUDE_CONFIG_DIR="$disabled_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$disabled_state" \
+    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
+    FAKE_CONTEXT_PACKAGE_ROOT="$disabled_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CONTEXT_DOCTOR_FAIL=codex \
+    "$tool" init > "$tmp/context-disabled.out" \
+    2> "$tmp/context-disabled.err"; then
+    echo 'init ignored a health failure after enabling a disabled Claude plugin' >&2
+    exit 1
+fi
+[[ -e "$disabled_state/claude-marketplace" ]]
+[[ -e "$disabled_state/claude-plugin" ]]
+[[ -e "$disabled_state/claude-plugin-disabled" ]]
+for marker in codex-marketplace codex-plugin; do
+    [[ ! -e "$disabled_state/$marker" ]]
+done
+[[ ! -e "$disabled_home/.codex/config.toml" ]]
+[[ ! -e "$disabled_home/.local/state/ags/context-mode.pending.json" ]]
+grep -Fq 'CLAUDE_CONTEXT=plugin enable context-mode@context-mode --scope user' \
+    "$tmp/home/.local/agsx.log"
+grep -Fq 'CLAUDE_CONTEXT=plugin disable context-mode@context-mode --scope user' \
+    "$tmp/home/.local/agsx.log"
+[[ ! -e "$disabled_home/.config/ags/identity.agekey" ]]
+[[ ! -e "$disabled_home/.local/state/ags/storage.json" ]]
+[[ ! -e "$disabled_home/.local/state/ags/context-mode.json" ]]
+
+malformed_home="$tmp/context-malformed-home"
+malformed_state="$tmp/context-malformed-state"
+malformed_root="$(
+    context_mode_test_runtime_root "$malformed_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$malformed_home"
+mkdir -p "$malformed_home/.local/state/ags"
+printf '{"local_path":42}\n' \
+    > "$malformed_home/.local/state/ags/storage.json"
+if env HOME="$malformed_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$malformed_home/.codex" \
+    CLAUDE_CONFIG_DIR="$malformed_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$malformed_state" \
+    FAKE_CONTEXT_PACKAGE_ROOT="$malformed_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    "$tool" init > "$tmp/context-malformed.out" \
+    2> "$tmp/context-malformed.err"; then
+    echo 'init changed Context Mode before rejecting malformed AGS storage' >&2
+    exit 1
+fi
+grep -Fq 'local storage path is invalid' "$tmp/context-malformed.err"
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin \
+    codex-hooks; do
+    [[ ! -e "$malformed_state/$marker" ]]
+done
+[[ ! -e "$malformed_home/.local/state/ags/context-mode.json" ]]
+[[ ! -e "$malformed_home/.config/ags/identity.agekey" ]]
+
+claude_conflict_home="$tmp/context-claude-conflict-home"
+claude_conflict_state="$tmp/context-claude-conflict-state"
+claude_conflict_root="$(
+    context_mode_test_runtime_root "$claude_conflict_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$claude_conflict_home"
+mkdir -p "$claude_conflict_state"
+: > "$claude_conflict_state/claude-marketplace"
+: > "$claude_conflict_state/claude-plugin"
+if env HOME="$claude_conflict_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$claude_conflict_home/.codex" \
+    CLAUDE_CONFIG_DIR="$claude_conflict_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$claude_conflict_state" \
+    FAKE_CONTEXT_PACKAGE_ROOT="$claude_conflict_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CLAUDE_CONTEXT_MARKETPLACE_ROOT="$tmp/different-claude-context-mode" \
+    "$tool" init > "$tmp/context-claude-conflict.out" \
+    2> "$tmp/context-claude-conflict.err"; then
+    echo 'init accepted a conflicting Claude Context Mode marketplace' >&2
+    exit 1
+fi
+grep -Fq 'Claude already has a different marketplace named context-mode' \
+    "$tmp/context-claude-conflict.err"
+[[ -e "$claude_conflict_state/claude-marketplace" ]]
+[[ -e "$claude_conflict_state/claude-plugin" ]]
+[[ ! -e "$claude_conflict_home/.local/state/ags/storage.json" ]]
+[[ ! -e "$claude_conflict_home/.local/state/ags/context-mode.json" ]]
+
+codex_conflict_home="$tmp/context-codex-conflict-home"
+codex_conflict_state="$tmp/context-codex-conflict-state"
+codex_conflict_root="$(
+    context_mode_test_runtime_root "$codex_conflict_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$codex_conflict_home"
+mkdir -p "$codex_conflict_state"
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
+    : > "$codex_conflict_state/$marker"
+done
+if env HOME="$codex_conflict_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$codex_conflict_home/.codex" \
+    CLAUDE_CONFIG_DIR="$codex_conflict_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$codex_conflict_state" \
+    FAKE_CONTEXT_PACKAGE_ROOT="$codex_conflict_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    FAKE_CODEX_CONTEXT_MARKETPLACE_ROOT="$tmp/different-codex-context-mode" \
+    "$tool" init > "$tmp/context-codex-conflict.out" \
+    2> "$tmp/context-codex-conflict.err"; then
+    echo 'init accepted a conflicting Codex Context Mode marketplace' >&2
+    exit 1
+fi
+grep -Fq 'Codex already has a different marketplace named context-mode' \
+    "$tmp/context-codex-conflict.err"
+for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
+    [[ -e "$codex_conflict_state/$marker" ]]
+done
+[[ ! -e "$codex_conflict_state/codex-hooks" ]]
+[[ ! -e "$codex_conflict_home/.local/state/ags/storage.json" ]]
+[[ ! -e "$codex_conflict_home/.local/state/ags/context-mode.json" ]]
+
+tampered_home="$tmp/context-tampered-home"
+tampered_state="$tmp/context-tampered-state"
+tampered_root="$(
+    context_mode_test_runtime_root "$tampered_home" 1.0.169
+)/node_modules/context-mode"
+prepare_context_mode_runtime "$tampered_home"
+env HOME="$tampered_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$tampered_home/.codex" \
+    CLAUDE_CONFIG_DIR="$tampered_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$tampered_state" \
+    FAKE_CONTEXT_PACKAGE_ROOT="$tampered_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    "$tool" init > "$tmp/context-tampered-init.out" \
+    2> "$tmp/context-tampered-init.err"
+printf '\n// post-install mutation\n' >> "$tampered_root/server.bundle.mjs"
+if env HOME="$tampered_home" \
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$tampered_home/.codex" \
+    CLAUDE_CONFIG_DIR="$tampered_home/.claude" \
+    FAKE_CONTEXT_PLUGIN_STATE_DIR="$tampered_state" \
+    FAKE_CONTEXT_PACKAGE_ROOT="$tampered_root" \
+    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
+    "$tool" init > "$tmp/context-tampered-reinit.out" \
+    2> "$tmp/context-tampered-reinit.err"; then
+    echo 'init accepted modified Context Mode executable bytes' >&2
+    exit 1
+fi
+grep -Fq 'invalid Context Mode last-good manifest' \
+    "$tmp/context-tampered-reinit.err"
+
+symlink_init_home="$tmp/symlink-init-home"
+symlink_init_outside="$tmp/symlink-init-outside"
+mkdir -p "$symlink_init_home/.local/share/ags" "$symlink_init_outside"
+chmod 755 "$symlink_init_outside"
+ln -s "$symlink_init_outside" \
+    "$symlink_init_home/.local/share/ags/checkpoints"
+symlink_init_mode="$(stat -c %a "$symlink_init_outside")"
+if run_clean_init "$symlink_init_home" \
+    >"$tmp/symlink-init.out" 2>"$tmp/symlink-init.err"; then
+    echo 'init accepted a symbolic-link vault' >&2
+    exit 1
+fi
+grep -Fq 'storage path cannot contain symbolic links' "$tmp/symlink-init.err"
+[[ "$(stat -c %a "$symlink_init_outside")" == "$symlink_init_mode" ]]
+[[ -z "$(find "$symlink_init_outside" -mindepth 1 -print -quit)" ]]
+
+migration_home="$tmp/migration-home"
+migration_vault="$tmp/migration-vault"
+migration_config="$migration_home/.local/state/ags/storage.json"
+mkdir -p "$migration_vault" "$(dirname "$migration_config")"
+jq -n --arg vault "$migration_vault" '{
+    version:3,
+    local_path:$vault,
+    remotes:{origin:{type:"git", url:"test://origin", branch:"main"}},
+    cloud:{url:"sftp://tester@example.test:22/ags", auth:"agent"}
+}' > "$migration_config"
+run_clean_init "$migration_home" > "$tmp/migration-init.out" 2> "$tmp/migration-init.err"
+jq -e --arg vault "$migration_vault" \
+    --arg identity "$migration_home/.config/ags/identity.agekey" '
+    .local_path == $vault and
+    .version == 4 and
+    .encryption.identity_file == $identity and
+    .remotes.origin.url == "test://origin" and
+    .cloud.auth == "agent"
+' "$migration_config" >/dev/null
+
+configured_home="$tmp/configured-identity-home"
+configured_vault="$tmp/configured-identity-vault"
+configured_identity="$tmp/configured-identity.agekey"
+configured_other_identity="$tmp/configured-other-identity.agekey"
+configured_config="$configured_home/.local/state/ags/storage.json"
+age-keygen -o "$configured_identity" >/dev/null 2>&1
+age-keygen -o "$configured_other_identity" >/dev/null 2>&1
+mkdir -p "$configured_vault" "$(dirname "$configured_config")"
+jq -n --arg vault "$configured_vault" --arg identity "$configured_identity" '{
+    version:3,
+    local_path:$vault,
+    encryption:{type:"age-x25519", identity_file:$identity}
+}' > "$configured_config"
+run_clean_init "$configured_home" > "$tmp/configured-init.out" 2> "$tmp/configured-init.err"
+grep -Fqx "identity=$configured_identity" "$tmp/configured-init.out"
+jq -e --arg identity "$configured_identity" \
+    '.version == 4 and .encryption.identity_file == $identity' \
+    "$configured_config" >/dev/null
+[[ ! -e "$configured_home/.config/ags/identity.agekey" ]]
+if run_clean_init "$configured_home" --identity "$configured_other_identity" \
+    >"$tmp/configured-conflict.out" 2>"$tmp/configured-conflict.err"; then
+    echo 'init replaced a configured identity' >&2
+    exit 1
+fi
+grep -Fq 'refusing to replace the configured identity' "$tmp/configured-conflict.err"
+jq -e --arg identity "$configured_identity" \
+    '.encryption.identity_file == $identity' "$configured_config" >/dev/null
+
+import_source="$tmp/import-source.agekey"
+age-keygen -o "$import_source" >/dev/null 2>&1
+chmod 640 "$import_source"
+import_source_sha="$(sha256sum "$import_source" | cut -d' ' -f1)"
+import_home="$tmp/import-home"
+run_clean_init "$import_home" --identity "$import_source" \
+    > "$tmp/import-init.out" 2> "$tmp/import-init.err"
+import_identity="$import_home/.config/ags/identity.agekey"
+cmp "$import_source" "$import_identity"
+[[ "$(stat -c %a "$import_source")" == 640 ]]
+[[ "$(stat -c %a "$import_identity")" == 600 ]]
+[[ "$import_source_sha" == "$(sha256sum "$import_source" | cut -d' ' -f1)" ]]
+run_clean_init "$import_home" --identity "$import_source" >/dev/null 2>&1
+[[ "$import_source_sha" == "$(sha256sum "$import_identity" | cut -d' ' -f1)" ]]
+different_identity="$tmp/different-identity.agekey"
+age-keygen -o "$different_identity" >/dev/null 2>&1
+if run_clean_init "$import_home" --identity "$different_identity" \
+    >"$tmp/import-conflict.out" 2>"$tmp/import-conflict.err"; then
+    echo 'init overwrote an existing identity' >&2
+    exit 1
+fi
+grep -Fq 'refusing to replace the existing identity' "$tmp/import-conflict.err"
+[[ "$import_source_sha" == "$(sha256sum "$import_identity" | cut -d' ' -f1)" ]]
+printf 'not an age identity\n' > "$tmp/invalid-identity"
+invalid_home="$tmp/invalid-init-home"
+if run_clean_init "$invalid_home" --identity "$tmp/invalid-identity" \
+    >"$tmp/invalid-init.out" 2>"$tmp/invalid-init.err"; then
+    echo 'init accepted an invalid age identity' >&2
+    exit 1
+fi
+[[ ! -e "$invalid_home/.config/ags/identity.agekey" ]]
+[[ ! -e "$invalid_home/.local/state/ags/storage.json" ]]
+if run_clean_init "$tmp/relative-init-home" --identity relative.agekey \
+    >/dev/null 2>&1; then
+    echo 'init accepted a relative identity path' >&2
+    exit 1
+fi
+
+age_session_id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+age_session_rel="sessions/2026/01/01/rollout-age-$age_session_id.jsonl"
+age_codex_home="$tmp/age-source/codex"
+mkdir -p "$age_codex_home/$(dirname "$age_session_rel")" "$tmp/age-work"
+seed_context_mode_agent_cache "$age_codex_home" codex
+printf '%s\n' '{"type":"session_meta"}' '{"type":"event_msg"}' \
+    > "$age_codex_home/$age_session_rel"
+age_env=(
+    HOME="$init_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$age_codex_home"
+    CLAUDE_CONFIG_DIR="$tmp/age-source/claude"
+    CODEX_THREAD_ID=
+    CLAUDE_CODE_SESSION_ID=
+    AGENT_SESSION_DISABLE_GEO=1
+)
+age_checkpoint_output="$(
+    cd "$tmp/age-work"
+    env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+        -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+        "${age_env[@]}" "$tool" save-now local codex "$age_session_id" \
+        age-only 'Native age identity'
+)"
+age_checkpoint_path="$(sed -n 's/^path=//p' <<< "$age_checkpoint_output")"
+age -d -i "$init_identity" "$age_checkpoint_path" | tar -tzf - | grep -Fqx manifest
+env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+    -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+    "${age_env[@]}" "$tool" list | grep -Fq 'Native age identity'
+env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+    -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+    "${age_env[@]}" "$tool" show age-only | grep -Eq '^ID +age-only$'
+age_resume="$(
+    cd "$tmp/age-work"
+    env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+        -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+        "${age_env[@]}" "$tool" resume age-only -- --model test-model
+)"
+grep -Fq "FAKE_CODEX <resume> <$age_session_id> <--model> <test-model>" <<< "$age_resume"
+
+identity_priority_output="$(
+    cd "$tmp/age-work"
+    env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_LOCAL_DIR \
+        -u AGENT_SESSION_STATE_DIR "${age_env[@]}" \
+        AGENT_SESSION_SSH_KEY="$tmp/key" \
+        "$tool" save-now local codex "$age_session_id" identity-priority \
+        'Configured identity wins over SFTP key'
+)"
+identity_priority_path="$(sed -n 's/^path=//p' <<< "$identity_priority_output")"
+age -d -i "$init_identity" "$identity_priority_path" | tar -tzf - | grep -Fqx manifest
+if age -d -i "$tmp/key" "$identity_priority_path" >/dev/null 2>&1; then
+    echo 'new record was encrypted to AGENT_SESSION_SSH_KEY after init' >&2
+    exit 1
+fi
+env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_LOCAL_DIR \
+    -u AGENT_SESSION_STATE_DIR "${age_env[@]}" \
+    AGENT_SESSION_SSH_KEY="$tmp/key" "$tool" show identity-priority |
+    grep -Eq '^ID +identity-priority$'
+
+legacy_init_home="$tmp/legacy-init-home"
+legacy_init_vault="$tmp/legacy-init-vault"
+mkdir -p "$legacy_init_home/.ssh"
+install -m600 "$tmp/key" "$legacy_init_home/.ssh/id_ed25519"
+legacy_init_env=(
+    HOME="$legacy_init_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$age_codex_home"
+    CLAUDE_CONFIG_DIR="$tmp/age-source/claude"
+    CODEX_THREAD_ID=
+    CLAUDE_CODE_SESSION_ID=
+    AGENT_SESSION_DISABLE_GEO=1
+)
+env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+    -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+    "${legacy_init_env[@]}" "$tool" set "$legacy_init_vault" >/dev/null
+(
+    cd "$tmp/age-work"
+    env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+        -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+        "${legacy_init_env[@]}" "$tool" save-now local codex "$age_session_id" \
+        legacy-before-init 'Legacy SSH identity'
+) >/dev/null
+run_clean_init "$legacy_init_home" >/dev/null 2>&1
+env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+    -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+    "${legacy_init_env[@]}" "$tool" list | grep -Fq 'Legacy SSH identity'
+env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
+    -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
+    "${legacy_init_env[@]}" "$tool" show legacy-before-init |
+    grep -Eq '^ID +legacy-before-init$'
+
+if env "${source_env[@]}" "$tool" list >/dev/null 2>&1; then
+    echo 'list accepted missing storage configuration' >&2
+    exit 1
+fi
+if env "${source_env[@]}" "$tool" set relative/path >/dev/null 2>&1; then
+    echo 'set accepted a relative path' >&2
+    exit 1
+fi
+if env "${source_env[@]}" "$tool" set /mnt/c >/dev/null 2>&1; then
+    echo 'set accepted a Windows mount' >&2
+    exit 1
+fi
+set_symlink_root="$tmp/set-symlink-root"
+set_symlink_outside="$tmp/set-symlink-outside"
+mkdir -p "$set_symlink_root" "$set_symlink_outside"
+chmod 755 "$set_symlink_outside"
+ln -s "$set_symlink_outside" "$set_symlink_root/linked"
+set_symlink_mode="$(stat -c %a "$set_symlink_outside")"
+if env "${source_env[@]}" "$tool" set "$set_symlink_root/linked/vault" \
+    >"$tmp/set-symlink.out" 2>"$tmp/set-symlink.err"; then
+    echo 'set accepted an intermediate symbolic link' >&2
+    exit 1
+fi
+grep -Fq 'storage path cannot contain symbolic links' "$tmp/set-symlink.err"
+[[ "$(stat -c %a "$set_symlink_outside")" == "$set_symlink_mode" ]]
+[[ ! -e "$set_symlink_outside/vault" ]]
+local_config="$(env "${source_env[@]}" "$tool" set "$tmp/local-checkpoints")"
+grep -Fqx 'status=configured' <<< "$local_config"
+grep -Fqx "path=$tmp/local-checkpoints" <<< "$local_config"
+if env "${source_env[@]}" "$tool" local "$tmp/local-checkpoints" >/dev/null 2>&1; then
+    echo 'legacy local command is still accepted' >&2
+    exit 1
+fi
+
+env "${source_env[@]}" "$tool" legacy history push
+env "${source_env[@]}" "$tool" legacy history status | grep -Fq '.sessions.tar.gz.age'
+env "${target_env[@]}" "$tool" legacy history pull
+cmp "$tmp/source/codex/sessions/2026/01/01/test.jsonl" \
+    "$tmp/target/codex/sessions/2026/01/01/test.jsonl"
+
+printf '%s\n' '{"turn":2}' >> "$tmp/source/codex/sessions/2026/01/01/test.jsonl"
+env "${source_env[@]}" "$tool" legacy history push
+env "${target_env[@]}" "$tool" legacy history pull
+cmp "$tmp/source/codex/sessions/2026/01/01/test.jsonl" \
+    "$tmp/target/codex/sessions/2026/01/01/test.jsonl"
+
+printf '%s\n' '{"branch":"local"}' >> "$tmp/target/codex/sessions/2026/01/01/test.jsonl"
+printf '%s\n' '{"branch":"remote"}' >> "$tmp/source/codex/sessions/2026/01/01/test.jsonl"
+env "${source_env[@]}" "$tool" legacy history push
+before="$(sha256sum "$tmp/target/codex/sessions/2026/01/01/test.jsonl")"
+env "${target_env[@]}" "$tool" legacy history pull >/dev/null 2>&1 && exit 1
+[[ "$before" == "$(sha256sum "$tmp/target/codex/sessions/2026/01/01/test.jsonl")" ]]
+
+session_id=11111111-2222-4333-8444-555555555555
+session_rel="sessions/2026/01/01/rollout-test-$session_id.jsonl"
+mkdir -p "$tmp/source/codex/$(dirname "$session_rel")" "$tmp/work"
+printf '%s\n' '{"type":"session_meta"}' '{"type":"event_msg"}' > "$tmp/source/codex/$session_rel"
+codex_mode=640
+codex_mtime=1700000001
+chmod "$codex_mode" "$tmp/source/codex/$session_rel"
+touch -d "@$codex_mtime" -- "$tmp/source/codex/$session_rel"
+checkpoint_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" sat-index 'SAT 抽取索引'
+)"
+checkpoint_id="$(sed -n 's/^checkpoint_id=//p' <<< "$checkpoint_output")"
+checkpoint_record_id="$(sed -n 's/^record_id=//p' <<< "$checkpoint_output")"
+checkpoint_path="$(sed -n 's/^path=//p' <<< "$checkpoint_output")"
+[[ "$checkpoint_id" == sat-index ]]
+[[ "$checkpoint_record_id" =~ ^[0-9a-f]{24}@sat-index$ ]]
+grep -Fqx 'description=SAT 抽取索引' <<< "$checkpoint_output"
+grep -Fqx 'agent=codex' <<< "$checkpoint_output"
+grep -Fqx "agent_binary=$tmp/home/.local/bin/codex" <<< "$checkpoint_output"
+grep -Fqx 'binary_resolution=path' <<< "$checkpoint_output"
+grep -Fqx "pwd=$tmp/work" <<< "$checkpoint_output"
+grep -Fqx 'public_ip=203.0.113.7' <<< "$checkpoint_output"
+grep -Fqx 'ip_location=Test City, Test Region, Test Country [1.25, 2.5]' <<< "$checkpoint_output"
+geo_disabled_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_DISABLE_GEO=1 \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" geo-disabled 'Geo disabled'
+)"
+grep -Fqx 'public_ip=unknown' <<< "$geo_disabled_output"
+grep -Fqx 'ip_location=unknown' <<< "$geo_disabled_output"
+layout_description='终端对齐检查：Long descriptions stay in the final column without wrapping.'
+layout_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_DISABLE_GEO=1 \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" list-layout "$layout_description"
+)"
+grep -Fqx "description=$layout_description" <<< "$layout_output"
+layout_record_id="$(sed -n 's/^record_id=//p' <<< "$layout_output")"
+assert_format4_archive "$checkpoint_path" "$tmp/extracted/codex"
+grep -Fqx "agent=codex" "$tmp/extracted/codex/manifest"
+grep -Fqx "relative_path=$session_rel" "$tmp/extracted/codex/manifest"
+grep -Fqx "binary_invoked_path=$tmp/home/.local/bin/codex" \
+    "$tmp/extracted/codex/manifest"
+grep -Fqx "binary_real_path=$tmp/home/.local/bin/codex" \
+    "$tmp/extracted/codex/manifest"
+grep -Fqx 'binary_version=codex-test 1.0' "$tmp/extracted/codex/manifest"
+grep -Fqx 'binary_resolution=path' "$tmp/extracted/codex/manifest"
+grep -Fqx "binary_sha256=$(sha256sum "$tmp/home/.local/bin/codex" | cut -d' ' -f1)" \
+    "$tmp/extracted/codex/manifest"
+cmp "$tmp/source/codex/$session_rel" "$tmp/extracted/codex/artifacts/$session_rel"
+grep -Fqx \
+    "$(sha256sum "$tmp/source/codex/$session_rel" | cut -d' ' -f1)"$'\t'"$(stat -c %s "$tmp/source/codex/$session_rel")"$'\t'"$session_rel"$'\t'"$codex_mode"$'\t'"$codex_mtime" \
+    "$tmp/extracted/codex/artifacts.tsv"
+
+checkpoint_list="$(env "${source_env[@]}" "$tool" list)"
+grep -Eq '^ID +AGENT +SAVED +DESCRIPTION$' <<< "$checkpoint_list"
+[[ "$checkpoint_list" != *$'\t'* ]]
+grep -Eq '^sat-index +CODEX +[^ ]+ +SAT 抽取索引$' <<< "$checkpoint_list"
+[[ "$checkpoint_list" != *"$checkpoint_record_id"* ]]
+[[ "$checkpoint_list" != *"$tmp/home/.local/bin/codex"* ]]
+[[ "$checkpoint_list" != *"$tmp/work"* ]]
+for terminal_width in 80 120; do
+    width_list="$(env "${source_env[@]}" COLUMNS="$terminal_width" "$tool" list)"
+    (( $(LC_ALL="$test_utf8_locale" wc -L <<< "$width_list") <= terminal_width ))
+    [[ "$(grep -Ec '^ID +AGENT +SAVED +DESCRIPTION$' <<< "$width_list")" == 1 ]]
+    [[ "$(grep -Ec '^list-layout +CODEX +' <<< "$width_list")" == 1 ]]
+done
+
+if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
+    run_checkpoint_pty() {
+        local input="$1" output="$2" checkpoint_root="$3" pty_command
+        shift 3
+        printf -v pty_command '%q ' \
+            env "${source_env[@]}" \
+            AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
+            "$tmp/stty-guard" "$tool" list
+        printf '%s' "$input" | \
+            SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
+                > "$output" 2>&1
+    }
+
+    run_checkpoint_pty $'\033[B\n' "$tmp/checkpoint-enter.out" \
+        "$tmp/local-checkpoints" FAKE_TERMINAL_ATTACH=1
+    grep -Fq "FAKE_TERMINAL_ATTACHED checkpoint/$layout_record_id/" \
+        "$tmp/checkpoint-enter.out"
+    grep -Fq 'STTY_UNCHANGED' "$tmp/checkpoint-enter.out"
+
+    checkpoint_root_before="$(
+        find "$tmp/local-checkpoints" -type f -print0 |
+            LC_ALL=C sort -z | xargs -0 sha256sum
+    )"
+    run_checkpoint_pty $'\033' "$tmp/checkpoint-escape.out" \
+        "$tmp/local-checkpoints"
+    run_checkpoint_pty $'\177\033' "$tmp/checkpoint-backspace.out" \
+        "$tmp/local-checkpoints"
+    run_checkpoint_pty $'\033[3~n\033' "$tmp/checkpoint-delete-no.out" \
+        "$tmp/local-checkpoints"
+    grep -Fq 'Delete selected session? [y/N]' \
+        "$tmp/checkpoint-delete-no.out"
+    [[ "$checkpoint_root_before" == "$(
+        find "$tmp/local-checkpoints" -type f -print0 |
+            LC_ALL=C sort -z | xargs -0 sha256sum
+    )" ]]
+
+    unsafe_selector_root="$tmp/unsafe-checkpoint-selector"
+    unsafe_selector_id=$'0000\033]52;c;AGS_CHECKPOINT\a'
+    mkdir -p "$unsafe_selector_root/codex"
+    cp -- "$checkpoint_path" \
+        "$unsafe_selector_root/codex/$unsafe_selector_id.checkpoint.tar.gz.age"
+    run_checkpoint_pty $'\033[3~n\033' "$tmp/checkpoint-unsafe-selector.out" \
+        "$unsafe_selector_root"
+    grep -Fq 'no local checkpoints' "$tmp/checkpoint-unsafe-selector.out"
+    if LC_ALL=C grep -Fq ']52;c;AGS_CHECKPOINT' \
+        "$tmp/checkpoint-unsafe-selector.out"; then
+        echo 'checkpoint selector emitted an unsafe terminal control payload' >&2
+        exit 1
+    fi
+
+    ui_checkpoint_root="$tmp/ui-checkpoints"
+    mkdir -p "$ui_checkpoint_root/codex"
+    cp -- "$checkpoint_path" \
+        "$ui_checkpoint_root/codex/$checkpoint_record_id.checkpoint.tar.gz.age"
+    run_checkpoint_pty $'\033[3~y' "$tmp/checkpoint-delete-yes.out" \
+        "$ui_checkpoint_root"
+    [[ ! -e "$ui_checkpoint_root/codex/$checkpoint_record_id.checkpoint.tar.gz.age" ]]
+    [[ -f "$ui_checkpoint_root/tombstones/codex/$checkpoint_record_id.tombstone" ]]
+    grep -Fq 'it remains recoverable' "$tmp/checkpoint-delete-yes.out"
+fi
+
+checkpoint_show="$(env "${source_env[@]}" "$tool" show "$checkpoint_id")"
+for expected in \
+    "^ID +$checkpoint_id$" \
+    "^Record +$checkpoint_record_id$" \
+    '^Agent +codex$' \
+    "^Native session +$session_id$" \
+    '^Description +SAT 抽取索引$' \
+    "^Workspace +$tmp/work$" \
+    '^Completeness +full$' \
+    '^Artifacts +1 files, [0-9]+ bytes$' \
+    '^Artifact metadata +mode-mtime-v1$' \
+    "^Binary invoked +$tmp/home/.local/bin/codex$" \
+    "^Binary real +$tmp/home/.local/bin/codex$" \
+    '^Binary version +codex-test 1.0$' \
+    '^Binary source +path$' \
+    '^Binary SHA-256 +[0-9a-f]{64}$' \
+    '^Binary selected +.*/codex$' \
+    '^Public IP +203.0.113.7$' \
+    '^Archive SHA-256 +[0-9a-f]{64}$' \
+    '^Local integrity +verified$' \
+    "^Path +$checkpoint_path$"; do
+    grep -Eq "$expected" <<< "$checkpoint_show"
+done
+restore_output="$(env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-target/codex" \
+    CLAUDE_CONFIG_DIR="$tmp/checkpoint-target/claude" \
+    AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" "$tool" restore local "$checkpoint_id")"
+grep -Fqx "saved_pwd=$tmp/work" <<< "$restore_output"
+grep -Fqx 'public_ip=203.0.113.7' <<< "$restore_output"
+cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-target/codex/$session_rel"
+[[ "$(stat -c '%a:%Y' "$tmp/checkpoint-target/codex/$session_rel")" == \
+   "$codex_mode:$codex_mtime" ]]
+write_codex_profile "$tmp/checkpoint-record-target/codex" exact-record
+record_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-target/codex" \
+    "$tool" resume "$checkpoint_record_id" --profile=exact-record)"
+grep -Fqx "FAKE_CODEX <resume> <$session_id> <--profile> <exact-record>" <<< "$record_resume"
+cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-record-target/codex/$session_rel"
+record_runtime_key="$(
+    sed -n 's/^TERMINAL=\([^	]*\)	.*/\1/p' "$tmp/home/.local/agsx.log" | tail -1
+)"
+terminal_launches_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")"
+ln -s "$tmp/checkpoint-record-target/codex" \
+    "$tmp/checkpoint-record-target/codex-equivalent"
+record_reattach="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-target/codex-equivalent" \
+        CLAUDE_CONFIG_DIR="$tmp/irrelevant-claude-home" \
+        FAKE_TERMINAL_ATTACH=1 \
+        "$tool" resume "$checkpoint_record_id" --to codex --cwd "$tmp/work" \
+            --profile exact-record
+)"
+grep -Fqx "FAKE_TERMINAL_ATTACHED $record_runtime_key" <<< "$record_reattach"
+grep -Fqx "ATTACH_PROBE=$record_runtime_key" "$tmp/home/.local/agsx.log"
+[[ "$terminal_launches_before" == \
+   "$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")" ]]
+
+race_attach_count="$tmp/race-attach-count"
+race_launches_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")"
+write_codex_profile "$tmp/checkpoint-race-target/codex" exact-record
+race_reattach="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-race-target/codex" \
+        FAKE_TERMINAL_ATTACH_AFTER=1 \
+        FAKE_TERMINAL_ATTACH_COUNT_FILE="$race_attach_count" \
+        "$tool" resume "$checkpoint_record_id" --profile exact-record
+)"
+grep -Fq 'FAKE_TERMINAL_ATTACHED checkpoint/' <<< "$race_reattach"
+[[ "$(<"$race_attach_count")" == 2 ]]
+[[ "$race_launches_before" == \
+   "$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")" ]]
+
+mkdir -p "$tmp/symlinked-codex-home-real"
+ln -s "$tmp/symlinked-codex-home-real" "$tmp/symlinked-codex-home"
+env "${source_env[@]}" CODEX_HOME="$tmp/symlinked-codex-home" \
+    AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+    "$tool" restore local "$checkpoint_id" >/dev/null
+[[ -L "$tmp/symlinked-codex-home" ]]
+cmp "$tmp/source/codex/$session_rel" "$tmp/symlinked-codex-home-real/$session_rel"
+[[ "$(stat -c '%a:%Y' "$tmp/symlinked-codex-home-real/$session_rel")" == \
+   "$codex_mode:$codex_mtime" ]]
+
+compat_payload="$tmp/format4-three-column/payload"
+compat_checkpoints="$tmp/format4-three-column/checkpoints"
+mkdir -p "$compat_payload" "$compat_checkpoints/codex"
+cp -a "$tmp/extracted/codex/." "$compat_payload/"
+cut -f1-3 "$compat_payload/artifacts.tsv" > "$compat_payload/artifacts.tsv.new"
+mv -- "$compat_payload/artifacts.tsv.new" "$compat_payload/artifacts.tsv"
+sed '/^artifact_metadata=/d' "$compat_payload/manifest" \
+    > "$compat_payload/manifest.new"
+mv -- "$compat_payload/manifest.new" "$compat_payload/manifest"
+compat_index_sha="$(sha256sum "$compat_payload/artifacts.tsv" | cut -d' ' -f1)"
+sed "s/^artifact_index_sha256=.*/artifact_index_sha256=$compat_index_sha/" \
+    "$compat_payload/manifest" > "$compat_payload/manifest.new"
+mv -- "$compat_payload/manifest.new" "$compat_payload/manifest"
+ssh-keygen -y -f "$tmp/key" > "$tmp/format4-three-column/recipient.pub"
+tar -C "$compat_payload" -czf - manifest artifacts.tsv artifacts | \
+    age -R "$tmp/format4-three-column/recipient.pub" \
+        -o "$compat_checkpoints/codex/$checkpoint_record_id.checkpoint.tar.gz.age"
+env "${source_env[@]}" CODEX_HOME="$tmp/format4-three-column/target" \
+    AGENT_SESSION_LOCAL_DIR="$compat_checkpoints" \
+    "$tool" restore local "$checkpoint_id" >/dev/null
+cmp "$tmp/source/codex/$session_rel" "$tmp/format4-three-column/target/$session_rel"
+[[ "$(stat -c %a "$tmp/format4-three-column/target/$session_rel")" == 600 ]]
+env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$compat_checkpoints" \
+    "$tool" show "$checkpoint_id" | grep -Eq '^Artifact metadata +not captured$'
+
+unsafe_metadata_payload="$tmp/unsafe-metadata/payload"
+unsafe_metadata_checkpoints="$tmp/unsafe-metadata/checkpoints"
+mkdir -p "$unsafe_metadata_payload" "$unsafe_metadata_checkpoints/codex"
+cp -a "$tmp/extracted/codex/." "$unsafe_metadata_payload/"
+awk -F '\t' 'BEGIN { OFS="\t" } { $4="4755"; print }' \
+    "$unsafe_metadata_payload/artifacts.tsv" > "$unsafe_metadata_payload/artifacts.tsv.new"
+mv -- "$unsafe_metadata_payload/artifacts.tsv.new" "$unsafe_metadata_payload/artifacts.tsv"
+unsafe_metadata_index_sha="$(sha256sum "$unsafe_metadata_payload/artifacts.tsv" | cut -d' ' -f1)"
+sed "s/^artifact_index_sha256=.*/artifact_index_sha256=$unsafe_metadata_index_sha/" \
+    "$unsafe_metadata_payload/manifest" > "$unsafe_metadata_payload/manifest.new"
+mv -- "$unsafe_metadata_payload/manifest.new" "$unsafe_metadata_payload/manifest"
+ssh-keygen -y -f "$tmp/key" > "$tmp/unsafe-metadata/recipient.pub"
+tar -C "$unsafe_metadata_payload" -czf - manifest artifacts.tsv artifacts | \
+    age -R "$tmp/unsafe-metadata/recipient.pub" \
+        -o "$unsafe_metadata_checkpoints/codex/$checkpoint_record_id.checkpoint.tar.gz.age"
+if env "${source_env[@]}" CODEX_HOME="$tmp/unsafe-metadata/target" \
+    AGENT_SESSION_LOCAL_DIR="$unsafe_metadata_checkpoints" \
+    "$tool" restore local "$checkpoint_id" \
+    >"$tmp/unsafe-metadata.out" 2>"$tmp/unsafe-metadata.err"; then
+    echo 'restore accepted unsafe artifact mode bits' >&2
+    exit 1
+fi
+grep -Fq 'checkpoint artifact metadata is malformed' "$tmp/unsafe-metadata.err"
+[[ ! -e "$tmp/unsafe-metadata/target" ]]
+
+zst_session_id=22222222-3333-4444-8555-666666666666
+zst_rel="archived_sessions/rollout-test-$zst_session_id.jsonl.zst"
+mkdir -p "$tmp/source/codex/$(dirname "$zst_rel")"
+printf 'fake-zstd-rollout\0payload\n' > "$tmp/source/codex/$zst_rel"
+zst_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$zst_session_id" compressed 'Compressed Codex session'
+)"
+zst_path="$(sed -n 's/^path=//p' <<< "$zst_output")"
+assert_format4_archive "$zst_path" "$tmp/extracted/zst"
+grep -Fqx "relative_path=$zst_rel" "$tmp/extracted/zst/manifest"
+cmp "$tmp/source/codex/$zst_rel" "$tmp/extracted/zst/artifacts/$zst_rel"
+seed_context_mode_agent_cache "$tmp/zst-target/codex" codex
+zst_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/zst-target/codex" \
+    "$tool" resume compressed -- --model compressed-model)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$zst_session_id> <--model> <compressed-model>" \
+    <<< "$zst_resume"
+[[ "$zst_resume" != *'<-->'* ]]
+cmp "$tmp/source/codex/$zst_rel" "$tmp/zst-target/codex/$zst_rel"
+zst_cross_home="$tmp/zst-cross-target/claude"
+seed_context_mode_agent_cache "$zst_cross_home" claude
+zst_cross_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$tmp/work")"
+zst_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$zst_cross_home" \
+    OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
+    "$tool" resume compressed --to claude -- \
+        --model converted-zstd)"
+grep -Fqx \
+    "FAKE_CLAUDE <--resume> <$converted_claude_id> <--model> <converted-zstd>" \
+    <<< "$zst_cross"
+[[ -f "$zst_cross_home/projects/$zst_cross_key/$converted_claude_id.jsonl" ]]
+grep -Fq $'CONVERT=codex\tclaude-code\t' "$tmp/home/.local/agsx.log"
+grep -F $'CONVERT=codex\tclaude-code\t' "$tmp/home/.local/agsx.log" |
+    grep -Fq '/agsx/source.jsonl'
+
+(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_STATE_DIR="$tmp/race-state-a" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" local-race 'Local race A'
+) >"$tmp/local-race-a.out" 2>"$tmp/local-race-a.err" &
+local_race_a_pid=$!
+(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_STATE_DIR="$tmp/race-state-b" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" local-race 'Local race B'
+) >"$tmp/local-race-b.out" 2>"$tmp/local-race-b.err" &
+local_race_b_pid=$!
+if wait "$local_race_a_pid"; then local_race_a=0; else local_race_a=$?; fi
+if wait "$local_race_b_pid"; then local_race_b=0; else local_race_b=$?; fi
+if (( (local_race_a == 0 && local_race_b == 0) ||
+      (local_race_a != 0 && local_race_b != 0) )); then
+    echo "local race returned unexpected statuses: $local_race_a, $local_race_b" >&2
+    exit 1
+fi
+mapfile -t local_race_records < <(
+    sed -n 's/^record_id=//p' "$tmp/local-race-a.out" "$tmp/local-race-b.out"
+)
+(( ${#local_race_records[@]} == 1 ))
+[[ "${local_race_records[0]}" =~ ^[0-9a-f]{24}@local-race$ ]]
+[[ -f "$tmp/local-checkpoints/codex/${local_race_records[0]}.checkpoint.tar.gz.age" ]]
+
+delete_move_seed="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" \
+            delete-move-failure 'Delete move failure'
+)"
+delete_move_record="$(sed -n 's/^record_id=//p' <<< "$delete_move_seed")"
+delete_move_path="$(sed -n 's/^path=//p' <<< "$delete_move_seed")"
+delete_move_failure="$tmp/delete-move-failure.injected"
+if env "${source_env[@]}" \
+    AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+    FAKE_MV_DELETE_ARCHIVE_ONCE="$delete_move_failure" \
+    "$tool" delete "$delete_move_record" \
+    >"$tmp/delete-move-failure.out" \
+    2>"$tmp/delete-move-failure.err"; then
+    echo 'local delete ignored a failed recoverable archive move' >&2
+    exit 1
+fi
+[[ -f "$delete_move_failure" && -f "$delete_move_path" ]]
+[[ ! -e "$tmp/local-checkpoints/tombstones/codex/$delete_move_record.tombstone" ]]
+grep -Fq 'cannot move checkpoint to recoverable trash' \
+    "$tmp/delete-move-failure.err"
+delete_move_done="$(
+    env "${source_env[@]}" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" delete "$delete_move_record"
+)"
+grep -Fqx 'status=deleted' <<< "$delete_move_done"
+
+cloud_url='sftp://tester@127.0.0.1:2222/agent-sessions'
+if env "${source_env[@]}" "$tool" cloud set 'https://example.test/sessions' --key "$tmp/key" >/dev/null 2>&1; then
+    echo 'cloud set accepted a non-SFTP URL' >&2
+    exit 1
+fi
+cloud_config="$(env "${source_env[@]}" "$tool" cloud set "$cloud_url" --key "$tmp/key")"
+grep -Fqx 'status=configured' <<< "$cloud_config"
+grep -Fqx "url=$cloud_url" <<< "$cloud_config"
+grep -Fqx 'auth=key' <<< "$cloud_config"
+
+if (
+    cd "$tmp/work"
+    env "${source_env[@]}" FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE=1 \
+        "$tool" save-now cloud codex "$session_id" rollback-check 'Rollback check'
+) >/dev/null 2>&1; then
+    echo 'cloud save ignored a failed manifest commit' >&2
+    exit 1
+fi
+! find "$tmp/remote/agent-sessions/codex" -maxdepth 1 -type f \
+    -name '*@rollback-check.checkpoint.tar.gz.age' | grep -q .
+! find "$tmp/remote/agent-sessions/codex" -maxdepth 1 -type f \
+    -name '*@rollback-check.manifest.age' | grep -q .
+rollback_retry="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" rollback-check 'Rollback check'
+)"
+grep -Fqx 'status=saved' <<< "$rollback_retry"
+env "${source_env[@]}" "$tool" cloud delete rollback-check >/dev/null
+
+manifest_after_move_marker="$tmp/manifest-after-move.failed"
+manifest_after_move="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        FAKE_RCLONE_FAIL_MANIFEST_AFTER_MOVE_ONCE="$manifest_after_move_marker" \
+        "$tool" save-now cloud codex "$session_id" \
+            manifest-after-move 'Manifest committed before client error'
+)"
+manifest_after_move_record="$(
+    sed -n 's/^record_id=//p' <<< "$manifest_after_move"
+)"
+grep -Fqx 'status=saved' <<< "$manifest_after_move"
+[[ -f "$manifest_after_move_marker" ]]
+[[ -f "$tmp/remote/agent-sessions/codex/$manifest_after_move_record.checkpoint.tar.gz.age" ]]
+[[ -f "$tmp/remote/agent-sessions/codex/$manifest_after_move_record.manifest.age" ]]
+env "${source_env[@]}" "$tool" cloud delete "$manifest_after_move_record" >/dev/null
+
+retained_pending="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_AGENT=codex \
+        AGENT_SESSION_ID="$session_id" \
+        "$tool" cloud save retained-archive 'Retain reused archive'
+)"
+retained_record="$(sed -n 's/^record_id=//p' <<< "$retained_pending")"
+retained_archive="$tmp/remote/agent-sessions/codex/$retained_record.checkpoint.tar.gz.age"
+retained_manifest="$tmp/remote/agent-sessions/codex/$retained_record.manifest.age"
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${source_env[@]}" \
+    FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE="$tmp/retained-manifest-first.failed" \
+    FAKE_RCLONE_FAIL_ARCHIVE_DELETE_ONCE="$tmp/retained-delete.failed" \
+    "$tool" hook >"$tmp/retained-first.out" 2>"$tmp/retained-first.err"
+grep -Fq "unconfirmed cloud checkpoint retained for safe recovery: codex/$retained_record" \
+    "$tmp/retained-first.err"
+[[ -f "$retained_archive" && ! -e "$retained_manifest" ]]
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${source_env[@]}" \
+    FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE="$tmp/retained-manifest-second.failed" \
+    "$tool" hook >"$tmp/retained-second.out" 2>"$tmp/retained-second.err"
+grep -Fq "unconfirmed cloud checkpoint retained for safe recovery: codex/$retained_record" \
+    "$tmp/retained-second.err"
+[[ -f "$retained_archive" && ! -e "$retained_manifest" ]]
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${source_env[@]}" "$tool" hook
+[[ -f "$retained_archive" && -f "$retained_manifest" ]]
+env "${source_env[@]}" "$tool" cloud delete "$retained_record" >/dev/null
+
+lsf_probe_counter="$tmp/rollback-lsf-probe.count"
+if (
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE="$tmp/rollback-lsf-manifest.failed" \
+        FAKE_RCLONE_FAIL_LSF_AT=2 \
+        FAKE_RCLONE_LSF_COUNTER_FILE="$lsf_probe_counter" \
+        "$tool" save-now cloud codex "$session_id" \
+            rollback-lsf-probe 'Unconfirmed rollback probe'
+) >"$tmp/rollback-lsf-probe.out" 2>"$tmp/rollback-lsf-probe.err"; then
+    echo 'cloud save ignored an unavailable rollback probe' >&2
+    exit 1
+fi
+grep -Fq 'unconfirmed cloud checkpoint retained for safe recovery: codex/' \
+    "$tmp/rollback-lsf-probe.err"
+mapfile -t rollback_lsf_archives < <(
+    find "$tmp/remote/agent-sessions/codex" -maxdepth 1 -type f \
+        -name '*@rollback-lsf-probe.checkpoint.tar.gz.age'
+)
+(( ${#rollback_lsf_archives[@]} == 1 ))
+rollback_lsf_record="${rollback_lsf_archives[0]##*/}"
+rollback_lsf_record="${rollback_lsf_record%.checkpoint.tar.gz.age}"
+[[ ! -e "$tmp/remote/agent-sessions/codex/$rollback_lsf_record.manifest.age" ]]
+env "${source_env[@]}" "$tool" cloud delete "$rollback_lsf_record" >/dev/null
+
+legacy_delete_retry="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" \
+            legacy-delete-retry 'Legacy delete retry'
+)"
+legacy_delete_record="$(
+    sed -n 's/^record_id=//p' <<< "$legacy_delete_retry"
+)"
+legacy_delete_archive="$tmp/remote/agent-sessions/codex/$legacy_delete_record.checkpoint.tar.gz.age"
+legacy_delete_manifest="$tmp/remote/agent-sessions/codex/$legacy_delete_record.manifest.age"
+legacy_delete_failure="$tmp/legacy-delete-trash-manifest.failed"
+if env "${source_env[@]}" \
+    FAKE_RCLONE_FAIL_LEGACY_TRASH_MANIFEST_ONCE="$legacy_delete_failure" \
+    "$tool" cloud delete legacy-delete-retry \
+    >"$tmp/legacy-delete-first.out" \
+    2>"$tmp/legacy-delete-first.err"; then
+    echo 'legacy cloud delete ignored a failed recoverable manifest move' >&2
+    exit 1
+fi
+[[ -f "$legacy_delete_failure" ]]
+[[ -f "$legacy_delete_archive" && -f "$legacy_delete_manifest" ]]
+legacy_delete_tombstone="$tmp/local-checkpoints/tombstones/codex/$legacy_delete_record.tombstone"
+[[ -f "$legacy_delete_tombstone" ]]
+legacy_delete_tombstone_digest="$(
+    sha256sum "$legacy_delete_tombstone" | cut -d' ' -f1
+)"
+legacy_delete_tombstone_marker="ags-v1/tombstones/codex/$legacy_delete_record.$legacy_delete_tombstone_digest.tombstone"
+[[ -f "$tmp/remote/agent-sessions/$legacy_delete_tombstone_marker" ]]
+
+# A new checkpoint may legitimately reuse the old logical ID after its
+# predecessor is tombstoned. Retrying cleanup of the exact legacy record must
+# not delete that newer, unrelated local checkpoint.
+legacy_delete_new="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" save-now local codex "$session_id" \
+            legacy-delete-retry 'New checkpoint with reused logical ID'
+)"
+legacy_delete_new_record="$(
+    sed -n 's/^record_id=//p' <<< "$legacy_delete_new"
+)"
+legacy_delete_new_path="$(
+    sed -n 's/^path=//p' <<< "$legacy_delete_new"
+)"
+[[ "$legacy_delete_new_record" != "$legacy_delete_record" ]]
+legacy_delete_done="$(
+    env "${source_env[@]}" "$tool" cloud delete legacy-delete-retry
+)"
+grep -Fqx 'status=deleted' <<< "$legacy_delete_done"
+grep -Fqx 'target=cloud' <<< "$legacy_delete_done"
+grep -Fqx "record_id=$legacy_delete_record" <<< "$legacy_delete_done"
+[[ -f "$legacy_delete_new_path" ]]
+[[ ! -e "$legacy_delete_archive" && ! -e "$legacy_delete_manifest" ]]
+find "$tmp/remote/agent-sessions/trash/codex" -maxdepth 1 -type f \
+    -name "$legacy_delete_record.checkpoint.tar.gz.age.deleted.*" | grep -q .
+find "$tmp/remote/agent-sessions/trash/codex" -maxdepth 1 -type f \
+    -name "$legacy_delete_record.manifest.age.deleted.*" | grep -q .
+
+legacy_archive_retry="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" \
+            legacy-archive-retry 'Legacy archive move retry'
+)"
+legacy_archive_record="$(
+    sed -n 's/^record_id=//p' <<< "$legacy_archive_retry"
+)"
+legacy_archive_path="$tmp/remote/agent-sessions/codex/$legacy_archive_record.checkpoint.tar.gz.age"
+legacy_archive_manifest="$tmp/remote/agent-sessions/codex/$legacy_archive_record.manifest.age"
+legacy_archive_failure="$tmp/legacy-delete-trash-archive.failed"
+if env "${source_env[@]}" \
+    FAKE_RCLONE_FAIL_LEGACY_TRASH_ARCHIVE_ONCE="$legacy_archive_failure" \
+    "$tool" cloud delete legacy-archive-retry \
+    >"$tmp/legacy-archive-first.out" \
+    2>"$tmp/legacy-archive-first.err"; then
+    echo 'legacy cloud delete ignored a failed final archive move' >&2
+    exit 1
+fi
+[[ -f "$legacy_archive_failure" && -f "$legacy_archive_path" ]]
+[[ ! -e "$legacy_archive_manifest" ]]
+find "$tmp/remote/agent-sessions/trash/codex" -maxdepth 1 -type f \
+    -name "$legacy_archive_record.manifest.age.deleted.*" | grep -q .
+legacy_archive_done="$(
+    env "${source_env[@]}" "$tool" cloud delete legacy-archive-retry
+)"
+grep -Fqx 'status=deleted' <<< "$legacy_archive_done"
+grep -Fqx "record_id=$legacy_archive_record" <<< "$legacy_archive_done"
+[[ ! -e "$legacy_archive_path" ]]
+
+queue_publish_retry="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" \
+            queue-publish-retry 'Queue publication failure'
+)"
+queue_publish_record="$(
+    sed -n 's/^record_id=//p' <<< "$queue_publish_retry"
+)"
+queue_publish_archive="$tmp/remote/agent-sessions/codex/$queue_publish_record.checkpoint.tar.gz.age"
+queue_publish_manifest="$tmp/remote/agent-sessions/codex/$queue_publish_record.manifest.age"
+queue_publish_failure="$tmp/queue-publish-failure.injected"
+if queue_publish_first="$(
+    env "${source_env[@]}" \
+        FAKE_RCLONE_FAIL_LSF_AT=3 \
+        FAKE_RCLONE_LSF_COUNTER_FILE="$tmp/queue-publish-lsf.count" \
+        FAKE_MV_PENDING_SYNC_ONCE="$queue_publish_failure" \
+        "$tool" cloud delete queue-publish-retry \
+        2>"$tmp/queue-publish-first.err"
+)"; then
+    echo 'delete ignored failure to publish its remote retry' >&2
+    exit 1
+fi
+grep -Fqx 'status=deleted' <<< "$queue_publish_first"
+grep -Fqx 'target=cloud' <<< "$queue_publish_first"
+! grep -Fq 'sync_status=pending' <<< "$queue_publish_first"
+grep -Fq 'remote retry could not be recorded' \
+    "$tmp/queue-publish-first.err"
+[[ -f "$queue_publish_failure" ]]
+[[ -f "$queue_publish_archive" && -f "$queue_publish_manifest" ]]
+[[ ! -d "$tmp/state/pending-sync" ]] ||
+    ! find "$tmp/state/pending-sync" -type f -name '*.json' | grep -q .
+env "${source_env[@]}" "$tool" sync neburst >/dev/null
+queue_publish_done="$(
+    env "${source_env[@]}" "$tool" cloud delete queue-publish-retry
+)"
+grep -Fqx "record_id=$queue_publish_record" <<< "$queue_publish_done"
+[[ ! -e "$queue_publish_archive" && ! -e "$queue_publish_manifest" ]]
+
+legacy_pending_retry="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" \
+            legacy-pending-retry 'Legacy pending sync retry'
+)"
+legacy_pending_record="$(
+    sed -n 's/^record_id=//p' <<< "$legacy_pending_retry"
+)"
+legacy_pending_archive="$tmp/remote/agent-sessions/codex/$legacy_pending_record.checkpoint.tar.gz.age"
+legacy_pending_manifest="$tmp/remote/agent-sessions/codex/$legacy_pending_record.manifest.age"
+if legacy_pending_first="$(
+    env "${source_env[@]}" \
+        FAKE_RCLONE_FAIL_LSF_AT=3 \
+        FAKE_RCLONE_LSF_COUNTER_FILE="$tmp/legacy-pending-lsf.count" \
+        "$tool" cloud delete legacy-pending-retry \
+        2>"$tmp/legacy-pending-first.err"
+)"; then
+    echo 'legacy cloud delete ignored a failed tombstone synchronization' >&2
+    exit 1
+fi
+grep -Fqx 'status=deleted' <<< "$legacy_pending_first"
+grep -Fqx 'target=cloud' <<< "$legacy_pending_first"
+grep -Fqx 'sync_status=pending' <<< "$legacy_pending_first"
+[[ -f "$legacy_pending_archive" && -f "$legacy_pending_manifest" ]]
+legacy_pending_sync="$(
+    sed -n 's/^pending_sync=//p' <<< "$legacy_pending_first"
+)"
+[[ -f "$legacy_pending_sync" ]]
+
+flush_race_retry="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" \
+            flush-race-retry 'Flush retry replacement race'
+)"
+flush_race_record="$(
+    sed -n 's/^record_id=//p' <<< "$flush_race_retry"
+)"
+mkdir -p "$tmp/flush-retry-race/hold"
+env "${source_env[@]}" \
+    FAKE_RM_PENDING_HOLD_DIR="$tmp/flush-retry-race/hold" \
+    "$tool" flush \
+    >"$tmp/flush-retry-race/flush.out" \
+    2>"$tmp/flush-retry-race/flush.err" &
+flush_race_flush_pid=$!
+test_child_pids["$flush_race_flush_pid"]=1
+flush_race_remove_ready=0
+for _ in {1..1000}; do
+    if [[ -e "$tmp/flush-retry-race/hold/ready" ]]; then
+        flush_race_remove_ready=1
+        break
+    fi
+    test_process_running "$flush_race_flush_pid" || break
+    sleep 0.01
+done
+(( flush_race_remove_ready == 1 ))
+if ! test_process_has_fd_target "$flush_race_flush_pid" \
+    "$tmp/state/storage-consolidation.lock"; then
+    : > "$tmp/flush-retry-race/hold/release"
+    wait "$flush_race_flush_pid" 2>/dev/null || true
+    unset "test_child_pids[$flush_race_flush_pid]"
+    echo 'pending retry removal was not protected by the consolidation lock' >&2
+    exit 1
+fi
+env "${source_env[@]}" \
+    FAKE_RCLONE_FAIL_LSF_AT=3 \
+    FAKE_RCLONE_LSF_COUNTER_FILE="$tmp/flush-retry-race/delete-lsf.count" \
+    "$tool" cloud delete flush-race-retry \
+    >"$tmp/flush-retry-race/delete.out" \
+    2>"$tmp/flush-retry-race/delete.err" &
+flush_race_delete_pid=$!
+test_child_pids["$flush_race_delete_pid"]=1
+flush_race_delete_waiting=0
+for _ in {1..500}; do
+    if test_process_has_fd_target "$flush_race_delete_pid" \
+        "$tmp/state/storage-consolidation.lock"; then
+        flush_race_delete_waiting=1
+        break
+    fi
+    test_process_running "$flush_race_delete_pid" || break
+    sleep 0.01
+done
+(( flush_race_delete_waiting == 1 ))
+test_process_running "$flush_race_flush_pid"
+test_process_running "$flush_race_delete_pid"
+: > "$tmp/flush-retry-race/hold/release"
+wait "$flush_race_flush_pid"
+unset "test_child_pids[$flush_race_flush_pid]"
+if wait "$flush_race_delete_pid"; then
+    unset "test_child_pids[$flush_race_delete_pid]"
+    echo 'replacement retry delete unexpectedly synchronized' >&2
+    exit 1
+fi
+unset "test_child_pids[$flush_race_delete_pid]"
+grep -Fqx 'status=deleted' "$tmp/flush-retry-race/delete.out"
+grep -Fqx 'sync_status=pending' "$tmp/flush-retry-race/delete.out"
+flush_race_pending="$(
+    sed -n 's/^pending_sync=//p' "$tmp/flush-retry-race/delete.out"
+)"
+[[ "$flush_race_pending" == "$legacy_pending_sync" ]]
+[[ -f "$flush_race_pending" ]]
+jq -e --arg reason "delete:$flush_race_record" \
+    '.reason == $reason' "$flush_race_pending" >/dev/null
+env "${source_env[@]}" "$tool" flush
+[[ ! -e "$flush_race_pending" ]]
+flush_race_done="$(
+    env "${source_env[@]}" "$tool" cloud delete flush-race-retry
+)"
+grep -Fqx "record_id=$flush_race_record" <<< "$flush_race_done"
+
+legacy_pending_done="$(
+    env "${source_env[@]}" "$tool" cloud delete legacy-pending-retry
+)"
+grep -Fqx "record_id=$legacy_pending_record" <<< "$legacy_pending_done"
+[[ ! -e "$legacy_pending_archive" && ! -e "$legacy_pending_manifest" ]]
+
+cloud_delete_lock="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        "$tool" save-now cloud codex "$session_id" \
+            cloud-delete-lock 'Cloud delete lock'
+)"
+cloud_delete_lock_record="$(
+    sed -n 's/^record_id=//p' <<< "$cloud_delete_lock"
+)"
+mkdir -p "$tmp/cloud-delete-lock/hold"
+env "${source_env[@]}" \
+    FAKE_RCLONE_LSF_HOLD_DIR="$tmp/cloud-delete-lock/hold" \
+    "$tool" cloud delete "$cloud_delete_lock_record" \
+    >"$tmp/cloud-delete-lock/delete.out" \
+    2>"$tmp/cloud-delete-lock/delete.err" &
+cloud_delete_lock_pid=$!
+test_child_pids["$cloud_delete_lock_pid"]=1
+cloud_delete_hold_ready=0
+for _ in {1..500}; do
+    if [[ -e "$tmp/cloud-delete-lock/hold/ready" ]]; then
+        cloud_delete_hold_ready=1
+        break
+    fi
+    sleep 0.01
+done
+(( cloud_delete_hold_ready == 1 ))
+env "${source_env[@]}" "$tool" status neburst \
+    >"$tmp/cloud-delete-lock/status.out" \
+    2>"$tmp/cloud-delete-lock/status.err" &
+cloud_delete_status_pid=$!
+test_child_pids["$cloud_delete_status_pid"]=1
+cloud_delete_status_waiting=0
+for _ in {1..500}; do
+    if test_process_has_fd_target "$cloud_delete_status_pid" \
+        "$tmp/state/storage-consolidation.lock"; then
+        cloud_delete_status_waiting=1
+        break
+    fi
+    test_process_running "$cloud_delete_status_pid" || break
+    sleep 0.01
+done
+(( cloud_delete_status_waiting == 1 ))
+test_process_running "$cloud_delete_lock_pid"
+test_process_running "$cloud_delete_status_pid"
+: > "$tmp/cloud-delete-lock/hold/release"
+wait "$cloud_delete_lock_pid"
+unset "test_child_pids[$cloud_delete_lock_pid]"
+wait "$cloud_delete_status_pid"
+unset "test_child_pids[$cloud_delete_status_pid]"
+grep -Fqx 'status=deleted' "$tmp/cloud-delete-lock/delete.out"
+grep -Fqx 'remote=neburst' "$tmp/cloud-delete-lock/status.out"
+grep -Fqx 'type=sftp' "$tmp/cloud-delete-lock/status.out"
+
+mkdir -p "$tmp/cloud-race-state-a" "$tmp/cloud-race-state-b"
+cp -- "$tmp/state/storage.json" "$tmp/cloud-race-state-a/storage.json"
+cp -- "$tmp/state/storage.json" "$tmp/cloud-race-state-b/storage.json"
+(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_STATE_DIR="$tmp/cloud-race-state-a" \
+        FAKE_RCLONE_LSF_BARRIER="$tmp/cloud-race-barrier" \
+        "$tool" save-now cloud codex "$session_id" cloud-race 'Cloud race A'
+) >"$tmp/cloud-race-a.out" 2>"$tmp/cloud-race-a.err" &
+cloud_race_a_pid=$!
+(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_STATE_DIR="$tmp/cloud-race-state-b" \
+        FAKE_RCLONE_LSF_BARRIER="$tmp/cloud-race-barrier" \
+        "$tool" save-now cloud codex "$session_id" cloud-race 'Cloud race B'
+) >"$tmp/cloud-race-b.out" 2>"$tmp/cloud-race-b.err" &
+cloud_race_b_pid=$!
+if wait "$cloud_race_a_pid"; then cloud_race_a=0; else cloud_race_a=$?; fi
+if wait "$cloud_race_b_pid"; then cloud_race_b=0; else cloud_race_b=$?; fi
+if (( cloud_race_a != 0 || cloud_race_b != 0 )); then
+    echo "cloud race returned unexpected statuses: $cloud_race_a, $cloud_race_b" >&2
+    exit 1
+fi
+mapfile -t cloud_race_records < <(
+    sed -n 's/^record_id=//p' "$tmp/cloud-race-a.out" "$tmp/cloud-race-b.out"
+)
+(( ${#cloud_race_records[@]} == 2 ))
+[[ "${cloud_race_records[0]}" != "${cloud_race_records[1]}" ]]
+for record_id in "${cloud_race_records[@]}"; do
+    [[ "$record_id" =~ ^[0-9a-f]{24}@cloud-race$ ]]
+    [[ -f "$tmp/remote/agent-sessions/codex/$record_id.checkpoint.tar.gz.age" ]]
+    [[ -f "$tmp/remote/agent-sessions/codex/$record_id.manifest.age" ]]
+done
+cloud_race_list="$(env "${source_env[@]}" "$tool" cloud list)"
+cloud_race_rows="$(grep -Ec '^cloud-race +CODEX +' <<< "$cloud_race_list" || true)"
+[[ "$cloud_race_rows" == 2 ]]
+if env "${source_env[@]}" CODEX_HOME="$tmp/cloud-race-ambiguous/codex" \
+    "$tool" restore cloud cloud-race >"$tmp/cloud-race-ambiguous.out" \
+    2>"$tmp/cloud-race-ambiguous.err"; then
+    echo 'cloud restore accepted an ambiguous ID' >&2
+    exit 1
+fi
+grep -Fq 'matching RECORD_ID values:' "$tmp/cloud-race-ambiguous.err"
+grep -Fq 'expected one cloud checkpoint named cloud-race; found 2' \
+    "$tmp/cloud-race-ambiguous.err"
+for record_id in "${cloud_race_records[@]}"; do
+    grep -Fq "$record_id" "$tmp/cloud-race-ambiguous.err"
+done
+seed_context_mode_agent_cache "$tmp/cloud-race-target/codex" codex
+cloud_race_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/cloud-race-target/codex" \
+    "$tool" cloud resume "${cloud_race_records[0]}" -- --model race-model)"
+grep -Fqx "FAKE_CODEX <resume> <$session_id> <--model> <race-model>" <<< "$cloud_race_resume"
+cmp "$tmp/source/codex/$session_rel" "$tmp/cloud-race-target/codex/$session_rel"
+for record_id in "${cloud_race_records[@]}"; do
+    cloud_race_delete="$(env "${source_env[@]}" "$tool" cloud delete "$record_id")"
+    grep -Fqx "record_id=$record_id" <<< "$cloud_race_delete"
+done
+
+cloud_pending="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+        "$tool" cloud save cloud-checkpoint '云端检查点'
+)"
+cloud_id="$(sed -n 's/^checkpoint_id=//p' <<< "$cloud_pending")"
+grep -Fqx 'status=pending' <<< "$cloud_pending"
+[[ "$cloud_id" == cloud-checkpoint ]]
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${source_env[@]}" "$tool" hook
+cloud_list="$(env "${source_env[@]}" "$tool" cloud list)"
+grep -Fq "$cloud_id" <<< "$cloud_list"
+cloud_restore="$(env "${source_env[@]}" CODEX_HOME="$tmp/cloud-target/codex" \
+    CLAUDE_CONFIG_DIR="$tmp/cloud-target/claude" "$tool" restore cloud "$cloud_id")"
+grep -Fqx "saved_pwd=$tmp/work" <<< "$cloud_restore"
+cmp "$tmp/source/codex/$session_rel" "$tmp/cloud-target/codex/$session_rel"
+if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+    "$tool" cloud save cloud-checkpoint 'Duplicate cloud ID' >/dev/null 2>&1; then
+    echo 'cloud save accepted a duplicate ID' >&2
+    exit 1
+fi
+
+queued_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+        "$tool" save active-window '活动窗口'
+)"
+queued_id="$(sed -n 's/^checkpoint_id=//p' <<< "$queued_output")"
+queued_path="$(sed -n 's/^path=//p' <<< "$queued_output")"
+grep -Fqx 'status=pending' <<< "$queued_output"
+[[ "$queued_id" == active-window ]]
+[[ ! -e "$queued_path" ]]
+mkdir -p "$tmp/pending-set-target"
+storage_before_pending_set="$(sha256sum "$tmp/state/storage.json")"
+if env "${source_env[@]}" "$tool" set "$tmp/pending-set-target" \
+    >"$tmp/pending-set.out" 2>"$tmp/pending-set.err"; then
+    echo 'local storage changed while a checkpoint was pending' >&2
+    exit 1
+fi
+grep -Fq 'cannot change local storage while a checkpoint or synchronization is pending' \
+    "$tmp/pending-set.err"
+[[ "$storage_before_pending_set" == "$(sha256sum "$tmp/state/storage.json")" ]]
+printf '%s\n' '{"type":"assistant","complete":true}' >> "$tmp/source/codex/$session_rel"
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" "$tool" hook
+[[ -f "$queued_path" ]]
+[[ ! -d "$tmp/state/pending" ]] || ! find "$tmp/state/pending" -type f -name '*.json' | grep -q .
+
+codex_active_home="$tmp/codex-active-target/codex"
+mkdir -p "$codex_active_home/${session_rel%/*}"
+seed_context_mode_agent_cache "$codex_active_home" codex
+cp -- "$tmp/source/codex/$session_rel" "$codex_active_home/$session_rel"
+start_codex_session_process "$codex_active_home" "$session_id" "$session_rel"
+codex_active_pid="$active_test_pid"
+if env "${source_env[@]}" CODEX_HOME="$codex_active_home" \
+    "$tool" resume "$queued_id" \
+    >"$tmp/codex-active.out" 2>"$tmp/codex-active.err"; then
+    echo 'resume accepted an active target Codex session' >&2
+    exit 1
+fi
+grep -Fq \
+    "codex session $session_id is already active in PID $codex_active_pid" \
+    "$tmp/codex-active.err"
+kill -0 "$codex_active_pid"
+cmp "$tmp/source/codex/$session_rel" "$codex_active_home/$session_rel"
+stop_test_process "$codex_active_pid"
+
+codex_deleted_home="$tmp/codex-deleted-target/codex"
+seed_context_mode_agent_cache "$codex_deleted_home" codex
+start_codex_session_process "$codex_deleted_home" "$session_id"
+codex_deleted_pid="$active_test_pid"
+codex_deleted_path="$active_codex_path"
+rm -f -- "$codex_deleted_path"
+codex_deleted_target="$(test_fd9_target "$codex_deleted_pid")"
+[[ "$codex_deleted_target" == "$codex_deleted_path" ||
+   "$codex_deleted_target" == "$codex_deleted_path (deleted)" ]]
+if env "${source_env[@]}" CODEX_HOME="$codex_deleted_home" \
+    "$tool" resume "$queued_id" \
+    >"$tmp/codex-deleted.out" 2>"$tmp/codex-deleted.err"; then
+    echo 'resume ignored an unlinked active Codex rollout' >&2
+    exit 1
+fi
+grep -Fq \
+    "codex session $session_id is already active in PID $codex_deleted_pid" \
+    "$tmp/codex-deleted.err"
+kill -0 "$codex_deleted_pid"
+[[ ! -e "$codex_deleted_path" ]]
+stop_test_process "$codex_deleted_pid"
+
+codex_unrelated_id=77777777-8888-4999-8aaa-bbbbbbbbbbbb
+codex_unrelated_home="$tmp/codex-unrelated-target/codex"
+start_codex_session_process "$codex_unrelated_home" "$codex_unrelated_id"
+write_codex_profile "$codex_unrelated_home" unrelated-running
+codex_unrelated_pid="$active_test_pid"
+codex_unrelated_resume="$(env "${source_env[@]}" CODEX_HOME="$codex_unrelated_home" \
+    "$tool" resume "$queued_id" -- -punrelated-running)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$session_id> <-punrelated-running>" \
+    <<< "$codex_unrelated_resume"
+kill -0 "$codex_unrelated_pid"
+cmp "$tmp/source/codex/$session_rel" "$codex_unrelated_home/$session_rel"
+stop_test_process "$codex_unrelated_pid"
+
+mkdir -p "$tmp/other-home/.local/bin"
+printf '%s\n' '#!/usr/bin/env sh' 'printf '\''WRONG_CODEX\n'\''' \
+    > "$tmp/other-home/.local/bin/codex"
+if [[ "$test_platform" == Darwin ]]; then
+    printf '%s\n' '#!/usr/bin/env sh' 'exec /usr/bin/pgrep "$@"' \
+        > "$tmp/other-home/.local/bin/pgrep"
+else
+    printf '%s\n' '#!/usr/bin/env sh' 'exit 1' > "$tmp/other-home/.local/bin/pgrep"
+fi
+chmod +x "$tmp/other-home/.local/bin/codex" "$tmp/other-home/.local/bin/pgrep"
+seed_context_mode_agent_cache "$tmp/resume-target/codex" codex
+resume_output="$(env "${source_env[@]}" \
+    PATH="$tmp/other-home/.local/bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    CODEX_HOME="$tmp/resume-target/codex" \
+    "$tool" resume "$queued_id" --to codex -- \
+        --to agent-owned --model test-model 'prompt words')"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$session_id> <--to> <agent-owned> <--model> <test-model> <prompt words>" \
+    <<< "$resume_output"
+cmp "$tmp/source/codex/$session_rel" "$tmp/resume-target/codex/$session_rel"
+if env "${source_env[@]}" CODEX_HOME="$tmp/resume-boundary-target/codex" \
+    "$tool" resume "$queued_id" --model must-follow-separator --to claude \
+    >"$tmp/resume-boundary.out" 2>"$tmp/resume-boundary.err"; then
+    echo 'resume accepted an Agent argument before --' >&2
+    exit 1
+fi
+grep -Fq 'unknown AGS resume argument: --model; put Agent arguments after --' \
+    "$tmp/resume-boundary.err"
+[[ ! -e "$tmp/resume-boundary-target" ]]
+
+conversion_log="$tmp/home/.local/agsx.log"
+conversion_log_lines="$(wc -l < "$conversion_log")"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/version-gate-target/claude" \
+    "$tool" resume "$queued_id" --to claude --force-unsupported-version \
+    >"$tmp/version-gate.out" 2>"$tmp/version-gate.err"; then
+    echo 'cross-Agent resume accepted a removed compatibility flag' >&2
+    exit 1
+fi
+grep -Fq -- '--force-unsupported-version was removed' "$tmp/version-gate.err"
+[[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
+[[ ! -e "$tmp/version-gate-target" ]]
+
+codex_to_claude_work="$tmp/codex-to-claude-work"
+codex_to_claude_home="$tmp/codex-to-claude-target/claude"
+codex_to_claude_settings="$codex_to_claude_home/sub2api.settings.json"
+mkdir -p "$codex_to_claude_work" "$codex_to_claude_home"
+seed_context_mode_agent_cache "$codex_to_claude_home" claude
+printf '%s\n' \
+    '{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example","ANTHROPIC_API_KEY":"","ANTHROPIC_AUTH_TOKEN":""},"apiKeyHelper":"/usr/bin/printenv SUB2API_API_KEY"}' \
+    > "$codex_to_claude_settings"
+codex_to_claude_settings_sha="$(
+    sha256sum "$codex_to_claude_settings" | cut -d' ' -f1
+)"
+codex_to_claude_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$codex_to_claude_work")"
+codex_to_claude="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$codex_to_claude_home" \
+    OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
+    "$tool" resume "$queued_id" --to claude \
+        --profile sub2api --cwd "$codex_to_claude_work" -- \
+        --model sonnet 'converted handoff')"
+grep -Fqx \
+    "FAKE_CLAUDE <--resume> <$converted_claude_id> <--settings> <$codex_to_claude_settings> <--model> <sonnet> <converted handoff>" \
+    <<< "$codex_to_claude"
+grep -Fqx "FAKE_PWD=$codex_to_claude_work" <<< "$codex_to_claude"
+[[ "$codex_to_claude_settings_sha" == \
+   "$(sha256sum "$codex_to_claude_settings" | cut -d' ' -f1)" ]]
+grep -Fqx 'source_agent=codex' <<< "$codex_to_claude"
+grep -Fqx 'agent=claude' <<< "$codex_to_claude"
+grep -Fqx "source_session_id=$session_id" <<< "$codex_to_claude"
+grep -Fqx "session_id=$converted_claude_id" <<< "$codex_to_claude"
+grep -Fqx 'conversion=agsx-0.3.0-test' <<< "$codex_to_claude"
+codex_to_claude_file="$codex_to_claude_home/projects/$codex_to_claude_key/$converted_claude_id.jsonl"
+[[ -f "$codex_to_claude_file" ]]
+jq -s -e --arg cwd "$codex_to_claude_work" \
+    'length > 0 and all(.[]; .cwd == $cwd)' \
+    "$codex_to_claude_file" >/dev/null
+grep -Fq 'converted reasoning summary' "$codex_to_claude_file"
+! grep -Fq '"type":"thinking"' "$codex_to_claude_file"
+[[ ! -e "$codex_to_claude_home/history.jsonl" ]]
+grep -Eq "^HOME=$tmp/state/restore\\.[^/]+/agsx/home$" "$conversion_log"
+grep -Eq "^CODEX_HOME=$tmp/state/restore\\.[^/]+/agsx/codex-home$" "$conversion_log"
+grep -Eq "^CLAUDE_CONFIG_DIR=$tmp/state/restore\\.[^/]+/agsx/claude-home$" \
+    "$conversion_log"
+grep -Fqx 'NO_STORE=1' "$conversion_log"
+
+missing_claude_profile_home="$tmp/codex-to-missing-claude-profile-target/claude"
+conversion_log_lines="$(wc -l < "$conversion_log")"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$missing_claude_profile_home" \
+    "$tool" resume "$queued_id" --to claude \
+        --profile missing \
+    >"$tmp/missing-claude-profile.out" 2>"$tmp/missing-claude-profile.err"; then
+    echo 'cross-Agent Claude resume accepted a missing profile' >&2
+    exit 1
+fi
+grep -Fq 'Claude profile does not exist' "$tmp/missing-claude-profile.err"
+[[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
+[[ ! -e "$missing_claude_profile_home/projects" ]]
+
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$codex_to_claude_home" \
+    "$tool" resume "$queued_id" --to claude \
+        --profile ../outside \
+    >"$tmp/unsafe-claude-profile.out" 2>"$tmp/unsafe-claude-profile.err"; then
+    echo 'Claude resume accepted an unsafe profile name' >&2
+    exit 1
+fi
+grep -Fq 'invalid profile name' "$tmp/unsafe-claude-profile.err"
+
+conversion_log_lines="$(wc -l < "$conversion_log")"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$codex_to_claude_home" \
+    "$tool" resume "$queued_id" --to claude \
+        --profile sub2api -- --settings "$tmp/other-claude-settings.json" \
+    >"$tmp/conflicting-claude-settings.out" \
+    2>"$tmp/conflicting-claude-settings.err"; then
+    echo 'Claude resume accepted both --profile and --settings' >&2
+    exit 1
+fi
+grep -Fq 'do not combine --profile with Claude --settings' \
+    "$tmp/conflicting-claude-settings.err"
+[[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
+
+unicode_cross_work="$tmp/项目😀"
+unicode_cross_home="$tmp/unicode-cross-target/claude"
+mkdir -p "$unicode_cross_work"
+seed_context_mode_agent_cache "$unicode_cross_home" claude
+unicode_parent_key="$(reference_ascii_claude_project_key "$tmp")"
+unicode_cross_key="${unicode_parent_key}-----"
+unicode_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$unicode_cross_home" \
+    "$tool" resume "$queued_id" --to=claude \
+        --cwd="$unicode_cross_work" -- -p 'print handoff')"
+grep -Fqx \
+    "FAKE_CLAUDE <--resume> <$converted_claude_id> <-p> <print handoff>" \
+    <<< "$unicode_cross"
+[[ -f "$unicode_cross_home/projects/$unicode_cross_key/$converted_claude_id.jsonl" ]]
+
+rehome_id=12345678-1234-4234-8234-123456789abc
+rehome_home="$tmp/rehome-target/claude"
+rehome_source="$rehome_home/projects/original/$rehome_id.jsonl"
+mkdir -p "${rehome_source%/*}"
+printf '%s\n' '{"type":"user","source":"rehome"}' > "$rehome_source"
+(
+    cd "$unicode_cross_work"
+    env "${source_env[@]}" CLAUDE_CONFIG_DIR="$rehome_home" \
+        "$tool" rehome-claude "$rehome_id"
+)
+cmp "$rehome_source" "$rehome_home/projects/$unicode_cross_key/$rehome_id.jsonl"
+
+long_cross_component="$(printf 'a%.0s' {1..210})"
+long_cross_work="$tmp/$long_cross_component"
+long_cross_home="$tmp/long-cross-target/claude"
+mkdir -p "$long_cross_work"
+seed_context_mode_agent_cache "$long_cross_home" claude
+long_cross_key="$(reference_ascii_claude_project_key "$long_cross_work")"
+long_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$long_cross_home" \
+    "$tool" resume "$queued_id" --to claude \
+        --cwd "$long_cross_work")"
+grep -Fqx "FAKE_CLAUDE <--resume> <$converted_claude_id>" <<< "$long_cross"
+[[ -f "$long_cross_home/projects/$long_cross_key/$converted_claude_id.jsonl" ]]
+
+mkdir -p "$tmp/vanishing-bin"
+cp -- "$tmp/home/.local/bin/codex" "$tmp/vanishing-bin/codex"
+vanishing_pending="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" PATH="$tmp/vanishing-bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+        "$tool" save vanishing-binary 'Vanishing binary'
+)"
+grep -Fqx "agent_binary=$tmp/vanishing-bin/codex" <<< "$vanishing_pending"
+rm -f -- "$tmp/vanishing-bin/codex"
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" "$tool" hook
+vanishing_list="$(env "${source_env[@]}" "$tool" list)"
+grep -Eq '^vanishing-binary +CODEX +' <<< "$vanishing_list"
+vanishing_show="$(env "${source_env[@]}" "$tool" show vanishing-binary)"
+grep -Eq "^Binary invoked +$tmp/vanishing-bin/codex$" <<< "$vanishing_show"
+write_codex_profile "$tmp/vanishing-target/codex" fallback
+vanishing_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/vanishing-target/codex" \
+    "$tool" resume vanishing-binary --profile fallback 2>"$tmp/vanishing.err")"
+grep -Fqx "FAKE_CODEX <resume> <$session_id> <--profile> <fallback>" <<< "$vanishing_resume"
+grep -Fq "saved codex binary is unavailable: $tmp/vanishing-bin/codex" "$tmp/vanishing.err"
+
+claude_session_id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+claude_initial_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$tmp/work")"
+claude_initial_rel="projects/$claude_initial_key/$claude_session_id.jsonl"
+mkdir -p "$tmp/source/claude/$(dirname "$claude_initial_rel")"
+printf '%s\n' '{"type":"user","source":"initial"}' \
+    > "$tmp/source/claude/$claude_initial_rel"
+claude_pending="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" CLAUDE_CODE_SESSION_ID="$claude_session_id" \
+        "$tool" save claude-window 'Claude 恢复检查'
+)"
+grep -Fqx 'checkpoint_id=claude-window' <<< "$claude_pending"
+grep -Fqx 'agent=claude' <<< "$claude_pending"
+grep -Fqx "agent_binary=$tmp/home/.local/bin/claude" <<< "$claude_pending"
+claude_path="$(sed -n 's/^path=//p' <<< "$claude_pending")"
+
+claude_hook_work="$tmp/claude-hook-work"
+claude_hook_key=hook-project
+claude_session_rel="projects/$claude_hook_key/$claude_session_id.jsonl"
+claude_session_tree="projects/$claude_hook_key/$claude_session_id"
+mkdir -p "$claude_hook_work" \
+    "$tmp/source/claude/$claude_session_tree/subagents" \
+    "$tmp/source/claude/$claude_session_tree/tool-results" \
+    "$tmp/source/claude/file-history/$claude_session_id" \
+    "$tmp/source/claude/tasks/$claude_session_id" \
+    "$tmp/source/claude/session-env/$claude_session_id"
+printf '%s\n' '{"type":"user","source":"hook"}' '{"type":"assistant"}' \
+    > "$tmp/source/claude/$claude_session_rel"
+printf '%s\n' '{"agent":"child"}' \
+    > "$tmp/source/claude/$claude_session_tree/subagents/child.jsonl"
+printf '%s\n' 'tool result' \
+    > "$tmp/source/claude/$claude_session_tree/tool-results/result.txt"
+printf '%s\n' 'history' \
+    > "$tmp/source/claude/file-history/$claude_session_id/history.txt"
+printf '%s\n' '{"task":"resume"}' \
+    > "$tmp/source/claude/tasks/$claude_session_id/task.json"
+printf '%s\n' 'SESSION_ENV=test' \
+    > "$tmp/source/claude/session-env/$claude_session_id/env"
+claude_relatives=(
+    "$claude_session_rel"
+    "$claude_session_tree/subagents/child.jsonl"
+    "$claude_session_tree/tool-results/result.txt"
+    "file-history/$claude_session_id/history.txt"
+    "tasks/$claude_session_id/task.json"
+    "session-env/$claude_session_id/env"
+)
+claude_modes=(640 600 444 640 600 600)
+claude_mtimes=(1700000101 1700000102 1700000103 1700000104 1700000105 1700000106)
+for metadata_index in "${!claude_relatives[@]}"; do
+    chmod "${claude_modes[$metadata_index]}" \
+        "$tmp/source/claude/${claude_relatives[$metadata_index]}"
+    touch -d "@${claude_mtimes[$metadata_index]}" -- \
+        "$tmp/source/claude/${claude_relatives[$metadata_index]}"
+done
+printf '{"hook_event_name":"Stop","session_id":"%s","transcript_path":"%s","cwd":"%s"}\n' \
+    "$claude_session_id" "$tmp/source/claude/$claude_session_rel" "$claude_hook_work" | \
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" "$tool" hook
+[[ -f "$claude_path" ]]
+assert_format4_archive "$claude_path" "$tmp/extracted/claude"
+grep -Fqx 'agent=claude' "$tmp/extracted/claude/manifest"
+grep -Fqx "relative_path=$claude_session_rel" "$tmp/extracted/claude/manifest"
+grep -Fqx "cwd=$claude_hook_work" "$tmp/extracted/claude/manifest"
+grep -Fqx 'artifact_count=6' "$tmp/extracted/claude/manifest"
+for metadata_index in "${!claude_relatives[@]}"; do
+    relative="${claude_relatives[$metadata_index]}"
+    cmp "$tmp/source/claude/$relative" "$tmp/extracted/claude/artifacts/$relative"
+    grep -Eq \
+        "^[0-9a-f]{64}"$'\t'"[0-9]+"$'\t'"$relative"$'\t'"${claude_modes[$metadata_index]}"$'\t'"${claude_mtimes[$metadata_index]}$" \
+        "$tmp/extracted/claude/artifacts.tsv"
+done
+
+claude_active_home="$tmp/claude-active-target/claude"
+mkdir -p "$claude_active_home/${claude_session_rel%/*}"
+seed_context_mode_agent_cache "$claude_active_home" claude
+cp -- "$tmp/source/claude/$claude_session_rel" \
+    "$claude_active_home/$claude_session_rel"
+start_claude_session_process "$claude_active_home" "$claude_session_id"
+claude_active_pid="$active_test_pid"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_active_home" \
+    "$tool" resume claude-window \
+    >"$tmp/claude-active.out" 2>"$tmp/claude-active.err"; then
+    echo 'resume accepted an active target Claude session' >&2
+    exit 1
+fi
+grep -Fq \
+    "claude session $claude_session_id is already active in PID $claude_active_pid" \
+    "$tmp/claude-active.err"
+kill -0 "$claude_active_pid"
+cmp "$tmp/source/claude/$claude_session_rel" \
+    "$claude_active_home/$claude_session_rel"
+stop_test_process "$claude_active_pid"
+
+claude_unrelated_id=cccccccc-dddd-4eee-8fff-111111111111
+claude_unrelated_home="$tmp/claude-unrelated-target/claude"
+seed_context_mode_agent_cache "$claude_unrelated_home" claude
+start_claude_session_process "$claude_unrelated_home" "$claude_unrelated_id"
+claude_unrelated_pid="$active_test_pid"
+claude_unrelated_resume="$(
+    env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_unrelated_home" \
+        "$tool" resume claude-window -- -p 'print native'
+)"
+grep -Fqx \
+    "FAKE_CLAUDE <--resume> <$claude_session_id> <-p> <print native>" \
+    <<< "$claude_unrelated_resume"
+kill -0 "$claude_unrelated_pid"
+stop_test_process "$claude_unrelated_pid"
+
+claude_stale_home="$tmp/claude-stale-target/claude"
+seed_context_mode_agent_cache "$claude_stale_home" claude
+start_claude_session_process "$claude_stale_home" "$claude_session_id" 1
+claude_stale_pid="$active_test_pid"
+claude_stale_resume="$(
+    env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_stale_home" \
+        "$tool" resume claude-window -- --model stale-registry
+)"
+grep -Fqx \
+    "FAKE_CLAUDE <--resume> <$claude_session_id> <--model> <stale-registry>" \
+    <<< "$claude_stale_resume"
+kill -0 "$claude_stale_pid"
+stop_test_process "$claude_stale_pid"
+
+rollback_home="$tmp/rollback-target/claude"
+rollback_main="$rollback_home/$claude_session_rel"
+mkdir -p "$(dirname "$rollback_main")"
+head -n 1 "$tmp/source/claude/$claude_session_rel" > "$rollback_main"
+chmod 604 "$rollback_main"
+touch -d '@1600000000' -- "$rollback_main"
+cp -p "$rollback_main" "$tmp/rollback-before.jsonl"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$rollback_home" \
+    AGENT_SESSION_TEST_FAIL_REPLACE_AT=2 \
+    "$tool" restore local claude-window \
+    >"$tmp/rollback.out" 2>"$tmp/rollback.err"; then
+    echo 'restore ignored an injected multi-artifact write failure' >&2
+    exit 1
+fi
+grep -Fq 'rolling back 1 committed artifact(s)' "$tmp/rollback.err"
+grep -Fq 'rolled back original artifact' "$tmp/rollback.err"
+grep -Fq 'restore rollback complete; no artifact changes were retained' "$tmp/rollback.err"
+cmp "$tmp/rollback-before.jsonl" "$rollback_main"
+[[ "$(stat -c '%a:%Y' "$rollback_main")" == 604:1600000000 ]]
+[[ "$(find "$rollback_home" -type f | wc -l)" == 1 ]]
+
+symlink_home="$tmp/symlink-escape-target/claude"
+symlink_outside="$tmp/symlink-escape-outside"
+mkdir -p "$symlink_home/projects/$claude_hook_key" "$symlink_outside"
+ln -s "$symlink_outside" \
+    "$symlink_home/projects/$claude_hook_key/$claude_session_id"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$symlink_home" \
+    "$tool" restore local claude-window \
+    >"$tmp/symlink-escape.out" 2>"$tmp/symlink-escape.err"; then
+    echo 'restore followed a symbolic-link artifact ancestor' >&2
+    exit 1
+fi
+grep -Fq 'restore destination has a symbolic-link ancestor' "$tmp/symlink-escape.err"
+[[ ! -e "$symlink_home/$claude_session_rel" ]]
+[[ -z "$(find "$symlink_outside" -mindepth 1 -print -quit)" ]]
+
+claude_resume_work="$tmp/claude-resume-work"
+mkdir -p "$claude_resume_work"
+claude_resume_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$claude_resume_work")"
+claude_resume_rel="projects/$claude_resume_key/$claude_session_id.jsonl"
+claude_resume_tree="projects/$claude_resume_key/$claude_session_id"
+seed_context_mode_agent_cache "$tmp/claude-resume-target/claude" claude
+claude_resume="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/claude-resume-target/claude" \
+    "$tool" resume claude-window --cwd "$claude_resume_work" -- \
+        --model sonnet 'continue here')"
+grep -Fqx "FAKE_CLAUDE <--resume> <$claude_session_id> <--model> <sonnet> <continue here>" <<< "$claude_resume"
+grep -Fqx "FAKE_PWD=$claude_resume_work" <<< "$claude_resume"
+[[ "$claude_resume" != *'<-->'* ]]
+cmp "$tmp/source/claude/$claude_session_rel" \
+    "$tmp/claude-resume-target/claude/$claude_resume_rel"
+cmp "$tmp/source/claude/$claude_session_tree/subagents/child.jsonl" \
+    "$tmp/claude-resume-target/claude/$claude_resume_tree/subagents/child.jsonl"
+cmp "$tmp/source/claude/$claude_session_tree/tool-results/result.txt" \
+    "$tmp/claude-resume-target/claude/$claude_resume_tree/tool-results/result.txt"
+for relative in \
+    "file-history/$claude_session_id/history.txt" \
+    "tasks/$claude_session_id/task.json" \
+    "session-env/$claude_session_id/env"; do
+    cmp "$tmp/source/claude/$relative" "$tmp/claude-resume-target/claude/$relative"
+done
+[[ ! -e "$tmp/claude-resume-target/claude/$claude_session_rel" ]]
+claude_restored_relatives=(
+    "$claude_resume_rel"
+    "$claude_resume_tree/subagents/child.jsonl"
+    "$claude_resume_tree/tool-results/result.txt"
+    "file-history/$claude_session_id/history.txt"
+    "tasks/$claude_session_id/task.json"
+    "session-env/$claude_session_id/env"
+)
+for metadata_index in "${!claude_relatives[@]}"; do
+    [[ "$(stat -c '%a:%Y' \
+        "$tmp/claude-resume-target/claude/${claude_restored_relatives[$metadata_index]}")" == \
+       "${claude_modes[$metadata_index]}:${claude_mtimes[$metadata_index]}" ]]
+done
+
+claude_profile_home="$tmp/claude-profile-target/claude"
+claude_profile_settings="$claude_profile_home/sub2api.settings.json"
+mkdir -p "$claude_profile_home"
+seed_context_mode_agent_cache "$claude_profile_home" claude
+printf '%s\n' \
+    '{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example","ANTHROPIC_API_KEY":"","ANTHROPIC_AUTH_TOKEN":""},"apiKeyHelper":"/usr/bin/printenv SUB2API_API_KEY"}' \
+    > "$claude_profile_settings"
+claude_profile_sha="$(sha256sum "$claude_profile_settings" | cut -d' ' -f1)"
+claude_profile_resume="$(
+    env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_profile_home" \
+        "$tool" resume claude-window --profile sub2api
+)"
+grep -Fqx \
+    "FAKE_CLAUDE <--resume> <$claude_session_id> <--settings> <$claude_profile_settings>" \
+    <<< "$claude_profile_resume"
+[[ "$claude_profile_sha" == "$(sha256sum "$claude_profile_settings" | cut -d' ' -f1)" ]]
+
+claude_to_codex_home="$tmp/claude-to-codex-target/codex"
+mkdir -p "$claude_to_codex_home"
+seed_context_mode_agent_cache "$claude_to_codex_home" codex
+printf '%s\n' 'model_provider = "sub2api"' \
+    > "$claude_to_codex_home/sub2api.config.toml"
+profile_after_separator_home="$tmp/profile-after-separator/codex"
+mkdir -p "$profile_after_separator_home"
+seed_context_mode_agent_cache "$profile_after_separator_home" codex
+printf '%s\n' 'model_provider = "sub2api"' \
+    > "$profile_after_separator_home/sub2api.config.toml"
+profile_after_separator="$(
+    env "${source_env[@]}" CODEX_HOME="$profile_after_separator_home" \
+    "$tool" resume claude-window --to codex -- \
+        -p sub2api
+)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$converted_codex_id> <-p> <sub2api>" \
+    <<< "$profile_after_separator"
+grep -Fqx 'source_agent=claude' <<< "$profile_after_separator"
+grep -Fqx 'agent=codex' <<< "$profile_after_separator"
+profile_after_separator_file="$profile_after_separator_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
+jq -s -e '
+    [.[] | select(.type == "session_meta")] |
+    length == 1 and
+    all(.[]; .payload.model_provider == "sub2api")
+' "$profile_after_separator_file" >/dev/null
+
+profile_long_home="$tmp/profile-long/codex"
+write_codex_profile "$profile_long_home" sub2api sub2api
+profile_long="$(
+    env "${source_env[@]}" CODEX_HOME="$profile_long_home" \
+    "$tool" resume claude-window --to codex -- \
+        --profile sub2api
+)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$converted_codex_id> <--profile> <sub2api>" \
+    <<< "$profile_long"
+jq -s -e '
+    [.[] | select(.type == "session_meta")] |
+    length == 1 and
+    all(.[]; .payload.model_provider == "sub2api")
+' "$profile_long_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl" \
+    >/dev/null
+
+profile_equals_home="$tmp/profile-equals/codex"
+write_codex_profile "$profile_equals_home" sub2api sub2api
+profile_equals="$(
+    env "${source_env[@]}" CODEX_HOME="$profile_equals_home" \
+    "$tool" resume claude-window --to codex -- \
+        --profile=sub2api
+)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$converted_codex_id> <--profile=sub2api>" \
+    <<< "$profile_equals"
+jq -s -e '
+    [.[] | select(.type == "session_meta")] |
+    length == 1 and
+    all(.[]; .payload.model_provider == "sub2api")
+' "$profile_equals_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl" \
+    >/dev/null
+
+duplicate_profile_home="$tmp/profile-duplicate/codex"
+write_codex_profile "$duplicate_profile_home" sub2api sub2api
+if env "${source_env[@]}" CODEX_HOME="$duplicate_profile_home" \
+    "$tool" resume claude-window --to codex \
+        --profile sub2api -- --profile=sub2api \
+        >"$tmp/profile-duplicate.out" 2>"$tmp/profile-duplicate.err"; then
+    echo 'resume accepted both AGS and native Codex profiles' >&2
+    exit 1
+fi
+grep -Fq 'do not combine AGS --profile with Codex -p/--profile' \
+    "$tmp/profile-duplicate.err"
+[[ ! -e "$duplicate_profile_home/sessions" ]]
+
+assert_cross_codex_provider_override_rejected() {
+    local label="$1" target_home before
+    shift
+    target_home="$tmp/codex-provider-override-$label/codex"
+    before="$(wc -l < "$conversion_log")"
+    if env "${source_env[@]}" CODEX_HOME="$target_home" \
+        "$tool" resume claude-window --to codex -- "$@" \
+        >"$tmp/codex-provider-override-$label.out" \
+        2>"$tmp/codex-provider-override-$label.err"; then
+        echo "cross-Agent Codex resume accepted provider override: $label" >&2
+        exit 1
+    fi
+    case "$label" in
+        config|provider-config)
+            grep -Fq 'cannot be forwarded because it changes the workspace or configuration after Context Mode audit' \
+                "$tmp/codex-provider-override-$label.err"
+            ;;
+        *)
+            grep -Fq 'do not override the Codex provider' \
+                "$tmp/codex-provider-override-$label.err"
+            ;;
+    esac
+    [[ "$before" == "$(wc -l < "$conversion_log")" ]]
+    [[ ! -e "$target_home/sessions" ]]
+}
+
+assert_cross_codex_provider_override_rejected \
+    config -c 'model_provider="other"'
+assert_cross_codex_provider_override_rejected \
+    provider-config --config=model_providers.sub2api.base_url='"https://other.example"'
+assert_cross_codex_provider_override_rejected oss --oss
+assert_cross_codex_provider_override_rejected \
+    local-provider --local-provider ollama
+
+cross_unrelated_codex_id=22222222-3333-4444-8555-666666666666
+start_codex_session_process "$claude_to_codex_home" "$cross_unrelated_codex_id"
+cross_unrelated_codex_pid="$active_test_pid"
+cross_unrelated_codex_path="$active_codex_path"
+claude_to_codex="$(env "${source_env[@]}" CODEX_HOME="$claude_to_codex_home" \
+    OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
+    "$tool" resume claude-window --to codex \
+        --profile sub2api)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$converted_codex_id> <--profile> <sub2api>" \
+    <<< "$claude_to_codex"
+grep -Fqx 'source_agent=claude' <<< "$claude_to_codex"
+grep -Fqx 'agent=codex' <<< "$claude_to_codex"
+grep -Fqx "source_session_id=$claude_session_id" <<< "$claude_to_codex"
+grep -Fqx "session_id=$converted_codex_id" <<< "$claude_to_codex"
+claude_to_codex_file="$claude_to_codex_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
+[[ -f "$claude_to_codex_file" ]]
+jq -s -e --arg cwd "$claude_hook_work" '
+    ([.[] | select(.type == "session_meta")] |
+        length == 1 and
+        all(.[]; .payload.model_provider == "sub2api" and .payload.cwd == $cwd)) and
+    ([.[] | select(
+        .type == "turn_context" and
+        ((.payload.workspace_roots? | type) == "array")
+    )] |
+        length > 0 and all(.[]; .payload.workspace_roots == [$cwd]))
+' "$claude_to_codex_file" >/dev/null || {
+    echo 'converted Codex transcript ignored the selected provider or target cwd' >&2
+    exit 1
+}
+grep -Fqx \
+    "REGISTER=$converted_codex_id"$'\t'"$claude_to_codex_file"$'\t'"$claude_hook_work" \
+    "$conversion_log"
+[[ ! -e "$claude_to_codex_home/session_index.jsonl" ]]
+kill -0 "$cross_unrelated_codex_pid"
+stop_test_process "$cross_unrelated_codex_pid"
+rm -f -- "$cross_unrelated_codex_path"
+[[ "$(find "$claude_to_codex_home/sessions" -type f | wc -l)" == 1 ]]
+
+register_failure_home="$tmp/register-failure-target/codex"
+seed_context_mode_agent_cache "$register_failure_home" codex
+register_failure_file="$register_failure_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
+if env "${source_env[@]}" CODEX_HOME="$register_failure_home" \
+    AGSX_REGISTER_FAIL=1 \
+    "$tool" resume claude-window --to codex --cwd "$claude_hook_work" \
+    >"$tmp/register-failure.out" 2>"$tmp/register-failure.err"; then
+    echo 'Codex resume ignored a failed thread-index registration' >&2
+    exit 1
+fi
+grep -Fq 'cannot register restored Codex session in its thread index' \
+    "$tmp/register-failure.err"
+grep -Fq 'restore rollback complete; no artifact changes were retained' \
+    "$tmp/register-failure.err"
+grep -Fqx \
+    "REGISTER=$converted_codex_id"$'\t'"$register_failure_file"$'\t'"$claude_hook_work" \
+    "$conversion_log"
+[[ ! -e "$register_failure_file" ]]
+[[ ! -d "$register_failure_home/sessions" ]]
+
+claude_to_default_codex_home="$tmp/claude-to-default-codex-target/codex"
+seed_context_mode_agent_cache "$claude_to_default_codex_home" codex
+claude_to_default_codex="$(env "${source_env[@]}" \
+    CODEX_HOME="$claude_to_default_codex_home" \
+    "$tool" resume claude-window --to codex)"
+grep -Fqx "FAKE_CODEX <resume> <$converted_codex_id>" \
+    <<< "$claude_to_default_codex"
+claude_to_default_codex_file="$claude_to_default_codex_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
+jq -e '
+    select(.type == "session_meta") |
+    .payload.model_provider == "openai"
+' "$claude_to_default_codex_file" >/dev/null || {
+    echo 'converted Codex transcript did not use the default provider' >&2
+    exit 1
+}
+
+claude_to_base_codex_home="$tmp/claude-to-base-codex-target/codex"
+mkdir -p "$claude_to_base_codex_home"
+seed_context_mode_agent_cache "$claude_to_base_codex_home" codex
+printf '%s\n' "model_provider = 'basegateway'" \
+    > "$claude_to_base_codex_home/config.toml"
+claude_to_base_codex="$(env "${source_env[@]}" \
+    CODEX_HOME="$claude_to_base_codex_home" \
+    "$tool" resume claude-window --to codex)"
+grep -Fqx "FAKE_CODEX <resume> <$converted_codex_id>" \
+    <<< "$claude_to_base_codex"
+claude_to_base_codex_file="$claude_to_base_codex_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
+jq -e '
+    select(.type == "session_meta") |
+    .payload.model_provider == "basegateway"
+' "$claude_to_base_codex_file" >/dev/null || {
+    echo 'converted Codex transcript ignored the base config provider' >&2
+    exit 1
+}
+
+missing_profile_home="$tmp/claude-to-missing-profile-target/codex"
+conversion_log_lines="$(wc -l < "$conversion_log")"
+if env "${source_env[@]}" CODEX_HOME="$missing_profile_home" \
+    "$tool" resume claude-window --to codex \
+        --profile missing \
+    >"$tmp/missing-profile.out" 2>"$tmp/missing-profile.err"; then
+    echo 'cross-Agent Codex resume accepted a missing profile' >&2
+    exit 1
+fi
+grep -Fq 'Codex profile does not exist' "$tmp/missing-profile.err"
+[[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
+[[ ! -d "$missing_profile_home/sessions" ]]
+
+cat > "$tmp/home/.local/bin/casr-fail" <<'EOF'
+#!/usr/bin/env sh
+if [ "${1:-}" = --version ]; then printf 'casr 0.3.0-test\n'; exit; fi
+if [ "${1:-}" = terminal-attach ]; then exit 3; fi
+printf '{"message":"synthetic conversion failure"}\n' >&2
+exit 42
+EOF
+chmod +x "$tmp/home/.local/bin/casr-fail"
+seed_context_mode_agent_cache "$tmp/conversion-failure-target/codex" codex
+if env "${source_env[@]}" CODEX_HOME="$tmp/conversion-failure-target/codex" \
+    AGSX_CONVERTER_BINARY="$tmp/home/.local/bin/casr-fail" \
+    "$tool" resume claude-window --to codex \
+    >"$tmp/conversion-failure.out" 2>"$tmp/conversion-failure.err"; then
+    echo 'resume ignored an agsx conversion failure' >&2
+    exit 1
+fi
+grep -Fq 'agsx conversion failed: synthetic conversion failure' "$tmp/conversion-failure.err"
+[[ ! -e "$tmp/conversion-failure-target/codex/sessions" ]]
+
+legacy_id='Legacy_描述--20260101T000000.000000000Z'
+legacy_session_id=99999999-8888-4777-8666-555555555555
+legacy_relative="sessions/2026/01/01/legacy-$legacy_session_id.jsonl"
+legacy_payload="$tmp/legacy/payload"
+mkdir -p "$legacy_payload" "$tmp/local-checkpoints/codex"
+printf '%s\n' '{"type":"legacy"}' > "$legacy_payload/session.jsonl"
+legacy_checksum="$(sha256sum "$legacy_payload/session.jsonl" | cut -d' ' -f1)"
+{
+    printf 'format=2\nkind=checkpoint\ncheckpoint_id=%s\n' "$legacy_id"
+    printf 'description=旧版检查点\ncreated_utc=2026-01-01T00:00:00.000Z\ntarget=local\n'
+    printf 'agent=codex\nsession_id=%s\nrelative_path=%s\n' \
+        "$legacy_session_id" "$legacy_relative"
+    printf 'cwd=%s\nsource_size=%s\nsource_sha256=%s\n' \
+        "$tmp/work" "$(stat -c %s "$legacy_payload/session.jsonl")" "$legacy_checksum"
+    printf 'public_ip=unknown\nip_location=unknown\ngeo_provider=unknown\n'
+} > "$legacy_payload/manifest"
+ssh-keygen -y -f "$tmp/key" > "$tmp/legacy-recipient.pub"
+tar -C "$legacy_payload" -czf - manifest session.jsonl | \
+    age -R "$tmp/legacy-recipient.pub" \
+        -o "$tmp/local-checkpoints/codex/$legacy_id.checkpoint.tar.gz.age"
+legacy_list="$(env "${source_env[@]}" "$tool" list)"
+grep -Fq "$legacy_id" <<< "$legacy_list"
+grep -Fq '旧版检查点' <<< "$legacy_list"
+grep -Eq '^sat-index +CODEX +' <<< "$legacy_list"
+grep -Eq '^claude-window +CLAUDE +' <<< "$legacy_list"
+seed_context_mode_agent_cache "$tmp/legacy-resume-target/codex" codex
+legacy_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/legacy-resume-target/codex" \
+    "$tool" resume "$legacy_id" -- --sandbox read-only)"
+grep -Fqx "FAKE_CODEX <resume> <$legacy_session_id> <--sandbox> <read-only>" <<< "$legacy_resume"
+cmp "$legacy_payload/session.jsonl" "$tmp/legacy-resume-target/codex/$legacy_relative"
+
+collision_id=collision
+collision_record_id=abcdefabcdefabcdefabcdef@collision
+{
+    printf 'format=2\nkind=checkpoint\ncheckpoint_id=%s\n' "$collision_id"
+    printf 'description=Legacy collision\ncreated_utc=2026-01-01T00:00:00.000Z\ntarget=local\n'
+    printf 'agent=codex\nsession_id=%s\nrelative_path=%s\n' \
+        "$legacy_session_id" "$legacy_relative"
+    printf 'cwd=%s\nsource_size=%s\nsource_sha256=%s\n' \
+        "$tmp/work" "$(stat -c %s "$legacy_payload/session.jsonl")" "$legacy_checksum"
+    printf 'public_ip=unknown\nip_location=unknown\ngeo_provider=unknown\n'
+} > "$legacy_payload/manifest"
+tar -C "$legacy_payload" -czf - manifest session.jsonl | \
+    age -R "$tmp/legacy-recipient.pub" \
+        -o "$tmp/local-checkpoints/codex/$collision_id.checkpoint.tar.gz.age"
+{
+    printf 'format=3\nkind=checkpoint\ncheckpoint_id=%s\nrecord_id=%s\n' \
+        "$collision_id" "$collision_record_id"
+    printf 'description=New collision\ncreated_utc=2026-01-02T00:00:00.000Z\ntarget=local\n'
+    printf 'agent=codex\nagent_binary=%s\nsession_id=%s\nrelative_path=%s\n' \
+        "$tmp/home/.local/bin/codex" "$legacy_session_id" "$legacy_relative"
+    printf 'cwd=%s\nsource_size=%s\nsource_sha256=%s\n' \
+        "$tmp/work" "$(stat -c %s "$legacy_payload/session.jsonl")" "$legacy_checksum"
+    printf 'public_ip=unknown\nip_location=unknown\ngeo_provider=unknown\n'
+} > "$legacy_payload/manifest"
+tar -C "$legacy_payload" -czf - manifest session.jsonl | \
+    age -R "$tmp/legacy-recipient.pub" \
+        -o "$tmp/local-checkpoints/codex/$collision_record_id.checkpoint.tar.gz.age"
+[[ "$(env "${source_env[@]}" "$tool" list | grep -Ec '^collision +CODEX +')" == 2 ]]
+if env "${source_env[@]}" "$tool" resume "$collision_id" \
+    >"$tmp/collision.out" 2>"$tmp/collision.err"; then
+    echo 'resume allowed a format 2/3 logical-ID collision' >&2
+    exit 1
+fi
+grep -Fq 'matching RECORD_ID values:' "$tmp/collision.err"
+grep -Fq "codex/$collision_id" "$tmp/collision.err"
+grep -Fq "codex/$collision_record_id" "$tmp/collision.err"
+grep -Fq 'expected one checkpoint named collision; found 2' "$tmp/collision.err"
+legacy_collision_show="$(env "${source_env[@]}" "$tool" show "codex/$collision_id")"
+grep -Eq "^Selector +codex/$collision_id$" <<< "$legacy_collision_show"
+grep -Eq '^Format +2$' <<< "$legacy_collision_show"
+grep -Eq '^Description +Legacy collision$' <<< "$legacy_collision_show"
+new_collision_show="$(env "${source_env[@]}" "$tool" show "codex/$collision_record_id")"
+grep -Eq "^Selector +codex/$collision_record_id$" <<< "$new_collision_show"
+grep -Eq '^Format +3$' <<< "$new_collision_show"
+grep -Eq '^Description +New collision$' <<< "$new_collision_show"
+write_codex_profile "$tmp/collision-legacy-target/codex" legacy-collision
+legacy_collision_resume="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/collision-legacy-target/codex" \
+        "$tool" resume "codex/$collision_id" --profile legacy-collision
+)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$legacy_session_id> <--profile> <legacy-collision>" \
+    <<< "$legacy_collision_resume"
+write_codex_profile "$tmp/collision-new-target/codex" new-collision
+new_collision_resume="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/collision-new-target/codex" \
+        "$tool" resume "codex/$collision_record_id" --profile new-collision
+)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$legacy_session_id> <--profile> <new-collision>" \
+    <<< "$new_collision_resume"
+legacy_collision_delete="$(env "${source_env[@]}" "$tool" delete "codex/$collision_id")"
+grep -Fqx "record_id=$collision_id" <<< "$legacy_collision_delete"
+[[ ! -e "$tmp/local-checkpoints/codex/$collision_id.checkpoint.tar.gz.age" ]]
+new_collision_delete="$(env "${source_env[@]}" "$tool" delete "codex/$collision_record_id")"
+grep -Fqx "record_id=$collision_record_id" <<< "$new_collision_delete"
+[[ ! -e "$tmp/local-checkpoints/codex/$collision_record_id.checkpoint.tar.gz.age" ]]
+
+unsafe_id=unsafe-binary
+unsafe_record_id=0123456789abcdef01234567@unsafe-binary
+{
+    printf 'format=3\nkind=checkpoint\ncheckpoint_id=%s\nrecord_id=%s\n' \
+        "$unsafe_id" "$unsafe_record_id"
+    printf 'description=Unsafe binary\ncreated_utc=2026-01-01T00:00:00.000Z\ntarget=local\n'
+    printf 'agent=codex\nagent_binary=/bin/sh\nsession_id=%s\nrelative_path=%s\n' \
+        "$legacy_session_id" "$legacy_relative"
+    printf 'cwd=%s\nsource_size=%s\nsource_sha256=%s\n' \
+        "$tmp/work" "$(stat -c %s "$legacy_payload/session.jsonl")" "$legacy_checksum"
+    printf 'public_ip=unknown\nip_location=unknown\ngeo_provider=unknown\n'
+} > "$legacy_payload/manifest"
+tar -C "$legacy_payload" -czf - manifest session.jsonl | \
+    age -R "$tmp/legacy-recipient.pub" \
+        -o "$tmp/local-checkpoints/codex/$unsafe_record_id.checkpoint.tar.gz.age"
+if env "${source_env[@]}" CODEX_HOME="$tmp/unsafe-target/codex" \
+    "$tool" restore local "$unsafe_id" >/dev/null 2>&1; then
+    echo 'restore accepted an agent binary for the wrong executable' >&2
+    exit 1
+fi
+[[ ! -e "$tmp/unsafe-target/codex/$legacy_relative" ]]
+
+mkdir -p "$tmp/archive-controlled"
+printf '%s\n' '#!/usr/bin/env sh' 'printf '\''MALICIOUS_ARCHIVE_BINARY\n'\''' \
+    > "$tmp/archive-controlled/codex"
+chmod +x "$tmp/archive-controlled/codex"
+archive_binary_id=archive-binary
+archive_binary_record_id=1234567890abcdef12345678@archive-binary
+{
+    printf 'format=3\nkind=checkpoint\ncheckpoint_id=%s\nrecord_id=%s\n' \
+        "$archive_binary_id" "$archive_binary_record_id"
+    printf 'description=Archive binary path\ncreated_utc=2026-01-01T00:00:00.000Z\ntarget=local\n'
+    printf 'agent=codex\nagent_binary=%s\nsession_id=%s\nrelative_path=%s\n' \
+        "$tmp/archive-controlled/codex" "$legacy_session_id" "$legacy_relative"
+    printf 'cwd=%s\nsource_size=%s\nsource_sha256=%s\n' \
+        "$tmp/work" "$(stat -c %s "$legacy_payload/session.jsonl")" "$legacy_checksum"
+    printf 'public_ip=unknown\nip_location=unknown\ngeo_provider=unknown\n'
+} > "$legacy_payload/manifest"
+tar -C "$legacy_payload" -czf - manifest session.jsonl | \
+    age -R "$tmp/legacy-recipient.pub" \
+        -o "$tmp/local-checkpoints/codex/$archive_binary_record_id.checkpoint.tar.gz.age"
+write_codex_profile "$tmp/archive-binary-target/codex" trusted
+archive_binary_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/archive-binary-target/codex" \
+    "$tool" resume "$archive_binary_id" -- --profile trusted)"
+grep -Fqx \
+    "FAKE_CODEX <resume> <$legacy_session_id> <--profile> <trusted>" \
+    <<< "$archive_binary_resume"
+[[ "$archive_binary_resume" != *MALICIOUS_ARCHIVE_BINARY* ]]
+
+if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+    "$tool" save missing-description >/dev/null 2>&1; then
+    echo 'save accepted a missing description' >&2
+    exit 1
+fi
+if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+    "$tool" save 'bad id' 'Invalid ID' >/dev/null 2>&1; then
+    echo 'save accepted an invalid ID' >&2
+    exit 1
+fi
+if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+    "$tool" save active-window 'Duplicate ID' >/dev/null 2>&1; then
+    echo 'save accepted a duplicate ID' >&2
+    exit 1
+fi
+
+startup_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+        "$tool" save startup-recovery '意外关闭恢复'
+)"
+startup_id="$(sed -n 's/^checkpoint_id=//p' <<< "$startup_output")"
+startup_path="$(sed -n 's/^path=//p' <<< "$startup_output")"
+[[ ! -e "$startup_path" ]]
+printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"99999999-9999-4999-8999-999999999999"}' | \
+    env "${source_env[@]}" "$tool" hook
+[[ -f "$startup_path" ]]
+env "${source_env[@]}" "$tool" list | grep -Fq "$startup_id"
+delete_output="$(env "${source_env[@]}" "$tool" delete "$startup_id")"
+grep -Fqx 'status=deleted' <<< "$delete_output"
+recoverable_path="$(sed -n 's/^recoverable_path=//p' <<< "$delete_output")"
+[[ -f "$recoverable_path" && ! -e "$startup_path" ]]
+! env "${source_env[@]}" "$tool" list | grep -Fq "$startup_id"
+
+cloud_delete="$(env "${source_env[@]}" "$tool" cloud delete "$cloud_id")"
+grep -Fqx 'status=deleted' <<< "$cloud_delete"
+grep -Fqx 'target=cloud' <<< "$cloud_delete"
+! env "${source_env[@]}" "$tool" cloud list | grep -Fq "$cloud_id"
+
+password_config="$(env "${source_env[@]}" AGENT_SESSION_CLOUD_PASSWORD='test password' \
+    "$tool" cloud set "$cloud_url" --password)"
+grep -Fqx 'auth=password' <<< "$password_config"
+if env "${source_env[@]}" AGENT_SESSION_CLOUD_PASSWORD=$'bad\npassword' \
+    "$tool" cloud set "$cloud_url" --password >/dev/null 2>&1; then
+    echo 'cloud set accepted a password containing a line break' >&2
+    exit 1
+fi
+cloud_secret="$(jq -er '.cloud.password_file' "$tmp/state/storage.json")"
+[[ "$cloud_secret" == "$tmp/state/remote-passwords/neburst."*.age ]]
+[[ -s "$cloud_secret" && ! -L "$cloud_secret" ]]
+[[ "$(jq -r '.remotes.neburst.password_file' "$tmp/state/storage.json")" == \
+   "$cloud_secret" ]]
+[[ ! -e "$tmp/state/cloud-password.age" ]]
+password_config_2="$(env "${source_env[@]}" \
+    AGENT_SESSION_CLOUD_PASSWORD='rotated test password' \
+    "$tool" cloud set "$cloud_url" --password)"
+grep -Fqx 'auth=password' <<< "$password_config_2"
+rotated_cloud_secret="$(jq -er '.cloud.password_file' "$tmp/state/storage.json")"
+[[ "$rotated_cloud_secret" != "$cloud_secret" ]]
+[[ -s "$rotated_cloud_secret" && ! -e "$cloud_secret" ]]
+[[ "$(age -d -i "$tmp/key" "$rotated_cloud_secret")" == \
+   'rotated test password' ]]
+find "$tmp/state/trash/passwords/neburst" -maxdepth 1 -type f \
+    -name "$(basename "$cloud_secret").retired.*" | grep -q .
+[[ "$(find "$tmp/state/remote-passwords" -maxdepth 1 -type f \
+    -name 'neburst.*.age' | wc -l)" == 1 ]]
+env "${source_env[@]}" "$tool" cloud list >/dev/null
+env "${source_env[@]}" "$tool" remote list | grep -Eq '^neburst +sftp +'
+
+sync_common_env=(
+    HOME="$tmp/home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$tmp/source/codex"
+    CLAUDE_CONFIG_DIR="$tmp/source/claude"
+    AGENT_SESSION_SSH_KEY="$tmp/key"
+    AGENT_SESSION_DISABLE_GEO=1
+)
+sync_a_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$tmp/sync-a/state"
+)
+sync_b_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$tmp/sync-b/state"
+)
+sync_record_id="${queued_path##*/}"
+sync_record_id="${sync_record_id%.checkpoint.tar.gz.age}"
+mkdir -p "$tmp/sync-a/local/codex" "$tmp/sync-b/local" "$tmp/git"
+cp -- "$queued_path" "$tmp/sync-a/local/codex/$sync_record_id.checkpoint.tar.gz.age"
+git init -q --bare "$tmp/git/records.git"
+git init -q -b main "$tmp/git/seed"
+git -C "$tmp/git/seed" config user.name AGS-Test
+git -C "$tmp/git/seed" config user.email ags-test@localhost
+printf '*\n' > "$tmp/git/seed/.gitignore"
+printf '* text eol=crlf\n' > "$tmp/git/seed/.gitattributes"
+git -C "$tmp/git/seed" add -f -- .gitignore .gitattributes
+git -C "$tmp/git/seed" commit -q -m 'seed hostile Git attributes'
+git -C "$tmp/git/seed" remote add origin "$tmp/git/records.git"
+git -C "$tmp/git/seed" push -q origin main
+env "${sync_a_env[@]}" "$tool" set "$tmp/sync-a/local" >/dev/null
+
+if env "${sync_a_env[@]}" "$tool" remote add insecure \
+    ftp://example.test/ags >/dev/null 2>&1; then
+    echo 'remote add accepted plaintext FTP' >&2
+    exit 1
+fi
+if env "${sync_a_env[@]}" "$tool" remote add password-git git \
+    https://user:secret@example.test/ags.git >/dev/null 2>&1; then
+    echo 'remote add accepted an embedded Git password' >&2
+    exit 1
+fi
+if env "${sync_a_env[@]}" "$tool" remote add token-git git \
+    https://secret-token@example.test/ags.git >/dev/null 2>&1; then
+    echo 'remote add accepted HTTP Git userinfo' >&2
+    exit 1
+fi
+if env "${sync_a_env[@]}" "$tool" remote add mixed-case-token-git git \
+    HTTPS://secret-token@example.test/ags.git >/dev/null 2>&1; then
+    echo 'remote add accepted mixed-case HTTP Git userinfo' >&2
+    exit 1
+fi
+if env "${sync_a_env[@]}" "$tool" remote add neburst git \
+    "$tmp/git/records.git" --branch main >/dev/null 2>&1; then
+    echo 'remote add accepted the SFTP-only neburst alias for Git' >&2
+    exit 1
+fi
+if env "${sync_a_env[@]}" "$tool" remote add cloud git \
+    "$tmp/git/records.git" --branch main >/dev/null 2>&1; then
+    echo 'remote add accepted the SFTP-only cloud alias for Git' >&2
+    exit 1
+fi
+git_add="$(env "${sync_a_env[@]}" "$tool" remote add backup git \
+    "$tmp/git/records.git" --branch main)"
+grep -Fqx 'status=configured' <<< "$git_add"
+grep -Fqx 'name=backup' <<< "$git_add"
+grep -Fqx 'type=git' <<< "$git_add"
+git_use="$(env "${sync_a_env[@]}" "$tool" remote use backup)"
+grep -Fqx 'status=selected' <<< "$git_use"
+storage_modes="$(env "${sync_a_env[@]}" "$tool" storage list)"
+grep -Eq '^RECENT +MODE +TYPE +LABEL$' <<< "$storage_modes"
+grep -Eq '^[*] +remote:backup +git +backup Git$' <<< "$storage_modes"
+storage_local="$(env "${sync_a_env[@]}" "$tool" storage use local)"
+grep -Fqx 'mode=local' <<< "$storage_local"
+storage_modes="$(env "${sync_a_env[@]}" "$tool" storage list)"
+grep -Eq '^[*] +local +local +Local$' <<< "$storage_modes"
+storage_github="$(env "${sync_a_env[@]}" "$tool" storage use github)"
+grep -Fqx 'mode=remote:backup' <<< "$storage_github"
+git_remotes="$(env "${sync_a_env[@]}" "$tool" remote list)"
+grep -Eq '^NAME +TYPE +DEFAULT +LOCATION$' <<< "$git_remotes"
+grep -Eq "^backup +git +\\* +$tmp/git/records.git$" <<< "$git_remotes"
+git_show="$(env "${sync_a_env[@]}" "$tool" remote show backup)"
+for expected in name=backup type=git "url=$tmp/git/records.git" branch=main default=true; do
+    grep -Fqx "$expected" <<< "$git_show"
+done
+
+unsafe_sync_record_id=$'unsafe\033]52;c;AGS_SYNC\a'
+unsafe_sync_path="$tmp/sync-a/local/codex/$unsafe_sync_record_id.checkpoint.tar.gz.age"
+cp -- "$queued_path" "$unsafe_sync_path"
+if env "${sync_a_env[@]}" "$tool" status backup \
+    >"$tmp/unsafe-sync-id.out" 2>"$tmp/unsafe-sync-id.err"; then
+    echo 'sync accepted a record ID containing terminal controls' >&2
+    exit 1
+fi
+grep -Fq 'record has an unsafe ID' "$tmp/unsafe-sync-id.err"
+if LC_ALL=C grep -Fq ']52;c;AGS_SYNC' "$tmp/unsafe-sync-id.err"; then
+    echo 'sync error emitted an unsafe record ID' >&2
+    exit 1
+fi
+rm -f -- "$unsafe_sync_path"
+
+git_status="$(env "${sync_a_env[@]}" "$tool" status)"
+for expected in remote=backup type=git push_records=1 pull_records=0 \
+    push_tombstones=0 pull_tombstones=0 unchanged_records=0 \
+    unchanged_tombstones=0; do
+    grep -Fqx "$expected" <<< "$git_status"
+done
+git_push="$(env "${sync_a_env[@]}" "$tool" push)"
+grep -Fqx 'status=synchronized' <<< "$git_push"
+grep -Fqx 'pushed=1' <<< "$git_push"
+grep -Fqx 'pulled=0' <<< "$git_push"
+sync_record_digest="$(sha256sum "$queued_path" | cut -d' ' -f1)"
+sync_v1_marker="ags-v1/records/codex/$sync_record_id.$sync_record_digest.record"
+git --git-dir="$tmp/git/records.git" cat-file -e "main:$sync_v1_marker"
+[[ "$(git --git-dir="$tmp/git/records.git" show main:.gitignore)" == '*' ]]
+[[ "$(git --git-dir="$tmp/git/records.git" show main:.gitattributes)" == \
+   '* text eol=crlf' ]]
+
+quiet_launch_state="$tmp/quiet-launch-state"
+quiet_launch_local="$tmp/quiet-launch-local"
+quiet_launch_remote="$tmp/git/quiet-launch.git"
+mkdir -p "$quiet_launch_state" "$quiet_launch_local/codex"
+cp -- "$tmp/state/context-mode.json" "$quiet_launch_state/context-mode.json"
+cp -- "$queued_path" \
+    "$quiet_launch_local/codex/$sync_record_id.checkpoint.tar.gz.age"
+git init -q --bare "$quiet_launch_remote"
+git -C "$tmp/git/seed" remote add quiet-launch "$quiet_launch_remote"
+git -C "$tmp/git/seed" push -q quiet-launch main
+env "${source_env[@]}" \
+    AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
+    "$tool" set "$quiet_launch_local" >/dev/null
+env "${source_env[@]}" \
+    AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
+    "$tool" remote add quiet-launch git "$quiet_launch_remote" \
+        --branch main >/dev/null
+quiet_remote_launch="$(
+    env "${source_env[@]}" \
+        AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
+        AGENT_SESSION_LOCAL_DIR="$quiet_launch_local" \
+        AGENT_SESSION_STORAGE_MODE=remote:quiet-launch \
+        "$tool" codex --model o3 2> "$tmp/quiet-remote-launch.err"
+)"
+grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$quiet_remote_launch"
+[[ ! -s "$tmp/quiet-remote-launch.err" ]]
+git --git-dir="$quiet_launch_remote" cat-file -e "main:$sync_v1_marker"
+git init -q --bare "$tmp/git/missing-launch.git"
+env "${source_env[@]}" \
+    AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
+    "$tool" remote add broken-launch git "$tmp/git/missing-launch.git" \
+        --branch main >/dev/null
+mv -- "$tmp/git/missing-launch.git" "$tmp/git/unavailable-launch.git"
+broken_launches_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")"
+if env "${source_env[@]}" \
+    AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
+    AGENT_SESSION_LOCAL_DIR="$quiet_launch_local" \
+    AGENT_SESSION_STORAGE_MODE=remote:broken-launch \
+    "$tool" codex --model o3 \
+        > "$tmp/broken-remote-launch.out" \
+        2> "$tmp/broken-remote-launch.err"; then
+    echo 'managed launch ignored an unavailable storage remote' >&2
+    exit 1
+fi
+[[ ! -s "$tmp/broken-remote-launch.out" ]]
+grep -Eq 'fatal:|\[ags\] error:' "$tmp/broken-remote-launch.err"
+[[ "$broken_launches_before" == \
+   "$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")" ]]
+
+env "${sync_b_env[@]}" "$tool" set "$tmp/sync-b/local" >/dev/null
+env "${sync_b_env[@]}" "$tool" remote add backup git \
+    "$tmp/git/records.git" --branch main >/dev/null
+env "${sync_b_env[@]}" "$tool" remote use backup >/dev/null
+git_pull_status="$(env "${sync_b_env[@]}" "$tool" status)"
+grep -Fqx 'pull_records=1' <<< "$git_pull_status"
+git_pull="$(env "${sync_b_env[@]}" "$tool" pull)"
+grep -Fqx 'status=synchronized' <<< "$git_pull"
+grep -Fqx 'pushed=0' <<< "$git_pull"
+grep -Fqx 'pulled=1' <<< "$git_pull"
+sync_b_record="$tmp/sync-b/local/codex/$sync_record_id.checkpoint.tar.gz.age"
+cmp "$queued_path" "$sync_b_record"
+
+auto_sync_pending="$(
+    cd "$tmp/work"
+    env "${sync_a_env[@]}" AGENT_SESSION_STORAGE_MODE=remote:backup \
+        AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+        "$tool" save auto-git 'Automatic Git update'
+)"
+auto_sync_record_id="$(sed -n 's/^record_id=//p' <<< "$auto_sync_pending")"
+auto_sync_path="$(sed -n 's/^path=//p' <<< "$auto_sync_pending")"
+[[ ! -e "$auto_sync_path" ]]
+printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
+    env "${sync_a_env[@]}" "$tool" hook
+[[ -f "$auto_sync_path" ]]
+auto_sync_digest="$(sha256sum "$auto_sync_path" | cut -d' ' -f1)"
+auto_sync_marker="ags-v1/records/codex/$auto_sync_record_id.$auto_sync_digest.record"
+git --git-dir="$tmp/git/records.git" cat-file -e "main:$auto_sync_marker"
+[[ ! -d "$tmp/sync-a/state/pending" ]] ||
+    ! find "$tmp/sync-a/state/pending" -type f -name '*.json' | grep -q .
+auto_sync_pull="$(env "${sync_b_env[@]}" "$tool" pull backup)"
+grep -Fqx 'pulled=1' <<< "$auto_sync_pull"
+
+long_legacy_id="Legacy_$(printf '界%.0s' {1..60})_ID"
+[[ "$(LC_ALL=C printf '%s' "$long_legacy_id" | wc -c)" == 190 ]]
+long_legacy_payload="$tmp/long-legacy/payload"
+long_legacy_archive="$tmp/long-legacy/$long_legacy_id.checkpoint.tar.gz.age"
+mkdir -p "$long_legacy_payload"
+cp -- "$legacy_payload/session.jsonl" "$long_legacy_payload/session.jsonl"
+{
+    printf 'format=2\nkind=checkpoint\ncheckpoint_id=%s\n' "$long_legacy_id"
+    printf 'description=Unicode legacy sync\ncreated_utc=2026-01-03T00:00:00.000Z\ntarget=local\n'
+    printf 'agent=codex\nsession_id=%s\nrelative_path=%s\n' \
+        "$legacy_session_id" "$legacy_relative"
+    printf 'cwd=%s\nsource_size=%s\nsource_sha256=%s\n' \
+        "$tmp/work" "$(stat -c %s "$long_legacy_payload/session.jsonl")" \
+        "$(sha256sum "$long_legacy_payload/session.jsonl" | cut -d' ' -f1)"
+    printf 'public_ip=unknown\nip_location=unknown\ngeo_provider=unknown\n'
+} > "$long_legacy_payload/manifest"
+tar -C "$long_legacy_payload" -czf - manifest session.jsonl | \
+    age -R "$tmp/legacy-recipient.pub" -o "$long_legacy_archive"
+cp -- "$long_legacy_archive" \
+    "$tmp/sync-a/local/codex/$long_legacy_id.checkpoint.tar.gz.age"
+git_long_status="$(env "${sync_a_env[@]}" "$tool" status backup)"
+grep -Fqx 'push_records=1' <<< "$git_long_status"
+git_long_push="$(env "${sync_a_env[@]}" "$tool" push backup)"
+grep -Fqx 'pushed=1' <<< "$git_long_push"
+long_legacy_id_digest="$(printf '%s' "$long_legacy_id" | sha256sum | cut -d' ' -f1)"
+long_legacy_record_digest="$(sha256sum "$long_legacy_archive" | cut -d' ' -f1)"
+long_legacy_marker="ags-v1/records/codex/id-$long_legacy_id_digest.$long_legacy_record_digest.record"
+git --git-dir="$tmp/git/records.git" cat-file -e "main:$long_legacy_marker"
+git --git-dir="$tmp/git/records.git" show "main:$long_legacy_marker" \
+    > "$tmp/long-legacy/marker"
+[[ "$(cut -f2 "$tmp/long-legacy/marker")" == "$long_legacy_id" ]]
+git_long_pull="$(env "${sync_b_env[@]}" "$tool" pull backup)"
+grep -Fqx 'pulled=1' <<< "$git_long_pull"
+sync_b_long_record="$tmp/sync-b/local/codex/$long_legacy_id.checkpoint.tar.gz.age"
+cmp "$long_legacy_archive" "$sync_b_long_record"
+git_long_show="$(env "${sync_b_env[@]}" "$tool" show "codex/$long_legacy_id")"
+grep -Eq "^Selector +codex/$long_legacy_id$" <<< "$git_long_show"
+grep -Eq '^Format +2$' <<< "$git_long_show"
+
+printf 'different bytes\n' > "$sync_b_record"
+if env "${sync_b_env[@]}" "$tool" status backup \
+    >"$tmp/git-conflict.out" 2>"$tmp/git-conflict.err"; then
+    echo 'Git status accepted different bytes for the same record ID' >&2
+    exit 1
+fi
+grep -Fq 'E_SYNC_CONFLICT' "$tmp/git-conflict.err"
+grep -Fq "record_id=$sync_record_id" "$tmp/git-conflict.err"
+cp -- "$queued_path" "$sync_b_record"
+
+sync_delete="$(env "${sync_a_env[@]}" "$tool" delete active-window)"
+grep -Fqx 'status=deleted' <<< "$sync_delete"
+grep -Fqx 'sync_status=synchronized' <<< "$sync_delete"
+grep -Fqx 'storage_mode=remote:backup' <<< "$sync_delete"
+sync_tombstone="$(sed -n 's/^tombstone=//p' <<< "$sync_delete")"
+[[ -f "$sync_tombstone" ]]
+sync_tombstone_digest="$(sha256sum "$sync_tombstone" | cut -d' ' -f1)"
+sync_tombstone_marker="ags-v1/tombstones/codex/$sync_record_id.$sync_tombstone_digest.tombstone"
+git --git-dir="$tmp/git/records.git" cat-file -e "main:$sync_tombstone_marker"
+tombstone_push="$(env "${sync_a_env[@]}" "$tool" push backup)"
+grep -Fqx 'push_tombstones=0' <<< "$tombstone_push"
+grep -Fqx 'status=synchronized' <<< "$tombstone_push"
+tombstone_pull="$(env "${sync_b_env[@]}" "$tool" pull backup)"
+grep -Fqx 'pull_tombstones=1' <<< "$tombstone_pull"
+grep -Fqx 'status=synchronized' <<< "$tombstone_pull"
+[[ ! -e "$sync_b_record" ]]
+[[ -f "$tmp/sync-b/local/tombstones/codex/$sync_record_id.tombstone" ]]
+find "$tmp/sync-b/state/trash/sync/codex" -type f \
+    -name "$sync_record_id.checkpoint.tar.gz.age.deleted.*" | grep -q .
+! env "${sync_b_env[@]}" "$tool" list | grep -Fq active-window
+
+mv -- "$tmp/git/records.git" "$tmp/git/records.offline.git"
+if pending_delete="$(env "${sync_a_env[@]}" "$tool" delete auto-git \
+    2>"$tmp/pending-delete.err")"; then
+    pending_delete_status=0
+else
+    pending_delete_status=$?
+fi
+mv -- "$tmp/git/records.offline.git" "$tmp/git/records.git"
+(( pending_delete_status != 0 ))
+grep -Fqx 'status=deleted' <<< "$pending_delete"
+grep -Fqx 'sync_status=pending' <<< "$pending_delete"
+grep -Fqx 'storage_mode=remote:backup' <<< "$pending_delete"
+pending_sync_path="$(sed -n 's/^pending_sync=//p' <<< "$pending_delete")"
+[[ -f "$pending_sync_path" ]]
+env "${sync_a_env[@]}" "$tool" flush
+[[ ! -e "$pending_sync_path" ]]
+auto_sync_tombstone="$tmp/sync-a/local/tombstones/codex/$auto_sync_record_id.tombstone"
+auto_sync_tombstone_digest="$(sha256sum "$auto_sync_tombstone" | cut -d' ' -f1)"
+auto_sync_tombstone_marker="ags-v1/tombstones/codex/$auto_sync_record_id.$auto_sync_tombstone_digest.tombstone"
+git --git-dir="$tmp/git/records.git" cat-file -e \
+    "main:$auto_sync_tombstone_marker"
+pending_delete_pull="$(env "${sync_b_env[@]}" "$tool" pull backup)"
+grep -Fqx 'pull_tombstones=1' <<< "$pending_delete_pull"
+[[ ! -e "$tmp/sync-b/local/codex/$auto_sync_record_id.checkpoint.tar.gz.age" ]]
+
+git_sync="$(env "${sync_b_env[@]}" "$tool" sync backup)"
+grep -Fqx 'status=synchronized' <<< "$git_sync"
+grep -Fqx 'pushed=0' <<< "$git_sync"
+grep -Fqx 'pulled=0' <<< "$git_sync"
+git_long_delete="$(env "${sync_a_env[@]}" "$tool" delete "codex/$long_legacy_id")"
+grep -Fqx 'sync_status=synchronized' <<< "$git_long_delete"
+grep -Fqx 'storage_mode=remote:backup' <<< "$git_long_delete"
+long_legacy_tombstone="$(sed -n 's/^tombstone=//p' <<< "$git_long_delete")"
+long_legacy_tombstone_digest="$(sha256sum "$long_legacy_tombstone" | cut -d' ' -f1)"
+long_legacy_tombstone_marker="ags-v1/tombstones/codex/id-$long_legacy_id_digest.$long_legacy_tombstone_digest.tombstone"
+git_long_tombstone_push="$(env "${sync_a_env[@]}" "$tool" push backup)"
+grep -Fqx 'push_tombstones=0' <<< "$git_long_tombstone_push"
+git --git-dir="$tmp/git/records.git" cat-file -e "main:$long_legacy_tombstone_marker"
+git_long_tombstone_pull="$(env "${sync_b_env[@]}" "$tool" pull backup)"
+grep -Fqx 'pull_tombstones=1' <<< "$git_long_tombstone_pull"
+[[ ! -e "$sync_b_long_record" ]]
+
+sftp_state="$tmp/sftp-sync/state"
+sftp_local="$tmp/sftp-sync/local"
+sftp_remote="$tmp/sftp-sync/remote"
+sftp_log="$tmp/sftp-sync/rclone.log"
+sftp_ssh_log="$tmp/sftp-sync/ssh.log"
+mkdir -p "$sftp_local/codex" "$sftp_remote" "$(dirname "$sftp_log")"
+sftp_record_id="${zst_path##*/}"
+sftp_record_id="${sftp_record_id%.checkpoint.tar.gz.age}"
+cp -- "$zst_path" "$sftp_local/codex/$sftp_record_id.checkpoint.tar.gz.age"
+sftp_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$sftp_state"
+    FAKE_RCLONE_ROOT="$sftp_remote"
+    FAKE_RCLONE_LOG="$sftp_log"
+    FAKE_SSH_LOG="$sftp_ssh_log"
+)
+env "${sftp_env[@]}" "$tool" set "$sftp_local" >/dev/null
+: > "$tmp/sftp-sync/untrusted-known-hosts"
+sftp_url='sftp://tester@127.0.0.1:2222/sync-records'
+if env "${sftp_env[@]}" "$tool" remote add rejected "$sftp_url" \
+    --known-hosts "$tmp/sftp-sync/untrusted-known-hosts" --key "$tmp/key" \
+    >"$tmp/sftp-host.out" 2>"$tmp/sftp-host.err"; then
+    echo 'SFTP remote accepted a host missing from known_hosts' >&2
+    exit 1
+fi
+grep -Fq 'no verified host key for [127.0.0.1]:2222' "$tmp/sftp-host.err"
+read -r host_key_type host_key_data _ < "$tmp/key.pub"
+printf '[127.0.0.1]:2222 %s %s\n' "$host_key_type" "$host_key_data" \
+    > "$tmp/sftp-sync/known_hosts"
+if env "${sftp_env[@]}" "$tool" remote add github "$sftp_url" \
+    --known-hosts "$tmp/sftp-sync/known_hosts" --key "$tmp/key" \
+    >/dev/null 2>&1; then
+    echo 'remote add accepted the Git-only github alias for SFTP' >&2
+    exit 1
+fi
+mkdir -p "$tmp/sftp-sync/outside-passwords"
+ln -s "$tmp/sftp-sync/outside-passwords" "$sftp_state/remote-passwords"
+if env "${sftp_env[@]}" AGENT_SESSION_REMOTE_PASSWORD='must stay inside' \
+    "$tool" remote add symlink-secret "$sftp_url" \
+        --known-hosts "$tmp/sftp-sync/known_hosts" --password \
+        >/dev/null 2>&1; then
+    echo 'SFTP password publication followed a state symlink' >&2
+    exit 1
+fi
+! find "$tmp/sftp-sync/outside-passwords" -type f | grep -q .
+rm -- "$sftp_state/remote-passwords"
+named_password='synthetic Neburst password'
+: > "$sftp_log"
+: > "$sftp_ssh_log"
+neburst_add="$(env "${sftp_env[@]}" \
+    AGENT_SESSION_REMOTE_PASSWORD="$named_password" \
+    "$tool" remote add neburst "$sftp_url" \
+        --known-hosts "$tmp/sftp-sync/known_hosts" --password)"
+grep -Fqx 'status=configured' <<< "$neburst_add"
+grep -Fqx 'auth=password' <<< "$neburst_add"
+neburst_secret="$sftp_state/remote-passwords/neburst.age"
+[[ -s "$neburst_secret" ]]
+[[ "$(age -d -i "$tmp/key" "$neburst_secret")" == "$named_password" ]]
+! grep -Fq "$named_password" "$sftp_state/storage.json"
+! grep -Fq "$named_password" "$sftp_log"
+! grep -Fq "$named_password" "$sftp_ssh_log"
+! grep -Fq 'pass=' "$sftp_log"
+! grep -Fq 'PLAINTEXT_ENV_LEAK=1' "$sftp_ssh_log"
+! grep -Fq 'CLOUD_PASSWORD_ENV_LEAK=1' "$sftp_ssh_log"
+! grep -Fq 'RCLONE_PASSWORD_ENV_LEAK=1' "$sftp_ssh_log"
+grep -Fq $'AUTH_ENV=1' "$sftp_log"
+grep -Fq $'sshpass\tPASSWORD_FD=1\tPASSWORD_SHA256=' "$sftp_ssh_log"
+neburst_remove="$(env "${sftp_env[@]}" "$tool" remote remove neburst)"
+neburst_recovery="$(sed -n 's/^recoverable_config=//p' <<< "$neburst_remove")"
+[[ -s "$neburst_recovery/password.age" && ! -e "$neburst_secret" ]]
+[[ "$(jq -r '.password_file' "$neburst_recovery/config.json")" == \
+   "$neburst_recovery/password.age" ]]
+
+sftp_add="$(env "${sftp_env[@]}" "$tool" remote add sftp-backup "$sftp_url" \
+    --known-hosts "$tmp/sftp-sync/known_hosts" --key "$tmp/key")"
+grep -Fqx 'status=configured' <<< "$sftp_add"
+grep -Fqx 'type=sftp' <<< "$sftp_add"
+env "${sftp_env[@]}" "$tool" remote use sftp-backup >/dev/null
+: > "$sftp_log"
+: > "$sftp_ssh_log"
+sftp_push="$(env "${sftp_env[@]}" "$tool" push)"
+grep -Fqx 'type=sftp' <<< "$sftp_push"
+grep -Fqx 'push_records=1' <<< "$sftp_push"
+grep -Fqx 'status=synchronized' <<< "$sftp_push"
+object_publish_line="$(awk \
+    '/STDIN=ags-v1\/objects\/.*\.checkpoint\.tar\.gz\.age/ {print NR; exit}' \
+    "$sftp_ssh_log")"
+marker_publish_line="$(awk \
+    '/STDIN=ags-v1\/records\/codex\/.*\.record/ {print NR; exit}' \
+    "$sftp_ssh_log")"
+[[ "$object_publish_line" =~ ^[0-9]+$ && "$marker_publish_line" =~ ^[0-9]+$ ]]
+(( object_publish_line < marker_publish_line ))
+find "$sftp_remote/sync-records/ags-v1/objects" -type f \
+    -name '*.checkpoint.tar.gz.age' | grep -q .
+find "$sftp_remote/sync-records/ags-v1/records/codex" -type f \
+    -name '*.record' | grep -q .
+sftp_record_digest="$(sha256sum "$zst_path" | cut -d' ' -f1)"
+sftp_v1_marker="ags-v1/records/codex/$sftp_record_id.$sftp_record_digest.record"
+[[ -f "$sftp_remote/sync-records/$sftp_v1_marker" ]]
+cp -- "$long_legacy_archive" \
+    "$sftp_local/codex/$long_legacy_id.checkpoint.tar.gz.age"
+sftp_long_push="$(env "${sftp_env[@]}" "$tool" push)"
+grep -Fqx 'push_records=1' <<< "$sftp_long_push"
+[[ -f "$sftp_remote/sync-records/$long_legacy_marker" ]]
+[[ "$(cut -f2 "$sftp_remote/sync-records/$long_legacy_marker")" == "$long_legacy_id" ]]
+sftp_long_status="$(env "${sftp_env[@]}" "$tool" status)"
+grep -Fqx 'unchanged_records=2' <<< "$sftp_long_status"
+sftp_show="$(env "${sftp_env[@]}" "$tool" remote show sftp-backup)"
+grep -Fqx 'default=true' <<< "$sftp_show"
+grep -Fqx "known_hosts=$tmp/sftp-sync/known_hosts" <<< "$sftp_show"
+
+mkdir -p "$tmp/sftp-sync/operation-hold"
+env "${sftp_env[@]}" \
+    FAKE_RCLONE_LSF_HOLD_DIR="$tmp/sftp-sync/operation-hold" \
+    "$tool" status sftp-backup \
+    >"$tmp/sftp-sync/held-status.out" \
+    2>"$tmp/sftp-sync/held-status.err" &
+held_status_pid=$!
+hold_ready=0
+for _ in {1..500}; do
+    if [[ -e "$tmp/sftp-sync/operation-hold/ready" ]]; then
+        hold_ready=1
+        break
+    fi
+    sleep 0.01
+done
+(( hold_ready == 1 ))
+env "${sftp_env[@]}" "$tool" remote remove sftp-backup \
+    >"$tmp/sftp-sync/concurrent-remove.out" \
+    2>"$tmp/sftp-sync/concurrent-remove.err" &
+concurrent_remove_pid=$!
+remove_waiting=0
+for _ in {1..100}; do
+    if kill -0 "$concurrent_remove_pid" 2>/dev/null; then
+        remove_waiting=1
+        break
+    fi
+    sleep 0.01
+done
+(( remove_waiting == 1 ))
+[[ -s "$sftp_state/storage.json" ]]
+jq -e '.remotes["sftp-backup"] != null' \
+    "$sftp_state/storage.json" >/dev/null
+: > "$tmp/sftp-sync/operation-hold/release"
+wait "$held_status_pid"
+wait "$concurrent_remove_pid"
+grep -Fqx 'status=removed' "$tmp/sftp-sync/concurrent-remove.out"
+jq -e '.remotes["sftp-backup"] == null' \
+    "$sftp_state/storage.json" >/dev/null
+[[ ! -d "$sftp_state/pending-sync" ]] ||
+    ! find "$sftp_state/pending-sync" -type f -name '*.json' | grep -q .
+env "${sftp_env[@]}" "$tool" remote add sftp-backup "$sftp_url" \
+    --known-hosts "$tmp/sftp-sync/known_hosts" --key "$tmp/key" >/dev/null
+
+merge_conflict_state="$tmp/merge-conflict/state"
+merge_conflict_local="$tmp/merge-conflict/local"
+merge_conflict_seed_state="$tmp/merge-conflict/seed-state"
+merge_conflict_seed_local="$tmp/merge-conflict/seed-local"
+merge_conflict_git="$tmp/merge-conflict/source.git"
+merge_conflict_destination_git="$tmp/merge-conflict/destination.git"
+merge_conflict_destination_work="$tmp/merge-conflict/destination-work"
+mkdir -p "$merge_conflict_local/codex" "$merge_conflict_seed_local/codex"
+git init -q --bare "$merge_conflict_git"
+git init -q --bare "$merge_conflict_destination_git"
+git init -q "$merge_conflict_destination_work"
+git -C "$merge_conflict_destination_work" config user.name AGS-Test
+git -C "$merge_conflict_destination_work" config user.email ags-test@localhost
+printf 'pre-existing destination history\n' \
+    > "$merge_conflict_destination_work/README"
+git -C "$merge_conflict_destination_work" add README
+git -C "$merge_conflict_destination_work" commit -qm 'seed destination'
+git -C "$merge_conflict_destination_work" remote add origin \
+    "$merge_conflict_destination_git"
+git -C "$merge_conflict_destination_work" push -q origin HEAD:main
+cp -- "$zst_path" \
+    "$merge_conflict_local/codex/$sftp_record_id.checkpoint.tar.gz.age"
+printf 'different encrypted checkpoint bytes\n' \
+    > "$merge_conflict_seed_local/codex/$sftp_record_id.checkpoint.tar.gz.age"
+merge_conflict_seed_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$merge_conflict_seed_state"
+)
+env "${merge_conflict_seed_env[@]}" "$tool" set \
+    "$merge_conflict_seed_local" >/dev/null
+env "${merge_conflict_seed_env[@]}" "$tool" remote add conflict-source git \
+    "$merge_conflict_git" --branch main >/dev/null
+env "${merge_conflict_seed_env[@]}" "$tool" push conflict-source >/dev/null
+merge_conflict_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$merge_conflict_state"
+)
+env "${merge_conflict_env[@]}" "$tool" set "$merge_conflict_local" >/dev/null
+env "${merge_conflict_env[@]}" "$tool" remote add conflict-source git \
+    "$merge_conflict_git" --branch main >/dev/null
+env "${merge_conflict_env[@]}" "$tool" remote add conflict-destination git \
+    "$merge_conflict_destination_git" --branch main >/dev/null
+cp -- "$merge_conflict_state/storage.json" \
+    "$tmp/merge-conflict/storage.before.json"
+merge_conflict_local_before="$(
+    {
+        find "$merge_conflict_local" -mindepth 1 ! -name .ags.lock \
+            -printf '%y\t%P\n' | sort
+        find "$merge_conflict_local" -type f ! -name .ags.lock -print0 |
+            sort -z | xargs -0 sha256sum
+    }
+)"
+merge_conflict_remote_before="$(
+    git --git-dir="$merge_conflict_git" rev-parse main
+)"
+merge_conflict_destination_before="$(
+    git --git-dir="$merge_conflict_destination_git" rev-parse main
+)"
+if env "${merge_conflict_env[@]}" "$tool" storage merge \
+    --into conflict-destination conflict-source \
+    >"$tmp/merge-conflict/merge.out" \
+    2>"$tmp/merge-conflict/merge.err"; then
+    echo 'storage merge accepted different bytes for the same record ID' >&2
+    exit 1
+fi
+grep -Fq 'E_SYNC_CONFLICT' "$tmp/merge-conflict/merge.err"
+grep -Fq "record_id=$sftp_record_id" "$tmp/merge-conflict/merge.err"
+[[ "$merge_conflict_local_before" == "$(
+    {
+        find "$merge_conflict_local" -mindepth 1 ! -name .ags.lock \
+            -printf '%y\t%P\n' | sort
+        find "$merge_conflict_local" -type f ! -name .ags.lock -print0 |
+            sort -z | xargs -0 sha256sum
+    }
+)" ]]
+[[ "$merge_conflict_remote_before" == \
+   "$(git --git-dir="$merge_conflict_git" rev-parse main)" ]]
+[[ "$merge_conflict_destination_before" == \
+   "$(git --git-dir="$merge_conflict_destination_git" rev-parse main)" ]]
+cmp "$tmp/merge-conflict/storage.before.json" \
+    "$merge_conflict_state/storage.json"
+jq -e '((.merged_modes // {}) | length) == 0' \
+    "$merge_conflict_state/storage.json" >/dev/null
+
+legacy_retire_state="$tmp/legacy-retire/state"
+legacy_retire_local="$tmp/legacy-retire/local"
+legacy_retire_remote="$tmp/legacy-retire/remote"
+legacy_retire_final="$tmp/legacy-retire/final.git"
+mkdir -p "$legacy_retire_local" "$legacy_retire_remote"
+git init -q --bare "$legacy_retire_final"
+legacy_retire_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$legacy_retire_state"
+    FAKE_RCLONE_ROOT="$legacy_retire_remote"
+    FAKE_RCLONE_LOG="$tmp/legacy-retire/rclone.log"
+    FAKE_SSH_LOG="$tmp/legacy-retire/ssh.log"
+)
+legacy_retire_url='sftp://tester@127.0.0.1:2222/legacy-only'
+env "${legacy_retire_env[@]}" "$tool" set "$legacy_retire_local" >/dev/null
+env "${legacy_retire_env[@]}" "$tool" cloud set \
+    "$legacy_retire_url" --key "$tmp/key" >/dev/null
+mkdir -p "$legacy_retire_remote/legacy-only/codex"
+cp -- "$long_legacy_archive" \
+    "$legacy_retire_remote/legacy-only/codex/$long_legacy_id.checkpoint.tar.gz.age"
+env "${legacy_retire_env[@]}" "$tool" remote add final git \
+    "$legacy_retire_final" --branch main >/dev/null
+legacy_only_merge="$(env "${legacy_retire_env[@]}" "$tool" storage merge \
+    --into final neburst)"
+grep -Fqx 'source=remote:neburst' <<< "$legacy_only_merge"
+if env "${legacy_retire_env[@]}" \
+    FAKE_SSH_FAIL_RETIRE_ONCE_MARKER="$tmp/legacy-retire/server.failed" \
+    "$tool" storage retire neburst --into final \
+    >"$tmp/legacy-retire/first.out" 2>"$tmp/legacy-retire/first.err"; then
+    echo 'legacy-only retirement ignored a failed server transaction' >&2
+    exit 1
+fi
+legacy_retire_timestamp="$(
+    jq -er '.remotes.neburst.retiring.timestamp' \
+        "$legacy_retire_state/storage.json"
+)"
+legacy_partial_dir="$legacy_retire_remote/legacy-only/.ags-retired/$legacy_retire_timestamp/legacy-cloud"
+mkdir -p "$legacy_partial_dir"
+mv -- "$legacy_retire_remote/legacy-only/codex" \
+    "$legacy_partial_dir/codex"
+legacy_partial_archive="$legacy_partial_dir/codex/$long_legacy_id.checkpoint.tar.gz.age"
+cp -- "$legacy_partial_archive" "$tmp/legacy-retire/legacy.original"
+printf 'partial-retirement-tamper\n' >> "$legacy_partial_archive"
+if env "${legacy_retire_env[@]}" "$tool" storage retire \
+    neburst --into final \
+    >"$tmp/legacy-retire/partial.out" \
+    2>"$tmp/legacy-retire/partial.err"; then
+    echo 'legacy-only partial retirement was incorrectly cancelled as untouched' >&2
+    exit 1
+fi
+grep -Fq 'fail-closed transaction was retained' \
+    "$tmp/legacy-retire/partial.err"
+jq -e '.remotes.neburst.retiring != null' \
+    "$legacy_retire_state/storage.json" >/dev/null
+cp -- "$tmp/legacy-retire/legacy.original" "$legacy_partial_archive"
+legacy_retire_done="$(env "${legacy_retire_env[@]}" "$tool" storage retire \
+    neburst --into final)"
+grep -Fqx 'status=retired' <<< "$legacy_retire_done"
+grep -Fqx 'source=remote:neburst' <<< "$legacy_retire_done"
+[[ ! -e "$legacy_retire_remote/legacy-only/codex" ]]
+[[ -f "$legacy_retire_remote/legacy-only/.ags-retired/ags-v1.retired" ]]
+jq -e '.cloud == null and .remotes.neburst == null' \
+    "$legacy_retire_state/storage.json" >/dev/null
+
+merge_state="$tmp/storage-merge/state"
+merge_local="$tmp/storage-merge/local"
+merge_final_git="$tmp/storage-merge/final.git"
+mkdir -p "$merge_local"
+git init -q --bare "$merge_final_git"
+merge_env=(
+    "${sync_common_env[@]}"
+    AGENT_SESSION_STATE_DIR="$merge_state"
+    FAKE_RCLONE_ROOT="$sftp_remote"
+    FAKE_RCLONE_LOG="$tmp/storage-merge/rclone.log"
+)
+env "${merge_env[@]}" "$tool" set "$merge_local" >/dev/null
+env "${merge_env[@]}" "$tool" remote add backup git \
+    "$tmp/git/records.git" --branch main >/dev/null
+env "${merge_env[@]}" "$tool" remote add sftp-backup "$sftp_url" \
+    --known-hosts "$tmp/sftp-sync/known_hosts" --key "$tmp/key" >/dev/null
+env "${merge_env[@]}" "$tool" remote add final git \
+    "$merge_final_git" --branch main >/dev/null
+env "${merge_env[@]}" "$tool" storage use backup >/dev/null
+env "${merge_env[@]}" "$tool" storage use sftp-backup >/dev/null
+env "${merge_env[@]}" "$tool" storage use local >/dev/null
+env "${merge_env[@]}" "$tool" storage use final >/dev/null
+merge_modes_before="$(env "${merge_env[@]}" "$tool" storage list)"
+mapfile -t merge_mode_order < <(
+    awk 'NR > 1 {if ($1 == "*") print $2; else print $1}' \
+        <<< "$merge_modes_before"
+)
+[[ "${merge_mode_order[*]}" == \
+   'remote:final local remote:sftp-backup remote:backup' ]]
+mkdir -p "$tmp/storage-merge/operation-hold"
+env "${merge_env[@]}" \
+    FAKE_RCLONE_LSF_HOLD_DIR="$tmp/storage-merge/operation-hold" \
+    "$tool" storage merge --into final backup sftp-backup \
+    >"$tmp/storage-merge/merge.out" \
+    2>"$tmp/storage-merge/merge.err" &
+storage_merge_pid=$!
+test_child_pids["$storage_merge_pid"]=1
+merge_hold_ready=0
+for _ in {1..500}; do
+    if [[ -e "$tmp/storage-merge/operation-hold/ready" ]]; then
+        merge_hold_ready=1
+        break
+    fi
+    sleep 0.01
+done
+(( merge_hold_ready == 1 ))
+(
+    cd "$tmp/work"
+    env "${merge_env[@]}" AGENT_SESSION_STORAGE_MODE=remote:backup \
+        "$tool" save-now local codex "$session_id" \
+            started-before-merge 'Started before storage redirect'
+) >"$tmp/storage-merge/concurrent-save.out" \
+    2>"$tmp/storage-merge/concurrent-save.err" &
+merge_save_pid=$!
+test_child_pids["$merge_save_pid"]=1
+merge_save_waiting=0
+for _ in {1..500}; do
+    if test_process_has_fd_target "$merge_save_pid" \
+        "$merge_state/storage-consolidation.lock"; then
+        merge_save_waiting=1
+        break
+    fi
+    test_process_running "$merge_save_pid" || break
+    sleep 0.01
+done
+(( merge_save_waiting == 1 ))
+test_process_running "$storage_merge_pid"
+test_process_running "$merge_save_pid"
+: > "$tmp/storage-merge/operation-hold/release"
+merge_finished=0
+for _ in {1..3000}; do
+    if ! test_process_running "$storage_merge_pid" &&
+       ! test_process_running "$merge_save_pid"; then
+        merge_finished=1
+        break
+    fi
+    sleep 0.01
+done
+(( merge_finished == 1 ))
+wait "$storage_merge_pid"
+unset "test_child_pids[$storage_merge_pid]"
+wait "$merge_save_pid"
+unset "test_child_pids[$merge_save_pid]"
+storage_merge="$(<"$tmp/storage-merge/merge.out")"
+grep -Fqx 'status=merged' <<< "$storage_merge"
+grep -Fqx 'destination=remote:final' <<< "$storage_merge"
+grep -Fqx 'source=remote:backup' <<< "$storage_merge"
+grep -Fqx 'source=remote:sftp-backup' <<< "$storage_merge"
+grep -Fq 'retire_command=ags storage retire remote:sftp-backup --into remote:final' \
+    <<< "$storage_merge"
+concurrent_save="$(<"$tmp/storage-merge/concurrent-save.out")"
+grep -Fqx 'storage_mode=remote:final' <<< "$concurrent_save"
+concurrent_record_id="$(sed -n 's/^record_id=//p' <<< "$concurrent_save")"
+concurrent_path="$(sed -n 's/^path=//p' <<< "$concurrent_save")"
+concurrent_digest="$(sha256sum "$concurrent_path" | cut -d' ' -f1)"
+concurrent_marker="ags-v1/records/codex/$concurrent_record_id.$concurrent_digest.record"
+git --git-dir="$merge_final_git" cat-file -e "main:$concurrent_marker"
+if git --git-dir="$tmp/git/records.git" cat-file -e \
+    "main:$concurrent_marker" 2>/dev/null; then
+    echo 'save started before merge repopulated its stale source replica' >&2
+    exit 1
+fi
+merge_final_status="$(env "${merge_env[@]}" "$tool" status final)"
+for expected in push_records=0 pull_records=0 \
+    push_tombstones=0 pull_tombstones=0; do
+    grep -Fqx "$expected" <<< "$merge_final_status"
+done
+find "$merge_local" -type f -name '*.checkpoint.tar.gz.age' | grep -q .
+merge_modes_after="$(env "${merge_env[@]}" "$tool" storage list)"
+grep -Eq '^[*] +remote:final +git +final Git$' <<< "$merge_modes_after"
+! grep -Fq 'remote:backup' <<< "$merge_modes_after"
+! grep -Fq 'remote:sftp-backup' <<< "$merge_modes_after"
+if env "${merge_env[@]}" "$tool" remote remove backup \
+    >"$tmp/storage-merge/remove-merged.out" \
+    2>"$tmp/storage-merge/remove-merged.err"; then
+    echo 'remote remove discarded an active merge redirect' >&2
+    exit 1
+fi
+grep -Fq 'participates in storage consolidation' \
+    "$tmp/storage-merge/remove-merged.err"
+redirected_save="$(
+    cd "$tmp/work"
+    env "${merge_env[@]}" AGENT_SESSION_STORAGE_MODE=remote:backup \
+        "$tool" save-now local codex "$session_id" \
+            redirected-after-merge 'Redirected merged storage'
+)"
+grep -Fqx 'storage_mode=remote:final' <<< "$redirected_save"
+redirected_record_id="$(sed -n 's/^record_id=//p' <<< "$redirected_save")"
+redirected_path="$(sed -n 's/^path=//p' <<< "$redirected_save")"
+redirected_digest="$(sha256sum "$redirected_path" | cut -d' ' -f1)"
+redirected_marker="ags-v1/records/codex/$redirected_record_id.$redirected_digest.record"
+git --git-dir="$merge_final_git" cat-file -e "main:$redirected_marker"
+if git --git-dir="$tmp/git/records.git" cat-file -e \
+    "main:$redirected_marker" 2>/dev/null; then
+    echo 'old merged mode wrote to its stale source replica' >&2
+    exit 1
+fi
+if env "${merge_env[@]}" \
+    FAKE_SSH_FAIL_RETIRE_ONCE_MARKER="$tmp/storage-merge/retire-server.failed" \
+    "$tool" storage retire sftp-backup --into final \
+    >"$tmp/storage-merge/retire-server.out" \
+    2>"$tmp/storage-merge/retire-server.err"; then
+    echo 'SFTP retirement ignored a failed server transaction' >&2
+    exit 1
+fi
+jq -e '.remotes["sftp-backup"].retiring != null' \
+    "$merge_state/storage.json" >/dev/null
+cp -- "$merge_state/storage.json" \
+    "$tmp/storage-merge/storage.before-recovery-path.json"
+jq '.remotes["sftp-backup"].retiring.recoverable_config =
+    (.remotes["sftp-backup"].retiring.recoverable_config + "/../escape")' \
+    "$merge_state/storage.json" > "$tmp/storage-merge/storage.invalid.json"
+mv -- "$tmp/storage-merge/storage.invalid.json" "$merge_state/storage.json"
+if env "${merge_env[@]}" "$tool" storage retire sftp-backup --into final \
+    >/dev/null 2>"$tmp/storage-merge/recovery-traversal.err"; then
+    echo 'retirement accepted a recovery path containing traversal' >&2
+    exit 1
+fi
+grep -Fq 'retirement recovery data is unavailable' \
+    "$tmp/storage-merge/recovery-traversal.err"
+cp -- "$tmp/storage-merge/storage.before-recovery-path.json" \
+    "$merge_state/storage.json"
+recovery_path="$(jq -er \
+    '.remotes["sftp-backup"].retiring.recoverable_config' \
+    "$merge_state/storage.json")"
+recovery_parent="$(dirname "$recovery_path")"
+mv -- "$recovery_parent" "$recovery_parent.safe"
+mkdir -p "$tmp/storage-merge/recovery-outside"
+ln -s "$tmp/storage-merge/recovery-outside" "$recovery_parent"
+if env "${merge_env[@]}" "$tool" storage retire sftp-backup --into final \
+    >/dev/null 2>"$tmp/storage-merge/recovery-symlink.err"; then
+    echo 'retirement followed a symbolic-link recovery ancestor' >&2
+    exit 1
+fi
+grep -Fq 'retirement recovery data is unavailable' \
+    "$tmp/storage-merge/recovery-symlink.err"
+rm -- "$recovery_parent"
+mv -- "$recovery_parent.safe" "$recovery_parent"
+if env "${merge_env[@]}" "$tool" storage merge --into backup final \
+    >"$tmp/storage-merge/merge-during-retire.out" \
+    2>"$tmp/storage-merge/merge-during-retire.err"; then
+    echo 'storage merge ran while another retirement was interrupted' >&2
+    exit 1
+fi
+grep -Fq 'interrupted storage retirement' \
+    "$tmp/storage-merge/merge-during-retire.err"
+tampered_sftp_file="$(
+    find "$sftp_remote/sync-records/ags-v1/objects" -type f | head -n 1
+)"
+[[ -n "$tampered_sftp_file" ]]
+cp -- "$tampered_sftp_file" "$tmp/storage-merge/tampered-object.original"
+printf 'tamper\n' >> "$tampered_sftp_file"
+if env "${merge_env[@]}" "$tool" storage retire \
+    sftp-backup --into final \
+    >"$tmp/storage-merge/retire-tamper.out" \
+    2>"$tmp/storage-merge/retire-tamper.err"; then
+    echo 'SFTP retirement accepted content outside its verified revision' >&2
+    exit 1
+fi
+grep -Fq 'remote advanced before retirement' \
+    "$tmp/storage-merge/retire-tamper.err"
+jq -e '.remotes["sftp-backup"].retiring == null' \
+    "$merge_state/storage.json" >/dev/null
+cmp -s "$tampered_sftp_file" "$tmp/storage-merge/tampered-object.original" && {
+    echo 'SFTP tamper fixture did not change the remote object' >&2
+    exit 1
+}
+cp -- "$tmp/storage-merge/tampered-object.original" "$tampered_sftp_file"
+
+if env "${merge_env[@]}" \
+    FAKE_RCLONE_FAIL_RETIRE_READBACK_ONCE="$tmp/storage-merge/retire-readback.failed" \
+    "$tool" storage retire sftp-backup --into final \
+    >"$tmp/storage-merge/retire-readback.out" \
+    2>"$tmp/storage-merge/retire-readback.err"; then
+    echo 'SFTP retirement ignored a failed marker read-back' >&2
+    exit 1
+fi
+[[ -f "$sftp_remote/sync-records/.ags-retired/ags-v1.retired" ]]
+jq -e '.remotes["sftp-backup"].retiring != null' \
+    "$merge_state/storage.json" >/dev/null
+storage_retire="$(env "${merge_env[@]}" "$tool" storage retire \
+    sftp-backup --into final)"
+grep -Fqx 'status=retired' <<< "$storage_retire"
+grep -Fqx 'source=remote:sftp-backup' <<< "$storage_retire"
+retired_sftp_path="$(sed -n 's/^recoverable_replica=//p' <<< "$storage_retire")"
+[[ "$retired_sftp_path" == "$sftp_url/"* ]]
+[[ ! -d "$sftp_remote/sync-records/ags-v1" ]]
+find "$sftp_remote/sync-records/.ags-retired" -type f | grep -q .
+! env "${merge_env[@]}" "$tool" remote list | grep -Fq sftp-backup
+if env "${sftp_env[@]}" "$tool" push sftp-backup \
+    >"$tmp/storage-merge/retired-push.out" \
+    2>"$tmp/storage-merge/retired-push.err"; then
+    echo 'SFTP sync resurrected a globally retired replica' >&2
+    exit 1
+fi
+grep -Fq 'retired' "$tmp/storage-merge/retired-push.err"
+if env "${merge_env[@]}" "$tool" remote add sftp-reborn "$sftp_url" \
+    --known-hosts "$tmp/sftp-sync/known_hosts" --key "$tmp/key" \
+    >/dev/null 2>&1; then
+    echo 'remote add resurrected a retired SFTP replica' >&2
+    exit 1
+fi
+
+final_before_retire="$(git --git-dir="$merge_final_git" rev-parse main)"
+final_tree_before_retire="$(
+    git --git-dir="$merge_final_git" rev-parse main:ags-v1
+)"
+reverse_merge="$(env "${merge_env[@]}" "$tool" storage merge \
+    --into backup final)"
+grep -Fqx 'status=merged' <<< "$reverse_merge"
+grep -Fqx 'destination=remote:backup' <<< "$reverse_merge"
+grep -Fqx 'source=remote:final' <<< "$reverse_merge"
+jq -e '
+    .merged_modes["remote:final"] == "remote:backup" and
+    .merged_modes["remote:backup"] == null and
+    .retired_modes["remote:sftp-backup"] == "remote:backup"
+' "$merge_state/storage.json" >/dev/null
+reverse_modes="$(env "${merge_env[@]}" "$tool" storage list)"
+grep -Eq '^[*] +remote:backup +git +backup Git$' <<< "$reverse_modes"
+! grep -Fq 'remote:final' <<< "$reverse_modes"
+reverse_redirect_save="$(
+    cd "$tmp/work"
+    env "${merge_env[@]}" AGENT_SESSION_STORAGE_MODE=remote:final \
+        "$tool" save-now local codex "$session_id" \
+            reverse-redirect 'Reverse redirect storage'
+)"
+grep -Fqx 'storage_mode=remote:backup' <<< "$reverse_redirect_save"
+reverse_record_id="$(sed -n 's/^record_id=//p' <<< "$reverse_redirect_save")"
+reverse_record_path="$(sed -n 's/^path=//p' <<< "$reverse_redirect_save")"
+reverse_record_digest="$(sha256sum "$reverse_record_path" | cut -d' ' -f1)"
+reverse_record_marker="ags-v1/records/codex/$reverse_record_id.$reverse_record_digest.record"
+git --git-dir="$tmp/git/records.git" cat-file -e \
+    "main:$reverse_record_marker"
+
+git_retire="$(env "${merge_env[@]}" "$tool" storage retire \
+    final --into backup)"
+grep -Fqx 'status=retired' <<< "$git_retire"
+grep -Fqx 'source=remote:final' <<< "$git_retire"
+git_retired_path="$(sed -n 's/^recoverable_replica=//p' <<< "$git_retire")"
+[[ "$git_retired_path" == "$merge_final_git#main:.ags-retired/"*"/ags-v1" ]]
+git_final_head="$(git --git-dir="$merge_final_git" rev-parse main)"
+[[ "$(git --git-dir="$merge_final_git" rev-parse main^)" == \
+   "$final_before_retire" ]]
+git --git-dir="$merge_final_git" cat-file -e \
+    'main:.ags-retired/ags-v1.retired'
+if git --git-dir="$merge_final_git" cat-file -e 'main:ags-v1' 2>/dev/null; then
+    echo 'Git retirement left the active AGS tree present' >&2
+    exit 1
+fi
+git_retired_tree_path="$(
+    git --git-dir="$merge_final_git" ls-tree -r --name-only "$git_final_head" |
+        sed -n 's#^\(.ags-retired/[^/]*/ags-v1\)/.*#\1#p' |
+        head -n 1
+)"
+[[ -n "$git_retired_tree_path" ]]
+[[ "$(git --git-dir="$merge_final_git" rev-parse \
+    "$git_final_head:$git_retired_tree_path")" == "$final_tree_before_retire" ]]
+if env "${merge_env[@]}" "$tool" remote add final git \
+    "$merge_final_git" --branch main >/dev/null 2>&1; then
+    echo 'remote add resurrected a retired Git replica' >&2
+    exit 1
+fi
+
+empty_git="$tmp/storage-merge/empty.git"
+git init -q --bare "$empty_git"
+env "${merge_env[@]}" "$tool" remote add empty git \
+    "$empty_git" --branch main >/dev/null
+empty_merge="$(env "${merge_env[@]}" "$tool" storage merge \
+    --into backup empty)"
+grep -Fqx 'source=remote:empty' <<< "$empty_merge"
+empty_retire="$(env "${merge_env[@]}" "$tool" storage retire \
+    empty --into backup)"
+grep -Fqx 'status=retired' <<< "$empty_retire"
+grep -Fqx "recoverable_replica=$empty_git#main:no-active-replica" \
+    <<< "$empty_retire"
+git --git-dir="$empty_git" cat-file -e 'main:.ags-retired/ags-v1.retired'
+if git --git-dir="$empty_git" cat-file -e 'main:ags-v1' 2>/dev/null; then
+    echo 'empty Git retirement created an active AGS tree' >&2
+    exit 1
+fi
+if env "${merge_env[@]}" "$tool" remote add empty git \
+    "$empty_git" --branch main >/dev/null 2>&1; then
+    echo 'remote add resurrected an empty retired Git replica' >&2
+    exit 1
+fi
+
+sftp_remove="$(env "${sftp_env[@]}" "$tool" remote remove sftp-backup)"
+grep -Fqx 'status=removed' <<< "$sftp_remove"
+! env "${sftp_env[@]}" "$tool" remote list | grep -Fq sftp-backup
+
+printf 'ags self-check passed\n'

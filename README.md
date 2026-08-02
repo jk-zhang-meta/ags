@@ -13,7 +13,7 @@ Cross Agent Session Resumer for coding agents: resume a session created in one p
 ## Quick Install (Recommended)
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?$(date +%s)" | bash
 ```
 
 That installer is the primary distribution path. It handles platform detection, secure artifact verification, fallback source builds, shell completions, and agent-oriented local setup in one step.
@@ -35,6 +35,7 @@ That installer is the primary distribution path. It handles platform detection, 
 | Provider auto-detection | Finds which provider owns a session ID without user guesswork |
 | Verification step | Re-reads written output to catch writer bugs before you try to resume |
 | Machine-friendly output | `--json` mode for scripts and automation |
+| Encrypted checkpoints | Save, restore, delete, and synchronize encrypted Codex/Claude records with `casr checkpoint` |
 | Debuggability | `--verbose`, `--trace`, and structured tracing with `RUST_LOG` |
 
 ## Quick Example
@@ -61,6 +62,180 @@ casr -gmi 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Gemini CLI
 claude --resume <new-session-id>
 ```
 
+## Encrypted Checkpoints
+
+`agsx` includes AGS's encrypted checkpoint, identity, Git/SFTP synchronization,
+tombstone, transactional restore runtime, and RMUX-managed live terminals:
+
+```bash
+ags                         # attach the most recently active live session
+ags claude                  # start Claude Code in an AGS terminal
+ags codex                   # start Codex in an AGS terminal
+ags claude --model opus     # everything after "claude" belongs to Claude Code
+ags codex --model o3        # everything after "codex" belongs to Codex
+ags save release-fix "Continue the release fix"
+ags list
+ags show release-fix
+ags resume release-fix
+ags resume release-fix --to claude -- --model sonnet
+ags delete release-fix
+```
+
+For `ags resume`, AGS options such as `--to`, `--cwd`, and `--profile` must
+precede an independent `--`; arguments after it are forwarded to the restored
+Agent in their original order. Direct launch has no mixed namespace:
+even a token named `--to`, `--cwd`, or `--profile` after `ags claude` or
+`ags codex` is an Agent token and is never consumed by AGS.
+
+Every managed launch selects one checkpoint storage mode:
+
+```bash
+ags storage list
+ags storage use local
+ags storage use neburst
+ags storage use github
+```
+
+Local storage is always the deduplication vault. `neburst` resolves the named
+Neburst SFTP remote (or the only configured SFTP remote), while `github`
+resolves the named GitHub Git remote (or the only configured Git remote). With
+one configured mode AGS selects it automatically. With several, AGS shows a
+short list ordered by most recent use and makes the previous choice the Enter
+default. A remote choice is reconciled before AGS selects or restores a
+checkpoint.
+
+A successful save first commits its encrypted local archive and then
+automatically synchronizes the selected Neburst or GitHub remote. If that
+network update fails, AGS retains a checksummed pending transaction and retries
+the same archive; it does not rebuild or duplicate the checkpoint. Deletion
+uses the same rule: the local record is moved to recoverable trash, a tombstone
+is committed, and the selected remote is updated immediately or gets one
+explicit pending retry. `ags set` refuses to switch the local vault while either
+kind of transaction is pending; `ags flush` completes and acknowledges each
+retry under the same storage transaction, without dropping a concurrent
+replacement retry.
+
+Several storage modes can be consolidated explicitly:
+
+```bash
+ags storage merge --into github local neburst
+ags storage retire neburst --into github
+```
+
+`merge` pulls every source into the local vault, deduplicates identical
+record digests, stops on conflicts, synchronizes the destination, and verifies
+that no push, pull, or tombstone remains. After verification, future saves from
+both new terminals and already-running terminals that still name an old source
+are redirected to the destination. The old replica remains recoverable and its
+name cannot be removed or reused until `retire`; a reverse merge can make a
+preserved source the destination again. `retire` repeats verification, moves
+the old remote replica to a recoverable `.ags-retired` location, and moves its
+local configuration (including any encrypted SFTP password) to AGS trash.
+Interrupted retirement must be resumed before another consolidation. This is
+intentionally different from deleting a checkpoint, which publishes a logical
+tombstone to every replica.
+
+Detach from a live Agent with RMUX's `Ctrl-b d`. The Agent and its shell remain
+alive; running `ags` later attaches to that same PTY. If the RMUX daemon or
+machine has stopped, AGS restores a saved checkpoint and starts the Agent's
+native resume command in a new managed terminal. AGS does not claim to preserve
+process memory across a reboot.
+
+The installer configures Codex and Claude lifecycle hooks and also installs
+`ags`. It installs the official checksummed RMUX 0.9.1 client, daemon, and
+private helper as one rollback-safe transaction; an already complete compatible
+stable 0.9.x installation at or above 0.9.1 is preserved. Interactive AGS
+commands require a compatible
+[RMUX 0.9.x release](https://rmux.io/docs/get-started/). Installation never
+signals or restarts an existing RMUX daemon; replaced binaries take full effect
+after that daemon exits naturally. Checkpoint support
+requires Linux or macOS, Bash 4+, `age`, `jq`, `rclone`, `rsync`, `zstd`,
+OpenSSH, Git, GNU file tools, and `flock`; conversion-only commands remain
+available without those tools. Use
+`--identity /absolute/path/to/identity.agekey` during installation to import an
+existing encryption identity.
+
+Context Mode is a required AGS runtime, not an optional integration. The online
+installer and every online `ags init` resolve npm's current stable `latest`
+release from the official registry. AGS records its exact version, tarball, and SHA-512
+integrity; installs the exact version with npm lifecycle scripts disabled into
+a sibling staging directory; validates the reviewed upstream native
+provisioner; runs that provisioner in an isolated environment until the
+package tree stops changing; and only then activates the versioned runtime under
+`${XDG_DATA_HOME:-~/.local/share}/ags/context-mode/runtimes/<platform>-<arch>-node<abi>/<version>`.
+A Node ABI change gets its own runtime and requires one online `ags init`;
+offline initialization fails closed when its last-good target does not match.
+A candidate that
+cannot be fetched, validated, configured, or health-checked never replaces the
+last-good release. Normal Agent launches use that last-good release without a
+network lookup.
+
+npm integrity is supplemented by an AGS SHA-256 manifest over the complete
+runtime package tree: every regular file and every safe in-package symbolic link,
+including nested dependencies and the active native ABI binding.
+Initialization and launch verify that tree and the Agent-managed plugin cache.
+This requires Node.js 22.5.0 or newer and `jq`; online refresh also requires
+`npm`. `ags init` repairs the registrations and runs Context Mode's
+initialization lifecycle for every installed Claude/Codex Agent. Online
+initialization runs the official `doctor`; an offline reinstall with a
+previously committed last-good runtime performs an `index`/`search` round trip
+against Context Mode's persistent SQLite/FTS store without making a network
+request.
+Context Mode currently has no public `init` subcommand, so AGS defines
+initialization as official plugin convergence plus one of those upstream health
+paths.
+
+For Claude, AGS also starts a short-lived real Claude process whose model API
+endpoint is redirected to loopback before every managed launch and requires the effective SessionStart protection
+marker, connected Context MCP server, both core `ctx_*` tools, and exact plugin
+version. Claude `--settings` accepts only provider authentication plus model
+fields; `apiKeyHelper` is limited to `/usr/bin/printenv ENV_NAME`. Hooks, MCP,
+plugin, permission, and tool settings fail closed. The same helper restriction
+is enforced for active managed, user, project, and local settings files while
+their other native Claude fields remain available. AGS performs this check
+before Context Mode initialization and verification can start Claude, and
+again at the managed-launch boundary. Other
+managed Claude arguments that can replace the selected Agent, settings, MCP,
+plugins, or Context tools are rejected, including `--agent`, `--agents`,
+`--setting-sources`, `--mcp-config`, `--plugin-dir`, `--plugin-url`,
+`--disallowedTools`, `--safe-mode`, `--bare`, and `--strict-mcp-config`.
+
+The integration has no opt-out: `--no-configure` and `--no-skill` only skip
+the optional AGS aliases, skills, hooks, and checkpoint bootstrap covered by
+those flags. They do not skip Context Mode.
+Claude is ready after installation. Codex launches fail closed until its six
+Context Mode lifecycle hooks have been reviewed in Codex's official UI. Run
+`ags context review-codex`, choose **Review hooks**, trust only
+`Plugin - context-mode@context-mode`, exit Codex, and retry the original AGS
+command. AGS never uses `--dangerously-bypass-hook-trust` or writes Codex's
+private trust hashes.
+
+Context Mode's databases remain in the Agent-native locations
+(`${CLAUDE_CONFIG_DIR:-~/.claude}/context-mode` and
+`${CODEX_HOME:-~/.codex}/context-mode`). They are not included in AGS
+checkpoint synchronization, because they can contain indexed project and
+conversation data. AGS checkpoints still restore the native Agent session;
+Context Mode then supplies its own continuity data on that machine.
+
+Named SFTP storage requires a verified `known_hosts` entry and an SSH server
+shell with `flock` plus standard file utilities. Password mode additionally
+requires `sshpass`: rclone receives only its obscured environment value, while
+direct SSH receives the plaintext through an inherited file descriptor, never
+through argv, logs, or storage JSON. An existing legacy `ags cloud set`
+configuration is registered as named `neburst`; its old `codex/` and `claude/`
+archives are content-verified and imported into the unified `ags-v1` store.
+`ags cloud delete` also goes through the unified tombstone path before moving
+the legacy copy to recoverable cloud trash, so a later sync cannot resurrect
+the record. Cleanup is exact-record and retryable after interruption: a newer
+checkpoint may reuse the old logical ID without being selected, and the active
+encrypted archive is moved last so every partial move remains recoverable.
+
+AGS forces RMUX for interactive Agent launches made through `ags` and agsx
+`--launch`. Direct `claude`/`codex` commands and the optional `cc`/`cod`
+compatibility wrappers remain direct executables for scripts and
+non-interactive modes; using them explicitly opts out of AGS terminal
+management.
+
 ## Design Philosophy
 
 1. **Provider fungibility over lock-in**: sessions are portable assets.
@@ -86,21 +261,21 @@ claude --resume <new-session-id>
 |---|---|---|---|---|
 | Claude Code | `cc` | Yes | Yes | `claude --resume <session-id>` |
 | Codex | `cod` | Yes | Yes | `codex resume <session-id>` |
-| Antigravity | `agy` | Yes | No | `agy --conversation <uuid>` |
+| Antigravity | `agy` | Yes | Yes* | `agy --conversation <conversation-id>` |
 | Gemini CLI | `gmi` | Yes | Yes | `gemini --resume <session-id>` |
-| Cursor | `cur` | Yes | Yes | `cursor .` |
-| Cline | `cln` | Yes | No | `code .` |
-| Aider | `aid` | Yes | Yes | `aider --restore-chat-history` |
+| Cursor | `cur` | Yes | No | `cursor .` |
+| Cline | `cln` | Yes | Yes* | `cline --id <session-id>` |
+| Aider | `aid` | Yes | Yes | `aider --chat-history-file <path> --restore-chat-history` |
 | Amp | `amp` | Yes | Yes | `amp threads continue <session-id>` |
-| OpenCode | `opc` | Yes | No | `opencode --session <session-id>` |
+| OpenCode | `opc` | Yes | Yes* | `opencode --session <session-id>` |
 | ChatGPT | `gpt` | Yes | No | `open "https://chatgpt.com/c/<session-id>"` |
 | ClawdBot | `cwb` | Yes | Yes | `clawdbot tui --session agent:main:<lowercase-session-id>` |
 | Vibe | `vib` | Yes | Yes | `vibe --resume <session-id>` |
 | Factory | `fac` | Yes | Yes | `droid --resume <session-id>` |
-| OpenClaw | `ocl` | Yes | No | `openclaw tui --session agent:main:<lowercase-session-id>` |
+| OpenClaw | `ocl` | Yes | Yes* | `openclaw tui --session <session-key>` |
 | Pi-Agent | `pi` | Yes | Yes | `pi --session <path-to-session.jsonl>` |
 | Kiro CLI | `kr` | Yes | Yes | `kiro-cli --resume-id <session-id>` |
-| Grok Build | `grk` | Yes | No | `grok --resume <session-id>` |
+| Grok Build | `grk` | Yes | Yes* | `grok --resume <session-id>` |
 
 Providers marked `Write: No` are valid sources and can resume their existing
 sessions, but casr refuses to target them—even with `--force` or `--dry-run`—
@@ -109,22 +284,49 @@ until a vendor-supported, natively resumable import path is verified.
 Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
 - Additional providers are implemented through the same `Provider` trait model.
-- Grok Build (xAI's official `grok` CLI) is currently read/resume-only: use it as a conversion source; writing into Grok is pending round-trip verification against a live `grok --resume`.
-- OpenClaw is read/resume-only because its live gateway serializes session-index
-  updates only in-process. Directly editing `sessions.json` can overwrite an
-  active gateway update; target imports remain disabled until casr can use the
-  authenticated gateway lifecycle.
-- Cline is read/resume-only because `taskHistory.json` has no cross-process
-  transaction or shared writer lock. A direct read-modify-write can overwrite
-  active Cline history; target imports remain disabled until casr can use a
-  vendor-authoritative lifecycle.
+- Antigravity target writes require Python and Google's official
+  `google-antigravity>=0.1.9` SDK. casr replays source user/model turns through
+  the SDK's local harness and a loopback deterministic model endpoint, then
+  reopens the generated SQLite conversation through the SDK and verifies every
+  stored step. `agy` resumes that native database directly. The public SDK has
+  no direct system/tool/assistant injection API, so adjacent messages are
+  visibly labelled and coalesced where necessary; a trailing unanswered
+  user-side turn is refused instead of inventing an assistant reply. Set
+  `AGSX_ANTIGRAVITY_PYTHON` when the SDK is installed in a non-default Python
+  environment.
+- `OpenCode` target writes require its official `opencode` CLI in `PATH` (or
+  `OPENCODE_BIN`). casr delegates import and rollback to the vendor CLI and
+  never edits `opencode.db` directly.
+- Aider target writes create a dedicated
+  `.aider.chat.history.agsx-<session-id>.md` and launch Aider with that exact
+  file. They never append to the shared `.aider.chat.history.md`.
+- Grok target writes require the official `grok` CLI in `PATH` (or `GROK_BIN`).
+  casr writes Grok's documented authoritative `summary.json` and
+  `updates.jsonl`, then requires the vendor CLI to discover and export the
+  session. Failed verification is rolled back through `grok sessions delete`;
+  derived history and search indexes remain owned by Grok.
+- OpenClaw target writes require the official `openclaw` CLI in `PATH` (or
+  `OPENCLAW_BIN`), a running authenticated Gateway granting `operator.admin`,
+  and the `sessions.create`,
+  `chat.inject`, `chat.history`, `sessions.patch`, and `sessions.delete` RPCs
+  introduced in OpenClaw 2026.7.2. agsx-convert creates the session and verifies
+  it through the Gateway, then uses archive-and-delete for rollback; it never
+  edits OpenClaw's SQLite database or session index. This import is deliberately
+  marked lossy: OpenClaw stores every imported turn as a gateway-injected
+  assistant note with a visible `agsx:v1:<role>` label, so the text and labels
+  survive but the original user/system/tool role semantics do not.
+- Cline target writes require the official `cline` CLI in `PATH` (or
+  `CLINE_BIN`). casr uses Cline's local Hub `client.register` →
+  `session.create` → official `session.messages` read-back lifecycle and uses
+  `session.delete` for rollback; it never edits Cline's database or indexes
+  directly. The write is unavailable when the official CLI is not installed.
 
 ## Installation
 
 ### Primary Path: Hardened `curl | bash` Installer
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?$(date +%s)" | bash
 ```
 
 What this installer does for you:
@@ -134,10 +336,10 @@ What this installer does for you:
 | Platform targeting | Detects Linux/macOS + x86_64/aarch64 and picks the right artifact |
 | Supply-chain checks | Verifies SHA256 and Sigstore/cosign when available |
 | Download fallback chain | Versioned release -> latest release naming variants -> source build |
-| Airgap install | `--offline <tarball>` installs from local artifacts |
+| Airgap install | `--offline <tarball>` uses a local AGS artifact and requires a previously committed, revalidated Context Mode last-good runtime |
 | Proxy-aware networking | Uses `HTTPS_PROXY` / `HTTP_PROXY` automatically |
 | Shell UX | Installs completions for bash/zsh/fish |
-| Agent setup | Installs `casr` skill for Claude/Codex and optional `cc`/`cod`/`gmi` wrappers |
+| Agent setup | Installs mandatory Context Mode, conversion/checkpoint skills, checkpoint hooks, `ags`, and optional `cc`/`cod`/`gmi` wrappers |
 
 High-value installer flags:
 
@@ -145,28 +347,38 @@ High-value installer flags:
 |---|---|
 | `--verify` | Runs post-install self-test |
 | `--force` | Reinstall even if same version is already present |
-| `--offline <tarball>` | Airgapped local install |
+| `--offline <tarball>` | Reinstall AGS without network access after Context Mode has completed one trusted online initialization |
 | `--from-source` | Build from source directly |
+| `--system` | Put the binary in `/usr/local/bin`; run as the target non-root user and only when that directory is already writable |
 | `--easy-mode` | Auto-update PATH in shell rc files |
 | `--yes` | Non-interactive prompt acceptance |
-| `--no-configure` | Skip agent skill/wrapper setup |
+| `--no-configure` | Skip optional agent skill/wrapper setup; Context Mode remains mandatory |
 | `--no-skill` | Skip Claude/Codex skill installation |
+| `--identity <file>` | Import an existing AGS age identity |
 
 ```bash
 # Examples
 bash install.sh --verify
+# Mandatory Context Mode is per-user, so do not run this example with sudo.
 bash install.sh --system --easy-mode --yes
 bash install.sh --offline ./casr-x86_64-unknown-linux-musl.tar.xz
 bash install.sh --no-configure --no-skill
 ```
+
+A fresh machine must complete one online `ags init` against the official npm
+registry before it can use `--offline`. AGS deliberately does not trust a
+copied Context Mode runtime cache or its self-carried hashes as a first-use
+trust anchor. After a successful activation, later offline reinstalls and
+initializations revalidate the committed last-good manifest, full runtime tree,
+native binding, and Agent plugin caches before use.
 
 Run `bash install.sh --help` for the full option set.
 
 ### Alternative: From Source
 
 ```bash
-git clone https://github.com/Dicklesworthstone/cross_agent_session_resumer
-cd cross_agent_session_resumer
+git clone -b agsx https://github.com/jk-zhang-meta/ags
+cd ags
 cargo build --release
 ./target/release/casr --help
 ```
@@ -362,12 +574,12 @@ same one.
 | OpenCode | `OPENCODE_HOME`, `OPENCODE_DB_PATH` | `OPENCODE_DB` (absolute path, or a filename under OpenCode's data dir) |
 | ClawdBot | `CLAWDBOT_HOME` | `CLAWDBOT_STATE_DIR` → `$CLAWDBOT_STATE_DIR/sessions` |
 | Aider | `AIDER_HOME` | `AIDER_CHAT_HISTORY_FILE` (a file, not a directory) |
-| Grok | — | `GROK_HOME` → used as `~/.grok` |
+| Grok | `GROK_BIN` (CLI path) | `GROK_HOME` → used as `~/.grok` |
 | Kiro (CLI store) | — | `KIRO_HOME` → used as `~/.kiro` |
 | Kiro (IDE store) | — | none exists — the IDE always uses `~/.kiro`, see below |
 | Amp | — | `XDG_DATA_HOME` → `$XDG_DATA_HOME/amp` |
 | Vibe | — | `VIBE_HOME` → `$VIBE_HOME/logs/session` |
-| OpenClaw | — | `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw` |
+| OpenClaw | `OPENCLAW_BIN` (CLI path) | `OPENCLAW_STATE_DIR`, else `$OPENCLAW_HOME/.openclaw` |
 | Cursor, ChatGPT | `CURSOR_HOME`, `CHATGPT_HOME` | none exists — these tools offer no relocation variable |
 
 A few names look like they should work but do not, because the real tool means
@@ -414,8 +626,8 @@ something else by them:
   `$OPENCLAW_HOME/.openclaw`. `OPENCLAW_STATE_DIR` names that state directory
   outright and outranks it. Sessions are keyed by agent —
   `<state>/agents/<agent-id>/sessions/` — and casr reads every agent's
-  directory. It can resume existing native sessions but does not mutate this
-  shared store.
+  directory. Target imports use the authenticated Gateway and do not mutate
+  this shared store directly.
 
 ## Canonical Session Model
 
@@ -596,7 +808,8 @@ Read-back verification compares role buckets rather than raw role enums for know
 
 ## Atomic Write and Recovery Semantics
 
-`casr` write operations are temp-then-rename and include rollback behavior:
+File-backed `casr` write operations are temp-then-rename and include rollback
+behavior:
 
 1. Create parent directories if needed.
 2. If target exists and `--force` is not set, return conflict.
@@ -610,6 +823,10 @@ If any step fails:
 - Temp files are cleaned up.
 - Existing backups are restored to original target paths.
 - Errors include provider and path context for debugging.
+
+Providers with vendor-owned shared stores override this lifecycle. OpenCode
+imports and deletes sessions through the official CLI, so verification failure
+removes only the imported session and never rolls back the whole database.
 
 ## `casr list` Selection and Ranking Internals
 
@@ -706,12 +923,33 @@ Recommended test set for new providers:
 ### Gemini CLI
 - Source path pattern: `~/.gemini/tmp/<hash>/chats/session-<id>.json`
 - JSON includes `sessionId`, `projectHash`, `messages`, and temporal fields.
-- Writer emits `user` and `model` message types with provider-compatible structure.
+- Writer emits `user` and `gemini` message types with provider-compatible structure.
+
+### Antigravity
+- Source/target database:
+  `~/.gemini/antigravity-cli/conversations/<conversation-id>.db`
+- Readable transcript:
+  `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`
+- Target writes delegate trajectory creation and resume verification to
+  `google-antigravity>=0.1.9`; casr does not synthesize Antigravity protobuf
+  blobs or edit a shared SQLite database.
+- Install the optional target dependency with
+  `python3 -m pip install "google-antigravity>=0.1.9"`.
 
 ### Cursor
 - Source path pattern: `~/.config/Cursor/User/globalStorage/state.vscdb`
 - SQLite `cursorDiskKV` keys: `composerData:<id>` and `bubbleId:<composerId>:<bubbleId>`.
 - `casr` uses a virtual per-session path (`state.vscdb/<encoded-session-id>`) for deterministic lookup and verification.
+- Cursor is read/resume-only: the editor also needs its `allComposers` index, whose safe write lifecycle is not yet verified.
+
+### Aider
+- Source path pattern: `.aider.chat.history.md` at the repository root (or the path named by `AIDER_CHAT_HISTORY_FILE`)
+- Target writes use a dedicated native history file and pass it through
+  `--chat-history-file <path> --restore-chat-history`; the shared append-only
+  history is never modified.
+- Aider's official restore parser drops blockquote turns. casr uses blockquotes
+  only as non-model-visible same-role boundaries and folds non-assistant roles
+  into visible user turns, which is reported as a fidelity loss.
 
 ## Validation Rules
 

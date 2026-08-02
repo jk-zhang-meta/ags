@@ -6,6 +6,7 @@
 //! The binary (`main.rs`) is a thin CLI wrapper around this library.
 
 pub mod budget;
+pub mod checkpoint_runtime;
 pub mod compare;
 pub mod conformance;
 pub mod discovery;

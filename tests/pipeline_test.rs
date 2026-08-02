@@ -1274,54 +1274,7 @@ fn pipeline_readback_mismatch_fails_and_removes_unverified_output() {
 }
 
 #[test]
-fn pipeline_accepts_cursors_declared_tool_to_assistant_fold() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
-    let src_root = tmp.path().join("src");
-    let dst_root = tmp.path().join("cursor");
-    fs::create_dir_all(&src_root).expect("create src root");
-    fs::create_dir_all(&dst_root).expect("create target root");
-
-    let src = MockProvider::new("Source", "src", "src", vec![src_root.clone()]);
-    let dst = MockProvider::new("Cursor", "cursor", "cur", vec![dst_root.clone()]);
-    let source_path = src_root.join("session-cursor-tool-fold.json");
-    let written_path = dst_root.join("out-cursor-tool-fold.json");
-    let mut canonical = valid_session_with_id("sid-cursor-tool-fold");
-    canonical.messages[2].role = MessageRole::Tool;
-    let mut readback = canonical.clone();
-    readback.messages[2].role = MessageRole::Assistant;
-
-    src.set_owned_session("sid-cursor-tool-fold", source_path.clone());
-    src.set_read_session(source_path, canonical);
-    dst.set_write_success(WrittenSession {
-        paths: vec![written_path.clone()],
-        session_id: "target-cursor-tool-fold".to_string(),
-        resume_command: "cursor .".to_string(),
-        backups: Vec::new(),
-        warnings: Vec::new(),
-    });
-    dst.set_read_session(written_path, readback);
-
-    let pipeline = ConversionPipeline {
-        registry: ProviderRegistry::new(vec![Box::new(src), Box::new(dst.clone())]),
-        store: None,
-    };
-    let result = pipeline
-        .convert("cur", "sid-cursor-tool-fold", options(false, None))
-        .expect("Cursor's declared Tool→Assistant fold should pass read-back verification");
-
-    assert!(
-        result.losses.iter().any(|loss| {
-            loss.note
-                .contains("1 message(s) were written as assistant bubbles")
-        }),
-        "the accepted fold must still be reported as a projection loss: {:?}",
-        result.losses
-    );
-    assert_eq!(dst.finalize_calls(), 1);
-}
-
-#[test]
-fn pipeline_rejects_tool_to_assistant_fold_for_non_cursor_targets() {
+fn pipeline_rejects_undeclared_tool_to_assistant_fold() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let src_root = tmp.path().join("src");
     let dst_root = tmp.path().join("other");
@@ -1355,7 +1308,7 @@ fn pipeline_rejects_tool_to_assistant_fold_for_non_cursor_targets() {
     };
     let err = pipeline
         .convert("oth", "sid-other-tool-fold", options(false, None))
-        .expect_err("other targets must not inherit Cursor's declared role fold");
+        .expect_err("an undeclared Tool-to-Assistant fold must fail verification");
 
     match err.downcast_ref::<CasrError>() {
         Some(CasrError::VerifyFailed { detail, .. }) => {

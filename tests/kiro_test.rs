@@ -42,6 +42,7 @@ impl Drop for EnvGuard {
 }
 
 const FIXTURE_ID: &str = "0a5376f2-7e2f-4981-bcbc-67195586604a";
+const PLANTED_WRITE_SECRET: &str = "kiro-write-residual-c0ffee11deadbeefc0ffee11deadbeef";
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kiro")
@@ -62,7 +63,7 @@ fn seed_kiro_home(home: &Path) {
 }
 
 #[test]
-fn full_filesystem_round_trip_preserves_state_and_drops_history() {
+fn full_filesystem_round_trip_preserves_messages_and_drops_history() {
     let _lock = KIRO_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _env = EnvGuard::set("KIRO_HOME", tmp.path());
@@ -105,11 +106,16 @@ fn full_filesystem_round_trip_preserves_state_and_drops_history() {
         );
     }
 
-    // Nested session_state survives verbatim — the round-trip risk.
+    // Only the audited state format survives; vendor-owned nested state does
+    // not belong in canonical metadata.
     assert_eq!(
         original.metadata.get("session_state"),
         reread.metadata.get("session_state"),
-        "session_state must round-trip verbatim"
+        "the minimal session_state must remain stable"
+    );
+    assert_eq!(
+        reread.metadata["session_state"],
+        serde_json::json!({"version": "v1"})
     );
     // `.history` does not round-trip, on purpose. kiro-cli's `addToHistory`
     // records every submitted line, not just slash commands, so the file is
@@ -124,6 +130,87 @@ fn full_filesystem_round_trip_preserves_state_and_drops_history() {
         original.metadata.get("parent_session_id"),
         reread.metadata.get("parent_session_id"),
     );
+}
+
+#[test]
+fn writer_drops_vendor_state_and_envelope_residuals() {
+    let _lock = KIRO_ENV.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let _env = EnvGuard::set("KIRO_HOME", tmp.path());
+
+    let mut session = Kiro.read_session(&fixture_json()).expect("read original");
+    session.metadata["session_state"] = serde_json::json!({
+        "version": "v1",
+        "conversation_metadata": {
+            "last_request": { "system_prompt": PLANTED_WRITE_SECRET }
+        },
+        "rts_model_state": {
+            "additional_fields": { "blob": PLANTED_WRITE_SECRET }
+        },
+        "permissions": {
+            "filesystem": { "future_secret": PLANTED_WRITE_SECRET }
+        }
+    });
+
+    for message in &mut session.messages {
+        let kind = match &message.role {
+            MessageRole::User => "Prompt",
+            MessageRole::Assistant => "AssistantMessage",
+            MessageRole::Tool => "ToolResults",
+            other => panic!("unexpected fixture role: {other:?}"),
+        };
+        message.extra = serde_json::json!({
+            "version": "v1",
+            "kind": kind,
+            "future_root": format!("{PLANTED_WRITE_SECRET}:{kind}:root"),
+            "data": {
+                "future_nested": format!("{PLANTED_WRITE_SECRET}:{kind}:data")
+            }
+        });
+    }
+
+    let written = Kiro
+        .write_session(&session, &WriteOptions { force: true })
+        .expect("write sanitized session");
+    let metadata_path = written
+        .paths
+        .iter()
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .expect("metadata path");
+    let journal_path = written
+        .paths
+        .iter()
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .expect("journal path");
+
+    let metadata_text = std::fs::read_to_string(metadata_path).unwrap();
+    let journal_text = std::fs::read_to_string(journal_path).unwrap();
+    assert!(
+        !metadata_text.contains(PLANTED_WRITE_SECRET),
+        "writer republished canonical session_state residuals:\n{metadata_text}"
+    );
+    assert!(
+        !journal_text.contains(PLANTED_WRITE_SECRET),
+        "writer republished a root or nested envelope residual:\n{journal_text}"
+    );
+
+    let native_metadata: serde_json::Value = serde_json::from_str(&metadata_text).unwrap();
+    assert_eq!(
+        native_metadata["session_state"],
+        serde_json::json!({"version": "v1"})
+    );
+
+    let reread = Kiro
+        .read_session(metadata_path)
+        .expect("re-read sanitized session");
+    assert_eq!(reread.messages.len(), session.messages.len());
+    for (expected, actual) in session.messages.iter().zip(&reread.messages) {
+        assert_eq!(actual.role, expected.role);
+        assert_eq!(actual.content, expected.content);
+        assert_eq!(actual.timestamp, expected.timestamp);
+        assert_eq!(actual.tool_calls, expected.tool_calls);
+        assert_eq!(actual.tool_results, expected.tool_results);
+    }
 }
 
 #[test]
@@ -215,7 +302,7 @@ fn cli_info_reports_seeded_kiro_session() {
 /// (sans `.history`) and re-reads cleanly.
 #[test]
 fn foreign_session_writes_and_rereads() {
-    use casr::model::{CanonicalMessage, CanonicalSession, ToolCall};
+    use casr::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
 
     let _lock = KIRO_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -250,7 +337,11 @@ fn foreign_session_writes_and_rereads() {
                     name: "shell".into(),
                     arguments: serde_json::json!({"command": "ls"}),
                 }],
-                tool_results: vec![],
+                tool_results: vec![ToolResult {
+                    call_id: Some("t1".into()),
+                    content: "file.txt".into(),
+                    is_error: false,
+                }],
                 extra: serde_json::Value::Null,
             },
         ],
@@ -264,6 +355,36 @@ fn foreign_session_writes_and_rereads() {
         .expect("write foreign session");
     // No history present → only .json + .jsonl.
     assert_eq!(written.paths.len(), 2);
+    let metadata_path = written
+        .paths
+        .iter()
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .expect("metadata path");
+    let native_metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
+    assert!(
+        native_metadata.get("session_created_reason").is_none(),
+        "an absent optional enum must be omitted, not written as null"
+    );
+    let journal_path = written
+        .paths
+        .iter()
+        .find(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .expect("journal path");
+    let journal = std::fs::read_to_string(journal_path).unwrap();
+    let envelopes: Vec<serde_json::Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let result_envelope = envelopes
+        .iter()
+        .find(|envelope| envelope["kind"] == "ToolResults")
+        .expect("Kiro needs a ToolResults envelope to replay native results");
+    assert_eq!(
+        result_envelope["data"]["results"]["t1"]["result"]["Success"]["items"][0]["Text"],
+        "file.txt",
+        "Kiro's V2 loader rebuilds tool results from data.results, not data.content"
+    );
 
     let reread = Kiro
         .read_session(&Kiro.owns_session(&written.session_id).unwrap())
@@ -273,4 +394,6 @@ fn foreign_session_writes_and_rereads() {
     assert_eq!(reread.messages[1].content, "Hello back");
     assert_eq!(reread.messages[1].tool_calls.len(), 1);
     assert_eq!(reread.messages[1].tool_calls[0].name, "shell");
+    assert_eq!(reread.messages[1].tool_results.len(), 1);
+    assert_eq!(reread.messages[1].tool_results[0].content, "file.txt");
 }

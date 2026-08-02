@@ -1,4 +1,4 @@
-//! Cline provider — reads sessions from VS Code-style `globalStorage`.
+//! Cline provider — reads extension and CLI sessions and writes through Cline's local Hub.
 //!
 //! Cline is the VS Code extension published as `saoudrizwan.claude-dev`.
 //! Its session artifacts are stored under the editor's `User/globalStorage`:
@@ -9,16 +9,18 @@
 //!
 //! Where `<HOST_CONFIG>` can be VS Code (`Code`, `Code - Insiders`, `VSCodium`) or Cursor.
 //!
-//! Cline's resume picker is driven by the shared `taskHistory.json`. Cline
-//! 4.0.11 updates that file with an unsynchronised read-modify-write; its atomic
-//! rename prevents torn JSON, but cannot prevent Cline and casr from replacing
-//! one another's concurrent history rows. Until Cline exposes a
-//! vendor-authoritative import lifecycle, casr is therefore read/resume-only
-//! for this provider.
+//! Current Cline CLI sessions live under
+//! `<CLINE_DATA_DIR>/sessions/<id>/<id>.messages.json`. Target writes use the
+//! official CLI's authenticated local Hub lifecycle:
+//! `session.create(initialMessages)` -> `session.messages` -> `session.delete`
+//! on rollback. No provider database, manifest, or shared index is edited
+//! directly, and no prompt is supplied, so Cline persists the imported history
+//! without starting a model turn.
 //!
 //! ## Session IDs
 //!
-//! Task IDs are numeric strings (typically `Date.now()` / epoch millis).
+//! Legacy task IDs are numeric strings (typically `Date.now()` / epoch millis).
+//! Current CLI session IDs are opaque strings.
 //!
 //! ## A `tool_use` block is represented exactly once
 //!
@@ -75,15 +77,24 @@
 //! and no prose. The emptiness test now asks about the whole message rather
 //! than about its text.
 
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::Context;
 use tracing::{debug, trace};
+use tungstenite::client::IntoClientRequest;
+use tungstenite::http::HeaderValue;
+use tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tungstenite::{Message, WebSocket};
 
 use crate::discovery::DetectionResult;
+use crate::launch::LaunchSpec;
 use crate::model::{
     CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult, flatten_content,
-    normalize_role, reindex_messages, truncate_title,
+    normalize_role, parse_timestamp, reindex_messages, truncate_title,
 };
 use crate::providers::{Provider, WriteOptions, WrittenSession, store_evidence};
 
@@ -94,16 +105,425 @@ const FILE_API_HISTORY: &str = "api_conversation_history.json";
 const FILE_UI_MESSAGES: &str = "ui_messages.json";
 const FILE_UI_MESSAGES_OLD: &str = "claude_messages.json";
 const FILE_TASK_HISTORY: &str = "taskHistory.json";
+const CURRENT_MESSAGES_SUFFIX: &str = ".messages.json";
+const CLINE_BIN_ENV: &str = "CLINE_BIN";
+const HUB_DISCOVERY_PATH: &str = "locks/hub/production.json";
+const HUB_AUTH_PROTOCOL_PREFIX: &str = "cline-hub-auth.";
 
-const CLINE_WRITE_REFUSAL: &str = "Cline is read/resume-only: state/taskHistory.json has no \
-cross-process transaction or shared lock, so direct read-modify-write can lose concurrent Cline \
-or casr updates. A safe import needs a vendor-authoritative lifecycle; use Cline as a conversion \
-source, not a target.";
+const CLINE_CLI_REQUIRED: &str = "Cline is read/resume-only on this machine: target writes require \
+the official `cline` CLI in PATH (or CLINE_BIN). agsx uses the vendor's local Hub create, read, \
+and delete lifecycle and will not modify Cline's database or session indexes directly.";
+
+type HubSocket = WebSocket<TcpStream>;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubDiscovery {
+    protocol_version: String,
+    min_client_protocol_version: Option<String>,
+    max_client_protocol_version: Option<String>,
+    url: String,
+    auth_token: String,
+    host: String,
+    port: u16,
+}
+
+struct HubClient {
+    socket: HubSocket,
+    client_id: String,
+}
+
+impl HubClient {
+    fn connect(discovery: &HubDiscovery) -> anyhow::Result<Self> {
+        if discovery.protocol_version != "v1"
+            || discovery
+                .min_client_protocol_version
+                .as_deref()
+                .is_some_and(|version| version != "v1")
+            || discovery
+                .max_client_protocol_version
+                .as_deref()
+                .is_some_and(|version| version != "v1")
+        {
+            anyhow::bail!("Cline Hub protocol is incompatible (agsx requires protocol v1)");
+        }
+        if discovery.url.trim().is_empty()
+            || discovery.auth_token.trim().is_empty()
+            || discovery.host.trim().is_empty()
+            || discovery.port == 0
+        {
+            anyhow::bail!("Cline Hub discovery record is incomplete");
+        }
+
+        let mut request = discovery
+            .url
+            .as_str()
+            .into_client_request()
+            .context("invalid Cline Hub discovery URL")?;
+        if request.uri().scheme_str() != Some("ws") {
+            anyhow::bail!("Cline Hub discovery URL must use local ws:// transport");
+        }
+        let request_host = request
+            .uri()
+            .host()
+            .context("Cline Hub discovery URL has no host")?
+            .trim_matches(['[', ']']);
+        let discovery_host = discovery.host.trim().trim_matches(['[', ']']);
+        if !request_host.eq_ignore_ascii_case(discovery_host)
+            || request.uri().port_u16() != Some(discovery.port)
+        {
+            anyhow::bail!("Cline Hub discovery URL does not match its host and port");
+        }
+        let address = if let Ok(ip) = discovery_host.parse::<IpAddr>() {
+            if !ip.is_loopback() {
+                anyhow::bail!("Cline Hub discovery host is not a loopback address");
+            }
+            SocketAddr::new(ip, discovery.port)
+        } else if discovery_host.eq_ignore_ascii_case("localhost") {
+            (discovery_host, discovery.port)
+                .to_socket_addrs()
+                .context("failed to resolve the local Cline Hub host")?
+                .find(|address| address.ip().is_loopback())
+                .context("Cline Hub localhost did not resolve to a loopback address")?
+        } else {
+            anyhow::bail!("Cline Hub discovery host is not local");
+        };
+
+        let protocol = format!(
+            "{HUB_AUTH_PROTOCOL_PREFIX}{}",
+            discovery.auth_token.trim()
+        );
+        request.headers_mut().insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::try_from(protocol).context("invalid Cline Hub authentication token")?,
+        );
+        let stream = TcpStream::connect_timeout(&address, Duration::from_secs(5))
+            .context("failed to connect to the local Cline Hub")?;
+        let timeout = Some(Duration::from_secs(20));
+        stream
+            .set_read_timeout(timeout)
+            .context("failed to set Cline Hub read timeout")?;
+        stream
+            .set_write_timeout(timeout)
+            .context("failed to set Cline Hub write timeout")?;
+        let (socket, _) = tungstenite::client(request, stream)
+            .context("Cline Hub WebSocket handshake failed")?;
+
+        Ok(Self {
+            socket,
+            client_id: format!("agsx-{}", uuid::Uuid::new_v4().simple()),
+        })
+    }
+
+    fn command_reply(
+        &mut self,
+        command: &str,
+        payload: serde_json::Value,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+        let request_id = format!("agsx-{}", uuid::Uuid::new_v4().simple());
+        let mut envelope = serde_json::json!({
+            "version": "v1",
+            "command": command,
+            "requestId": request_id,
+            "clientId": self.client_id,
+            "payload": payload,
+        });
+        if let Some(session_id) = session_id {
+            envelope["sessionId"] = serde_json::Value::String(session_id.to_string());
+        }
+        let body = serde_json::to_string(&serde_json::json!({
+            "kind": "command",
+            "envelope": envelope,
+        }))
+        .context("failed to serialize a Cline Hub command")?;
+        self.socket
+            .send(Message::Text(body.into()))
+            .with_context(|| format!("failed to send Cline Hub command {command}"))?;
+
+        loop {
+            let frame = match self
+                .socket
+                .read()
+                .with_context(|| format!("failed while waiting for Cline Hub command {command}"))?
+            {
+                Message::Text(text) => serde_json::from_str::<serde_json::Value>(text.as_str())
+                    .context("Cline Hub returned invalid JSON")?,
+                Message::Binary(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .context("Cline Hub returned invalid binary JSON")?,
+                Message::Ping(bytes) => {
+                    self.socket
+                        .send(Message::Pong(bytes))
+                        .context("failed to answer Cline Hub ping")?;
+                    continue;
+                }
+                Message::Close(reason) => {
+                    anyhow::bail!("Cline Hub closed the connection: {reason:?}");
+                }
+                Message::Pong(_) | Message::Frame(_) => continue,
+            };
+
+            if frame.get("kind").and_then(serde_json::Value::as_str) != Some("reply") {
+                continue;
+            }
+            let Some(reply) = frame.get("envelope").and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            if reply
+                .get("requestId")
+                .and_then(serde_json::Value::as_str)
+                != Some(request_id.as_str())
+            {
+                continue;
+            }
+            if reply
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                != Some("v1")
+            {
+                anyhow::bail!("Cline Hub returned an incompatible reply protocol");
+            }
+            return Ok(reply.clone());
+        }
+    }
+
+    fn command(
+        &mut self,
+        command: &str,
+        payload: serde_json::Value,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let reply = self.command_reply(command, payload, session_id)?;
+        if reply
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(reply
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
+        }
+
+        let code = reply
+            .get("error")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let message = reply
+            .get("error")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("Cline Hub command {command} failed ({code}): {message}");
+    }
+
+    fn register(&mut self, workspace: &Path) -> anyhow::Result<()> {
+        self.command(
+            "client.register",
+            serde_json::json!({
+                "clientId": self.client_id,
+                "clientType": "agsx-convert",
+                "displayName": "agsx-convert",
+                "transport": "native",
+                "actorKind": "client",
+                "workspaceContext": {
+                    "workspaceRoot": workspace,
+                    "cwd": workspace,
+                },
+            }),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn session_exists(&mut self, session_id: &str) -> anyhow::Result<bool> {
+        let reply = self.command_reply(
+            "session.get",
+            serde_json::json!({"sessionId": session_id}),
+            Some(session_id),
+        )?;
+        if reply
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(true);
+        }
+        if reply
+            .get("error")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str)
+            == Some("session_not_found")
+        {
+            return Ok(false);
+        }
+
+        let code = reply
+            .get("error")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let message = reply
+            .get("error")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        anyhow::bail!("Cline Hub command session.get failed ({code}): {message}");
+    }
+
+    fn delete_session(&mut self, session_id: &str) -> anyhow::Result<bool> {
+        let reply = self.command(
+            "session.delete",
+            serde_json::json!({"sessionId": session_id}),
+            Some(session_id),
+        )?;
+        Ok(reply
+            .get("deleted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    }
+}
 
 /// Cline provider implementation.
 pub struct Cline;
 
 impl Cline {
+    fn resume_spec(session_id: &str) -> LaunchSpec {
+        LaunchSpec::new("cline", ["--id".to_string(), session_id.to_string()])
+    }
+
+    fn absolute_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        Ok(std::env::current_dir()
+            .context("could not resolve a Cline path against the current directory")?
+            .join(path))
+    }
+
+    fn binary_path() -> anyhow::Result<PathBuf> {
+        if let Some(path) = std::env::var_os(CLINE_BIN_ENV).filter(|value| !value.is_empty()) {
+            let path = Self::absolute_path(PathBuf::from(path))?;
+            if path.is_file() {
+                return Ok(path);
+            }
+            anyhow::bail!(
+                "{CLINE_BIN_ENV} names {}, but that is not a Cline executable file",
+                path.display()
+            );
+        }
+        which::which("cline")
+            .context("Cline writes require the official `cline` CLI in PATH (or CLINE_BIN)")
+    }
+
+    fn write_data_dir() -> anyhow::Result<PathBuf> {
+        let data_dir = std::env::var_os("CLINE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(Self::sdk_data_dir)
+            .context("could not determine Cline's data directory")?;
+        Self::absolute_path(data_dir)
+    }
+
+    fn cli_command(binary: &Path, data_dir: &Path, cwd: &Path) -> Command {
+        let mut command = Command::new(binary);
+        command
+            .current_dir(cwd)
+            .env("CLINE_DATA_DIR", data_dir)
+            .env("CLINE_NO_AUTO_UPDATE", "1")
+            .env("CLINE_TELEMETRY_DISABLED", "1");
+        command
+    }
+
+    fn command_status(output: &Output) -> String {
+        format!("exit status {}", output.status)
+    }
+
+    fn ensure_hub(binary: &Path, data_dir: &Path, cwd: &Path) -> anyhow::Result<HubDiscovery> {
+        std::fs::create_dir_all(data_dir).with_context(|| {
+            format!("failed to create Cline data directory {}", data_dir.display())
+        })?;
+        let output = Self::cli_command(binary, data_dir, cwd)
+            .args(["hub", "ensure"])
+            .output()
+            .with_context(|| format!("failed to start {}", binary.display()))?;
+        if !output.status.success() {
+            anyhow::bail!("Cline `hub ensure` failed: {}", Self::command_status(&output));
+        }
+
+        let discovery_path = data_dir.join(HUB_DISCOVERY_PATH);
+        let mut last_error = None;
+        for _ in 0..40 {
+            match std::fs::File::open(&discovery_path)
+                .with_context(|| format!("failed to open {}", discovery_path.display()))
+                .and_then(|file| {
+                    serde_json::from_reader(file)
+                        .with_context(|| format!("invalid json: {}", discovery_path.display()))
+                }) {
+                Ok(discovery) => return Ok(discovery),
+                Err(error) => last_error = Some(error),
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!(
+                "Cline Hub discovery record did not appear at {}",
+                discovery_path.display()
+            )
+        }))
+    }
+
+    fn connected_hub(
+        binary: &Path,
+        data_dir: &Path,
+        workspace: &Path,
+    ) -> anyhow::Result<HubClient> {
+        let discovery = Self::ensure_hub(binary, data_dir, workspace)?;
+        let mut hub = HubClient::connect(&discovery)?;
+        hub.register(workspace)?;
+        Ok(hub)
+    }
+
+    fn workspace_for_write(session: &CanonicalSession) -> anyhow::Result<(PathBuf, Vec<String>)> {
+        if let Some(workspace) = session.workspace.as_ref()
+            && workspace.is_dir()
+        {
+            return Ok((workspace.clone(), Vec::new()));
+        }
+
+        let cwd = std::env::current_dir().context("could not determine a workspace for Cline")?;
+        let warnings = session.workspace.as_ref().map_or_else(Vec::new, |workspace| {
+            vec![format!(
+                "The source workspace {} does not exist; Cline imported the session into {}.",
+                workspace.display(),
+                cwd.display()
+            )]
+        });
+        Ok((cwd, warnings))
+    }
+
+    fn title_for_write(session: &CanonicalSession) -> String {
+        session
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                session
+                    .messages
+                    .iter()
+                    .find(|message| message.role == MessageRole::User)
+                    .map(|message| truncate_title(&message.content, 100))
+                    .filter(|title| !title.trim().is_empty())
+            })
+            .unwrap_or_else(|| "Imported session".to_string())
+    }
+
     /// Directories that each contain a `tasks/` (and possibly `state/`) tree.
     ///
     /// `CLINE_HOME` is casr's own override and names such a directory outright;
@@ -176,6 +596,29 @@ impl Cline {
 
     fn tasks_root(storage_root: &Path) -> PathBuf {
         storage_root.join("tasks")
+    }
+
+    fn sessions_root(storage_root: &Path) -> PathBuf {
+        storage_root.join("sessions")
+    }
+
+    fn current_messages_path(storage_root: &Path, session_id: &str) -> PathBuf {
+        Self::sessions_root(storage_root)
+            .join(session_id)
+            .join(format!("{session_id}{CURRENT_MESSAGES_SUFFIX}"))
+    }
+
+    fn current_session_from_path(path: &Path) -> Option<(PathBuf, String)> {
+        let file_name = path.file_name()?.to_str()?;
+        let session_id = file_name.strip_suffix(CURRENT_MESSAGES_SUFFIX)?;
+        if session_id.is_empty()
+            || path.parent()?.file_name()?.to_str()? != session_id
+            || path.parent()?.parent()?.file_name()?.to_str()? != "sessions"
+        {
+            return None;
+        }
+        let storage_root = path.parent()?.parent()?.parent()?.to_path_buf();
+        Some((storage_root, session_id.to_string()))
     }
 
     fn state_dir(storage_root: &Path) -> PathBuf {
@@ -374,6 +817,293 @@ impl Cline {
                 })
             })
             .collect()
+    }
+
+    fn parse_message_items(
+        items: &[serde_json::Value],
+    ) -> (Vec<CanonicalMessage>, HashMap<String, usize>) {
+        let mut messages = Vec::new();
+        let mut model_counts = HashMap::new();
+
+        for item in items {
+            let Some(obj) = item.as_object() else {
+                continue;
+            };
+            let role = normalize_role(
+                obj.get("role")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("user"),
+            );
+            let content_value = obj.get("content").unwrap_or(&serde_json::Value::Null);
+            let content = Self::flatten_message_text(content_value);
+            let tool_calls = Self::extract_tool_calls(Some(content_value));
+            let tool_results = Self::extract_tool_results(Some(content_value));
+            if content.trim().is_empty() && tool_calls.is_empty() && tool_results.is_empty() {
+                continue;
+            }
+
+            let author = obj
+                .get("modelInfo")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|model| model.get("id").or_else(|| model.get("modelId")))
+                .and_then(serde_json::Value::as_str)
+                .filter(|model| !model.is_empty())
+                .map(String::from);
+            if let Some(model) = author.as_ref() {
+                *model_counts.entry(model.clone()).or_insert(0) += 1;
+            }
+
+            messages.push(CanonicalMessage {
+                idx: 0,
+                role,
+                content,
+                timestamp: obj.get("ts").and_then(parse_timestamp),
+                author,
+                tool_calls,
+                tool_results,
+                extra: serde_json::Value::Object(obj.clone()),
+            });
+        }
+        reindex_messages(&mut messages);
+        (messages, model_counts)
+    }
+
+    fn build_hub_messages(session: &CanonicalSession) -> Vec<serde_json::Value> {
+        let mut call_ids: HashMap<(usize, usize), String> = HashMap::new();
+        let mut tool_names: HashMap<String, String> = HashMap::new();
+        let mut unmatched_calls = VecDeque::new();
+        for (message_index, message) in session.messages.iter().enumerate() {
+            for (call_index, call) in message.tool_calls.iter().enumerate() {
+                let call_id = call
+                    .id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(String::from)
+                    .unwrap_or_else(|| format!("agsx-call-{message_index}-{call_index}"));
+                let tool_name = if call.name.trim().is_empty() {
+                    "tool".to_string()
+                } else {
+                    call.name.clone()
+                };
+                call_ids.insert((message_index, call_index), call_id.clone());
+                tool_names.insert(call_id.clone(), tool_name);
+                unmatched_calls.push_back(call_id);
+            }
+        }
+
+        session
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(message_index, message)| {
+                let role = if message.role == MessageRole::Assistant {
+                    "assistant"
+                } else {
+                    "user"
+                };
+                let mut blocks = Vec::new();
+                if !message.content.is_empty() {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": message.content,
+                    }));
+                }
+                for (index, call) in message.tool_calls.iter().enumerate() {
+                    let id = call_ids
+                        .get(&(message_index, index))
+                        .expect("Cline tool call IDs are precomputed");
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": tool_names.get(id).expect("Cline tool name is precomputed"),
+                        "input": crate::providers::claude_code::coerce_tool_input(&call.arguments),
+                    }));
+                }
+                for (result_index, result) in message.tool_results.iter().enumerate() {
+                    let call_id = result
+                        .call_id
+                        .as_deref()
+                        .filter(|id| !id.trim().is_empty())
+                        .map(String::from)
+                        .or_else(|| unmatched_calls.pop_front())
+                        .unwrap_or_else(|| {
+                            format!("agsx-result-{message_index}-{result_index}")
+                        });
+                    if let Some(position) = unmatched_calls
+                        .iter()
+                        .position(|candidate| candidate == &call_id)
+                    {
+                        unmatched_calls.remove(position);
+                    }
+                    let tool_name = tool_names
+                        .get(&call_id)
+                        .map(String::as_str)
+                        .unwrap_or("tool");
+                    blocks.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "name": tool_name,
+                        "content": result.content,
+                        "is_error": result.is_error,
+                    }));
+                }
+
+                let mut out = serde_json::json!({
+                    "role": role,
+                    "content": blocks,
+                });
+                if let Some(timestamp) = message.timestamp {
+                    out["ts"] = serde_json::Value::Number(timestamp.into());
+                }
+                if let Some(model) = message
+                    .author
+                    .as_deref()
+                    .or(session.model_name.as_deref())
+                    .filter(|model| !model.trim().is_empty())
+                {
+                    out["modelInfo"] = serde_json::json!({
+                        "id": model,
+                        "provider": session.provider_slug,
+                    });
+                }
+                out
+            })
+            .collect()
+    }
+
+    fn without_generated_message_ids(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                if let Some(object) = message.as_object_mut() {
+                    object.remove("id");
+                }
+                message
+            })
+            .collect()
+    }
+
+    fn read_current_session(path: &Path) -> anyhow::Result<CanonicalSession> {
+        let (_storage_root, session_id) = Self::current_session_from_path(path)
+            .ok_or_else(|| anyhow::anyhow!("not a current Cline session path: {}", path.display()))?;
+        let root = Self::read_json(path)?;
+        let items = root
+            .as_array()
+            .or_else(|| root.get("messages").and_then(serde_json::Value::as_array))
+            .context("Cline messages file has no messages array")?;
+        let (messages, model_counts) = Self::parse_message_items(items);
+
+        let manifest_path = path
+            .parent()
+            .context("Cline messages file has no session directory")?
+            .join(format!("{session_id}.json"));
+        let manifest = if manifest_path.is_file() {
+            Self::read_json(&manifest_path)?
+        } else {
+            serde_json::Value::Null
+        };
+        let manifest_metadata = manifest
+            .get("metadata")
+            .and_then(serde_json::Value::as_object);
+        let workspace = manifest
+            .get("workspace_root")
+            .and_then(serde_json::Value::as_str)
+            .filter(|workspace| !workspace.trim().is_empty())
+            .map(PathBuf::from);
+        let started_at = manifest.get("started_at").and_then(parse_timestamp);
+        let ended_at = manifest
+            .get("ended_at")
+            .and_then(parse_timestamp)
+            .or(started_at);
+        let title = manifest_metadata
+            .and_then(|metadata| metadata.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|title| !title.trim().is_empty())
+            .map(|title| truncate_title(title, 100))
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|message| message.role == MessageRole::User)
+                    .map(|message| truncate_title(&message.content, 100))
+                    .filter(|title| !title.trim().is_empty())
+            });
+        let model_name = model_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(model, _)| model)
+            .or_else(|| {
+                manifest_metadata
+                    .and_then(|metadata| metadata.get("sourceModel"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|model| !model.trim().is_empty())
+                    .map(String::from)
+            })
+            .or_else(|| {
+                manifest
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|model| !model.trim().is_empty() && *model != "hub")
+                    .map(String::from)
+            });
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "source".into(),
+            serde_json::Value::String("cline-cli".to_string()),
+        );
+        let mut kept_manifest = serde_json::Map::new();
+        for field in [
+            "version",
+            "source",
+            "status",
+            "interactive",
+            "provider",
+            "model",
+            "workspace_root",
+            "started_at",
+            "ended_at",
+        ] {
+            if let Some(value) = manifest.get(field) {
+                kept_manifest.insert(field.to_string(), value.clone());
+            }
+        }
+        if let Some(source) = manifest_metadata {
+            let mut kept = serde_json::Map::new();
+            for field in [
+                "source",
+                "importedBy",
+                "sourceProvider",
+                "sourceModel",
+                "title",
+            ] {
+                if let Some(value) = source.get(field) {
+                    kept.insert(field.to_string(), value.clone());
+                }
+            }
+            if !kept.is_empty() {
+                kept_manifest.insert("metadata".to_string(), serde_json::Value::Object(kept));
+            }
+        }
+        if !kept_manifest.is_empty() {
+            metadata.insert(
+                "sessionManifest".to_string(),
+                serde_json::Value::Object(kept_manifest),
+            );
+        }
+
+        Ok(CanonicalSession {
+            session_id,
+            provider_slug: "cline".to_string(),
+            workspace,
+            title,
+            started_at,
+            ended_at,
+            messages,
+            metadata: serde_json::Value::Object(metadata),
+            source_path: path.to_path_buf(),
+            model_name,
+        })
     }
 
     // These serializers remain test-only format probes. They let the reader's
@@ -615,6 +1345,11 @@ impl Provider for Cline {
         let mut evidence = Vec::new();
         let mut installed = false;
 
+        if let Ok(binary) = Self::binary_path() {
+            installed = true;
+            evidence.push(format!("official CLI: {}", binary.display()));
+        }
+
         if let Ok(home) = std::env::var("CLINE_HOME") {
             evidence.push(format!("CLINE_HOME={home}"));
             let p = PathBuf::from(&home);
@@ -640,6 +1375,7 @@ impl Provider for Cline {
         if installed {
             for root in &roots {
                 evidence.push(store_evidence(&Self::tasks_root(root)));
+                evidence.push(store_evidence(&Self::sessions_root(root)));
             }
         }
 
@@ -654,7 +1390,7 @@ impl Provider for Cline {
     fn session_roots(&self) -> Vec<PathBuf> {
         Self::storage_roots()
             .into_iter()
-            .map(|root| Self::tasks_root(&root))
+            .flat_map(|root| [Self::tasks_root(&root), Self::sessions_root(&root)])
             .collect()
     }
 
@@ -715,6 +1451,12 @@ impl Provider for Cline {
     /// storage root the file is in: `session_roots()` is one `tasks/` per
     /// storage root, and each is the anchor for the tasks it holds.
     fn is_session_path(&self, path: &Path) -> bool {
+        if let Some((storage_root, _)) = Self::current_session_from_path(path) {
+            return Self::storage_roots()
+                .iter()
+                .any(|candidate| candidate == &storage_root);
+        }
+
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
@@ -746,6 +1488,10 @@ impl Provider for Cline {
 
     fn owns_session(&self, session_id: &str) -> Option<PathBuf> {
         for storage_root in Self::storage_roots() {
+            let current = Self::current_messages_path(&storage_root, session_id);
+            if current.is_file() {
+                return Some(current);
+            }
             let task_dir = Self::tasks_root(&storage_root).join(session_id);
             let api = task_dir.join(FILE_API_HISTORY);
             if api.is_file() {
@@ -764,6 +1510,10 @@ impl Provider for Cline {
     }
 
     fn read_session(&self, path: &Path) -> anyhow::Result<CanonicalSession> {
+        if Self::current_session_from_path(path).is_some() {
+            return Self::read_current_session(path);
+        }
+
         let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if !matches!(
             file_name,
@@ -800,9 +1550,8 @@ impl Provider for Cline {
             path.to_path_buf()
         };
 
-        let mut messages: Vec<CanonicalMessage> = Vec::new();
-        let mut model_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut messages = Vec::new();
+        let mut model_counts = HashMap::new();
 
         if api_source_path
             .file_name()
@@ -813,48 +1562,7 @@ impl Provider for Cline {
             let serde_json::Value::Array(items) = root else {
                 return Err(anyhow::anyhow!("Cline api history is not an array"));
             };
-
-            for item in items {
-                let Some(obj) = item.as_object() else {
-                    continue;
-                };
-                let role_str = obj.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-                let role = normalize_role(role_str);
-                let content_value = obj.get("content").unwrap_or(&serde_json::Value::Null);
-                let content = Self::flatten_message_text(content_value);
-
-                let tool_calls = Self::extract_tool_calls(Some(content_value));
-                let tool_results = Self::extract_tool_results(Some(content_value));
-
-                // Emptiness is a property of the message, not of its prose. An
-                // assistant turn whose only content is a `tool_use` block has
-                // no text and is still the turn that made the call; dropping it
-                // here is how a converted session came back one message short.
-                if content.trim().is_empty() && tool_calls.is_empty() && tool_results.is_empty() {
-                    continue;
-                }
-
-                let author = obj
-                    .get("modelInfo")
-                    .and_then(|v| v.get("modelId"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
-                if let Some(ref m) = author {
-                    *model_counts.entry(m.clone()).or_insert(0) += 1;
-                }
-
-                messages.push(CanonicalMessage {
-                    idx: 0,
-                    role,
-                    content,
-                    timestamp: None,
-                    author,
-                    tool_calls,
-                    tool_results,
-                    extra: serde_json::Value::Object(obj.clone()),
-                });
-            }
+            (messages, model_counts) = Self::parse_message_items(&items);
         } else {
             // ui_messages.json fallback: extract a minimal conversational transcript.
             let root = Self::read_json(&api_source_path)?;
@@ -957,19 +1665,170 @@ impl Provider for Cline {
 
     fn write_session(
         &self,
-        _session: &CanonicalSession,
+        session: &CanonicalSession,
         _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        Err(anyhow::anyhow!(CLINE_WRITE_REFUSAL))
+        if session.messages.is_empty() {
+            anyhow::bail!(
+                "Cline import requires at least one message; no provider state was created"
+            );
+        }
+
+        let binary = Self::binary_path().map_err(|_| anyhow::anyhow!(CLINE_CLI_REQUIRED))?;
+        let data_dir = Self::write_data_dir()?;
+        let (workspace, warnings) = Self::workspace_for_write(session)?;
+        let mut hub = Self::connected_hub(&binary, &data_dir, &workspace)?;
+        let session_id = format!("agsx-{}", uuid::Uuid::new_v4().simple());
+        if hub.session_exists(&session_id)? {
+            anyhow::bail!("Cline Hub already contains generated session ID {session_id}");
+        }
+        let initial_messages = Self::build_hub_messages(session);
+        let title = Self::title_for_write(session);
+        let create = hub.command(
+            "session.create",
+            serde_json::json!({
+                "workspaceRoot": workspace,
+                "cwd": workspace,
+                "sessionConfig": {
+                    "sessionId": session_id,
+                    "providerId": "hub",
+                    "modelId": "hub",
+                    "cwd": workspace,
+                    "workspaceRoot": workspace,
+                    "systemPrompt": "",
+                    "mode": "act",
+                    "enableTools": false,
+                    "enableSpawnAgent": false,
+                    "enableAgentTeams": false,
+                },
+                "metadata": {
+                    "source": "agsx-convert",
+                    "interactive": false,
+                    "title": title,
+                    "importedBy": "agsx-convert",
+                    "sourceProvider": session.provider_slug,
+                    "sourceModel": session.model_name,
+                },
+                "runtimeOptions": {
+                    "enableTools": false,
+                    "enableSpawn": false,
+                    "enableTeams": false,
+                },
+                "initialMessages": initial_messages,
+            }),
+            None,
+        );
+        if let Err(create_error) = create {
+            return Err(match hub.delete_session(&session_id) {
+                Ok(_) => create_error,
+                Err(cleanup_error) => anyhow::anyhow!(
+                    "{create_error:#}; partial-session cleanup failed: {cleanup_error:#}"
+                ),
+            });
+        }
+
+        let verified = hub
+            .command(
+                "session.messages",
+                serde_json::json!({"sessionId": session_id}),
+                Some(&session_id),
+            )
+            .and_then(|reply| {
+                let messages = reply
+                    .get("messages")
+                    .and_then(serde_json::Value::as_array)
+                    .context("Cline Hub session.messages reply has no messages array")?;
+                let readback = Self::without_generated_message_ids(messages);
+                if readback != initial_messages {
+                    anyhow::bail!(
+                        "Cline Hub changed the imported history (wrote {} messages, read back {})",
+                        initial_messages.len(),
+                        readback.len()
+                    );
+                }
+                Ok(())
+            });
+        if let Err(verify_error) = verified {
+            return Err(match hub.delete_session(&session_id) {
+                Ok(true) => anyhow::anyhow!(
+                    "Cline imported session {session_id}, but official read-back failed: \
+                     {verify_error:#}; rollback succeeded"
+                ),
+                Ok(false) => anyhow::anyhow!(
+                    "Cline imported session {session_id}, but official read-back failed: \
+                     {verify_error:#}; rollback did not find the session"
+                ),
+                Err(cleanup_error) => anyhow::anyhow!(
+                    "Cline imported session {session_id}, but official read-back failed: \
+                     {verify_error:#}; rollback failed: {cleanup_error:#}"
+                ),
+            });
+        }
+
+        let messages_path = Self::current_messages_path(&data_dir, &session_id);
+        if !messages_path.is_file() {
+            return Err(match hub.delete_session(&session_id) {
+                Ok(true) => anyhow::anyhow!(
+                    "Cline Hub verified session {session_id}, but its official messages artifact \
+                     is missing at {}; rollback succeeded",
+                    messages_path.display()
+                ),
+                Ok(false) => anyhow::anyhow!(
+                    "Cline Hub verified session {session_id}, but its official messages artifact \
+                     is missing at {}; rollback did not find the session",
+                    messages_path.display()
+                ),
+                Err(cleanup_error) => anyhow::anyhow!(
+                    "Cline Hub verified session {session_id}, but its official messages artifact \
+                     is missing at {}; rollback failed: {cleanup_error:#}",
+                    messages_path.display()
+                ),
+            });
+        }
+
+        Ok(WrittenSession {
+            paths: vec![messages_path],
+            session_id: session_id.clone(),
+            resume_command: Self::resume_spec(&session_id).display(),
+            backups: Vec::new(),
+            warnings,
+        })
+    }
+
+    fn rollback_write(&self, written: &WrittenSession) -> anyhow::Result<()> {
+        let locator = written
+            .paths
+            .first()
+            .context("Cline rollback has no messages artifact path")?;
+        let (data_dir, locator_session_id) = Self::current_session_from_path(locator)
+            .context("Cline rollback received an invalid messages artifact path")?;
+        if locator_session_id != written.session_id {
+            anyhow::bail!(
+                "Cline rollback path names {locator_session_id}, but the write names {}",
+                written.session_id
+            );
+        }
+
+        let binary = Self::binary_path()?;
+        let cwd = std::env::current_dir().context("could not determine Cline rollback cwd")?;
+        let mut hub = Self::connected_hub(&binary, &data_dir, &cwd)?;
+        if hub.delete_session(&written.session_id)? {
+            Ok(())
+        } else {
+            anyhow::bail!("Cline Hub did not delete session {}", written.session_id);
+        }
     }
 
     fn write_refusal(&self) -> Option<&'static str> {
-        Some(CLINE_WRITE_REFUSAL)
+        Self::binary_path().is_err().then_some(CLINE_CLI_REQUIRED)
     }
 
-    fn resume_command(&self, _session_id: &str) -> String {
-        // Cline has no CLI resume flag. Best effort: open the workspace in VS Code.
-        "code .".to_string()
+    fn resume_command(&self, session_id: &str) -> String {
+        Self::resume_spec(session_id).display()
+    }
+
+    fn launch_spec(&self, session_id: &str) -> Option<LaunchSpec> {
+        Some(Self::resume_spec(session_id).targeting_session(session_id))
     }
 }
 
@@ -1543,7 +2402,10 @@ mod tests {
 
     #[test]
     fn writer_resume_command() {
-        assert_eq!(Cline.resume_command("123456789"), "code .");
+        assert_eq!(
+            Cline.resume_command("agsx-session"),
+            "cline --id agsx-session"
+        );
     }
 
     #[test]

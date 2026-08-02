@@ -26,7 +26,7 @@ bypasses the permission bits, so the operation succeeds and the assertion trips.
 These are correct tests that cannot pass as root; they say nothing about the code
 under test. Run them as an unprivileged user if they need to be exercised.
 
-### 1 is a genuine pre-existing failure
+### 1 was a fixture transport failure
 
 `fixture_agy_simple` — the Antigravity provider returns `title: None` where
 `tests/fixtures/expected/agy_simple.json` expects
@@ -34,16 +34,16 @@ under test. Run them as an unprivileged user if they need to be exercised.
 
 The fixture's `conversations/*.db` is a 45-byte stub (literal bytes
 `SQLite format 3\0fixture-not-a-re…`), present only so discovery finds the
-session; the real content lives in
-`antigravity/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`.
-The provider is not deriving the title from it.
-
-Not investigated further: Antigravity is read-only upstream and stays on the
-flat text track in this fork, so it is outside the fidelity work. Recorded here
-so it is not later mistaken for a regression.
+session. The real content originally lived below a directory named `logs`,
+which the synchronized runtime intentionally excludes. The provider derives
+the title correctly when that transcript is present; the failure came from the
+runtime mirror omitting the fixture. The current test stores the transcript in
+a sync-safe fixture path and reconstructs the native Antigravity layout in a
+temporary directory.
 
 ## Regression rule for this fork
 
-A change is clean when it leaves **1159 passed / 13 failed** unchanged, with the
-failure set identical to the list above. Anything else needs explaining before
-it is committed.
+At the fork point, a change was considered clean when it left **1159 passed /
+13 failed** unchanged, with the failure set identical to the list above. This
+document is a historical snapshot; the current tree uses its full test suite as
+the acceptance baseline.

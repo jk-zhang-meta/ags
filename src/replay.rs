@@ -98,6 +98,80 @@ pub enum ExclusionReason {
     NotModelVisible,
 }
 
+/// The live model context during the fold: ordered, and each id at most once.
+///
+/// A plain `Vec<String>` stood here, and one real shape of input put the same
+/// id into it twice. `claude_code_ir` prepends a compaction anchor's id to the
+/// marker's [`Body::Compaction::context`] when the summary record is written
+/// *after* the boundary — which is where Claude Code's own loader puts it — so
+/// that id is live from the marker onward and is offered again when its own
+/// record is reached in file order.
+///
+/// The replay survived that, because it deduplicated on the way out. The other
+/// three readers of the live set did not: the next compaction's supersede loop,
+/// [`roll_back`] and [`prune_forks`] each sweep it and push one [`Excluded`]
+/// per entry, so one event produced two exclusions. That double-counts it in
+/// every loss the fidelity report derives from that list, and breaks the
+/// replay-closure invariant `conformance::invariants` checks — on five
+/// multi-compaction transcripts of the local corpus, each over-counting by
+/// exactly its number of repeats.
+///
+/// So deduplicating the output was the wrong place: it hid the repeat from the
+/// one consumer that tolerated it. The invariant belongs where an id enters,
+/// where no future reader of the live set has to remember it.
+///
+/// First insertion wins. That is both the position the reader intends — the
+/// anchor ahead of the tail it preserved — and what the removed output filter
+/// already did, so no replay changes.
+#[derive(Default)]
+struct Live {
+    order: Vec<String>,
+    member: HashSet<String>,
+}
+
+impl Live {
+    /// Add `id` unless it is already live.
+    fn push(&mut self, id: &str) {
+        if !self.member.contains(id) {
+            self.member.insert(id.to_string());
+            self.order.push(id.to_string());
+        }
+    }
+
+    /// Replace the whole set with `ids`, in the order given.
+    ///
+    /// A compaction's state assignment. `ids` is deduplicated on the way in for
+    /// the same reason [`Live::push`] is: a reader is entitled to name a record
+    /// twice, and nothing downstream should have to cope with it.
+    fn assign(&mut self, ids: &[String]) {
+        self.order.clear();
+        self.member.clear();
+        for id in ids {
+            self.push(id);
+        }
+    }
+
+    /// Keep the entries `keep` answers `true` for.
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let member = &mut self.member;
+        self.order.retain(|id| {
+            let kept = keep(id);
+            if !kept {
+                member.remove(id.as_str());
+            }
+            kept
+        });
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.order.iter()
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.order
+    }
+}
+
 /// Fold the capture into the context the target should be handed.
 pub fn resolve(ir: &SessionIr) -> ReplayPlan {
     // `Event::id` is documented unique within the session and every map here
@@ -121,7 +195,7 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
         position.entry(event.id.as_str()).or_insert(index);
     }
 
-    let mut live: Vec<String> = Vec::new();
+    let mut live = Live::default();
     let mut excluded: Vec<Excluded> = Vec::new();
     let mut checkpoints: Vec<String> = Vec::new();
     // The newest checkpoint's surviving context, carried out of the fold rather
@@ -173,7 +247,7 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
             }
             Body::Compaction { context, .. } => {
                 let kept: HashSet<&str> = context.iter().map(String::as_str).collect();
-                for id in &live {
+                for id in live.iter() {
                     if !kept.contains(id.as_str()) {
                         excluded.push(Excluded {
                             id: id.clone(),
@@ -186,7 +260,7 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
                 // The marker itself never joins `live`: it is a boundary, not
                 // replayable content.
                 checkpoint_context = context.clone();
-                live = context.clone();
+                live.assign(context);
                 checkpoints.push(event.id.clone());
             }
             // Ordinary content: model-visible, and it edits no history. Several
@@ -202,15 +276,15 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
             | Body::EnvSnapshot { .. }
             | Body::Attachment { .. }
             | Body::Control { .. }
-            | Body::Unknown { .. } => live.push(event.id.clone()),
+            | Body::Unknown { .. } => live.push(&event.id),
         }
     }
 
-    let live = prune_forks(
+    let events = prune_forks(
         ir,
         &checkpoint_context,
         checkpoints.last().map(String::as_str),
-        live,
+        live.into_vec(),
         &mut excluded,
     );
 
@@ -227,18 +301,11 @@ pub fn resolve(ir: &SessionIr) -> ReplayPlan {
     // corpus compactions, 0 that do not), so the sort was a no-op on every real
     // session while making the fold's authority fictional for the next reader.
     //
-    // The `filter` is the id-uniqueness guarantee. A repeated `Event::id` puts
-    // both copies in `live`, and one of the two events is unreachable by id
-    // anyway — every map here and in `model_visible` keys on it. Nothing can
-    // recover the shadowed event at this point, but the target must at least
-    // not be shown the survivor twice.
-    let mut seen: HashSet<&str> = HashSet::with_capacity(live.len());
-    let events: Vec<String> = live
-        .iter()
-        .filter(|id| seen.insert(id.as_str()))
-        .cloned()
-        .collect();
-
+    // Uniqueness needs no pass here either: [`Live`] holds it from the first
+    // insertion and the prune above only removes. A `.filter` over a `seen` set
+    // used to stand here instead, and deduplicating the *output* was the wrong
+    // place — it hid the repeat from the one consumer that tolerated it while
+    // every other reader of the live set still saw both copies. See [`Live`].
     ReplayPlan {
         events,
         excluded,
@@ -257,7 +324,7 @@ fn roll_back(
     position: &HashMap<&str, usize>,
     turns: u32,
     by: &str,
-    live: &mut Vec<String>,
+    live: &mut Live,
     excluded: &mut Vec<Excluded>,
 ) {
     let num_turns = turns.max(1) as usize;
@@ -287,7 +354,7 @@ fn roll_back(
         match turn_of(id) {
             Some(turn) if undone.contains(turn) => {
                 excluded.push(Excluded {
-                    id: id.clone(),
+                    id: id.to_string(),
                     reason: ExclusionReason::RolledBack { by: by.to_string() },
                 });
                 false
@@ -550,6 +617,110 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// The Claude shape: a `context` that names a record written *later* in the
+    /// file.
+    ///
+    /// `claude_code_ir::Sink::attach_compaction_anchor` prepends the summary's
+    /// id to the marker's `context` when the summary record arrives after the
+    /// boundary, because that is where the vendor's own loader puts it. The id
+    /// is therefore live from the marker onward *and* offered again when its own
+    /// record is reached, and `live` used to hold both copies. The replay was
+    /// still right — it deduplicated on the way out — but every later sweep over
+    /// `live` saw the id twice: the next compaction's supersede loop, and the
+    /// removals in `roll_back` and `prune_forks`. Each pushed a second
+    /// `Excluded` for one event, which double-counts it in every loss the
+    /// fidelity report derives from that list and breaks the replay-closure
+    /// invariant `conformance::invariants` checks.
+    ///
+    /// Measured, not hypothesised: five multi-compaction transcripts in the
+    /// local corpus failed exactly this way, each over-counting by precisely its
+    /// number of repeated exclusions.
+    #[test]
+    fn a_context_naming_a_later_record_is_excluded_once() {
+        let plan = resolve(&ir(vec![
+            message("old"),
+            compaction("c1", &["anchor"], &["old"]),
+            message("anchor"),
+            message("tail"),
+            compaction("c2", &[], &["anchor", "tail"]),
+        ]));
+
+        let mut seen = HashSet::new();
+        let repeated: Vec<&str> = plan
+            .excluded
+            .iter()
+            .filter(|excluded| !seen.insert(excluded.id.as_str()))
+            .map(|excluded| excluded.id.as_str())
+            .collect();
+        assert!(
+            repeated.is_empty(),
+            "an event excluded twice is counted twice in every fidelity report: {repeated:?}"
+        );
+    }
+
+    /// The other half: the fix must not move what the model is shown.
+    ///
+    /// The anchor belongs where the reader put it — ahead of the tail it
+    /// preserved — and it belongs there exactly once.
+    #[test]
+    fn a_context_naming_a_later_record_keeps_the_position_the_reader_chose() {
+        let plan = resolve(&ir(vec![
+            message("old"),
+            compaction("c1", &["anchor"], &["old"]),
+            message("anchor"),
+            message("tail"),
+        ]));
+
+        assert_eq!(plan.events, ["anchor", "tail"]);
+    }
+
+    /// [`Live::retain`] has to take the id out of the membership set as well as
+    /// out of the order, and this is the one input that can tell.
+    ///
+    /// A compaction names a record that is still to come, so the id is live
+    /// before its own line is reached; a rollback then undoes the turn it
+    /// belongs to. When the line finally arrives it is a fresh insertion and
+    /// must be replayed — the rollback removed the *earlier* assignment of it,
+    /// not the record. A `retain` that dropped the id from the order and left
+    /// it in the set would refuse that insertion and silently lose the event,
+    /// which is the failure mode this whole type exists to prevent, inverted.
+    #[test]
+    fn a_rolled_back_id_can_re_enter_when_its_own_record_arrives() {
+        let plan = resolve(&ir(vec![
+            turned("a", "t1"),
+            compaction("c1", &["late"], &["a"]),
+            rollback("r", 1),
+            turned("late", "t2"),
+        ]));
+
+        assert_eq!(plan.events, ["late"]);
+    }
+
+    /// A reader is entitled to name a record twice in one `context`, and
+    /// [`Live::assign`] is where that stops mattering.
+    ///
+    /// Without the dedupe on the way in, the repeat survives to the next
+    /// compaction's supersede loop and is excluded twice — the same defect as a
+    /// late-written anchor, reached by a different route.
+    #[test]
+    fn a_context_that_names_one_record_twice_excludes_it_once() {
+        let plan = resolve(&ir(vec![
+            message("x"),
+            message("y"),
+            compaction("c1", &["x", "x"], &["y"]),
+            compaction("c2", &[], &["x"]),
+        ]));
+
+        let mut seen = HashSet::new();
+        let repeated: Vec<&str> = plan
+            .excluded
+            .iter()
+            .filter(|excluded| !seen.insert(excluded.id.as_str()))
+            .map(|excluded| excluded.id.as_str())
+            .collect();
+        assert!(repeated.is_empty(), "excluded twice: {repeated:?}");
     }
 
     #[test]

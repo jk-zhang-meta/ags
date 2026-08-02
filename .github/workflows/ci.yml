@@ -367,6 +367,47 @@ jobs:
         env:
           NO_COLOR: "1"
 
+  # The Bash runtime in plugins/ags/scripts/ags is the larger half of the
+  # product and had no automated coverage here at all: these two suites are
+  # ~8,000 lines and ran only when someone remembered to run them by hand.
+  #
+  # scripts/real_e2e_test.sh and scripts/real_provider_smoke.sh are
+  # deliberately *not* here. Both skip per provider when the vendor CLI or its
+  # home directory is absent, so on a runner they would pass having asserted
+  # nothing — a green job that means less than no job at all.
+  ags-shell:
+    name: AGS Shell Suites
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Both suites derive FAKE_CONTEXT_RUNTIME_* from whatever `node` they
+      # find. Pinning it keeps the Context Mode fixtures reproducible when the
+      # runner image bumps its preinstalled Node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # test-ags-install-smoke.sh needs the debug binary; test-ags.sh drives the
+      # Bash runtime directly and does not.
+      - name: Build debug binary
+        run: cargo build
+
+      - name: AGS runtime suite
+        run: bash tests/test-ags.sh
+        env:
+          NO_COLOR: "1"
+
+      - name: Installer smoke suite
+        run: bash tests/test-ags-install-smoke.sh
+        env:
+          NO_COLOR: "1"
+
   build:
     name: Release build
     runs-on: ubuntu-latest

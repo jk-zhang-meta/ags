@@ -337,6 +337,14 @@ assert_file_exists() {
     fi
 }
 
+assert_file_not_exists() {
+    if [[ ! -e "$2" ]]; then
+        pass "$1"
+    else
+        fail "$1" "path absent: $2" "path exists"
+    fi
+}
+
 assert_file_size_gt() {
     local label="$1" filepath="$2" min_bytes="$3"
     if [[ -f "$filepath" ]]; then
@@ -438,6 +446,14 @@ setup_codex_fixture() {
     echo "$session_id"
 }
 
+setup_cursor_fixture() {
+    local session_id="cur-composer-001"
+    local target_dir="$CURSOR_HOME/User/globalStorage"
+    mkdir -p "$target_dir"
+    cp "$FIXTURES_DIR/cursor/state.vscdb" "$target_dir/state.vscdb"
+    echo "$session_id"
+}
+
 setup_gemini_fixture() {
     local fixture_name="$1"
     local src="$FIXTURES_DIR/gemini/${fixture_name}.json"
@@ -464,6 +480,13 @@ setup_chatgpt_fixture() {
     session_id=$(jq -r '.id' "$src")
     mkdir -p "$CHATGPT_HOME/conversations-fixture"
     cp "$src" "$CHATGPT_HOME/conversations-fixture/${session_id}.json"
+    echo "$session_id"
+}
+
+setup_cline_fixture() {
+    local session_id="1700001234567"
+    mkdir -p "$CLINE_HOME"
+    cp -R "$FIXTURES_DIR/cline/." "$CLINE_HOME/"
     echo "$session_id"
 }
 
@@ -699,18 +722,14 @@ fi
 log "TEST: Resume CC → Cursor"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->cur" --json resume cur "$cc_sid"
-assert_exit_ok "CC→Cursor write succeeds"
-assert_valid_json "CC→Cursor JSON is valid"
-cursor_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-if [[ -n "$cursor_sid" ]]; then
-    pass "CC→Cursor JSON includes target_session_id"
-else
-    fail "CC→Cursor JSON includes target_session_id" "non-empty id" "<empty>"
-fi
-assert_file_exists "Cursor DB exists after conversion" "$CURSOR_HOME/User/globalStorage/state.vscdb"
+EXPECT_FAIL=1 run_casr "resume cc->cur refused" --json resume cur "$cc_sid" || true
+assert_exit_fail "CC→Cursor write is refused"
+assert_json_error_envelope "CC→Cursor refusal is JSON"
+assert_stderr_contains "CC→Cursor explains the vendor lifecycle boundary" "read/resume-only"
+assert_file_count "CC→Cursor refusal writes no state" "$CURSOR_HOME" 0
 
 log "TEST: Resume Cursor → CC"
+cursor_sid=$(setup_cursor_fixture)
 run_casr "resume cur->cc" resume cc "$cursor_sid" --source cur
 assert_exit_ok "Cursor→CC write succeeds"
 assert_stdout_contains "cursor→cc shows claude-code" "claude-code"
@@ -722,19 +741,14 @@ assert_stdout_contains "cursor→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → Cline"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->cln" --json resume cln "$cc_sid"
-assert_exit_ok "CC→Cline write succeeds"
-assert_valid_json "CC→Cline JSON is valid"
-cline_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-if [[ -n "$cline_sid" ]]; then
-    pass "CC→Cline JSON includes target_session_id"
-else
-    fail "CC→Cline JSON includes target_session_id" "non-empty id" "<empty>"
-fi
-assert_file_exists "Cline API history exists after conversion" \
-    "$CLINE_HOME/tasks/$cline_sid/api_conversation_history.json"
+EXPECT_FAIL=1 run_casr "resume cc->cln refused" --json resume cln "$cc_sid" || true
+assert_exit_fail "CC→Cline write is refused without the official CLI"
+assert_json_error_envelope "CC→Cline refusal is JSON"
+assert_stderr_contains "CC→Cline explains the vendor API boundary" "read/resume-only"
+assert_file_count "CC→Cline refusal writes no state" "$CLINE_HOME" 0
 
 log "TEST: Resume Cline → CC"
+cline_sid=$(setup_cline_fixture)
 run_casr "resume cln->cc" resume cc "$cline_sid" --source cln
 assert_exit_ok "Cline→CC write succeeds"
 assert_stdout_contains "cline→cc shows claude-code" "claude-code"
@@ -778,7 +792,10 @@ if [[ -n "$aid_sid" ]]; then
 else
     fail "CC→Aider JSON includes target_session_id" "non-empty id" "<empty>"
 fi
-assert_file_exists "Aider history file exists after conversion" "$AIDER_HOME/.aider.chat.history.md"
+aider_path=$(echo "$LAST_STDOUT" | jq -r '.written_paths[0] // empty')
+assert_file_exists "Independent Aider history exists after conversion" "$aider_path"
+assert_file_not_exists "Aider conversion does not overwrite the default history" \
+    "$AIDER_HOME/.aider.chat.history.md"
 
 log "TEST: Resume Aider → CC"
 run_casr "resume aid->cc" resume cc "$aid_sid" --source aid
@@ -858,7 +875,7 @@ run_casr "resume gmi->cod" resume cod "$gmi_sid"
 assert_exit_ok "Gemini→Codex write succeeds"
 
 # ===========================================================================
-# TEST: Resume — Antigravity (agy) → CC  [agy is a read/resume-only SOURCE]
+# TEST: Resume — Antigravity (agy) → CC
 # ===========================================================================
 
 log "TEST: Resume Antigravity → CC"
@@ -878,12 +895,25 @@ assert_exit_ok "info agy conversation succeeds"
 assert_json_field "agy info provider is antigravity" ".provider" "antigravity"
 assert_json_field "agy info model is unknown" ".model_name" "null"
 
-# agy is read/resume-only: it must NOT accept being a conversion TARGET.
-log "TEST: Antigravity rejected as conversion target"
+# Antigravity target writes are available when the optional official SDK is
+# installed. Without it, the refusal must name the missing dependency and
+# leave the target store untouched.
+log "TEST: Resume CC → Antigravity"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->agy refused" resume agy "$cc_sid" || true
-assert_exit_fail "CC→Antigravity write is refused (agy is read/resume-only)"
+EXPECT_FAIL=1 run_casr "resume cc->agy" --json resume agy "$cc_sid" || true
+if [[ "$LAST_EXIT" -eq 0 ]]; then
+    assert_json_field "CC→Antigravity target is antigravity" ".target_provider" "antigravity"
+    agy_db=$(echo "$LAST_STDOUT" | jq -r '.written_paths[0] // empty')
+    agy_transcript=$(echo "$LAST_STDOUT" | jq -r '.written_paths[1] // empty')
+    assert_file_exists "CC→Antigravity native database exists" "$agy_db"
+    assert_file_exists "CC→Antigravity transcript exists" "$agy_transcript"
+else
+    assert_exit_fail "CC→Antigravity refuses without the official SDK"
+    assert_stderr_contains "CC→Antigravity names the SDK dependency" "google-antigravity>=0.1.9"
+    assert_file_count "CC→Antigravity SDK refusal creates no database" \
+        "$GEMINI_HOME/antigravity-cli/conversations" 0
+fi
 
 # ===========================================================================
 # TEST: Resume — CC → ChatGPT
@@ -985,7 +1015,7 @@ cc_sid=$(setup_cc_fixture "cc_simple")
 EXPECT_FAIL=1 run_casr "resume cc->ocl refused" --json resume ocl "$cc_sid" || true
 assert_exit_fail "CC→OpenClaw write is refused"
 assert_json_error_envelope "CC→OpenClaw refusal is JSON"
-assert_stderr_contains "CC→OpenClaw explains gateway boundary" "gateway"
+assert_stderr_contains "CC→OpenClaw explains gateway boundary" "Gateway"
 assert_file_count "CC→OpenClaw refusal writes no state" "$OPENCLAW_HOME" 0
 
 log "TEST: Resume OpenClaw → CC"
@@ -1048,12 +1078,9 @@ assert_json_error_envelope "malformed Amp error is JSON"
 
 log "TEST: Malformed Cline session (wrong JSON shape)"
 reset_env
-cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "seed cln for malformed" --json resume cln "$cc_sid"
-assert_exit_ok "seed cln succeeds"
-cline_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
+cline_sid=$(setup_cline_fixture)
 cline_api="$CLINE_HOME/tasks/$cline_sid/api_conversation_history.json"
-assert_file_exists "Cline API history exists after seed" "$cline_api"
+assert_file_exists "Cline API history fixture exists" "$cline_api"
 printf '{}' > "$cline_api"
 EXPECT_FAIL=1 run_casr "malformed cln read" --json resume cc "$cline_sid" --dry-run --source cln || true
 assert_exit_fail "malformed Cline session fails"
@@ -1132,10 +1159,12 @@ assert_json_field "dry-run Gemini target_provider" ".target_provider" "gemini"
 log "TEST: Dry-run JSON content — CC→Cursor"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "dry-run json cc->cur" --json resume cur "$cc_sid" --dry-run
-assert_exit_ok "CC→Cursor dry-run JSON succeeds"
-assert_valid_json "dry-run Cursor JSON is valid"
-assert_json_field "dry-run Cursor ok=true" ".ok" "true"
+EXPECT_FAIL=1 run_casr "dry-run json cc->cur refused" \
+    --json resume cur "$cc_sid" --dry-run || true
+assert_exit_fail "CC→Cursor dry-run is refused"
+assert_json_error_envelope "CC→Cursor dry-run refusal is JSON"
+assert_stderr_contains "CC→Cursor dry-run explains refusal" "read/resume-only"
+assert_file_count "CC→Cursor dry-run writes no files" "$CURSOR_HOME" 0
 
 log "TEST: Dry-run JSON content — CC→ChatGPT"
 reset_env
@@ -1177,12 +1206,13 @@ cc_sid=$(setup_cc_fixture "cc_simple")
 run_casr "force gmi: write" resume gmi "$cc_sid" --force
 assert_exit_ok "CC→Gemini --force accepted"
 
-log "TEST: --force accepted — CC→Cursor"
+log "TEST: --force cannot bypass Cursor refusal"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "force cur: write" --json resume cur "$cc_sid" --force
-assert_exit_ok "CC→Cursor --force accepted"
-assert_valid_json "--force Cursor JSON is valid"
+EXPECT_FAIL=1 run_casr "force cur: refused" --json resume cur "$cc_sid" --force || true
+assert_exit_fail "CC→Cursor --force is refused"
+assert_json_error_envelope "CC→Cursor --force refusal is JSON"
+assert_file_count "CC→Cursor --force writes no files" "$CURSOR_HOME" 0
 
 log "TEST: --force accepted — CC→ClawdBot"
 reset_env
@@ -1274,9 +1304,10 @@ assert_file_count "enrich dry-run writes no files" "$CODEX_HOME/sessions" 0
 # TEST: Full 14x14 source/target behavior matrix (bd-1bh.29)
 # ===========================================================================
 # Tests every directed (source, target) provider pair — 14 sources × 13
-# targets = 182 behaviors. OpenCode, ChatGPT and OpenClaw are fixture-backed
-# sources and expected-refusal targets. CC, Codex, and Gemini also load native
-# fixtures; the other eight providers are seeded via CC → provider.
+# targets = 182 behaviors. Cursor, Cline, OpenCode, ChatGPT and OpenClaw are
+# fixture-backed sources and expected-refusal targets when their official
+# vendor write API/CLI is unavailable. CC, Codex, and Gemini also load native
+# fixtures; the other seven providers are seeded via CC → provider.
 # Each source is set up once and reused across all 13 targets.
 
 ALL_ALIASES=(cc cod gmi cur cln aid amp opc gpt cwb vib fac ocl pi)
@@ -1289,6 +1320,8 @@ setup_source_session() {
         cc)  setup_cc_fixture "cc_simple" ;;
         cod) setup_codex_fixture "codex_modern" "jsonl" ;;
         gmi) setup_gemini_fixture "gmi_simple" ;;
+        cur) setup_cursor_fixture ;;
+        cln) setup_cline_fixture ;;
         opc) setup_opencode_fixture ;;
         gpt) setup_chatgpt_fixture ;;
         ocl) setup_openclaw_fixture ;;
@@ -1325,15 +1358,21 @@ for source in "${ALL_ALIASES[@]}"; do
         MATRIX_PAIRS=$((MATRIX_PAIRS + 1))
         local_pair="${source}->${target}"
 
-        if [[ "$target" == "opc" || "$target" == "gpt" || "$target" == "ocl" ]]; then
-            if [[ "$target" == "opc" ]]; then
+        if [[ "$target" == "cur" || "$target" == "cln" || "$target" == "opc" || "$target" == "gpt" || "$target" == "ocl" ]]; then
+            if [[ "$target" == "cur" ]]; then
+                refusal_text="Cursor is read/resume-only"
+                refusal_home="$CURSOR_HOME"
+            elif [[ "$target" == "cln" ]]; then
+                refusal_text="Cline is read/resume-only"
+                refusal_home="$CLINE_HOME"
+            elif [[ "$target" == "opc" ]]; then
                 refusal_text="OpenCode is read/resume-only"
                 refusal_home="$OPENCODE_HOME"
             elif [[ "$target" == "gpt" ]]; then
                 refusal_text="no supported session import path"
                 refusal_home="$CHATGPT_HOME"
             else
-                refusal_text="gateway"
+                refusal_text="Gateway"
                 refusal_home="$OPENCLAW_HOME"
             fi
 

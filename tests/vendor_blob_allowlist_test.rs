@@ -508,9 +508,14 @@ const PLANTED_KIRO_HISTORY_SECRET: &str =
 /// A value in a `session_state` field that `SessionStateV1` does not declare.
 const PLANTED_KIRO_STATE_SECRET: &str = "kiro-oidc-refresh-c0ffee11deadbeefc0ffee11deadbeef";
 
-/// A `$KIRO_HOME` holding the captured fixture triplet, with two additions:
-/// a plain credential line appended to `.history`, and a `session_state` key
-/// outside the five `SessionStateV1` declares.
+/// A value planted under declared state objects whose nested shapes are not
+/// safe to copy wholesale.
+const PLANTED_KIRO_NESTED_SECRET: &str =
+    "kiro-nested-future-secret-c0ffee11deadbeefc0ffee11deadbeef";
+
+/// A `$KIRO_HOME` holding the captured fixture triplet, with a plain credential
+/// line appended to `.history` and secrets planted at every unbounded
+/// `session_state` boundary.
 fn seed_kiro(root: &Path) {
     let src = fixtures_dir().join("kiro");
     let dst = root.join("sessions").join("cli");
@@ -534,6 +539,16 @@ fn seed_kiro(root: &Path) {
     .unwrap();
     meta["session_state"]["auth_state"] =
         serde_json::json!({ "refresh_token": PLANTED_KIRO_STATE_SECRET });
+    meta["session_state"]["conversation_metadata"]["user_turn_metadatas"] =
+        serde_json::json!([{ "future_secret": PLANTED_KIRO_NESTED_SECRET }]);
+    meta["session_state"]["conversation_metadata"]["user_turn_start_request"] =
+        serde_json::json!({ "system_prompt": PLANTED_KIRO_NESTED_SECRET });
+    meta["session_state"]["conversation_metadata"]["last_request"] =
+        serde_json::json!({ "system_prompt": PLANTED_KIRO_NESTED_SECRET });
+    meta["session_state"]["permissions"]["filesystem"]["future_secret"] =
+        serde_json::json!(PLANTED_KIRO_NESTED_SECRET);
+    meta["session_state"]["rts_model_state"]["additional_fields"] =
+        serde_json::json!({ "blob": PLANTED_KIRO_NESTED_SECRET });
     std::fs::write(
         dst.join(format!("{KIRO_SESSION_ID}.json")),
         serde_json::to_vec_pretty(&meta).unwrap(),
@@ -542,7 +557,7 @@ fn seed_kiro(root: &Path) {
 }
 
 #[test]
-fn kiro_info_json_publishes_neither_history_nor_an_unlisted_state_field() {
+fn kiro_info_json_publishes_neither_history_nor_unbounded_state_fields() {
     let home = tempfile::tempdir().unwrap();
     let store = tempfile::tempdir().unwrap();
     seed_kiro(home.path());
@@ -563,6 +578,12 @@ fn kiro_info_json_publishes_neither_history_nor_an_unlisted_state_field() {
         !stdout.contains(PLANTED_KIRO_STATE_SECRET),
         "`casr info --json` republished a session_state field that \
          SessionStateV1 does not declare.\n--- stdout ---\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(PLANTED_KIRO_NESTED_SECRET),
+        "`casr info --json` republished an unbounded nested session_state \
+         value. Naming a parent object is not a recursive allow-list.\n\
+         --- stdout ---\n{stdout}"
     );
 }
 
@@ -595,19 +616,14 @@ fn kiro_session_state_is_an_allow_list_and_history_is_absent() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        [
-            "agent_name",
-            "conversation_metadata",
-            "permissions",
-            "rts_model_state",
-            "version",
-        ],
-        "session_state must carry only the fields SessionStateV1 declares \
-         (`goal` is optional and absent from this capture). Widening this set \
-         republishes a field nobody has read."
+        ["version"],
+        "session_state must carry only the audited format tag. Kiro accepts \
+         this minimal state, while every nested state object contains fields \
+         casr cannot safely publish wholesale."
     );
+    assert_eq!(state["version"], "v1");
 
-    // The one thing casr reads back out of session_state must still work.
+    // The useful facts derived before filtering must still work.
     assert_eq!(json["model_name"], "claude-opus-4.8");
     assert_eq!(
         json["metadata"]["parent_session_id"],

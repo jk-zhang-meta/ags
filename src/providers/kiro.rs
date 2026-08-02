@@ -161,7 +161,7 @@
 //! (`summary` + `messages_snapshot`) and `ResetTo` (`target_index`). The last
 //! two carry no turn and no `content`, so [`parse_envelope`] yields nothing for
 //! them. There is no system or operator member, which is what
-//! [`message_to_envelope`] has to place a system turn against. The
+//! [`message_to_envelopes`] has to place a system turn against. The
 //! `data.content` array carries typed parts whose
 //! own `kind` is `text` | `thinking` | `toolUse` | `toolResult`:
 //!
@@ -171,8 +171,10 @@
 //! - `toolResult` → `data` is `{ toolUseId, content: [...], status }`.
 //!
 //! A `ToolResults` line additionally carries `data.results`, a map keyed by
-//! tool-use id with the rich tool invocation/outcome. We preserve it verbatim
-//! in the message `extra` so it survives a round-trip.
+//! tool-use id with the typed invocation/outcome Kiro actually replays. The
+//! reader derives canonical tool results from the bounded `data.content`
+//! blocks; the writer reconstructs the minimum accepted `results` entries and
+//! never republishes the unbounded vendor map from `extra`.
 //!
 //! ## Resume
 //!
@@ -352,69 +354,22 @@ impl Kiro {
         path.with_extension(ext)
     }
 
-    /// The `session_state` object, reduced to the fields `kiro-cli` puts there.
+    /// Reduce `session_state` to the only value casr can safely publish.
     ///
-    /// The doc above described this as
-    /// `{"version": …, "rts_model_state": {…}, "permissions": {…}, … }`, and
-    /// the `…` was the whole problem: nobody had enumerated it, and the reader
-    /// copied it wholesale into a bag `casr info --json` prints verbatim.
+    /// `conversation_metadata` contains outbound model requests,
+    /// `rts_model_state` has an open extension bag, and `permissions` is itself
+    /// nested. Copying any parent object is therefore still a wholesale vendor
+    /// blob. The model name is derived before this filter and parent linkage is
+    /// a separate top-level field, so no displayed fact depends on those
+    /// objects.
     ///
-    /// It is `chat_cli_v2::agent::session::SessionStateV1`, internally tagged
-    /// on `version`, and it is exactly five fields plus the tag. Read from the
-    /// shipped `kiro-cli-chat` 2.14.2 binary, which retains DWARF and a symbol
-    /// table: the serde visitor string `struct SessionStateV1 with 5 elements`
-    /// and its `FIELDS` table, cross-checked against two captured
-    /// `sessions/cli/<id>.json` files. (`rewind` sits next to `agent_name` in
-    /// `.rodata`, but the live serializer emits `goal`; string-table adjacency
-    /// is not struct membership, and the capture is authoritative.)
-    ///
-    /// No field is a credential. Kiro keeps auth in
-    /// `~/.local/share/kiro-cli/data.sqlite3` (mode 0600) — `auth_kv` holding
-    /// the OIDC device registration and tokens, `state` holding temporary STS
-    /// credentials — plus the `KIRO_API_KEY` variable. Grepping 872 captured
-    /// session files for the credential keyword set returns nothing.
-    ///
-    /// Filtering costs nothing at load. Measured against the real V2 loader
-    /// (`chat _ ensure-session`): the `session_state` *key* is required, but
-    /// its value is unvalidated — `{}`, `null`, `42`, any subset of sub-fields,
-    /// and unknown keys all load. Kiro's own `chat _ export-session` omits
-    /// `session_state` entirely and `import-session` accepts the result.
-    ///
-    /// Two residuals this list keeps but does not vouch for, recorded rather
-    /// than guessed at:
-    ///
-    /// * `conversation_metadata.user_turn_start_request` and `.last_request`
-    ///   are stored outbound model requests (`SendRequestArgs`: tool specs,
-    ///   system prompt, …). Both were `null` in every capture, and populating
-    ///   them needs a real model call, so their populated contents are
-    ///   **undetermined** — bulk content rather than a credential, since auth
-    ///   is applied at transport.
-    /// * `rts_model_state.additional_fields` is an open extension bag by
-    ///   construction. Naming its parent does not bound it.
-    ///
-    /// Adding a name here republishes it.
+    /// The shipped 2.14.2 loader accepts an empty or version-only state, and
+    /// Kiro's own export omits the state while its import accepts that export.
+    /// Keep only the exact format tag observed in captured V2 sessions.
     fn session_state_metadata(state: &serde_json::Value) -> serde_json::Value {
-        const KEPT_FIELDS: [&str; 6] = [
-            "version",
-            "conversation_metadata",
-            "rts_model_state",
-            "permissions",
-            "agent_name",
-            "goal",
-        ];
-
-        // A non-object `session_state` is not something this reader can vouch
-        // for; carry it as-is only when it is the empty/absent shapes the
-        // loader also accepts.
-        let Some(obj) = state.as_object() else {
-            return serde_json::Value::Null;
-        };
-
         let mut kept = serde_json::Map::new();
-        for field in KEPT_FIELDS {
-            if let Some(value) = obj.get(field) {
-                kept.insert(field.to_string(), value.clone());
-            }
+        if state.get("version").and_then(|value| value.as_str()) == Some("v1") {
+            kept.insert("version".into(), serde_json::Value::String("v1".into()));
         }
         serde_json::Value::Object(kept)
     }
@@ -632,6 +587,7 @@ impl Provider for Kiro {
 
         // --- Conversation journal (.jsonl) --------------------------------
         let mut messages: Vec<CanonicalMessage> = Vec::new();
+        let mut previous_group: Option<(String, u8)> = None;
         if jsonl_path.is_file() {
             let text = std::fs::read_to_string(&jsonl_path)
                 .with_context(|| format!("failed to read {}", jsonl_path.display()))?;
@@ -645,12 +601,53 @@ impl Provider for Kiro {
                     Err(e) => {
                         // Tolerate malformed/partial trailing lines.
                         trace!(line = lineno, error = %e, "skipping unparseable Kiro journal line");
+                        previous_group = None;
                         continue;
                     }
                 };
-                if let Some(msg) = parse_envelope(&envelope, &mut ended_at) {
-                    messages.push(msg);
+                let Some(mut msg) = parse_envelope(&envelope, &mut ended_at) else {
+                    previous_group = None;
+                    continue;
+                };
+                let group = generated_message_group(&envelope);
+                let joins_previous = match (&previous_group, &group) {
+                    (Some((previous_id, previous_rank)), Some((id, rank, _))) => {
+                        previous_id == id
+                            && (previous_rank < rank || (*previous_rank == 2 && *rank == 2))
+                    }
+                    _ => false,
+                };
+                if let Some((_, _, role)) = &group {
+                    msg.role = role.clone();
                 }
+
+                // A canonical message can carry prose/calls and results
+                // together, while Kiro consumes text, calls, and results
+                // from different variants. Merge only consecutive,
+                // ordered groups carrying the writer's validated id;
+                // ordinary native UUIDs remain independent even if a
+                // vendor happens to repeat one.
+                if joins_previous && let Some(previous) = messages.last_mut() {
+                    if !msg.content.is_empty() {
+                        if !previous.content.is_empty() {
+                            previous.content.push_str("\n\n");
+                        }
+                        previous.content.push_str(&msg.content);
+                    }
+                    if previous.timestamp.is_none() {
+                        previous.timestamp = msg.timestamp;
+                    }
+                    if previous.author.is_none() {
+                        previous.author = msg.author;
+                    }
+                    previous.tool_calls.append(&mut msg.tool_calls);
+                    previous.tool_results.append(&mut msg.tool_results);
+                    previous_group = group.map(|(id, rank, _)| (id, rank));
+                    continue;
+                }
+
+                previous_group = group.map(|(id, rank, _)| (id, rank));
+                messages.push(msg);
             }
         }
 
@@ -808,30 +805,37 @@ impl Provider for Kiro {
             "title".into(),
             serde_json::Value::String(session.title.clone().unwrap_or_default()),
         );
-        // Preserve parent/reason/session_state from the canonical metadata bag
-        // when present so a Kiro→…→Kiro round-trip keeps the nested state.
-        meta.insert(
-            "parent_session_id".into(),
-            session
-                .metadata
-                .get("parent_session_id")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
-        meta.insert(
-            "session_created_reason".into(),
-            session
-                .metadata
-                .get("session_created_reason")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null),
-        );
-        let session_state = session
+        // Both fields are optional in Kiro's loader. `session_created_reason`
+        // is not nullable and accepts exactly these two enum members; emitting
+        // `null` makes the entire session unreadable.
+        if let Some(parent) = session
             .metadata
-            .get("session_state")
-            .cloned()
-            .unwrap_or_else(|| default_session_state(&target_session_id, session));
-        meta.insert("session_state".into(), session_state);
+            .get("parent_session_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+        {
+            meta.insert(
+                "parent_session_id".into(),
+                serde_json::Value::String(parent.to_string()),
+            );
+        }
+        if let Some(reason @ ("subagent" | "rewind")) = session
+            .metadata
+            .get("session_created_reason")
+            .and_then(|value| value.as_str())
+        {
+            meta.insert(
+                "session_created_reason".into(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+        // Never replay vendor-owned state from canonical metadata. The shipped
+        // loader accepts this minimal state; omitted runtime/request/permission
+        // snapshots are not needed to load the transcript.
+        meta.insert(
+            "session_state".into(),
+            serde_json::json!({ "version": "v1" }),
+        );
 
         let json_bytes =
             serde_json::to_string_pretty(&serde_json::Value::Object(meta))?.into_bytes();
@@ -839,7 +843,7 @@ impl Provider for Kiro {
         // --- Conversation journal (.jsonl) --------------------------------
         let mut jsonl = String::new();
         for msg in &session.messages {
-            if let Some(envelope) = message_to_envelope(msg) {
+            for envelope in message_to_envelopes(msg) {
                 jsonl.push_str(&serde_json::to_string(&envelope)?);
                 jsonl.push('\n');
             }
@@ -1253,9 +1257,9 @@ fn parse_ide_message(
         author,
         tool_calls,
         tool_results,
-        // The whole record, so a round-trip keeps the fields the canonical
-        // message has nowhere to put (status, executionId, snapshot ids, …).
-        extra: record.clone(),
+        // No Kiro writer consumes the native event, and the canonical fields
+        // above contain everything this reader can safely carry.
+        extra: serde_json::Value::Null,
     })
 }
 
@@ -1386,10 +1390,10 @@ fn parse_envelope(
         }),
         tool_calls,
         tool_results,
-        // Preserve the full envelope for high-fidelity round-trip (the nested
-        // `results` map on ToolResults can't be reconstructed from the
-        // canonical fields alone).
-        extra: envelope.clone(),
+        // The writer rebuilds a bounded envelope from the typed fields above.
+        // Keeping the native envelope here would retain the same unbounded
+        // vendor blob after refusing to publish it.
+        extra: serde_json::Value::Null,
     })
 }
 
@@ -1466,58 +1470,42 @@ fn rfc3339_micros(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// Build a minimal but well-formed `session_state` when none was carried.
-fn default_session_state(session_id: &str, session: &CanonicalSession) -> serde_json::Value {
-    let cwd = session
-        .workspace
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    let allowed_read = cwd
-        .as_ref()
-        .map(|c| serde_json::json!([c]))
-        .unwrap_or_else(|| serde_json::json!([]));
-    serde_json::json!({
-        "version": "v1",
-        "conversation_metadata": {
-            "user_turn_metadatas": [],
-            "user_turn_start_request": null,
-            "last_request": null
-        },
-        "rts_model_state": {
-            "conversation_id": session_id,
-            "model_info": null,
-            "context_usage_percentage": null
-        },
-        "permissions": {
-            "filesystem": {
-                "allowed_read_paths": allowed_read,
-                "allowed_write_paths": [],
-                "denied_read_paths": [],
-                "denied_write_paths": []
-            },
-            "trusted_tools": [],
-            "denied_tools": [],
-            "allowed_commands": []
-        },
-        "agent_name": null
-    })
-}
-
-/// Serialize a canonical message into a Kiro `.jsonl` envelope.
+/// Recognize one envelope in a group synthesized by [`message_to_envelopes`].
 ///
-/// When the message still carries its original Kiro envelope in `extra`, we
-/// re-emit it verbatim for maximal round-trip fidelity. Otherwise we
-/// synthesize an envelope from the canonical fields (cross-provider import).
-fn message_to_envelope(msg: &CanonicalMessage) -> Option<serde_json::Value> {
-    if let Some(kind) = msg.extra.get("kind").and_then(|v| v.as_str())
-        && matches!(kind, "Prompt" | "AssistantMessage" | "ToolResults")
-        && msg.extra.get("data").is_some()
-    {
-        return Some(msg.extra.clone());
+/// Native Kiro ids are UUIDs. Requiring the private prefix, a valid role code,
+/// a valid UUID, and a legal variant keeps duplicate native ids from becoming
+/// an accidental instruction to coalesce unrelated turns.
+fn generated_message_group(envelope: &serde_json::Value) -> Option<(String, u8, MessageRole)> {
+    let id = envelope.pointer("/data/message_id")?.as_str()?;
+    let mut parts = id.split(':');
+    if parts.next() != Some("agsx") {
+        return None;
+    }
+    let role_code = parts.next()?;
+    let uuid = parts.next()?;
+    if parts.next().is_some() || uuid::Uuid::parse_str(uuid).is_err() {
+        return None;
     }
 
-    // Synthesize for messages that did not originate from Kiro.
-    //
+    let kind = envelope.get("kind")?.as_str()?;
+    let (rank, role) = match (role_code, kind) {
+        ("u", "Prompt") => (0, MessageRole::User),
+        ("u", "AssistantMessage") => (1, MessageRole::User),
+        ("u", "ToolResults") => (2, MessageRole::User),
+        ("a", "AssistantMessage") => (1, MessageRole::Assistant),
+        ("a", "ToolResults") => (2, MessageRole::Assistant),
+        ("t", "AssistantMessage") => (1, MessageRole::Tool),
+        ("t", "ToolResults") => (2, MessageRole::Tool),
+        _ => return None,
+    };
+    Some((id.to_string(), rank, role))
+}
+
+/// Serialize a canonical message into up to three Kiro `.jsonl` envelopes.
+///
+/// `CanonicalMessage::extra` is untrusted vendor data. Always synthesize a
+/// bounded envelope from the canonical fields, regardless of origin.
+fn message_to_envelopes(msg: &CanonicalMessage) -> Vec<serde_json::Value> {
     // `kind` is not a free-form label. The journal line is an adjacently tagged
     // Rust enum, and the shipped `kiro-cli-chat` 2.14.2 binary names it and its
     // whole membership in the serde strings it carries — `adjacently tagged
@@ -1538,18 +1526,25 @@ fn message_to_envelope(msg: &CanonicalMessage) -> Option<serde_json::Value> {
     // anonymise anything; it tells the resumed agent that it issued the
     // instruction itself. The first is recoverable news, the second is a
     // falsehood about who holds authority in the session.
-    let kind = match msg.role {
-        MessageRole::User | MessageRole::System | MessageRole::Other(_) => "Prompt",
-        MessageRole::Assistant => "AssistantMessage",
-        MessageRole::Tool => "ToolResults",
+    let role_code = match msg.role {
+        MessageRole::User | MessageRole::System | MessageRole::Other(_) => "u",
+        MessageRole::Assistant => "a",
+        MessageRole::Tool => "t",
     };
 
-    let mut content: Vec<serde_json::Value> = Vec::new();
-    if !msg.content.is_empty() {
-        content.push(serde_json::json!({ "kind": "text", "data": msg.content }));
+    let content_is_structural_result = matches!(msg.role, MessageRole::Tool)
+        && !msg.content.trim().is_empty()
+        && msg
+            .tool_results
+            .iter()
+            .any(|result| result.content == msg.content);
+    let mut text_content: Vec<serde_json::Value> = Vec::new();
+    if !msg.content.is_empty() && !content_is_structural_result {
+        text_content.push(serde_json::json!({ "kind": "text", "data": msg.content }));
     }
+    let mut call_content: Vec<serde_json::Value> = Vec::new();
     for tc in &msg.tool_calls {
-        content.push(serde_json::json!({
+        call_content.push(serde_json::json!({
             "kind": "toolUse",
             "data": {
                 "toolUseId": tc.id.clone().unwrap_or_default(),
@@ -1558,36 +1553,101 @@ fn message_to_envelope(msg: &CanonicalMessage) -> Option<serde_json::Value> {
             }
         }));
     }
-    for tr in &msg.tool_results {
+
+    let mut result_payloads = Vec::with_capacity(msg.tool_results.len());
+    for (index, tr) in msg.tool_results.iter().enumerate() {
+        let call_id = tr.call_id.clone().unwrap_or_default();
+        let mut content = Vec::new();
+        if content_is_structural_result && index == 0 {
+            // Kiro ignores ToolResults.content, but casr uses this bounded copy
+            // to restore readers that expose the same observation as both text
+            // and a structural result without showing it twice to the model.
+            content.push(serde_json::json!({ "kind": "text", "data": msg.content }));
+        }
         content.push(serde_json::json!({
             "kind": "toolResult",
             "data": {
-                "toolUseId": tr.call_id.clone().unwrap_or_default(),
+                "toolUseId": call_id.clone(),
                 "content": [{ "kind": "text", "data": tr.content }],
                 "status": if tr.is_error { "error" } else { "success" },
             }
         }));
+        let result = if tr.is_error {
+            serde_json::json!({ "Error": { "Custom": tr.content } })
+        } else {
+            serde_json::json!({ "Success": { "items": [{ "Text": tr.content }] } })
+        };
+        let mut results = serde_json::Map::new();
+        results.insert(
+            call_id,
+            serde_json::json!({
+                "tool": {
+                    "kind": {
+                        "BuiltIn": {
+                            "ExecuteCmd": { "command": "" }
+                        }
+                    }
+                },
+                "result": result,
+            }),
+        );
+        // One result per map preserves duplicate and missing call ids. Kiro
+        // accepts repeated ToolResults records in one correlated group.
+        result_payloads.push((content, results));
     }
 
-    if content.is_empty() {
-        return None;
+    let message_id = format!("agsx:{role_code}:{}", uuid::Uuid::new_v4());
+    let envelope =
+        |kind: &str,
+         content: Vec<serde_json::Value>,
+         results: Option<serde_json::Map<String, serde_json::Value>>| {
+            let mut data = serde_json::Map::new();
+            data.insert(
+                "message_id".into(),
+                serde_json::Value::String(message_id.clone()),
+            );
+            data.insert("content".into(), serde_json::Value::Array(content));
+            if kind == "Prompt"
+                && let Some(ts) = msg.timestamp
+            {
+                data.insert("meta".into(), serde_json::json!({ "timestamp": ts / 1000 }));
+            }
+            if let Some(results) = results {
+                data.insert("results".into(), serde_json::Value::Object(results));
+            }
+            serde_json::json!({
+                "version": "v1",
+                "kind": kind,
+                "data": serde_json::Value::Object(data),
+            })
+        };
+
+    // Kiro 2.15 consumes Prompt text, AssistantMessage text/toolUse, and
+    // ToolResults.results. `data.content` on ToolResults is accepted but never
+    // replayed. Split by the vendor's real channels, then let the reader join
+    // the bounded group back into the original canonical message.
+    let mut envelopes = Vec::with_capacity(2 + result_payloads.len());
+    match msg.role {
+        MessageRole::User | MessageRole::System | MessageRole::Other(_) => {
+            if !text_content.is_empty() {
+                envelopes.push(envelope("Prompt", text_content, None));
+            }
+            if !call_content.is_empty() {
+                envelopes.push(envelope("AssistantMessage", call_content, None));
+            }
+        }
+        MessageRole::Assistant | MessageRole::Tool => {
+            text_content.extend(call_content);
+            if !text_content.is_empty() {
+                envelopes.push(envelope("AssistantMessage", text_content, None));
+            }
+        }
     }
 
-    let message_id = uuid::Uuid::new_v4().to_string();
-    let mut data = serde_json::Map::new();
-    data.insert("message_id".into(), serde_json::Value::String(message_id));
-    data.insert("content".into(), serde_json::Value::Array(content));
-    if kind == "Prompt"
-        && let Some(ts) = msg.timestamp
-    {
-        data.insert("meta".into(), serde_json::json!({ "timestamp": ts / 1000 }));
+    for (content, results) in result_payloads {
+        envelopes.push(envelope("ToolResults", content, Some(results)));
     }
-
-    Some(serde_json::json!({
-        "version": "v1",
-        "kind": kind,
-        "data": serde_json::Value::Object(data),
-    }))
+    envelopes
 }
 
 #[cfg(test)]
@@ -1729,16 +1789,17 @@ mod tests {
             .read_session(&fixture_json_path())
             .expect("read original");
 
-        // Re-emit each message to a Kiro envelope, then re-parse it.
-        let mut ended = None;
-        let reparsed: Vec<_> = original
-            .messages
-            .iter()
-            .map(|m| {
-                let env = message_to_envelope(m).expect("envelope for non-empty message");
-                parse_envelope(&env, &mut ended).expect("re-parse envelope")
-            })
-            .collect();
+        // Re-emit every message, including multi-result turns that require
+        // several ToolResults envelopes, then exercise the real reader's
+        // bounded group reassembly.
+        let mut journal = tempfile::NamedTempFile::with_suffix(".jsonl").unwrap();
+        for message in &original.messages {
+            for envelope in message_to_envelopes(message) {
+                writeln!(journal, "{}", serde_json::to_string(&envelope).unwrap()).unwrap();
+            }
+        }
+        journal.flush().unwrap();
+        let reparsed = Kiro.read_session(journal.path()).unwrap().messages;
 
         assert_eq!(reparsed.len(), original.messages.len());
         for (a, b) in original.messages.iter().zip(reparsed.iter()) {
@@ -1784,23 +1845,145 @@ mod tests {
             extra: serde_json::Value::Null,
         };
 
-        let u_env = message_to_envelope(&user).unwrap();
+        let u_envs = message_to_envelopes(&user);
+        assert_eq!(u_envs.len(), 1);
+        let u_env = &u_envs[0];
         assert_eq!(u_env["kind"], "Prompt");
         // Prompt timestamps are emitted as epoch seconds under data.meta.
         assert_eq!(u_env["data"]["meta"]["timestamp"], 1_700_000_000);
 
-        let a_env = message_to_envelope(&assistant).unwrap();
+        let a_envs = message_to_envelopes(&assistant);
+        assert_eq!(a_envs.len(), 2);
+        let a_env = &a_envs[0];
+        let result_env = &a_envs[1];
         assert_eq!(a_env["kind"], "AssistantMessage");
+        assert_eq!(result_env["kind"], "ToolResults");
+        assert!(
+            a_env["data"]["message_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("agsx:a:")
+        );
+        assert_eq!(
+            a_env["data"]["message_id"], result_env["data"]["message_id"],
+            "split records must rejoin during read-back"
+        );
+        assert_eq!(
+            result_env["data"]["results"]["t1"]["result"]["Success"]["items"][0]["Text"],
+            "file.txt"
+        );
 
         let mut ended = None;
-        let ru = parse_envelope(&u_env, &mut ended).unwrap();
-        let ra = parse_envelope(&a_env, &mut ended).unwrap();
+        let ru = parse_envelope(u_env, &mut ended).unwrap();
+        let ra = parse_envelope(a_env, &mut ended).unwrap();
+        let rr = parse_envelope(result_env, &mut ended).unwrap();
         assert_eq!(ru.content, "Hi there");
         assert_eq!(ra.content, "Hello back");
         assert_eq!(ra.tool_calls.len(), 1);
         assert_eq!(ra.tool_calls[0].name, "shell");
-        assert_eq!(ra.tool_results.len(), 1);
-        assert_eq!(ra.tool_results[0].content, "file.txt");
+        assert_eq!(rr.tool_results.len(), 1);
+        assert_eq!(rr.tool_results[0].content, "file.txt");
+    }
+
+    #[test]
+    fn native_or_malformed_group_ids_do_not_merge_messages() {
+        for id in ["00000000-0000-4000-8000-000000000001", "agsx:a:not-a-uuid"] {
+            let mut journal = tempfile::NamedTempFile::with_suffix(".jsonl").unwrap();
+            writeln!(
+                journal,
+                "{}",
+                serde_json::json!({
+                    "version": "v1",
+                    "kind": "AssistantMessage",
+                    "data": {
+                        "message_id": id,
+                        "content": [{"kind": "text", "data": "first"}]
+                    }
+                })
+            )
+            .unwrap();
+            writeln!(
+                journal,
+                "{}",
+                serde_json::json!({
+                    "version": "v1",
+                    "kind": "ToolResults",
+                    "data": {
+                        "message_id": id,
+                        "content": [{
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "call-1",
+                                "content": [{"kind": "text", "data": "second"}],
+                                "status": "success"
+                            }
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+            journal.flush().unwrap();
+
+            let messages = Kiro.read_session(journal.path()).unwrap().messages;
+            assert_eq!(messages.len(), 2, "id {id} must not authorize merging");
+            assert_eq!(messages[0].role, MessageRole::Assistant);
+            assert_eq!(messages[1].role, MessageRole::Tool);
+        }
+    }
+
+    #[test]
+    fn generated_groups_do_not_merge_across_non_message_records() {
+        let id = "agsx:a:00000000-0000-4000-8000-000000000001";
+        for separator in [
+            "this is not json at all",
+            r#"{"version":"v1","kind":"Compaction","data":{"summary":"older context","messages_snapshot":[]}}"#,
+        ] {
+            let mut journal = tempfile::NamedTempFile::with_suffix(".jsonl").unwrap();
+            writeln!(
+                journal,
+                "{}",
+                serde_json::json!({
+                    "version": "v1",
+                    "kind": "AssistantMessage",
+                    "data": {
+                        "message_id": id,
+                        "content": [{"kind": "text", "data": "first"}]
+                    }
+                })
+            )
+            .unwrap();
+            writeln!(journal, "{separator}").unwrap();
+            writeln!(
+                journal,
+                "{}",
+                serde_json::json!({
+                    "version": "v1",
+                    "kind": "ToolResults",
+                    "data": {
+                        "message_id": id,
+                        "content": [{
+                            "kind": "toolResult",
+                            "data": {
+                                "toolUseId": "call-1",
+                                "content": [{"kind": "text", "data": "second"}],
+                                "status": "success"
+                            }
+                        }]
+                    }
+                })
+            )
+            .unwrap();
+            journal.flush().unwrap();
+
+            let messages = Kiro.read_session(journal.path()).unwrap().messages;
+            assert_eq!(
+                messages.len(),
+                2,
+                "separator {separator:?} must break a generated group"
+            );
+            assert_eq!(messages[0].content, "first");
+            assert_eq!(messages[1].tool_results[0].content, "second");
+        }
     }
 
     // -----------------------------------------------------------------------

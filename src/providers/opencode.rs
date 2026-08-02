@@ -10,8 +10,15 @@
 //! casr addresses specific OpenCode sessions using a virtual path form:
 //! `<db-path>/<urlencoded-session-id>`
 //! This mirrors the approach used by Cursor and Aider providers.
+//!
+//! Target writes never edit SQLite directly. When the official `opencode` CLI
+//! is available, casr gives its `import` command an export-shaped JSON file,
+//! verifies the imported session through this reader, and uses
+//! `opencode session delete` for rollback.
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
@@ -30,9 +37,10 @@ pub struct OpenCode;
 
 const DB_FILENAME: &str = "opencode.db";
 const DATA_DIRNAME: &str = ".opencode";
-const OPENCODE_WRITE_REFUSAL: &str = "OpenCode is read/resume-only: casr cannot create a \
-natively resumable OpenCode session without using OpenCode's own import machinery. Refusing to \
-modify opencode.db; use OpenCode as a conversion source, not a target.";
+const OPENCODE_BIN_ENV: &str = "OPENCODE_BIN";
+const OPENCODE_CLI_REQUIRED: &str = "OpenCode is read/resume-only on this machine: target writes \
+require the official `opencode` CLI in PATH (or OPENCODE_BIN). casr uses the vendor's import and \
+delete commands and will not modify opencode.db directly.";
 
 /// Which physical layout an `opencode.db` uses.
 ///
@@ -95,6 +103,305 @@ impl OpenCode {
             "opencode",
             ["--session".to_string(), session_id.to_string()],
         )
+    }
+
+    fn binary_path() -> anyhow::Result<PathBuf> {
+        if let Some(path) = std::env::var_os(OPENCODE_BIN_ENV).filter(|value| !value.is_empty()) {
+            let path = Self::absolute_path(PathBuf::from(path))?;
+            if path.is_file() {
+                return Ok(path);
+            }
+            anyhow::bail!(
+                "{OPENCODE_BIN_ENV} names {}, but that is not an OpenCode executable file",
+                path.display()
+            );
+        }
+
+        which::which("opencode").context(
+            "OpenCode writes require the official `opencode` CLI in PATH (or OPENCODE_BIN)",
+        )
+    }
+
+    /// The database the official CLI must import into.
+    ///
+    /// casr's `OPENCODE_HOME` and `OPENCODE_DB_PATH` overrides are intentionally
+    /// understood here even though OpenCode itself does not know them. The child
+    /// receives the resolved absolute path through OpenCode's own `OPENCODE_DB`.
+    fn write_db_path() -> anyhow::Result<PathBuf> {
+        let path = Self::env_db_path()
+            .or_else(|| Self::upstream_data_dir().map(|dir| dir.join(DB_FILENAME)))
+            .context("could not determine OpenCode's data directory")?;
+        Self::absolute_path(path)
+    }
+
+    fn absolute_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        Ok(std::env::current_dir()
+            .context("could not resolve an OpenCode path against the current directory")?
+            .join(path))
+    }
+
+    fn command(binary: &Path, db_path: &Path, cwd: &Path) -> Command {
+        let mut command = Command::new(binary);
+        command
+            .current_dir(cwd)
+            .env("OPENCODE_DB", db_path)
+            // Import/delete do not need user plugins, model catalog downloads,
+            // or an update check. Keeping them out makes this a local storage
+            // operation instead of an accidental network/plugin lifecycle.
+            .env("OPENCODE_PURE", "1")
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+            .env("OPENCODE_DISABLE_MODELS_FETCH", "1");
+        command
+    }
+
+    fn command_detail(output: &Output) -> String {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = match (stdout.trim(), stderr.trim()) {
+            ("", "") => format!("exit status {}", output.status),
+            (stdout, "") => format!("exit status {}; stdout: {stdout}", output.status),
+            ("", stderr) => format!("exit status {}; stderr: {stderr}", output.status),
+            (stdout, stderr) => format!(
+                "exit status {}; stdout: {stdout}; stderr: {stderr}",
+                output.status
+            ),
+        };
+        const LIMIT: usize = 2_000;
+        if detail.len() <= LIMIT {
+            detail
+        } else {
+            format!("{}...", &detail[..detail.floor_char_boundary(LIMIT)])
+        }
+    }
+
+    fn workspace_for_write(session: &CanonicalSession) -> anyhow::Result<(PathBuf, Vec<String>)> {
+        if let Some(workspace) = session.workspace.as_ref()
+            && workspace.is_dir()
+        {
+            return Ok((workspace.clone(), Vec::new()));
+        }
+
+        let cwd = std::env::current_dir().context("could not determine a workspace for OpenCode")?;
+        let warnings = session.workspace.as_ref().map_or_else(Vec::new, |workspace| {
+            vec![format!(
+                "The source workspace {} does not exist; OpenCode imported the session into {}.",
+                workspace.display(),
+                cwd.display()
+            )]
+        });
+        Ok((cwd, warnings))
+    }
+
+    fn inferred_model(session: &CanonicalSession) -> (String, String) {
+        let model = session
+            .model_name
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .unwrap_or("big-pickle")
+            .to_string();
+        let lower = model.to_ascii_lowercase();
+        let provider = if lower.contains("claude") {
+            "anthropic"
+        } else if lower.contains("gemini") {
+            "google"
+        } else if lower.contains("grok") {
+            "xai"
+        } else if lower.starts_with("gpt")
+            || lower.starts_with('o')
+            || lower.contains("codex")
+        {
+            "openai"
+        } else {
+            "opencode"
+        };
+        (provider.to_string(), model)
+    }
+
+    fn message_text(message: &CanonicalMessage) -> String {
+        let mut text = message.content.clone();
+        let mut append = |block: String| {
+            if text.contains(&block) {
+                return;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&block);
+        };
+
+        for call in &message.tool_calls {
+            append(format!("[Tool: {}]", call.name));
+        }
+        for result in &message.tool_results {
+            if !result.content.trim().is_empty() && message.content == result.content {
+                continue;
+            }
+            append(if result.is_error {
+                format!("[Tool Error] {}", result.content)
+            } else {
+                format!("[Tool Output] {}", result.content)
+            });
+        }
+        text
+    }
+
+    fn import_payload(
+        session: &CanonicalSession,
+        session_id: &str,
+        workspace: &Path,
+    ) -> serde_json::Value {
+        let id_seed = session_id.trim_start_matches("ses_");
+        let (provider_id, model_id) = Self::inferred_model(session);
+        let fallback_time = chrono::Utc::now().timestamp_millis().max(0);
+        let mut previous_time = session.started_at.unwrap_or(fallback_time).max(0);
+        let mut previous_message_id: Option<String> = None;
+        let mut last_user_id: Option<String> = None;
+        let mut messages = Vec::with_capacity(session.messages.len());
+
+        for (index, message) in session.messages.iter().enumerate() {
+            let message_id = format!("msg_{id_seed}_{index:08}");
+            let part_id = format!("prt_{id_seed}_{index:08}");
+            let created = message.timestamp.unwrap_or(previous_time).max(0);
+            let created = created.max(previous_time);
+            previous_time = created;
+            let text = Self::message_text(message);
+            let parts = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![serde_json::json!({
+                    "id": part_id,
+                    "sessionID": session_id,
+                    "messageID": message_id,
+                    "type": "text",
+                    "text": text,
+                })]
+            };
+
+            let is_assistant = message.role == MessageRole::Assistant;
+            let info = if is_assistant {
+                let parent_id = last_user_id
+                    .as_ref()
+                    .or(previous_message_id.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| format!("msg_{id_seed}_parent"));
+                serde_json::json!({
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "assistant",
+                    "time": {"created": created, "completed": created},
+                    "parentID": parent_id,
+                    "modelID": model_id,
+                    "providerID": provider_id,
+                    "mode": "build",
+                    "agent": "build",
+                    "path": {
+                        "cwd": workspace.display().to_string(),
+                        "root": workspace.display().to_string(),
+                    },
+                    "cost": 0,
+                    "tokens": {
+                        "input": 0,
+                        "output": 0,
+                        "reasoning": 0,
+                        "cache": {"read": 0, "write": 0},
+                    },
+                    "finish": "stop",
+                })
+            } else {
+                last_user_id = Some(message_id.clone());
+                serde_json::json!({
+                    "id": message_id,
+                    "sessionID": session_id,
+                    "role": "user",
+                    "time": {"created": created},
+                    "agent": "build",
+                    "model": {
+                        "providerID": provider_id,
+                        "modelID": model_id,
+                    },
+                })
+            };
+
+            previous_message_id = Some(message_id);
+            messages.push(serde_json::json!({"info": info, "parts": parts}));
+        }
+
+        let title = session
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                session
+                    .messages
+                    .iter()
+                    .find(|message| message.role == MessageRole::User)
+                    .map(|message| truncate_title(&message.content, 80))
+                    .filter(|title| !title.is_empty())
+            })
+            .unwrap_or_else(|| "Imported session".to_string());
+        let created = session.started_at.unwrap_or(fallback_time).max(0);
+        let updated = session
+            .ended_at
+            .unwrap_or(previous_time)
+            .max(created)
+            .max(previous_time);
+
+        serde_json::json!({
+            "info": {
+                "id": session_id,
+                "slug": format!("agsx-{}", &id_seed[..id_seed.len().min(12)]),
+                "projectID": "global",
+                "directory": workspace.display().to_string(),
+                "title": title,
+                "version": env!("CARGO_PKG_VERSION"),
+                "metadata": {
+                    "importedBy": "agsx-convert",
+                    "sourceProvider": session.provider_slug,
+                },
+                "time": {"created": created, "updated": updated},
+            },
+            "messages": messages,
+        })
+    }
+
+    fn session_exists_in_db(db_path: &Path, session_id: &str) -> anyhow::Result<bool> {
+        if !db_path.is_file() {
+            return Ok(false);
+        }
+        let conn = Self::open_db(db_path)?;
+        Ok(Self::session_exists(&conn, session_id))
+    }
+
+    fn delete_imported_session(
+        binary: &Path,
+        db_path: &Path,
+        session_id: &str,
+        cwd: &Path,
+    ) -> anyhow::Result<()> {
+        if !Self::session_exists_in_db(db_path, session_id)? {
+            return Ok(());
+        }
+
+        let output = Self::command(binary, db_path, cwd)
+            .args(["session", "delete", session_id])
+            .output()
+            .with_context(|| format!("failed to start {}", binary.display()))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "OpenCode could not delete imported session {session_id}: {}",
+                Self::command_detail(&output)
+            );
+        }
+        if Self::session_exists_in_db(db_path, session_id)? {
+            anyhow::bail!(
+                "OpenCode reported deletion success, but session {session_id} remains in {}",
+                db_path.display()
+            );
+        }
+        Ok(())
     }
 
     /// Parse OPENCODE environment overrides into a target DB path.
@@ -755,9 +1062,15 @@ impl Provider for OpenCode {
         let mut installed = false;
         let mut evidence = Vec::new();
 
-        if which::which("opencode").is_ok() {
-            installed = true;
-            evidence.push("opencode binary found in PATH".to_string());
+        match Self::binary_path() {
+            Ok(binary) => {
+                installed = true;
+                evidence.push(format!("opencode binary found at {}", binary.display()));
+            }
+            Err(error) if std::env::var_os(OPENCODE_BIN_ENV).is_some() => {
+                evidence.push(format!("{OPENCODE_BIN_ENV} is unusable: {error:#}"));
+            }
+            Err(_) => {}
         }
 
         if let Some(env_path) = Self::env_db_path() {
@@ -843,14 +1156,110 @@ impl Provider for OpenCode {
 
     fn write_session(
         &self,
-        _session: &CanonicalSession,
+        session: &CanonicalSession,
         _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        Err(anyhow::anyhow!(OPENCODE_WRITE_REFUSAL))
+        let binary = Self::binary_path()
+            .map_err(|_| anyhow::anyhow!("{OPENCODE_CLI_REQUIRED}"))?;
+        let db_path = Self::write_db_path()?;
+        let (workspace, warnings) = Self::workspace_for_write(session)?;
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create OpenCode data directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
+        let payload = Self::import_payload(session, &session_id, &workspace);
+        let mut import_file = tempfile::Builder::new()
+            .prefix("casr-opencode-import-")
+            .suffix(".json")
+            .tempfile()
+            .context("failed to create temporary OpenCode import file")?;
+        serde_json::to_writer(&mut import_file, &payload)
+            .context("failed to serialize OpenCode import data")?;
+        import_file
+            .flush()
+            .context("failed to flush OpenCode import data")?;
+        import_file
+            .as_file()
+            .sync_all()
+            .context("failed to sync OpenCode import data")?;
+
+        let output = Self::command(&binary, &db_path, &workspace)
+            .arg("import")
+            .arg(import_file.path())
+            .output()
+            .with_context(|| format!("failed to start {}", binary.display()))?;
+
+        if !output.status.success() {
+            let import_error = Self::command_detail(&output);
+            let rollback = Self::delete_imported_session(
+                &binary,
+                &db_path,
+                &session_id,
+                &workspace,
+            );
+            return Err(match rollback {
+                Ok(()) => anyhow::anyhow!("OpenCode import failed: {import_error}"),
+                Err(error) => anyhow::anyhow!(
+                    "OpenCode import failed: {import_error}; partial-session cleanup failed: {error:#}"
+                ),
+            });
+        }
+
+        let readback = Self::open_db(&db_path).and_then(|conn| {
+            Self::read_session_by_id(&conn, &db_path, &session_id)
+        });
+        if let Err(read_error) = readback {
+            let rollback = Self::delete_imported_session(
+                &binary,
+                &db_path,
+                &session_id,
+                &workspace,
+            );
+            return Err(match rollback {
+                Ok(()) => anyhow::anyhow!(
+                    "OpenCode imported session {session_id}, but its native store could not be read back: {read_error:#}; rollback succeeded"
+                ),
+                Err(error) => anyhow::anyhow!(
+                    "OpenCode imported session {session_id}, but its native store could not be read back: {read_error:#}; rollback failed: {error:#}"
+                ),
+            });
+        }
+
+        let virtual_path = Self::virtual_session_path(&db_path, &session_id);
+        Ok(WrittenSession {
+            paths: vec![virtual_path],
+            session_id: session_id.clone(),
+            resume_command: Self::resume_spec(&session_id).display(),
+            backups: Vec::new(),
+            warnings,
+        })
+    }
+
+    fn rollback_write(&self, written: &WrittenSession) -> anyhow::Result<()> {
+        let locator = written.paths.first().context(
+            "OpenCode rollback has no virtual session locator",
+        )?;
+        let (db_path, locator_session_id) = Self::parse_virtual_path(locator)
+            .context("OpenCode rollback received an invalid virtual session locator")?;
+        if locator_session_id != written.session_id {
+            anyhow::bail!(
+                "OpenCode rollback locator names {locator_session_id}, but the write names {}",
+                written.session_id
+            );
+        }
+        let binary = Self::binary_path()?;
+        let cwd = std::env::current_dir().context("could not determine OpenCode rollback cwd")?;
+        Self::delete_imported_session(&binary, &db_path, &written.session_id, &cwd)
     }
 
     fn write_refusal(&self) -> Option<&'static str> {
-        Some(OPENCODE_WRITE_REFUSAL)
+        Self::binary_path().is_err().then_some(OPENCODE_CLI_REQUIRED)
     }
 
     fn resume_command(&self, session_id: &str) -> String {
@@ -1182,8 +1591,8 @@ fn parse_current_parts(parts: &[serde_json::Value]) -> (String, Vec<ToolCall>, V
 }
 
 /// Reader tests use only isolated fixture databases. Target-side tests live in
-/// `tests/opencode_write_test.rs` and prove that every write mode refuses
-/// without creating or changing an `opencode.db`.
+/// `tests/opencode_write_test.rs`; the vendor-backed write probe is gated on an
+/// explicit official binary so ordinary test runs never touch a real store.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1199,7 +1608,6 @@ mod tests {
             <OpenCode as Provider>::resume_command(&provider, "sid"),
             "opencode --session sid"
         );
-        assert_eq!(provider.write_refusal(), Some(OPENCODE_WRITE_REFUSAL));
     }
 
     #[test]

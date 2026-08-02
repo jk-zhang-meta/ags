@@ -6,10 +6,12 @@
 //! Complements the lower-level unit tests in `pipeline.rs`.
 
 mod test_env;
+mod test_perms;
 
 #[cfg(unix)]
 mod atomic_write_integration {
     use super::test_env;
+    use super::test_perms::directory_rejects_writes;
 
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -216,6 +218,9 @@ mod atomic_write_integration {
             path: sessions_dir,
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = Codex.write_session(&session, &WriteOptions { force: false });
@@ -239,6 +244,9 @@ mod atomic_write_integration {
             path: projects_dir,
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = ClaudeCode.write_session(&session, &WriteOptions { force: false });
@@ -262,6 +270,9 @@ mod atomic_write_integration {
             path: gemini_dir,
             mode: 0o755,
         };
+        if !directory_rejects_writes(&_guard.path) {
+            return;
+        }
 
         let session = make_session("/tmp");
         let err = Gemini.write_session(&session, &WriteOptions { force: false });
@@ -399,19 +410,20 @@ mod atomic_write_integration {
     }
 
     #[test]
-    fn openclaw_write_refuses_without_creating_state() {
+    fn openclaw_write_refuses_without_official_cli_or_creating_state() {
         let _lock = OPENCLAW_ENV.lock().unwrap();
         let tmp = tempfile::TempDir::new().unwrap();
         let state_dir = tmp.path().join("openclaw-state");
         let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+        let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
         let session = make_session("/tmp");
         let error = OpenClaw
             .write_session(&session, &WriteOptions { force: false })
-            .expect_err("OpenClaw target writes require a gateway-backed import");
+            .expect_err("OpenClaw target writes require the official CLI");
         assert!(
-            error.to_string().contains("gateway"),
-            "refusal should identify the safe import boundary: {error:#}"
+            error.to_string().contains("official `openclaw` CLI"),
+            "refusal should identify the missing official lifecycle: {error:#}"
         );
         assert!(
             !state_dir.exists(),

@@ -38,17 +38,30 @@ Two consequences worth stating plainly:
    plain MIT or anything else — requires written permission from Jeffrey
    Emanuel.
 
-## Why `ags` is kept in a separate repository
+## AGS code included in this fork
 
-[`ags`](../ags) stays under a plain MIT license and does **not** vendor,
-statically link, or otherwise incorporate any code from this fork. It invokes
-`agsx-convert` as an external executable across a process boundary, in the same
-way it previously invoked `transession`.
+The encrypted checkpoint runtime and skill under `plugins/ags/` come from
+**AGS** by Jingkun Zhang. That source was released under the MIT License; its
+notice is retained at `licenses/AGS-MIT.txt`.
 
-That boundary is the point: it keeps the rider contained in this repository
-instead of propagating into `ags` and, from there, into everyone who uses `ags`.
-Anything that would merge the two codebases into one distributable artifact
-should be treated as a licensing decision, not a refactor.
+Because AGS is now distributed inside this fork, the combined distribution is
+also governed by this repository's root `LICENSE`, including the upstream
+OpenAI/Anthropic rider. The AGS source's original MIT grant remains recorded,
+but embedding it here does not remove the rider from the combined artifact.
+
+## Mandatory Context Mode dependency
+
+AGS installs **Context Mode** by Mert Koseoglu from
+<https://github.com/mksglu/context-mode>. AGS resolves the package's stable npm
+`latest` channel and activates only an exact release that passes AGS integrity,
+plugin-contract, and health checks. AGS invokes the published package and
+official Claude Code/Codex plugin manifests without copying or rewriting
+Context Mode source into this repository.
+
+Context Mode is licensed under the Elastic License 2.0, not MIT and not an
+OSI-approved open-source license. A copy of its terms is retained at
+`licenses/Context-Mode-ELv2.txt`. Users installing or using AGS also install and
+use Context Mode subject to those separate terms.
 
 ## What this fork changes
 

@@ -74,15 +74,27 @@
 //!
 //! ## Write support
 //!
-//! Antigravity conversations are protobuf-backed trajectories that the CLI
-//! creates and owns; there is no documented, supported way to synthesize a
-//! resumable conversation from foreign session history. `agy` is therefore a
-//! **read/resume-only** provider: [`Provider::write_session`] returns an
-//! actionable error rather than writing an un-resumable stub.
+//! Antigravity's official Python SDK can create the same SQLite trajectory that
+//! `agy` resumes. The writer uses `google-antigravity>=0.1.9` with a loopback
+//! OpenAI-compatible endpoint: source user turns are submitted to the official
+//! harness and the endpoint returns the corresponding source assistant turns.
+//! The SDK then reopens the conversation and verifies every stored user/model
+//! step before the database is moved into the CLI's conversation store.
+//!
+//! The public SDK has no assistant/system/tool injection API. Adjacent
+//! non-assistant messages are therefore visibly labelled and coalesced into one
+//! user turn, and adjacent assistant messages are coalesced into one model turn.
+//! A trailing user-side turn is refused because inventing an assistant reply
+//! would make the resumed history claim that an unanswered request was answered.
+//! The generated transcript sidecar preserves the canonical preview and makes
+//! casr's normal read-back verification and rollback cover the import.
 
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
 use crate::discovery::DetectionResult;
@@ -97,9 +109,307 @@ use crate::providers::{
 /// Antigravity CLI provider implementation.
 pub struct Antigravity;
 
-const ANTIGRAVITY_WRITE_REFUSAL: &str = "Antigravity (agy) is read/resume-only: casr cannot \
-create a resumable agy conversation from another provider's history. Use agy as a conversion \
-SOURCE (e.g. `casr cc resume <agy-uuid> --source agy`), not a target.";
+const ANTIGRAVITY_SDK_REQUIRED: &str = "Antigravity target writes require Python and the official \
+`google-antigravity>=0.1.9` SDK. Install it with \
+`python3 -m pip install \"google-antigravity>=0.1.9\"`, or point \
+`AGSX_ANTIGRAVITY_PYTHON` at a Python interpreter where it is installed.";
+
+const ANTIGRAVITY_PYTHON_ENV: &str = "AGSX_ANTIGRAVITY_PYTHON";
+
+const SDK_PROBE: &str = r#"
+import importlib.metadata
+import sys
+from google.antigravity import Agent, LocalOpenAIAgentConfig, types
+
+version = importlib.metadata.version("google-antigravity").split("+", 1)[0]
+parts = tuple(int(part) for part in version.split(".")[:3])
+if parts < (0, 1, 9):
+  raise SystemExit(2)
+if not hasattr(types.BuiltinTools, "none"):
+  raise SystemExit(3)
+print(sys.executable)
+"#;
+
+const SDK_BRIDGE: &str = r#"
+import asyncio
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import secrets
+import sys
+import tempfile
+import threading
+import time
+
+from google.antigravity import Agent, LocalOpenAIAgentConfig, types
+
+
+class ReplayHandler(BaseHTTPRequestHandler):
+  protocol_version = "HTTP/1.1"
+  responses = deque()
+  path_token = ""
+
+  def log_message(self, format, *args):
+    return
+
+  def do_GET(self):
+    if self.path.startswith(self.path_token) and self.path.rstrip("/").endswith("/models"):
+      self.send_json({
+          "object": "list",
+          "data": [{
+              "id": "agsx-import",
+              "object": "model",
+              "created": 0,
+              "owned_by": "agsx",
+          }],
+      })
+      return
+    self.send_error(404)
+
+  def do_POST(self):
+    if (
+        not self.path.startswith(self.path_token)
+        or not self.path.rstrip("/").endswith("/chat/completions")
+    ):
+      self.send_error(404)
+      return
+
+    length = int(self.headers.get("Content-Length", "0"))
+    payload = json.loads(self.rfile.read(length) or b"{}")
+    if not self.responses:
+      self.send_error(500, "unexpected extra model request")
+      return
+    content = self.responses.popleft()
+
+    if payload.get("stream"):
+      self.send_response(200)
+      self.send_header("Content-Type", "text/event-stream")
+      self.send_header("Cache-Control", "no-cache")
+      self.send_header("Connection", "close")
+      self.end_headers()
+      chunks = [
+          {
+              "id": "chatcmpl-agsx",
+              "object": "chat.completion.chunk",
+              "created": int(time.time()),
+              "model": "agsx-import",
+              "choices": [{
+                  "index": 0,
+                  "delta": {"role": "assistant", "content": content},
+                  "finish_reason": None,
+              }],
+          },
+          {
+              "id": "chatcmpl-agsx",
+              "object": "chat.completion.chunk",
+              "created": int(time.time()),
+              "model": "agsx-import",
+              "choices": [{
+                  "index": 0,
+                  "delta": {},
+                  "finish_reason": "stop",
+              }],
+          },
+      ]
+      for chunk in chunks:
+        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+      self.wfile.write(b"data: [DONE]\n\n")
+      self.wfile.flush()
+      return
+
+    self.send_json({
+        "id": "chatcmpl-agsx",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "agsx-import",
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+        },
+    })
+
+  def send_json(self, payload):
+    encoded = json.dumps(payload).encode()
+    self.send_response(200)
+    self.send_header("Content-Type", "application/json")
+    self.send_header("Content-Length", str(len(encoded)))
+    self.end_headers()
+    self.wfile.write(encoded)
+
+
+def make_config(port, token, save_dir, app_data_dir, conversation_id=None):
+  return LocalOpenAIAgentConfig(
+      model="agsx-import",
+      base_url=f"http://127.0.0.1:{port}/{token}/v1",
+      capabilities=types.CapabilitiesConfig(
+          enabled_tools=types.BuiltinTools.none(),
+          enable_subagents=False,
+      ),
+      policies=[],
+      workspaces=[],
+      conversation_id=conversation_id,
+      save_dir=str(save_dir),
+      app_data_dir=str(app_data_dir),
+  )
+
+
+async def import_and_verify(turns, save_dir, app_data_dir, port, token):
+  conversation_id = None
+  async with Agent(make_config(port, token, save_dir, app_data_dir)) as agent:
+    for index, turn in enumerate(turns):
+      response = await agent.chat(turn["user"])
+      actual = await response.text()
+      if actual != turn["assistant"]:
+        raise RuntimeError(
+            f"assistant replay mismatch at turn {index}: "
+            f"expected {len(turn['assistant'])} chars, got {len(actual)}"
+        )
+    conversation_id = agent.conversation_id
+
+  if not conversation_id:
+    raise RuntimeError("official SDK returned no conversation ID")
+  conversation_id = str(conversation_id)
+  if any(
+      not (character.isascii() and (character.isalnum() or character == "-"))
+      for character in conversation_id
+  ):
+    raise RuntimeError("official SDK returned an invalid conversation ID")
+
+  expected = []
+  for turn in turns:
+    expected.extend([
+        {"source": "USER", "content": turn["user"]},
+        {"source": "MODEL", "content": turn["assistant"]},
+    ])
+
+  async with Agent(
+      make_config(port, token, save_dir, app_data_dir, conversation_id)
+  ) as resumed:
+    actual = [
+        {"source": step.source.value, "content": step.content}
+        for step in resumed.conversation.history
+        if step.source.value in ("USER", "MODEL")
+    ]
+    if actual != expected:
+      raise RuntimeError(
+          f"official SDK resume verification changed the projected history: "
+          f"expected {len(expected)} steps, got {len(actual)}"
+      )
+
+  return conversation_id
+
+
+def main():
+  request = json.load(sys.stdin)
+  cli_dir = Path(request["cli_dir"]).resolve()
+  conversations_dir = Path(request["conversations_dir"]).resolve()
+  turns = request["turns"]
+  if not turns:
+    raise ValueError("at least one replay turn is required")
+  for index, turn in enumerate(turns):
+    if not isinstance(turn.get("user"), str) or not turn["user"]:
+      raise ValueError(f"turn {index} has no user content")
+    if not isinstance(turn.get("assistant"), str) or not turn["assistant"]:
+      raise ValueError(f"turn {index} has no assistant content")
+
+  cli_dir.mkdir(parents=True, exist_ok=True)
+  conversations_dir.mkdir(parents=True, exist_ok=True)
+  token = secrets.token_urlsafe(24)
+  ReplayHandler.responses = deque(turn["assistant"] for turn in turns)
+  ReplayHandler.path_token = f"/{token}/"
+  server = ThreadingHTTPServer(("127.0.0.1", 0), ReplayHandler)
+  thread = threading.Thread(target=server.serve_forever, daemon=True)
+  thread.start()
+
+  target = None
+  committed = False
+  try:
+    with tempfile.TemporaryDirectory(
+        prefix=".agsx-antigravity-", dir=cli_dir
+    ) as staging:
+      staging = Path(staging)
+      save_dir = staging / "conversations"
+      app_data_dir = staging / "app-data"
+      save_dir.mkdir()
+      app_data_dir.mkdir()
+      try:
+        conversation_id = asyncio.run(
+            import_and_verify(
+                turns,
+                save_dir,
+                app_data_dir,
+                server.server_address[1],
+                token,
+            )
+        )
+      finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+      staged_db = save_dir / f"{conversation_id}.db"
+      if not staged_db.is_file():
+        raise RuntimeError("official SDK did not create the expected conversation database")
+      if staged_db.read_bytes()[:16] != b"SQLite format 3\x00":
+        raise RuntimeError("official SDK output is not a SQLite conversation database")
+
+      target = conversations_dir / f"{conversation_id}.db"
+      if target.exists():
+        raise FileExistsError(f"target conversation already exists: {target}")
+      os.rename(staged_db, target)
+      result = {"conversation_id": conversation_id}
+      print(json.dumps(result), flush=True)
+      committed = True
+  finally:
+    if server.fileno() != -1:
+      server.shutdown()
+      thread.join()
+      server.server_close()
+    if target is not None and not committed:
+      try:
+        target.unlink()
+      except FileNotFoundError:
+        pass
+
+
+if __name__ == "__main__":
+  main()
+"#;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ReplayTurn {
+    user: String,
+    assistant: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplayProjection {
+    turns: Vec<ReplayTurn>,
+    coalesced_user_messages: usize,
+    coalesced_assistant_messages: usize,
+}
+
+#[derive(Serialize)]
+struct BridgeRequest<'a> {
+    cli_dir: &'a Path,
+    conversations_dir: &'a Path,
+    turns: &'a [ReplayTurn],
+}
+
+#[derive(Deserialize)]
+struct BridgeResponse {
+    // Paths are derived in Rust: Python resolves symlinks before writing, so
+    // comparing the two path spellings would reject the same target.
+    conversation_id: String,
+}
 
 impl Antigravity {
     /// Root directory for the shared Gemini family data.
@@ -145,6 +455,235 @@ impl Antigravity {
         };
         list_conversations_in(&conv_dir)
     }
+}
+
+fn python_with_sdk() -> Option<PathBuf> {
+    let configured = std::env::var_os(ANTIGRAVITY_PYTHON_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let candidates: Vec<PathBuf> = match configured {
+        Some(path) => vec![path],
+        None => ["python3", "python"]
+            .into_iter()
+            .filter_map(|name| which::which(name).ok())
+            .collect(),
+    };
+
+    candidates.into_iter().find(|python| {
+        Command::new(python)
+            .args(["-c", SDK_PROBE])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+fn role_label(role: &MessageRole) -> String {
+    match role {
+        MessageRole::User => "user".to_string(),
+        MessageRole::Assistant => "assistant".to_string(),
+        MessageRole::Tool => "tool".to_string(),
+        MessageRole::System => "system".to_string(),
+        MessageRole::Other(name) => format!("other:{name}"),
+    }
+}
+
+fn render_user_batch(messages: &[&CanonicalMessage]) -> String {
+    if let [message] = messages
+        && message.role == MessageRole::User
+    {
+        return message.content.clone();
+    }
+
+    messages
+        .iter()
+        .map(|message| {
+            format!(
+                "[agsx imported {} message]\n{}",
+                role_label(&message.role),
+                message.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn project_replay(session: &CanonicalSession) -> anyhow::Result<ReplayProjection> {
+    let mut turns: Vec<ReplayTurn> = Vec::new();
+    let mut pending_user_messages: Vec<&CanonicalMessage> = Vec::new();
+    let mut coalesced_user_messages = 0usize;
+    let mut coalesced_assistant_messages = 0usize;
+
+    for message in &session.messages {
+        if message.role != MessageRole::Assistant {
+            pending_user_messages.push(message);
+            continue;
+        }
+
+        if message.content.is_empty() {
+            anyhow::bail!(
+                "Antigravity import cannot replay empty assistant message {} through the official SDK",
+                message.idx
+            );
+        }
+
+        if pending_user_messages.is_empty() {
+            let Some(previous) = turns.last_mut() else {
+                anyhow::bail!(
+                    "Antigravity import cannot start with an assistant message: the official SDK \
+                     creates model output only in response to a user-side turn"
+                );
+            };
+            previous
+                .assistant
+                .push_str("\n\n[agsx imported assistant continuation]\n");
+            previous.assistant.push_str(&message.content);
+            coalesced_assistant_messages += 1;
+            continue;
+        }
+
+        if pending_user_messages
+            .iter()
+            .any(|pending| pending.content.is_empty())
+        {
+            anyhow::bail!(
+                "Antigravity import cannot replay an empty user-side message through the official SDK"
+            );
+        }
+
+        coalesced_user_messages += pending_user_messages.len().saturating_sub(1);
+        turns.push(ReplayTurn {
+            user: render_user_batch(&pending_user_messages),
+            assistant: message.content.clone(),
+        });
+        pending_user_messages.clear();
+    }
+
+    if !pending_user_messages.is_empty() {
+        anyhow::bail!(
+            "Antigravity import cannot preserve {} trailing user-side message(s) without inventing \
+             an assistant reply; resume the source agent once to complete that turn, then convert again",
+            pending_user_messages.len()
+        );
+    }
+    if turns.is_empty() {
+        anyhow::bail!("Antigravity import has no complete user/assistant turn to replay");
+    }
+
+    Ok(ReplayProjection {
+        turns,
+        coalesced_user_messages,
+        coalesced_assistant_messages,
+    })
+}
+
+fn run_sdk_bridge(
+    python: &Path,
+    cli_dir: &Path,
+    conversations_dir: &Path,
+    projection: &ReplayProjection,
+) -> anyhow::Result<BridgeResponse> {
+    let request = BridgeRequest {
+        cli_dir,
+        conversations_dir,
+        turns: &projection.turns,
+    };
+    let mut child = Command::new(python)
+        .args(["-c", SDK_BRIDGE])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to start Antigravity SDK bridge with {}",
+                python.display()
+            )
+        })?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .context("Antigravity SDK bridge stdin was not available")
+        .and_then(|mut stdin| {
+            serde_json::to_writer(&mut stdin, &request)
+                .context("failed to send session to Antigravity SDK bridge")?;
+            stdin
+                .flush()
+                .context("failed to flush Antigravity SDK bridge input")
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed while waiting for Antigravity SDK bridge")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        anyhow::bail!(
+            "official Antigravity SDK import failed{}",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+
+    serde_json::from_slice(&output.stdout)
+        .context("official Antigravity SDK bridge returned invalid JSON")
+}
+
+fn transcript_source(role: &MessageRole) -> &'static str {
+    match role {
+        MessageRole::User | MessageRole::Other(_) => "USER_EXPLICIT",
+        MessageRole::Assistant => "MODEL",
+        MessageRole::Tool => "TOOL",
+        MessageRole::System => "SYSTEM",
+    }
+}
+
+fn transcript_type(role: &MessageRole) -> &'static str {
+    match role {
+        MessageRole::User | MessageRole::Other(_) => "USER_INPUT",
+        MessageRole::Assistant => "PLANNER_RESPONSE",
+        MessageRole::Tool => "TOOL_RESULT",
+        MessageRole::System => "SYSTEM_MESSAGE",
+    }
+}
+
+fn render_import_transcript(session: &CanonicalSession) -> anyhow::Result<Vec<u8>> {
+    let mut transcript = Vec::new();
+    for message in &session.messages {
+        let content = if message.role == MessageRole::User {
+            format!("<USER_REQUEST>\n{}\n</USER_REQUEST>", message.content)
+        } else {
+            message.content.clone()
+        };
+        let mut step = serde_json::json!({
+            "step_index": message.idx,
+            "source": transcript_source(&message.role),
+            "type": transcript_type(&message.role),
+            "status": "DONE",
+            "content": content,
+            "tool_calls": message.tool_calls,
+            "agsx_imported": true,
+            "agsx_original_role": role_label(&message.role),
+        });
+        if let Some(timestamp) = message.timestamp {
+            step["created_at"] = serde_json::Value::Number(timestamp.into());
+        }
+        serde_json::to_writer(&mut transcript, &step)
+            .context("failed to serialize Antigravity import transcript")?;
+        transcript.push(b'\n');
+    }
+    Ok(transcript)
 }
 
 /// Enumerate `(uuid, db_path)` for every `<uuid>.db` directly under `conv_dir`.
@@ -194,6 +733,17 @@ impl Provider for Antigravity {
         if which::which("agy").is_ok() {
             evidence.push("agy binary found in PATH".to_string());
             installed = true;
+        }
+        if let Some(python) = python_with_sdk() {
+            evidence.push(format!(
+                "official google-antigravity>=0.1.9 SDK found via {}",
+                python.display()
+            ));
+        } else {
+            evidence.push(
+                "target writes unavailable: official google-antigravity>=0.1.9 SDK not found"
+                    .to_string(),
+            );
         }
 
         if let Some(cli_dir) = Self::cli_dir()
@@ -368,19 +918,122 @@ impl Provider for Antigravity {
 
     fn write_session(
         &self,
-        _session: &CanonicalSession,
+        session: &CanonicalSession,
         _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        // Antigravity conversations are protobuf-backed trajectories created and
-        // owned by the `agy` runtime (the `steps`/`trajectory_meta` SQLite blobs
-        // plus the sibling `brain/<uuid>/` working tree). There is no supported
-        // way to synthesize a *resumable* conversation from foreign session
-        // history, so we refuse rather than write an un-resumable stub.
-        Err(anyhow::anyhow!(ANTIGRAVITY_WRITE_REFUSAL))
+        let python = python_with_sdk().ok_or_else(|| anyhow::anyhow!(ANTIGRAVITY_SDK_REQUIRED))?;
+        let cli_dir = Self::cli_dir()
+            .context("cannot determine Antigravity CLI directory for target write")?;
+        let conversations_dir = cli_dir.join("conversations");
+        let projection = project_replay(session)?;
+        let response = run_sdk_bridge(&python, &cli_dir, &conversations_dir, &projection)?;
+
+        if response.conversation_id.is_empty()
+            || !response
+                .conversation_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            anyhow::bail!("official Antigravity SDK returned an invalid conversation ID");
+        }
+        let db_path = Self::db_path(&conversations_dir, &response.conversation_id);
+        let mut sqlite_header = [0u8; 16];
+        if let Err(error) =
+            std::fs::File::open(&db_path).and_then(|mut file| file.read_exact(&mut sqlite_header))
+        {
+            let rollback = std::fs::remove_file(&db_path);
+            return Err(match rollback {
+                Ok(()) => anyhow::anyhow!(
+                    "failed to read Antigravity SDK output {}: {error}; rollback succeeded",
+                    db_path.display()
+                ),
+                Err(rollback_error) => anyhow::anyhow!(
+                    "failed to read Antigravity SDK output {}: {error}; rollback failed: \
+                     {rollback_error}",
+                    db_path.display()
+                ),
+            });
+        }
+        if sqlite_header != *b"SQLite format 3\0" {
+            let rollback = std::fs::remove_file(&db_path);
+            return Err(match rollback {
+                Ok(()) => anyhow::anyhow!(
+                    "official Antigravity SDK output {} is not a SQLite conversation; \
+                     rollback succeeded",
+                    db_path.display()
+                ),
+                Err(rollback_error) => anyhow::anyhow!(
+                    "official Antigravity SDK output {} is not a SQLite conversation; \
+                     rollback failed: {rollback_error}",
+                    db_path.display()
+                ),
+            });
+        }
+
+        let transcript_path = Self::transcript_path(&cli_dir, &response.conversation_id);
+        let transcript = match render_import_transcript(session) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                let rollback = std::fs::remove_file(&db_path);
+                return Err(match rollback {
+                    Ok(()) => anyhow::anyhow!(
+                        "failed to render Antigravity transcript after SDK import: {error:#}; \
+                         rollback succeeded"
+                    ),
+                    Err(rollback_error) => anyhow::anyhow!(
+                        "failed to render Antigravity transcript after SDK import: {error:#}; \
+                         rollback failed: {rollback_error}"
+                    ),
+                });
+            }
+        };
+        if let Err(error) =
+            crate::pipeline::atomic_write(&transcript_path, &transcript, false, self.slug())
+        {
+            let rollback = std::fs::remove_file(&db_path);
+            return Err(match rollback {
+                Ok(()) => anyhow::anyhow!(
+                    "failed to write Antigravity transcript after SDK import: {error}; rollback succeeded"
+                ),
+                Err(rollback_error) => anyhow::anyhow!(
+                    "failed to write Antigravity transcript after SDK import: {error}; rollback failed: {rollback_error}"
+                ),
+            });
+        }
+
+        let mut warnings = vec![
+            "Antigravity history was rebuilt by google-antigravity's official local harness; \
+             source model reasoning and native tool trajectories are not available to replay."
+                .to_string(),
+        ];
+        if projection.coalesced_user_messages > 0 {
+            warnings.push(format!(
+                "{} adjacent user/system/tool message(s) were visibly labelled and coalesced into \
+                 neighbouring Antigravity user turns.",
+                projection.coalesced_user_messages
+            ));
+        }
+        if projection.coalesced_assistant_messages > 0 {
+            warnings.push(format!(
+                "{} adjacent assistant message(s) were visibly labelled and coalesced into \
+                 neighbouring Antigravity model turns.",
+                projection.coalesced_assistant_messages
+            ));
+        }
+
+        Ok(WrittenSession {
+            paths: vec![db_path, transcript_path],
+            session_id: response.conversation_id.clone(),
+            resume_command: self.resume_command(&response.conversation_id),
+            backups: Vec::new(),
+            warnings,
+        })
     }
 
     fn write_refusal(&self) -> Option<&'static str> {
-        Some(ANTIGRAVITY_WRITE_REFUSAL)
+        python_with_sdk()
+            .is_none()
+            .then_some(ANTIGRAVITY_SDK_REQUIRED)
     }
 
     /// `agy --conversation <uuid>`, with no `--model` / `--effort` pin. See the
@@ -401,6 +1054,7 @@ fn role_for_source(source: &str) -> Option<MessageRole> {
     match source {
         "USER_EXPLICIT" | "USER" => Some(MessageRole::User),
         "MODEL" => Some(MessageRole::Assistant),
+        "TOOL" => Some(MessageRole::Tool),
         "SYSTEM" => Some(MessageRole::System),
         _ => None,
     }
@@ -513,10 +1167,11 @@ fn step_to_message(step: &serde_json::Value) -> Option<CanonicalMessage> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ANTIGRAVITY_WRITE_REFUSAL, Antigravity, is_housekeeping_type, list_conversations_in,
-        role_for_source, step_to_message, unwrap_user_request,
+        ANTIGRAVITY_SDK_REQUIRED, Antigravity, is_housekeeping_type, list_conversations_in,
+        project_replay, python_with_sdk, render_import_transcript, role_for_source,
+        step_to_message, unwrap_user_request,
     };
-    use crate::model::MessageRole;
+    use crate::model::{CanonicalMessage, CanonicalSession, MessageRole};
     use crate::providers::Provider;
     use serde_json::json;
     use std::io::Write as _;
@@ -530,6 +1185,7 @@ mod tests {
         assert_eq!(role_for_source("USER_EXPLICIT"), Some(MessageRole::User));
         assert_eq!(role_for_source("USER"), Some(MessageRole::User));
         assert_eq!(role_for_source("MODEL"), Some(MessageRole::Assistant));
+        assert_eq!(role_for_source("TOOL"), Some(MessageRole::Tool));
         assert_eq!(role_for_source("SYSTEM"), Some(MessageRole::System));
         assert_eq!(role_for_source("UNKNOWN_THING"), None);
     }
@@ -648,7 +1304,10 @@ mod tests {
         assert_eq!(p.name(), "Antigravity CLI");
         assert_eq!(p.slug(), "antigravity");
         assert_eq!(p.cli_alias(), "agy");
-        assert_eq!(p.write_refusal(), Some(ANTIGRAVITY_WRITE_REFUSAL));
+        assert_eq!(p.write_refusal().is_none(), python_with_sdk().is_some());
+        if let Some(refusal) = p.write_refusal() {
+            assert_eq!(refusal, ANTIGRAVITY_SDK_REQUIRED);
+        }
     }
 
     /// The resume command must be exactly what the shipped `agy` accepts.
@@ -678,26 +1337,120 @@ mod tests {
         );
     }
 
-    #[test]
-    fn write_session_is_refused() {
-        let p = Antigravity;
-        let session = crate::model::CanonicalSession {
-            session_id: "x".to_string(),
+    fn canonical(messages: Vec<CanonicalMessage>) -> CanonicalSession {
+        CanonicalSession {
+            session_id: "source".to_string(),
             provider_slug: "claude-code".to_string(),
             workspace: None,
             title: None,
             started_at: None,
             ended_at: None,
-            messages: vec![],
+            messages,
             metadata: serde_json::Value::Null,
-            source_path: std::path::PathBuf::from("/tmp/x"),
+            source_path: std::path::PathBuf::from("/tmp/source"),
             model_name: None,
-        };
-        let opts = crate::providers::WriteOptions { force: false };
-        let err = p
-            .write_session(&session, &opts)
-            .expect_err("agy must refuse writes");
-        assert_eq!(err.to_string(), ANTIGRAVITY_WRITE_REFUSAL);
+        }
+    }
+
+    fn message(idx: usize, role: MessageRole, content: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            idx,
+            role,
+            content: content.to_string(),
+            timestamp: Some(1_700_000_000_000 + idx as i64),
+            author: None,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn replay_projection_preserves_alternating_user_assistant_turns() {
+        let session = canonical(vec![
+            message(0, MessageRole::User, "question"),
+            message(1, MessageRole::Assistant, "answer"),
+            message(2, MessageRole::User, "follow-up"),
+            message(3, MessageRole::Assistant, "second answer"),
+        ]);
+        let projection = project_replay(&session).expect("alternating session should replay");
+        assert_eq!(projection.turns.len(), 2);
+        assert_eq!(projection.turns[0].user, "question");
+        assert_eq!(projection.turns[0].assistant, "answer");
+        assert_eq!(projection.coalesced_user_messages, 0);
+        assert_eq!(projection.coalesced_assistant_messages, 0);
+    }
+
+    #[test]
+    fn replay_projection_labels_and_coalesces_adjacent_roles() {
+        let session = canonical(vec![
+            message(0, MessageRole::System, "follow policy"),
+            message(1, MessageRole::User, "question"),
+            message(2, MessageRole::Assistant, "answer"),
+            message(3, MessageRole::Assistant, "more detail"),
+        ]);
+        let projection = project_replay(&session).expect("session should be projectable");
+        assert_eq!(projection.turns.len(), 1);
+        assert_eq!(projection.coalesced_user_messages, 1);
+        assert_eq!(projection.coalesced_assistant_messages, 1);
+        assert!(
+            projection.turns[0]
+                .user
+                .contains("[agsx imported system message]")
+        );
+        assert!(
+            projection.turns[0]
+                .user
+                .contains("[agsx imported user message]")
+        );
+        assert!(
+            projection.turns[0]
+                .assistant
+                .contains("[agsx imported assistant continuation]")
+        );
+    }
+
+    #[test]
+    fn replay_projection_refuses_trailing_unanswered_turn() {
+        let session = canonical(vec![
+            message(0, MessageRole::User, "question"),
+            message(1, MessageRole::Assistant, "answer"),
+            message(2, MessageRole::User, "unanswered"),
+        ]);
+        let error = project_replay(&session).expect_err("trailing user turn must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("without inventing an assistant reply")
+        );
+    }
+
+    #[test]
+    fn import_transcript_round_trips_all_role_buckets() {
+        let session = canonical(vec![
+            message(0, MessageRole::System, "system"),
+            message(1, MessageRole::User, "user"),
+            message(2, MessageRole::Assistant, "assistant"),
+            message(3, MessageRole::Tool, "tool"),
+        ]);
+        let bytes = render_import_transcript(&session).expect("transcript should render");
+        let mut readback = Vec::new();
+        for line in String::from_utf8(bytes).expect("UTF-8 transcript").lines() {
+            let step: serde_json::Value = serde_json::from_str(line).expect("JSON line");
+            readback.push(step_to_message(&step).expect("message line"));
+        }
+        assert_eq!(
+            readback
+                .iter()
+                .map(|message| (&message.role, message.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (&MessageRole::System, "system"),
+                (&MessageRole::User, "user"),
+                (&MessageRole::Assistant, "assistant"),
+                (&MessageRole::Tool, "tool"),
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------

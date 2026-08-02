@@ -3,15 +3,15 @@
 # casr installer — Cross Agent Session Resumer
 #
 # One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?$(date +%s)" | bash
 #
 # Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh | bash
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
-#   --system           Install to /usr/local/bin (requires sudo)
+#   --system           Install to user-writable /usr/local/bin (never with sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --yes              Non-interactive; auto-accept install prompts
 #   --verify           Run self-test after install
@@ -19,7 +19,7 @@
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #   --no-verify        Skip checksum + signature verification (not recommended)
-#   --no-configure     Skip agent auto-configuration (skills/wrappers)
+#   --no-configure     Skip optional agent setup; Context Mode remains mandatory
 #   --no-skill         Skip skill installation for Claude/Codex
 #   --offline TARBALL  Install from local tarball (airgap mode)
 #   --force            Reinstall even if same version exists
@@ -40,11 +40,14 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 
 VERSION="${VERSION:-}"
-OWNER="${OWNER:-Dicklesworthstone}"
-REPO="${REPO:-cross_agent_session_resumer}"
+OWNER="${OWNER:-jk-zhang-meta}"
+REPO="${REPO:-ags}"
 BINARY_NAME="casr"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
+SYSTEM_INSTALL=0
+CLAUDE_CONFIG_ROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CODEX_CONFIG_ROOT="${CODEX_HOME:-$HOME/.codex}"
 EASY=0
 ASSUME_YES=0
 QUIET=0
@@ -63,6 +66,19 @@ NO_CONFIGURE=0
 NO_SKILL=0
 FORCE_INSTALL=0
 OFFLINE_TARBALL=""
+CHECKPOINT_IDENTITY=""
+CONTEXT_MODE_RUNTIME_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/ags/context-mode"
+CONTEXT_MODE_RUNTIME_ROOT="$CONTEXT_MODE_RUNTIME_BASE"
+CONTEXT_MODE_ACTIVE_MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ags/context-mode.json"
+CONTEXT_MODE_PENDING_MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ags/context-mode.pending.json"
+CONTEXT_MODE_STATUS="not-attempted"
+INSTALL_TRANSACTION_FILE=""
+INSTALL_TRANSACTION_ACTIVE=0
+INSTALL_CORE_COMMITTED=0
+RESUME_CORE_ONLY=0
+BINARY_PREEXISTED=0
+BINARY_BACKUP=""
+BINARY_STAGE=""
 PROVIDER_VERSION_TIMEOUT="${CASR_INSTALLER_PROVIDER_VERSION_TIMEOUT:-1}"
 SKILL_ARCHIVE_STATUS="not-attempted"
 CLAUDE_SKILL_STATUS="not-detected"
@@ -70,6 +86,16 @@ CODEX_SKILL_STATUS="not-detected"
 CC_WRAPPER_STATUS="not-attempted"
 COD_WRAPPER_STATUS="not-attempted"
 GMI_WRAPPER_STATUS="not-attempted"
+AGS_WRAPPER_STATUS="not-attempted"
+AGS_CODEX_SKILL_STATUS="not-attempted"
+AGS_CLAUDE_SKILL_STATUS="not-attempted"
+AGS_HOOK_STATUS="not-attempted"
+AGS_INIT_STATUS="not-attempted"
+AGS_TERMINAL_STATUS="not-attempted"
+RMUX_VERSION="0.9.1"
+RMUX_RELEASE_BASE="https://github.com/Helvesec/rmux/releases/download/v${RMUX_VERSION}"
+RMUX_TRANSACTION_FILE=""
+RMUX_TRANSACTION_ACTIVE=0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Output System (Gum + ANSI Dual-Path)
@@ -279,13 +305,13 @@ detect_providers() {
   DETECTED_PROVIDERS=()
 
   # Claude Code (cc)
-  if [[ -d "$HOME/.claude" ]] || command -v claude &>/dev/null; then
+  if [[ -d "$CLAUDE_CONFIG_ROOT" ]] || command -v claude &>/dev/null; then
     DETECTED_PROVIDERS+=("claude-code")
     CLAUDE_VERSION=$(try_version claude)
   fi
 
   # Codex CLI (cod)
-  if [[ -d "$HOME/.codex" ]] || command -v codex &>/dev/null; then
+  if [[ -d "$CODEX_CONFIG_ROOT" ]] || command -v codex &>/dev/null; then
     DETECTED_PROVIDERS+=("codex")
     CODEX_VERSION=$(try_version codex)
   fi
@@ -449,6 +475,10 @@ SKILL_EOF
 
 download_skill_archive() {
   [ "$NO_SKILL" -eq 1 ] && return 1
+  [ -z "$OFFLINE_TARBALL" ] || {
+    SKILL_ARCHIVE_STATUS="bundled inline skill (offline)"
+    return 1
+  }
 
   local dest="$TMP/casr-skill.tar.gz"
   local urls=(
@@ -476,6 +506,11 @@ install_skill_for_agent() {
 
   if [ "$NO_SKILL" -eq 1 ]; then
     printf -v "$status_var" '%s' "skipped (--no-skill)"
+    return 0
+  fi
+  if checkpoint_path_has_symlink "$skills_root/casr"; then
+    printf -v "$status_var" '%s' "refused (symbolic-link path)"
+    warn "$agent_label skill path contains a symbolic link: $skills_root/casr"
     return 0
   fi
 
@@ -512,14 +547,14 @@ configure_agent_skills() {
 
   download_skill_archive || true
 
-  if has_provider "claude-code" || [ -d "$HOME/.claude" ] || command -v claude >/dev/null 2>&1; then
-    install_skill_for_agent "Claude Code" "$HOME/.claude/skills" CLAUDE_SKILL_STATUS
+  if has_provider "claude-code" || [ -d "$CLAUDE_CONFIG_ROOT" ] || command -v claude >/dev/null 2>&1; then
+    install_skill_for_agent "Claude Code" "$CLAUDE_CONFIG_ROOT/skills" CLAUDE_SKILL_STATUS
   else
     CLAUDE_SKILL_STATUS="not-detected"
   fi
 
-  if has_provider "codex" || [ -d "$HOME/.codex" ] || command -v codex >/dev/null 2>&1; then
-    install_skill_for_agent "Codex" "$HOME/.codex/skills" CODEX_SKILL_STATUS
+  if has_provider "codex" || [ -d "$CODEX_CONFIG_ROOT" ] || command -v codex >/dev/null 2>&1; then
+    install_skill_for_agent "Codex" "$CODEX_CONFIG_ROOT/skills" CODEX_SKILL_STATUS
   else
     CODEX_SKILL_STATUS="not-detected"
   fi
@@ -580,9 +615,722 @@ configure_provider_wrappers() {
   install_wrapper_command "gmi" "gemini" GMI_WRAPPER_STATUS
 }
 
+checkpoint_path_has_symlink() {
+  local path="$1" current="/" relative component
+  [[ "$path" == /* ]] || return 0
+  relative="${path#/}"
+  while [ -n "$relative" ]; do
+    component="${relative%%/*}"
+    if [ "$component" = "$relative" ]; then
+      relative=""
+    else
+      relative="${relative#*/}"
+    fi
+    if [ "$current" = / ]; then
+      current="/$component"
+    else
+      current="$current/$component"
+    fi
+    [ ! -L "$current" ] || return 0
+  done
+  return 1
+}
+
+install_checkpoint_wrapper() {
+  local wrapper_path="$DEST/ags"
+  local marker="# agsx-installer-checkpoint-wrapper"
+  local temporary
+
+  if [ "$NO_CONFIGURE" -eq 1 ]; then
+    AGS_WRAPPER_STATUS="skipped (--no-configure)"
+    return 0
+  fi
+  if [ -e "$wrapper_path" ] && ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null; then
+    AGS_WRAPPER_STATUS="preserved unmanaged ($(status_path "$wrapper_path"))"
+    return 0
+  fi
+
+  temporary="$(mktemp "$DEST/.ags-wrapper.XXXXXX")"
+  cat > "$temporary" <<'EOF'
+#!/bin/sh
+# agsx-installer-checkpoint-wrapper
+script_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
+exec "$script_dir/casr" checkpoint "$@"
+EOF
+  chmod 0755 "$temporary"
+  mv -f "$temporary" "$wrapper_path"
+  AGS_WRAPPER_STATUS="installed ($(status_path "$wrapper_path") -> casr checkpoint)"
+}
+
+install_checkpoint_skill() {
+  local root="$1" status_var="$2" skill_dir
+  local staged="$TMP/ags-skill-${status_var}"
+  skill_dir="$root/ags"
+
+  if [ "$NO_SKILL" -eq 1 ]; then
+    printf -v "$status_var" '%s' "skipped (--no-skill)"
+    return 0
+  fi
+  if checkpoint_path_has_symlink "$skill_dir"; then
+    printf -v "$status_var" '%s' "refused (symbolic-link path)"
+    warn "Checkpoint skill path contains a symbolic link: $skill_dir"
+    return 0
+  fi
+
+  mkdir -p "$staged/agents"
+  "$DEST/$BINARY_NAME" checkpoint-asset skill > "$staged/SKILL.md"
+  "$DEST/$BINARY_NAME" checkpoint-asset openai-agent > "$staged/agents/openai.yaml"
+  mkdir -p "$skill_dir/agents"
+  install -m 0644 "$staged/SKILL.md" "$skill_dir/SKILL.md"
+  install -m 0644 "$staged/agents/openai.yaml" "$skill_dir/agents/openai.yaml"
+  printf -v "$status_var" '%s' "installed ($(status_path "$skill_dir"))"
+}
+
+write_checkpoint_hooks() {
+  local file="$1" kind="$2" directory temporary source
+  local command="$DEST/$BINARY_NAME checkpoint hook"
+  local legacy_ags="$DEST/ags hook"
+  local legacy_session="$DEST/agent-session hook"
+
+  if checkpoint_path_has_symlink "$file"; then
+    warn "Checkpoint hook path contains a symbolic link: $file"
+    return 1
+  fi
+  directory="$(dirname "$file")"
+  mkdir -p "$directory"
+  source="$TMP/hooks-${kind}.json"
+  if [ -s "$file" ]; then
+    jq -e 'type == "object"' "$file" >/dev/null ||
+      { warn "Checkpoint hooks skipped; invalid JSON object: $file"; return 1; }
+    cp "$file" "$source"
+  else
+    printf '{}\n' > "$source"
+  fi
+
+  temporary="$(mktemp "$directory/.agsx-hooks.XXXXXX")"
+  jq --arg command "$command" --arg legacy_ags "$legacy_ags" \
+    --arg legacy_session "$legacy_session" --arg kind "$kind" '
+      .hooks = (.hooks // {}) |
+      reduce ["Stop", "SessionStart"][] as $event (.;
+        .hooks[$event] = (
+          [(.hooks[$event] // [])[] |
+            .hooks = [
+              (.hooks // [])[] |
+              select(
+                (.command // "") != $command and
+                (.command // "") != $legacy_ags and
+                (.command // "") != $legacy_session and
+                (.command // "") != "/usr/local/bin/ags hook" and
+                (.command // "") != "/usr/local/bin/agent-session hook"
+              )
+            ] |
+            select((.hooks | length) > 0)
+          ] + [{
+            hooks: [{type: "command", command: $command, timeout: 300}]
+          }]
+        )
+      ) |
+      if $kind == "claude" then
+        .skillOverrides = (.skillOverrides // {}) |
+        del(.skillOverrides["agent-session"]) |
+        .skillOverrides.ags = "user-invocable-only"
+      else . end
+    ' "$source" > "$temporary"
+  chmod 0600 "$temporary"
+  mv -f "$temporary" "$file"
+}
+
+checkpoint_dependencies_ready() {
+  local missing=() command
+  for command in age age-keygen column flock git jq rclone rsync ssh ssh-keygen tar zstd; do
+    command -v "$command" >/dev/null 2>&1 || missing+=("$command")
+  done
+  if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    missing+=("bash>=4")
+  fi
+  if [ "${#missing[@]}" -gt 0 ]; then
+    warn "Checkpoint runtime not initialized; missing: ${missing[*]}"
+    return 1
+  fi
+  return 0
+}
+
+rmux_version_supported() {
+  local version="$1" major minor patch
+  if [[ "$version" =~ ^rmux[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+)(\+[A-Za-z0-9._-]+)?$ ]]; then
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    patch="${BASH_REMATCH[3]}"
+    (( major == 0 && minor == 9 && patch >= 1 ))
+    return
+  fi
+  return 1
+}
+
+rmux_install_layout() {
+  local prefix
+  prefix="${RMUX_INSTALL_PREFIX:-}"
+  if [ -z "$prefix" ]; then
+    case "$DEST" in
+      */bin) prefix="${DEST%/bin}" ;;
+      *) prefix="$DEST" ;;
+    esac
+  fi
+  RMUX_CLIENT_PATH="$DEST/rmux"
+  RMUX_DAEMON_PATH="$DEST/rmux-daemon"
+  RMUX_HELPER_PATH="$prefix/libexec/rmux/rmux"
+}
+
+rmux_stage_path() {
+  printf '%s.install-transaction.\n' "$1"
+}
+
+rmux_backup_path() {
+  printf '%s/.rmux.rollback.%s.\n' "$DEST" "$1"
+}
+
+validate_rmux_transaction() {
+  local index path stage backup previous_existed
+  local -a destinations
+  rmux_install_layout
+  destinations=("$RMUX_CLIENT_PATH" "$RMUX_DAEMON_PATH" "$RMUX_HELPER_PATH")
+  [[ -f "$RMUX_TRANSACTION_FILE" &&
+     ! -L "$RMUX_TRANSACTION_FILE" ]] || return 1
+  jq -e --arg version "$RMUX_VERSION" '
+    (keys | sort) == ["entries","managed_by","schema","version"] and
+    .schema == 1 and
+    .managed_by == "ags-rmux-installer" and
+    .version == $version and
+    (.entries | type == "array" and length == 3) and
+    all(.entries[];
+      (keys | sort) ==
+        ["candidate_sha256","path","previous","stage_path"] and
+      (.path | type == "string" and startswith("/")) and
+      (.stage_path | type == "string" and startswith("/")) and
+      (.candidate_sha256 | test("^[0-9a-f]{64}$")) and
+      (.previous | keys | sort) ==
+        ["backup_path","existed","sha256"] and
+      (.previous.existed | type == "boolean") and
+      (
+        if .previous.existed then
+          (.previous.sha256 | test("^[0-9a-f]{64}$")) and
+          (.previous.backup_path | type == "string" and startswith("/"))
+        else
+          .previous.sha256 == null and .previous.backup_path == null
+        end
+      )
+    )
+  ' "$RMUX_TRANSACTION_FILE" >/dev/null 2>&1 || return 1
+  for index in "${!destinations[@]}"; do
+    path="$(jq -er --argjson index "$index" \
+      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
+    stage="$(jq -er --argjson index "$index" \
+      '.entries[$index].stage_path' "$RMUX_TRANSACTION_FILE")" || return 1
+    [[ "$path" == "${destinations[$index]}" &&
+       "$stage" == "$(rmux_stage_path "$path")"* &&
+       "$(dirname "$stage")" == "$(dirname "$path")" ]] || return 1
+    previous_existed="$(jq -er --argjson index "$index" '
+      .entries[$index].previous.existed |
+      if type == "boolean" then tostring else error("invalid boolean") end
+    ' "$RMUX_TRANSACTION_FILE")" ||
+      return 1
+    if [[ "$previous_existed" == true ]]; then
+      backup="$(jq -er --argjson index "$index" \
+        '.entries[$index].previous.backup_path' \
+        "$RMUX_TRANSACTION_FILE")" || return 1
+      [[ "$backup" == "$(rmux_backup_path "$index")"* &&
+         "$(dirname "$backup")" == "$DEST" ]] || return 1
+    fi
+  done
+}
+
+clear_rmux_transaction() {
+  local index previous_existed artifact
+  local -a stages backups
+  validate_rmux_transaction || return 1
+  for index in 0 1 2; do
+    stages[$index]="$(jq -er --argjson index "$index" \
+      '.entries[$index].stage_path' "$RMUX_TRANSACTION_FILE")" || return 1
+    previous_existed="$(jq -er --argjson index "$index" '
+      .entries[$index].previous.existed |
+      if type == "boolean" then tostring else error("invalid boolean") end
+    ' "$RMUX_TRANSACTION_FILE")" ||
+      return 1
+    if [[ "$previous_existed" == true ]]; then
+      backups[$index]="$(jq -er --argjson index "$index" \
+        '.entries[$index].previous.backup_path' \
+        "$RMUX_TRANSACTION_FILE")" || return 1
+    else
+      backups[$index]=""
+    fi
+  done
+  # Once every destination is proven committed or rolled back, remove the
+  # recovery authority first. Leftover stages/backups are harmless orphans.
+  rm -f -- "$RMUX_TRANSACTION_FILE" || return 1
+  RMUX_TRANSACTION_ACTIVE=0
+  durable_sync_path "$DEST" || return 1
+  for artifact in "${stages[@]}" "${backups[@]}"; do
+    [[ -z "$artifact" ]] || rm -f -- "$artifact" 2>/dev/null || true
+  done
+}
+
+rollback_rmux_install() {
+  local index current_sha partial
+  local -a destinations candidate_shas previous_existed previous_shas
+  local -a backups current_shas
+  [ "$RMUX_TRANSACTION_ACTIVE" -eq 1 ] ||
+    [[ -e "$RMUX_TRANSACTION_FILE" || -L "$RMUX_TRANSACTION_FILE" ]] ||
+    return 0
+  validate_rmux_transaction || return 1
+  # Prove every rollback input before changing any installed executable.
+  for index in 0 1 2; do
+    destinations[$index]="$(jq -er --argjson index "$index" \
+      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
+    candidate_shas[$index]="$(jq -er --argjson index "$index" \
+      '.entries[$index].candidate_sha256' "$RMUX_TRANSACTION_FILE")" ||
+      return 1
+    previous_existed[$index]="$(jq -er --argjson index "$index" '
+      .entries[$index].previous.existed |
+      if type == "boolean" then tostring else error("invalid boolean") end
+    ' "$RMUX_TRANSACTION_FILE")" ||
+      return 1
+    current_sha=
+    if [[ -e "${destinations[$index]}" ||
+          -L "${destinations[$index]}" ]]; then
+      [[ -f "${destinations[$index]}" &&
+         ! -L "${destinations[$index]}" ]] || return 1
+      current_sha="$(
+        installer_sha256_file "${destinations[$index]}"
+      )" || return 1
+    fi
+    current_shas[$index]="$current_sha"
+    if [[ "${previous_existed[$index]}" == true ]]; then
+      previous_shas[$index]="$(jq -er --argjson index "$index" \
+        '.entries[$index].previous.sha256' "$RMUX_TRANSACTION_FILE")" ||
+        return 1
+      backups[$index]="$(jq -er --argjson index "$index" \
+        '.entries[$index].previous.backup_path' \
+        "$RMUX_TRANSACTION_FILE")" || return 1
+      [[ -f "${backups[$index]}" && ! -L "${backups[$index]}" &&
+         "$(installer_sha256_file "${backups[$index]}")" == \
+           "${previous_shas[$index]}" ]] || return 1
+      [[ -z "$current_sha" ||
+         "$current_sha" == "${candidate_shas[$index]}" ||
+         "$current_sha" == "${previous_shas[$index]}" ]] || return 1
+    else
+      previous_shas[$index]=""
+      backups[$index]=""
+      [[ -z "$current_sha" ||
+         "$current_sha" == "${candidate_shas[$index]}" ]] || return 1
+    fi
+  done
+
+  for index in 0 1 2; do
+    current_sha="${current_shas[$index]}"
+    if [[ "${previous_existed[$index]}" == true ]]; then
+      if [[ "$current_sha" != "${previous_shas[$index]}" ]]; then
+        partial="$(
+          mktemp "${destinations[$index]}.rollback.XXXXXX"
+        )" || return 1
+        if ! install -m 0755 "${backups[$index]}" "$partial" ||
+           ! durable_sync_path "$partial" ||
+           ! mv -f -- "$partial" "${destinations[$index]}" ||
+           ! durable_sync_path "${destinations[$index]}"; then
+          rm -f -- "$partial"
+          return 1
+        fi
+      fi
+    elif [[ -n "$current_sha" ]]; then
+      rm -f -- "${destinations[$index]}" || return 1
+      durable_sync_path "$(dirname "${destinations[$index]}")" || return 1
+    fi
+  done
+  for index in 0 1 2; do
+    if [[ "${previous_existed[$index]}" == true ]]; then
+      [[ -f "${destinations[$index]}" &&
+         ! -L "${destinations[$index]}" &&
+         "$(installer_sha256_file "${destinations[$index]}")" == \
+           "${previous_shas[$index]}" ]] || return 1
+    else
+      [[ ! -e "${destinations[$index]}" &&
+         ! -L "${destinations[$index]}" ]] || return 1
+    fi
+  done
+  clear_rmux_transaction
+}
+
+commit_rmux_install() {
+  local index destination candidate_sha
+  validate_rmux_transaction || return 1
+  for index in 0 1 2; do
+    destination="$(jq -er --argjson index "$index" \
+      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
+    candidate_sha="$(jq -er --argjson index "$index" \
+      '.entries[$index].candidate_sha256' "$RMUX_TRANSACTION_FILE")" ||
+      return 1
+    [[ -f "$destination" && ! -L "$destination" &&
+       "$(installer_sha256_file "$destination")" == "$candidate_sha" ]] ||
+      return 1
+  done
+  detect_rmux >/dev/null 2>&1 || return 1
+  clear_rmux_transaction
+}
+
+recover_pending_rmux_transaction() {
+  local index destination candidate_sha current_sha all_candidate=1
+  if [[ ! -e "$RMUX_TRANSACTION_FILE" &&
+        ! -L "$RMUX_TRANSACTION_FILE" ]]; then
+    return 0
+  fi
+  validate_rmux_transaction || {
+    err "Invalid pending RMUX transaction: $RMUX_TRANSACTION_FILE"
+    return 1
+  }
+  for index in 0 1 2; do
+    destination="$(jq -er --argjson index "$index" \
+      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
+    candidate_sha="$(jq -er --argjson index "$index" \
+      '.entries[$index].candidate_sha256' "$RMUX_TRANSACTION_FILE")" ||
+      return 1
+    current_sha=
+    if [[ -e "$destination" || -L "$destination" ]]; then
+      [[ -f "$destination" && ! -L "$destination" ]] || {
+        err "Pending RMUX target is no longer a regular file: $destination"
+        return 1
+      }
+      current_sha="$(installer_sha256_file "$destination")" || return 1
+    fi
+    [[ "$current_sha" == "$candidate_sha" ]] || all_candidate=0
+  done
+  RMUX_TRANSACTION_ACTIVE=1
+  if [[ "$all_candidate" -eq 1 ]] && detect_rmux >/dev/null 2>&1; then
+    info "Recovering interrupted RMUX and Context Mode installation"
+    return 0
+  fi
+  if rollback_rmux_install; then
+    warn "Rolled back an interrupted RMUX activation"
+    return 0
+  fi
+  err "Interrupted RMUX installation could not be recovered safely"
+  return 1
+}
+
+detect_rmux() {
+  local version
+  rmux_install_layout
+  [ -x "$RMUX_CLIENT_PATH" ] &&
+    [ -x "$RMUX_DAEMON_PATH" ] &&
+    [ -x "$RMUX_HELPER_PATH" ] || {
+      err "AGS requires its complete RMUX installation at $RMUX_CLIENT_PATH"
+      return 1
+    }
+  version="$("$RMUX_CLIENT_PATH" -V 2>/dev/null || true)"
+  rmux_version_supported "$version" || {
+    err "AGS requires a compatible RMUX 0.9.x release (0.9.1 or newer); found ${version:-an unrecognized version}"
+    return 1
+  }
+  "$RMUX_CLIENT_PATH" list-commands >/dev/null 2>&1 || {
+    err "RMUX cannot find its private helper at $RMUX_HELPER_PATH"
+    return 1
+  }
+  AGS_TERMINAL_STATUS="available (${version#rmux })"
+}
+
+install_rmux() {
+  local os arch platform archive checksum url package_root version
+  local index entries_file journal_tmp previous_sha previous_json
+  local candidate_sha prepare_ok=1 activation_ok=1
+  local -a sources destinations stages backups existed candidate_shas previous_shas
+  rmux_install_layout
+  if detect_rmux >/dev/null 2>&1; then
+    return 0
+  fi
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=macos ;;
+    *) err "RMUX does not support this operating system"; return 1 ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64) arch=x86_64 ;;
+    arm64|aarch64) arch=aarch64 ;;
+    *) err "RMUX does not support this CPU architecture"; return 1 ;;
+  esac
+  platform="$os-$arch"
+  archive="rmux-$RMUX_VERSION-$platform.tar.gz"
+  case "$platform" in
+    linux-x86_64)
+      checksum=f7e91baa912e942c1fd090b9bfb30142d51ac1da8b142e088e6b3a417321d54b
+      ;;
+    linux-aarch64)
+      checksum=dc5fdb1257154c19f53a6c6a78fb08573556b9c791d2411c013e819862316db3
+      ;;
+    macos-x86_64)
+      checksum=6ef9c27019593affc3bc487f85fed28571ba47ce57587ddfcf8f33b8c924522a
+      ;;
+    macos-aarch64)
+      checksum=608d932cb2ea40cad741b45c78d1fbd9065e503942499423a2fcc2ccd914979f
+      ;;
+  esac
+  command -v tar >/dev/null 2>&1 || {
+    err "RMUX installation requires tar"
+    return 1
+  }
+  if ! command -v sha256sum >/dev/null 2>&1 &&
+     ! command -v shasum >/dev/null 2>&1; then
+    err "RMUX installation requires sha256sum or shasum"
+    return 1
+  fi
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    for package_root in \
+      "$TMP/rmux-$RMUX_VERSION-$platform" \
+      "$TMP/rmux" \
+      "$TMP"; do
+      if [ -x "$package_root/bin/rmux" ] &&
+         [ -x "$package_root/bin/rmux-daemon" ] &&
+         [ -x "$package_root/libexec/rmux/rmux" ]; then
+        break
+      fi
+    done
+    [ -x "$package_root/bin/rmux" ] || {
+      err "Offline bundle is missing mandatory RMUX $RMUX_VERSION"
+      return 1
+    }
+    info "Installing mandatory bundled RMUX $RMUX_VERSION"
+  else
+    url="$RMUX_RELEASE_BASE/$archive"
+    info "Installing mandatory RMUX $RMUX_VERSION"
+    curl -fsSL "${PROXY_ARGS[@]}" "$url" -o "$TMP/$archive" || {
+      err "Cannot download official RMUX release: $url"
+      return 1
+    }
+    verify_checksum "$TMP/$archive" "$checksum" || {
+      err "RMUX archive checksum verification failed"
+      return 1
+    }
+    tar -xzf "$TMP/$archive" -C "$TMP"
+    package_root="$TMP/rmux-$RMUX_VERSION-$platform"
+  fi
+  sources=(
+    "$package_root/bin/rmux"
+    "$package_root/bin/rmux-daemon"
+    "$package_root/libexec/rmux/rmux"
+  )
+  destinations=(
+    "$RMUX_CLIENT_PATH"
+    "$RMUX_DAEMON_PATH"
+    "$RMUX_HELPER_PATH"
+  )
+  for index in "${!sources[@]}"; do
+    [ -x "${sources[$index]}" ] || {
+      err "Official RMUX archive is missing its required executable layout"
+      return 1
+    }
+  done
+  version="$("${sources[0]}" -V 2>/dev/null || true)"
+  [ "$version" = "rmux $RMUX_VERSION" ] || {
+    err "Official RMUX archive reported an unexpected version: ${version:-unknown}"
+    return 1
+  }
+
+  [[ ! -e "$RMUX_TRANSACTION_FILE" &&
+     ! -L "$RMUX_TRANSACTION_FILE" ]] || {
+    err "A pending RMUX transaction must be recovered first"
+    return 1
+  }
+  entries_file="$TMP/rmux-transaction-entries.jsonl"
+  : > "$entries_file"
+  for index in "${!destinations[@]}"; do
+    mkdir -p "$(dirname "${destinations[$index]}")"
+    stages[$index]="$(
+      mktemp "$(rmux_stage_path "${destinations[$index]}")XXXXXX"
+    )" || { prepare_ok=0; break; }
+    if ! install -m 0755 "${sources[$index]}" "${stages[$index]}" ||
+       ! durable_sync_path "${stages[$index]}"; then
+      prepare_ok=0
+      break
+    fi
+    if [ "$os" = macos ] && command -v codesign >/dev/null 2>&1; then
+      if ! codesign --force --sign - "${stages[$index]}" >/dev/null ||
+         ! durable_sync_path "${stages[$index]}"; then
+        prepare_ok=0
+        break
+      fi
+    fi
+    candidate_sha="$(installer_sha256_file "${stages[$index]}")" || {
+      prepare_ok=0
+      break
+    }
+    candidate_shas[$index]="$candidate_sha"
+    if [[ -e "${destinations[$index]}" ||
+          -L "${destinations[$index]}" ]]; then
+      [[ -f "${destinations[$index]}" &&
+         ! -L "${destinations[$index]}" ]] || {
+        prepare_ok=0
+        break
+      }
+      existed[$index]=1
+      backups[$index]="$(
+        mktemp "$(rmux_backup_path "$index")XXXXXX"
+      )" || { prepare_ok=0; break; }
+      if ! cp -p -- "${destinations[$index]}" "${backups[$index]}" ||
+         ! durable_sync_path "${backups[$index]}"; then
+        prepare_ok=0
+        break
+      fi
+      previous_sha="$(installer_sha256_file "${backups[$index]}")" || {
+        prepare_ok=0
+        break
+      }
+      previous_shas[$index]="$previous_sha"
+    else
+      existed[$index]=0
+      backups[$index]=""
+      previous_shas[$index]=""
+    fi
+  done
+  if [[ "$prepare_ok" -ne 1 || "${#stages[@]}" -ne 3 ]]; then
+    rm -f -- "${stages[@]:-}" "${backups[@]:-}" 2>/dev/null || true
+    err "RMUX transaction could not be staged"
+    return 1
+  fi
+
+  for index in 0 1 2; do
+    if [[ "${existed[$index]}" -eq 1 ]]; then
+      previous_json=true
+    else
+      previous_json=false
+    fi
+    jq -n \
+      --arg path "${destinations[$index]}" \
+      --arg stage "${stages[$index]}" \
+      --arg candidate "${candidate_shas[$index]}" \
+      --argjson existed "$previous_json" \
+      --arg previous_sha "${previous_shas[$index]}" \
+      --arg backup "${backups[$index]}" '
+        {
+          path:$path,
+          stage_path:$stage,
+          candidate_sha256:$candidate,
+          previous:{
+            existed:$existed,
+            sha256:(if $existed then $previous_sha else null end),
+            backup_path:(if $existed then $backup else null end)
+          }
+        }
+      ' >> "$entries_file" || {
+        rm -f -- "${stages[@]}" "${backups[@]}" 2>/dev/null || true
+        return 1
+      }
+  done
+  journal_tmp="$(
+    mktemp "$DEST/.rmux-install-transaction.tmp.XXXXXX"
+  )" || return 1
+  if ! jq -s --arg version "$RMUX_VERSION" '{
+      schema:1,
+      managed_by:"ags-rmux-installer",
+      version:$version,
+      entries:.
+    }' "$entries_file" > "$journal_tmp" ||
+     ! chmod 600 "$journal_tmp" ||
+     ! mv -- "$journal_tmp" "$RMUX_TRANSACTION_FILE"; then
+    rm -f -- "$journal_tmp" "${stages[@]}" "${backups[@]}" \
+      2>/dev/null || true
+    err "Cannot persist the RMUX installer transaction"
+    return 1
+  fi
+  RMUX_TRANSACTION_ACTIVE=1
+  if ! durable_sync_path "$RMUX_TRANSACTION_FILE"; then
+    err "RMUX transaction journal was retained after a durability failure"
+    return 1
+  fi
+  for index in 0 1 2; do
+    if ! mv -f -- "${stages[$index]}" "${destinations[$index]}" ||
+       ! durable_sync_path "${destinations[$index]}"; then
+      activation_ok=0
+      break
+    fi
+  done
+  if [[ "$activation_ok" -ne 1 ]] || ! detect_rmux >/dev/null 2>&1; then
+    rollback_rmux_install ||
+      err "RMUX installation failed and automatic rollback was not proven safe"
+    return 1
+  fi
+  AGS_TERMINAL_STATUS="installed ($RMUX_VERSION)"
+}
+
+run_checkpoint_runtime() {
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    AGS_CONTEXT_MODE_OFFLINE=1 "$DEST/$BINARY_NAME" checkpoint "$@"
+  else
+    "$DEST/$BINARY_NAME" checkpoint "$@"
+  fi
+}
+
+configure_context_mode_only() {
+  local init_output version root runtime_base="$CONTEXT_MODE_RUNTIME_BASE"
+  local runtime_target
+  init_output="$(run_checkpoint_runtime context-init)"
+  version="$(sed -n 's/^context-mode-version=//p' <<< "$init_output" | tail -n 1)"
+  root="$(sed -n 's/^context-mode-root=//p' <<< "$init_output" | tail -n 1)"
+  runtime_target="${root#"$runtime_base/runtimes/"}"
+  runtime_target="${runtime_target%"/$version"}"
+  if ! grep -Fqx 'status=context-mode-initialized' <<< "$init_output" ||
+     [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+     [[ ! "$runtime_target" =~ ^(linux|darwin)-[a-z0-9_]+-node[1-9][0-9]*$ ]] ||
+     [ "$root" != "$runtime_base/runtimes/$runtime_target/$version" ]; then
+    CONTEXT_MODE_STATUS="failed"
+    err "Context Mode initialization returned an unexpected result"
+    return 1
+  fi
+  CONTEXT_MODE_RUNTIME_ROOT="$root"
+  CONTEXT_MODE_STATUS="initialized ($version)"
+}
+
+configure_checkpoints() {
+  local init_output
+  if [ "$NO_CONFIGURE" -eq 1 ]; then
+    AGS_WRAPPER_STATUS="skipped (--no-configure)"
+    AGS_CODEX_SKILL_STATUS="skipped (--no-configure)"
+    AGS_CLAUDE_SKILL_STATUS="skipped (--no-configure)"
+    AGS_HOOK_STATUS="skipped (--no-configure)"
+    AGS_INIT_STATUS="skipped (--no-configure)"
+    return 0
+  fi
+
+  install_checkpoint_wrapper
+  detect_rmux
+  install_checkpoint_skill "$CODEX_CONFIG_ROOT/skills" AGS_CODEX_SKILL_STATUS
+  install_checkpoint_skill "$CLAUDE_CONFIG_ROOT/skills" AGS_CLAUDE_SKILL_STATUS
+  if write_checkpoint_hooks "$CODEX_CONFIG_ROOT/hooks.json" codex &&
+     write_checkpoint_hooks "$CLAUDE_CONFIG_ROOT/settings.json" claude; then
+    AGS_HOOK_STATUS="installed"
+  else
+    AGS_HOOK_STATUS="partial; see warnings"
+  fi
+
+  if ! checkpoint_dependencies_ready; then
+    AGS_INIT_STATUS="skipped (missing dependencies)"
+    return 0
+  fi
+
+  if [ -n "$CHECKPOINT_IDENTITY" ]; then
+    init_output="$(run_checkpoint_runtime init --identity "$CHECKPOINT_IDENTITY")"
+  else
+    init_output="$(run_checkpoint_runtime init)"
+  fi
+  if grep -Fqx 'status=initialized' <<< "$init_output"; then
+    AGS_INIT_STATUS="initialized"
+  else
+    AGS_INIT_STATUS="failed"
+    err "Checkpoint initialization returned an unexpected result"
+    return 1
+  fi
+}
+
 configure_agents() {
   configure_provider_wrappers
   configure_agent_skills
+  configure_checkpoints
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -591,6 +1339,10 @@ configure_agents() {
 
 resolve_version() {
   if [ -n "$VERSION" ]; then return 0; fi
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    info "Offline mode; the version will be read from the verified local artifact"
+    return 0
+  fi
 
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
@@ -616,8 +1368,25 @@ resolve_version() {
     fi
   fi
 
-  VERSION="v0.1.0"
-  warn "Could not resolve latest version; defaulting to $VERSION"
+  # A source build takes the default branch, not a tag, so it needs no version.
+  # `check_installed_version` rejects an empty target, so the already-installed
+  # short-circuit stays off and the build still runs.
+  if [ "$FROM_SOURCE" -eq 1 ]; then
+    info "Could not resolve a release version; building from source instead"
+    return 0
+  fi
+
+  # Never guess. A guessed version is worse than no install: the guess is
+  # compared against what is already on disk, an older guess always loses that
+  # comparison, and the installer then reports "already installed" and exits 0
+  # having updated nothing. A user asking to be updated must not be told they
+  # are up to date because a lookup failed.
+  err "Could not resolve the latest ${OWNER}/${REPO} release."
+  err "Neither the GitHub API nor the /releases/latest redirect returned a tag."
+  err "This is expected if the repository has no releases yet, is private and"
+  err "this host is unauthenticated, or the network blocks github.com."
+  err "Pass --version vX.Y.Z, --from-source, or --offline TARBALL."
+  exit 1
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -740,6 +1509,452 @@ check_network() {
     warn "Network check failed for $URL"
     warn "Continuing; download may fail"
   fi
+}
+
+context_mode_node_supported() {
+  local version="${1:-}" major minor patch
+  [[ "$version" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+  (( major > 22 || (major == 22 && minor >= 5) ))
+}
+
+preflight_context_mode() {
+  local mode="${1:-install}" node_version command
+  for command in cmp flock jq realpath; do
+    command -v "$command" >/dev/null 2>&1 || {
+      err "Context Mode integration requires $command"
+      exit 1
+    }
+  done
+  if ! command -v sha256sum >/dev/null 2>&1 &&
+     ! command -v shasum >/dev/null 2>&1; then
+    err "Context Mode integration requires sha256sum or shasum"
+    exit 1
+  fi
+  command -v node >/dev/null 2>&1 || {
+    err "Context Mode requires Node.js 22.5.0 or newer"
+    exit 1
+  }
+  node_version="$(node --version 2>/dev/null || true)"
+  context_mode_node_supported "$node_version" || {
+    err "Context Mode requires Node.js 22.5.0 or newer; found ${node_version:-unknown}"
+    exit 1
+  }
+  if [[ "$mode" != recovery && -z "$OFFLINE_TARBALL" ]]; then
+    command -v npm >/dev/null 2>&1 || {
+      err "Installing or refreshing mandatory Context Mode requires npm"
+      exit 1
+    }
+  fi
+}
+
+installer_sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | cut -d' ' -f1
+  else
+    shasum -a 256 "$file" | cut -d' ' -f1
+  fi
+}
+
+durable_sync_path() {
+  local path="$1"
+  node - "$path" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const target = process.argv[2];
+const targetStat = fs.lstatSync(target);
+if (targetStat.isSymbolicLink()) process.exit(1);
+
+function flush(entry, directory) {
+  const descriptor = fs.openSync(entry, "r");
+  try {
+    fs.fsyncSync(descriptor);
+  } catch (error) {
+    if (
+      !directory ||
+      !["EINVAL", "ENOTSUP", "EISDIR"].includes(error?.code)
+    ) {
+      throw error;
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+flush(target, targetStat.isDirectory());
+if (!targetStat.isDirectory()) {
+  flush(path.dirname(target), true);
+}
+NODE
+}
+
+install_transaction_child_path() {
+  local path="$1" kind="$2" parent name
+  parent="$(dirname -- "$path")" || return 1
+  name="$(basename -- "$path")" || return 1
+  [[ "$parent" == "$DEST" &&
+     "$name" == ".${BINARY_NAME}.${kind}."* &&
+     "$name" != *$'\t'* &&
+     "$name" != *$'\n'* &&
+     "$name" != *$'\r'* ]]
+}
+
+context_manifest_fingerprint() {
+  if [[ -e "$CONTEXT_MODE_ACTIVE_MANIFEST" ||
+        -L "$CONTEXT_MODE_ACTIVE_MANIFEST" ]]; then
+    [[ -f "$CONTEXT_MODE_ACTIVE_MANIFEST" &&
+       ! -L "$CONTEXT_MODE_ACTIVE_MANIFEST" ]] ||
+      return 1
+    installer_sha256_file "$CONTEXT_MODE_ACTIVE_MANIFEST"
+  else
+    printf 'absent\n'
+  fi
+}
+
+validate_install_transaction() {
+  [[ -f "$INSTALL_TRANSACTION_FILE" &&
+     ! -L "$INSTALL_TRANSACTION_FILE" ]] ||
+    return 1
+  jq -e --arg binary "$DEST/$BINARY_NAME" \
+    --arg active "$CONTEXT_MODE_ACTIVE_MANIFEST" \
+    --arg pending "$CONTEXT_MODE_PENDING_MANIFEST" '
+      (keys | sort) ==
+        ["binary_path", "candidate", "context", "managed_by",
+         "previous", "schema"] and
+      .schema == 1 and
+      .managed_by == "ags-installer" and
+      .binary_path == $binary and
+      (.candidate | keys | sort) == ["sha256", "stage_path"] and
+      (.candidate.sha256 | test("^[0-9a-f]{64}$")) and
+      (.candidate.stage_path | type) == "string" and
+      (.previous | keys | sort) ==
+        ["backup_path", "existed", "sha256"] and
+      (.previous.existed | type) == "boolean" and
+      (
+        if .previous.existed
+        then
+          (.previous.sha256 | test("^[0-9a-f]{64}$")) and
+          (.previous.backup_path | type) == "string"
+        else
+          .previous.sha256 == null and
+          .previous.backup_path == null
+        end
+      ) and
+      (.context | keys | sort) ==
+        ["active_before", "active_manifest_path",
+         "pending_manifest_path"] and
+      .context.active_manifest_path == $active and
+      .context.pending_manifest_path == $pending and
+      (
+        .context.active_before == "absent" or
+        (.context.active_before | test("^[0-9a-f]{64}$"))
+      )
+    ' "$INSTALL_TRANSACTION_FILE" >/dev/null 2>&1 ||
+    return 1
+
+  local stage backup previous_existed
+  stage="$(jq -er '.candidate.stage_path' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  install_transaction_child_path "$stage" install || return 1
+  previous_existed="$(jq -er '
+    .previous.existed |
+    if type == "boolean" then tostring else error("invalid boolean") end
+  ' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  if [[ "$previous_existed" == true ]]; then
+    backup="$(jq -er '.previous.backup_path' \
+      "$INSTALL_TRANSACTION_FILE")" || return 1
+    install_transaction_child_path "$backup" rollback || return 1
+  fi
+}
+
+write_install_transaction() {
+  local stage="$1" candidate_sha="$2"
+  local previous_sha= backup_json=null active_before temporary
+  [[ ! -e "$INSTALL_TRANSACTION_FILE" &&
+     ! -L "$INSTALL_TRANSACTION_FILE" ]] ||
+    return 1
+  active_before="$(context_manifest_fingerprint)" || return 1
+  if [[ "$BINARY_PREEXISTED" -eq 1 ]]; then
+    previous_sha="$(installer_sha256_file "$DEST/$BINARY_NAME")" ||
+      return 1
+    backup_json="$(jq -Rn --arg path "$BINARY_BACKUP" '$path')" ||
+      return 1
+  fi
+  durable_sync_path "$stage" || return 1
+  if [[ "$BINARY_PREEXISTED" -eq 1 ]]; then
+    durable_sync_path "$BINARY_BACKUP" || return 1
+  fi
+  temporary="$(
+    mktemp "$DEST/.${BINARY_NAME}.install-transaction.tmp.XXXXXX"
+  )" || return 1
+  if ! jq -n \
+      --arg binary "$DEST/$BINARY_NAME" \
+      --arg candidate_sha "$candidate_sha" \
+      --arg stage "$stage" \
+      --argjson previous_existed \
+        "$([[ "$BINARY_PREEXISTED" -eq 1 ]] && printf true || printf false)" \
+      --arg previous_sha "$previous_sha" \
+      --argjson backup "$backup_json" \
+      --arg active "$CONTEXT_MODE_ACTIVE_MANIFEST" \
+      --arg pending "$CONTEXT_MODE_PENDING_MANIFEST" \
+      --arg active_before "$active_before" '
+        {
+          schema:1,
+          managed_by:"ags-installer",
+          binary_path:$binary,
+          candidate:{
+            sha256:$candidate_sha,
+            stage_path:$stage
+          },
+          previous:{
+            existed:$previous_existed,
+            sha256:(
+              if $previous_existed then $previous_sha else null end
+            ),
+            backup_path:$backup
+          },
+          context:{
+            active_manifest_path:$active,
+            pending_manifest_path:$pending,
+            active_before:$active_before
+          }
+        }
+      ' > "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  chmod 600 "$temporary" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  mv -- "$temporary" "$INSTALL_TRANSACTION_FILE" || {
+    rm -f -- "$temporary"
+    return 1
+  }
+  INSTALL_TRANSACTION_ACTIVE=1
+  durable_sync_path "$INSTALL_TRANSACTION_FILE"
+}
+
+install_transaction_context_changed() {
+  local before current
+  before="$(jq -er '.context.active_before' \
+    "$INSTALL_TRANSACTION_FILE")" || return 0
+  current="$(context_manifest_fingerprint 2>/dev/null)" || return 0
+  [[ "$current" != "$before" ]]
+}
+
+clear_install_transaction_artifacts() {
+  local stage backup previous_existed
+  validate_install_transaction || return 1
+  stage="$(jq -er '.candidate.stage_path' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  previous_existed="$(jq -er '
+    .previous.existed |
+    if type == "boolean" then tostring else error("invalid boolean") end
+  ' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  backup=
+  if [[ "$previous_existed" == true ]]; then
+    backup="$(jq -er '.previous.backup_path' \
+      "$INSTALL_TRANSACTION_FILE")" || return 1
+  fi
+  rm -f -- "$INSTALL_TRANSACTION_FILE" || return 1
+  INSTALL_TRANSACTION_ACTIVE=0
+  durable_sync_path "$DEST" || return 1
+  [[ -z "$backup" ]] || rm -f -- "$backup"
+  [[ ! -e "$stage" && ! -L "$stage" ]] || rm -f -- "$stage"
+  BINARY_BACKUP=""
+  BINARY_STAGE=""
+}
+
+commit_install_transaction() {
+  local candidate_sha current_sha
+  validate_install_transaction || return 1
+  candidate_sha="$(jq -er '.candidate.sha256' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  [[ -f "$DEST/$BINARY_NAME" &&
+     ! -L "$DEST/$BINARY_NAME" ]] ||
+    return 1
+  current_sha="$(installer_sha256_file "$DEST/$BINARY_NAME")" ||
+    return 1
+  [[ "$current_sha" == "$candidate_sha" ]] || return 1
+  [[ ! -e "$CONTEXT_MODE_PENDING_MANIFEST" &&
+     ! -L "$CONTEXT_MODE_PENDING_MANIFEST" &&
+     -f "$CONTEXT_MODE_ACTIVE_MANIFEST" &&
+     ! -L "$CONTEXT_MODE_ACTIVE_MANIFEST" ]] ||
+    return 1
+  clear_install_transaction_artifacts
+}
+
+restore_install_transaction_if_safe() {
+  local candidate_sha previous_existed previous_sha backup current_sha=
+  local restore_stage
+  validate_install_transaction || return 1
+  [[ ! -e "$CONTEXT_MODE_PENDING_MANIFEST" &&
+     ! -L "$CONTEXT_MODE_PENDING_MANIFEST" ]] ||
+    return 1
+  install_transaction_context_changed && return 1
+  candidate_sha="$(jq -er '.candidate.sha256' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  previous_existed="$(jq -er '
+    .previous.existed |
+    if type == "boolean" then tostring else error("invalid boolean") end
+  ' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  if [[ -e "$DEST/$BINARY_NAME" || -L "$DEST/$BINARY_NAME" ]]; then
+    [[ -f "$DEST/$BINARY_NAME" &&
+       ! -L "$DEST/$BINARY_NAME" ]] ||
+      return 1
+    current_sha="$(installer_sha256_file "$DEST/$BINARY_NAME")" ||
+      return 1
+    [[ "$current_sha" == "$candidate_sha" ]] || {
+      if [[ "$previous_existed" == true ]]; then
+        previous_sha="$(jq -er '.previous.sha256' \
+          "$INSTALL_TRANSACTION_FILE")" || return 1
+        [[ "$current_sha" == "$previous_sha" ]] || return 1
+      else
+        return 1
+      fi
+    }
+  fi
+
+  if [[ "$previous_existed" == true ]]; then
+    previous_sha="$(jq -er '.previous.sha256' \
+      "$INSTALL_TRANSACTION_FILE")" || return 1
+    backup="$(jq -er '.previous.backup_path' \
+      "$INSTALL_TRANSACTION_FILE")" || return 1
+    [[ -f "$backup" && ! -L "$backup" ]] || return 1
+    [[ "$(installer_sha256_file "$backup")" == "$previous_sha" ]] ||
+      return 1
+    if [[ "$current_sha" != "$previous_sha" ]]; then
+      restore_stage="$(
+        mktemp "$DEST/.${BINARY_NAME}.restore.XXXXXX"
+      )" || return 1
+      if ! install -m 0755 "$backup" "$restore_stage" ||
+         ! durable_sync_path "$restore_stage" ||
+         ! mv -f -- "$restore_stage" "$DEST/$BINARY_NAME" ||
+         ! durable_sync_path "$DEST/$BINARY_NAME"; then
+        rm -f -- "$restore_stage"
+        return 1
+      fi
+    fi
+  elif [[ -e "$DEST/$BINARY_NAME" ||
+          -L "$DEST/$BINARY_NAME" ]]; then
+    rm -f -- "$DEST/$BINARY_NAME" || return 1
+    durable_sync_path "$DEST" || return 1
+  fi
+  clear_install_transaction_artifacts
+}
+
+recover_pending_install_transaction() {
+  local candidate_sha previous_existed previous_sha current_sha=
+  if [[ ! -e "$INSTALL_TRANSACTION_FILE" &&
+        ! -L "$INSTALL_TRANSACTION_FILE" ]]; then
+    return 0
+  fi
+  validate_install_transaction || {
+    err "Invalid pending installer transaction: $INSTALL_TRANSACTION_FILE"
+    return 1
+  }
+  candidate_sha="$(jq -er '.candidate.sha256' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  previous_existed="$(jq -er '
+    .previous.existed |
+    if type == "boolean" then tostring else error("invalid boolean") end
+  ' \
+    "$INSTALL_TRANSACTION_FILE")" || return 1
+  if [[ -e "$DEST/$BINARY_NAME" || -L "$DEST/$BINARY_NAME" ]]; then
+    [[ -f "$DEST/$BINARY_NAME" &&
+       ! -L "$DEST/$BINARY_NAME" ]] || {
+      err "Pending install target is no longer a regular file"
+      return 1
+    }
+    current_sha="$(installer_sha256_file "$DEST/$BINARY_NAME")" ||
+      return 1
+  fi
+
+  if [[ -n "$current_sha" && "$current_sha" == "$candidate_sha" ]]; then
+    # Keep the binary journal active and rejoin the ordinary post-install path.
+    # That path proves/installs RMUX first, initializes Context Mode, then
+    # commits RMUX before the casr binary.
+    INSTALL_TRANSACTION_ACTIVE=1
+    info "Resuming the interrupted casr, RMUX, and Context Mode installation"
+    return 0
+  fi
+
+  if [[ "$previous_existed" == true ]]; then
+    previous_sha="$(jq -er '.previous.sha256' \
+      "$INSTALL_TRANSACTION_FILE")" || return 1
+    if [[ -z "$current_sha" ]]; then
+      if restore_install_transaction_if_safe; then
+        warn "Restored the previous binary after interrupted activation"
+        return 0
+      fi
+      err "Pending install target disappeared and could not be restored safely"
+      return 1
+    fi
+    [[ -n "$current_sha" && "$current_sha" == "$previous_sha" ]] || {
+      err "Pending install target does not match the candidate or previous binary"
+      return 1
+    }
+  elif [[ -n "$current_sha" ]]; then
+    err "Pending first-install target does not match the candidate binary"
+    return 1
+  fi
+  clear_install_transaction_artifacts || return 1
+  warn "Discarded an interrupted install before binary activation"
+}
+
+install_casr_binary() {
+  local source="$1"
+  local candidate_sha
+  [ -x "$source" ] || {
+    err "Binary is not executable: $source"
+    return 1
+  }
+  [[ ! -e "$INSTALL_TRANSACTION_FILE" &&
+     ! -L "$INSTALL_TRANSACTION_FILE" ]] || {
+    err "A pending installer transaction must be recovered first"
+    return 1
+  }
+  BINARY_STAGE="$(
+    mktemp "$DEST/.${BINARY_NAME}.install.XXXXXX"
+  )" || return 1
+  install -m 0755 "$source" "$BINARY_STAGE" || return 1
+  if [[ -e "$DEST/$BINARY_NAME" || -L "$DEST/$BINARY_NAME" ]]; then
+    [ -f "$DEST/$BINARY_NAME" ] && [ ! -L "$DEST/$BINARY_NAME" ] || {
+      err "Refusing to overwrite a non-regular binary target: $DEST/$BINARY_NAME"
+      return 1
+    }
+    BINARY_BACKUP="$(
+      mktemp "$DEST/.${BINARY_NAME}.rollback.XXXXXX"
+    )" || return 1
+    if ! cp -p "$DEST/$BINARY_NAME" "$BINARY_BACKUP"; then
+      rm -f -- "$BINARY_BACKUP"
+      BINARY_BACKUP=""
+      return 1
+    fi
+    BINARY_PREEXISTED=1
+  else
+    BINARY_PREEXISTED=0
+  fi
+  candidate_sha="$(installer_sha256_file "$BINARY_STAGE")" || return 1
+  if ! write_install_transaction "$BINARY_STAGE" "$candidate_sha"; then
+    if [[ ! -e "$INSTALL_TRANSACTION_FILE" &&
+          ! -L "$INSTALL_TRANSACTION_FILE" ]]; then
+      [[ -z "$BINARY_BACKUP" ]] || rm -f -- "$BINARY_BACKUP"
+    fi
+    err "Cannot persist the installer transaction"
+    return 1
+  fi
+  mv -f -- "$BINARY_STAGE" "$DEST/$BINARY_NAME" || return 1
+  BINARY_STAGE=""
+  durable_sync_path "$DEST/$BINARY_NAME"
 }
 
 preflight_checks() {
@@ -1050,7 +2265,7 @@ Usage: install.sh [OPTIONS]
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
   --dest DIR         Install to DIR (default: ~/.local/bin)
-  --system           Install to /usr/local/bin (requires sudo)
+  --system           Install to /usr/local/bin as the current non-root user
   --easy-mode        Auto-update PATH in shell rc files
   --yes              Non-interactive; auto-accept install prompts
   --verify           Run self-test after install
@@ -1058,9 +2273,10 @@ Options:
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum + signature verification (not recommended)
-  --no-configure     Skip agent auto-configuration (skills/wrappers)
+  --no-configure     Skip optional AGS setup; Context Mode remains mandatory
   --no-skill         Skip skill installation for Claude/Codex
-  --offline TARBALL  Install from local tarball (airgap mode)
+  --identity FILE     Import an existing AGS age identity during initialization
+  --offline TARBALL  Install from local tarball; Context Mode must exist locally
   --force            Force reinstall even if same version is installed
 
 Environment:
@@ -1072,13 +2288,13 @@ Environment:
 
 Examples:
   # Install latest release
-  curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/cross_agent_session_resumer/main/install.sh?\$(date +%s)" | bash
+  curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?\$(date +%s)" | bash
 
   # Install specific version with self-test
   bash install.sh --version v0.2.0 --verify
 
-  # Install system-wide with auto-PATH + non-interactive prompts
-  sudo bash install.sh --system --easy-mode --yes
+  # Install system-wide only when /usr/local/bin is already user-writable
+  bash install.sh --system --easy-mode --yes
 
   # Offline / airgap install
   bash install.sh --offline ./casr-x86_64-unknown-linux-musl.tar.xz
@@ -1086,7 +2302,7 @@ Examples:
   # Build from source (requires Rust nightly)
   bash install.sh --from-source
 
-  # Install but skip any local agent configuration writes
+  # Skip optional setup (mandatory Context Mode is still configured)
   bash install.sh --no-configure --no-skill
 EOFU
 }
@@ -1101,7 +2317,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version)      needs_arg "$@"; VERSION="$2"; shift 2 ;;
     --dest)         needs_arg "$@"; DEST="$2"; shift 2 ;;
-    --system)       DEST="/usr/local/bin"; shift ;;
+    --system)       SYSTEM_INSTALL=1; DEST="/usr/local/bin"; shift ;;
     --easy-mode)    EASY=1; shift ;;
     --yes)          ASSUME_YES=1; shift ;;
     --verify)       VERIFY=1; shift ;;
@@ -1114,6 +2330,7 @@ while [ $# -gt 0 ]; do
     --no-verify)    NO_CHECKSUM=1; shift ;;
     --no-configure) NO_CONFIGURE=1; shift ;;
     --no-skill)     NO_SKILL=1; shift ;;
+    --identity)     needs_arg "$@"; CHECKPOINT_IDENTITY="$2"; shift 2 ;;
     --force)        FORCE_INSTALL=1; shift ;;
     --offline)      needs_arg "$@"; OFFLINE_TARBALL="$2"; shift 2 ;;
     -h|--help)      usage; exit 0 ;;
@@ -1125,50 +2342,38 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+if [ "$SYSTEM_INSTALL" -eq 1 ] && [ "$EUID" -eq 0 ]; then
+  err "--system cannot run as root because mandatory Context Mode belongs to the target user's Claude/Codex configuration"
+  err "Run the installer as that user with a writable --dest (the default is recommended)"
+  exit 1
+fi
+
+if [ -n "$CHECKPOINT_IDENTITY" ]; then
+  case "$CHECKPOINT_IDENTITY" in
+    /*) ;;
+    *) err "--identity requires an absolute file path"; exit 1 ;;
+  esac
+  [ -r "$CHECKPOINT_IDENTITY" ] ||
+    { err "Identity file is not readable: $CHECKPOINT_IDENTITY"; exit 1; }
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main Installation Flow
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Show branded header
-if [ "$QUIET" -eq 0 ]; then
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style \
-      --border normal \
-      --border-foreground 39 \
-      --padding "0 1" \
-      --margin "1 0" \
-      "$(gum style --foreground 42 --bold 'casr installer')" \
-      "$(gum style --foreground 245 'Cross Agent Session Resumer')" \
-      "$(gum style --foreground 245 'Resume AI coding sessions across providers')"
-  else
-    echo ""
-    echo -e "\033[1;32mcasr installer\033[0m"
-    echo -e "\033[0;90mCross Agent Session Resumer\033[0m"
-    echo -e "\033[0;90mResume AI coding sessions across providers\033[0m"
-    echo ""
-  fi
-fi
-
-# Detect providers early (informational display)
-print_provider_scan_notice
-detect_providers
-if [ "$QUIET" -eq 0 ]; then
-  print_detected_providers
-fi
-
-# Setup proxy
-setup_proxy
-
-# Resolve version and platform
-resolve_version
-detect_platform
-set_artifact_url
-
-# Ensure destination directory exists
-mkdir -p "$DEST" 2>/dev/null || true
-
-# Preflight
-preflight_checks
+# Recover an interrupted binary/Context transaction before network resolution
+# or any new installation work.
+mkdir -p "$DEST" || {
+  err "Cannot create destination directory: $DEST"
+  exit 1
+}
+DEST="$(cd "$DEST" && pwd -P)" || {
+  err "Cannot resolve destination directory: $DEST"
+  exit 1
+}
+INSTALL_TRANSACTION_FILE="$DEST/.${BINARY_NAME}.install-transaction.json"
+RMUX_TRANSACTION_FILE="$DEST/.rmux-install-transaction.json"
+preflight_context_mode recovery
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Atomic Locking (mkdir-based, cross-platform)
@@ -1207,6 +2412,23 @@ fi
 
 TMP=$(mktemp -d)
 cleanup() {
+  local status=$? binary_rollback_safe=1
+  if [ "$status" -ne 0 ] && [ "$INSTALL_CORE_COMMITTED" -eq 0 ] &&
+     [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
+    if ! restore_install_transaction_if_safe; then
+      binary_rollback_safe=0
+      warn "Installer transaction was retained because automatic rollback was not proven safe"
+    fi
+  fi
+  if [ "$status" -ne 0 ] && [ "$RMUX_TRANSACTION_ACTIVE" -eq 1 ]; then
+    if [ "$binary_rollback_safe" -eq 1 ]; then
+      rollback_rmux_install ||
+        warn "RMUX rollback could not be completed automatically"
+    else
+      warn "RMUX transaction was retained with the binary transaction for joint recovery"
+    fi
+  fi
+  [ -z "$BINARY_STAGE" ] || rm -f -- "$BINARY_STAGE" 2>/dev/null || true
   rm -rf "$TMP" 2>/dev/null || true
   if [ "$LOCKED" -eq 1 ]; then
     release_lock_dir
@@ -1214,10 +2436,67 @@ cleanup() {
 }
 trap cleanup EXIT
 
+recover_pending_rmux_transaction || exit 1
+recover_pending_install_transaction || exit 1
+if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ] &&
+   detect_rmux >/dev/null 2>&1; then
+  # The installed casr and the complete RMUX layout are already the exact
+  # journaled candidates. Finish Context Mode and commit those transactions
+  # without requiring the original artifact or any network access.
+  RESUME_CORE_ONLY=1
+fi
+
+# Show branded header
+if [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style \
+      --border normal \
+      --border-foreground 39 \
+      --padding "0 1" \
+      --margin "1 0" \
+      "$(gum style --foreground 42 --bold 'casr installer')" \
+      "$(gum style --foreground 245 'Cross Agent Session Resumer')" \
+      "$(gum style --foreground 245 'Resume AI coding sessions across providers')"
+  else
+    echo ""
+    echo -e "\033[1;32mcasr installer\033[0m"
+    echo -e "\033[0;90mCross Agent Session Resumer\033[0m"
+    echo -e "\033[0;90mResume AI coding sessions across providers\033[0m"
+    echo ""
+  fi
+fi
+
+# Detect providers early (informational display)
+print_provider_scan_notice
+detect_providers
+if [ "$QUIET" -eq 0 ]; then
+  print_detected_providers
+fi
+
+# Setup proxy
+setup_proxy
+
+if [ "$RESUME_CORE_ONLY" -eq 1 ]; then
+  info "Finishing the recovered casr, RMUX, and Context Mode transaction"
+else
+  # Resolve version and platform only for new installation work. A recovered
+  # candidate is already identified by its journaled SHA-256.
+  resolve_version
+  detect_platform
+  set_artifact_url
+fi
+
+# Mandatory Context Mode must be viable before AGS writes its binary.
+preflight_context_mode
+
+# Preflight
+preflight_checks
+
 # Check if already at target version.
 # Keep post-install steps idempotent so installer still refreshes local setup.
 INSTALLED_CASR_VERSION=""
-if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
+if [ "$RESUME_CORE_ONLY" -eq 0 ] && [ "$FORCE_INSTALL" -eq 0 ] &&
+   check_installed_version "$VERSION"; then
   ok "casr $INSTALLED_CASR_VERSION is already installed at $DEST/$BINARY_NAME (target $VERSION)"
   info "Use --force to reinstall"
   INSTALL_SOURCE="already installed ($INSTALLED_CASR_VERSION)"
@@ -1228,8 +2507,11 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 
 INSTALL_SOURCE="${INSTALL_SOURCE:-}"
+if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
+  INSTALL_SOURCE="recovered interrupted binary activation"
+fi
 
-if [ -n "$OFFLINE_TARBALL" ]; then
+if [ -n "$OFFLINE_TARBALL" ] && [ "$RESUME_CORE_ONLY" -eq 0 ]; then
   if [ ! -f "$OFFLINE_TARBALL" ]; then
     err "Offline tarball not found: $OFFLINE_TARBALL"
     exit 1
@@ -1238,18 +2520,38 @@ if [ -n "$OFFLINE_TARBALL" ]; then
   cp "$OFFLINE_TARBALL" "$TMP/artifact.tar.xz"
   tar -xf "$TMP/artifact.tar.xz" -C "$TMP"
 
-  BIN="$TMP/$BINARY_NAME"
-  if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-    BIN="$TMP/casr-${TARGET}/$BINARY_NAME"
-  fi
-  if [ ! -x "$BIN" ]; then
-    BIN=$(find "$TMP" -maxdepth 3 -type f -name "$BINARY_NAME" -perm -111 | head -n 1)
-  fi
-  [ -x "$BIN" ] || { err "Binary not found in tarball"; exit 1; }
+  if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 0 ]; then
+    BIN="$TMP/$BINARY_NAME"
+    if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
+      BIN="$TMP/casr-${TARGET}/$BINARY_NAME"
+    fi
+    if [ ! -x "$BIN" ]; then
+      BIN=$(find "$TMP" -maxdepth 3 -type f -name "$BINARY_NAME" -perm -111 | head -n 1)
+    fi
+    [ -x "$BIN" ] || { err "Binary not found in tarball"; exit 1; }
 
-  install -m 0755 "$BIN" "$DEST/$BINARY_NAME"
-  ok "Installed to $DEST/$BINARY_NAME (offline)"
-  INSTALL_SOURCE="offline tarball"
+    artifact_version="$("$BIN" --version 2>/dev/null | head -1 |
+      sed -E 's/[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+    [[ "$artifact_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+      err "Cannot determine the version of the offline binary"
+      exit 1
+    }
+    if [ -n "$VERSION" ]; then
+      requested_core="${VERSION#v}"
+      requested_core="${requested_core%%[-+]*}"
+      if [ "$requested_core" != "$artifact_version" ]; then
+        err "Offline artifact is v$artifact_version, not requested $VERSION"
+        exit 1
+      fi
+    else
+      VERSION="v$artifact_version"
+    fi
+    install_casr_binary "$BIN"
+    ok "Installed to $DEST/$BINARY_NAME (offline)"
+    INSTALL_SOURCE="offline tarball"
+  else
+    info "Keeping the exact casr candidate from the recovered transaction"
+  fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1299,7 +2601,7 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 1 ]; then
       _ "$TMP/src" "$BUILD_TARGET_DIR" "$BINARY_NAME"
   BIN="$BUILD_TARGET_DIR/release/$BINARY_NAME"
   [ -x "$BIN" ] || { err "Build failed: binary not found at $BIN"; exit 1; }
-  install -m 0755 "$BIN" "$DEST/$BINARY_NAME"
+  install_casr_binary "$BIN"
   ok "Installed to $DEST/$BINARY_NAME (source build)"
   INSTALL_SOURCE="built from source (Rust nightly)"
 fi
@@ -1360,7 +2662,7 @@ if [ -z "$INSTALL_SOURCE" ]; then
   fi
   [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
-  install -m 0755 "$BIN" "$DEST/$BINARY_NAME"
+  install_casr_binary "$BIN"
   ok "Installed to $DEST/$BINARY_NAME"
   INSTALL_SOURCE="prebuilt binary ($VERSION)"
 fi
@@ -1369,6 +2671,21 @@ fi
 # Post-Install (shared across all install paths)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+install_rmux
+configure_context_mode_only
+if [ "$RMUX_TRANSACTION_ACTIVE" -eq 1 ]; then
+  commit_rmux_install || {
+    err "Context Mode succeeded, but the RMUX transaction could not be committed"
+    exit 1
+  }
+fi
+if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
+  commit_install_transaction || {
+    err "Context Mode succeeded, but the binary transaction could not be committed"
+    exit 1
+  }
+fi
+INSTALL_CORE_COMMITTED=1
 maybe_add_path
 maybe_install_completions
 configure_agents
@@ -1412,6 +2729,13 @@ summary_lines=(
   "Wrapper cc:       $CC_WRAPPER_STATUS"
   "Wrapper cod:      $COD_WRAPPER_STATUS"
   "Wrapper gmi:      $GMI_WRAPPER_STATUS"
+  "Wrapper ags:      $AGS_WRAPPER_STATUS"
+  "AGS Codex skill:  $AGS_CODEX_SKILL_STATUS"
+  "AGS Claude skill: $AGS_CLAUDE_SKILL_STATUS"
+  "AGS hooks:        $AGS_HOOK_STATUS"
+  "AGS vault:        $AGS_INIT_STATUS"
+  "AGS terminal:     $AGS_TERMINAL_STATUS"
+  "Context Mode:     $CONTEXT_MODE_STATUS"
   ""
   "Get started:"
   "  casr providers"
@@ -1419,11 +2743,14 @@ summary_lines=(
   "  casr -cc <session-id>"
   "  casr -cod <session-id>"
   "  casr -gmi <session-id>"
+  "  casr checkpoint list"
+  "  ags"
   ""
   "Managed paths:"
   "  binary:   $(status_path "$DEST/$BINARY_NAME")"
-  "  wrappers: $(status_path "$DEST")/{cc,cod,gmi}"
-  "  skills:   ~/.claude/skills/casr and ~/.codex/skills/casr"
+  "  wrappers: $(status_path "$DEST")/{cc,cod,gmi,ags}"
+  "  skills:   ~/.claude/skills/{casr,ags} and ~/.codex/skills/{casr,ags}"
+  "  context:  $(status_path "$CONTEXT_MODE_RUNTIME_ROOT")"
 )
 
 echo ""

@@ -1478,27 +1478,25 @@ fn contract_resume_json_launch_passthrough_flags_are_in_the_command() {
 }
 
 #[test]
-fn contract_resume_json_reports_an_untargetable_launch_as_false() {
+fn contract_resume_json_refuses_cursor_target() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    // Cursor's IDE composer has no direct resume form. `cursor-agent --resume`
-    // addresses a separate store, so the file written to state.vscdb is
-    // correct but the editor cannot be pointed at it. A script has to be able
-    // to see that without parsing prose.
     let output = casr_cmd(&tmp)
         .args(["--json", "resume", "cur", &session_id, "--launch-dry-run"])
         .output()
         .expect("resume should run");
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("Invalid JSON from resume: {e}\nOutput: {stdout}"));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed = parse_json_from_maybe_logged_stream(&stderr, "stderr");
 
-    assert_resume_success_object(&parsed);
-    assert_eq!(parsed["launch_command"].as_str().unwrap(), "cursor .");
-    assert_eq!(parsed["launch_targets_session"], false);
+    assert_error_envelope(&parsed);
+    assert!(
+        parsed["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("allComposers"))
+    );
 }
 
 // ---------------------------------------------------------------------------

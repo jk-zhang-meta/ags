@@ -698,27 +698,30 @@ but resume may fail until the CLI is installed.",
                 // through `read_session_ir` and compared IR to IR by
                 // [`crate::compare`], whose whole point is that it can tell a
                 // predicted vendor-boundary drop from a hole.
-                let verified_fidelity;
-                match verify_structured_write(target_provider, ir, &budget, &written, fidelity) {
-                    Ok((notes, observed)) => {
-                        all_warnings.extend(notes);
-                        verified_fidelity = observed;
-                    }
-                    Err(detail) => {
-                        warn!(detail, "structured read-back verification failed");
-                        let rollback_detail =
-                            match rollback_written_session(target_provider.slug(), &written) {
-                                Ok(()) => "rollback succeeded".to_string(),
-                                Err(rollback_error) => format!("rollback failed: {rollback_error}"),
-                            };
-                        return Err(CasrError::VerifyFailed {
-                            provider: target_provider.slug().to_string(),
-                            written_paths: written.paths.clone(),
-                            detail: format!("{detail}; {rollback_detail}"),
+                let verified_fidelity =
+                    match verify_structured_write(target_provider, ir, &budget, &written, fidelity)
+                    {
+                        Ok((notes, observed)) => {
+                            all_warnings.extend(notes);
+                            observed
                         }
-                        .into());
-                    }
-                }
+                        Err(detail) => {
+                            warn!(detail, "structured read-back verification failed");
+                            let rollback_detail =
+                                match rollback_written_session(target_provider, &written) {
+                                    Ok(()) => "rollback succeeded".to_string(),
+                                    Err(rollback_error) => {
+                                        format!("rollback failed: {rollback_error}")
+                                    }
+                                };
+                            return Err(CasrError::VerifyFailed {
+                                provider: target_provider.slug().to_string(),
+                                written_paths: written.paths.clone(),
+                                detail: format!("{detail}; {rollback_detail}"),
+                            }
+                            .into());
+                        }
+                    };
 
                 // 7a1c. Commit any provider-owned shared index only after the
                 // transcript passed verification. Until this point rollback
@@ -806,9 +809,9 @@ but resume may fail until the CLI is installed.",
         //
         // A tool call reaches a target twice over: structurally, in
         // [`CanonicalMessage::tool_calls`], and as prose, as `[Tool: <name>]`
-        // inside [`CanonicalMessage::content`]. Six of the thirteen writable
-        // targets have only the second channel — clawdbot, vibe, factory,
-        // pi-agent, cursor and aider write `content` and nothing else
+        // inside [`CanonicalMessage::content`]. Four writable targets have
+        // only the second channel — clawdbot, vibe, factory, and pi-agent
+        // write `content` and nothing else
         // — so for those, whatever `content` does not say when the writer runs
         // is not in the session the model resumes. This step makes `content`
         // self-sufficient for exactly those targets: it renders the calls the
@@ -915,12 +918,10 @@ but resume may fail until the CLI is installed.",
                         original_messages = canonical.messages.len(),
                         "read-back verification"
                     );
-                    if let Some(detail) =
-                        readback_mismatch_detail(target_provider.slug(), &canonical, &readback)
-                    {
+                    if let Some(detail) = readback_mismatch_detail(&canonical, &readback) {
                         warn!(detail, "read-back verification failed");
                         let rollback_detail =
-                            match rollback_written_session(target_provider.slug(), &written) {
+                            match rollback_written_session(target_provider, &written) {
                                 Ok(()) => "rollback succeeded".to_string(),
                                 Err(rollback_error) => {
                                     format!("rollback failed: {rollback_error}")
@@ -936,13 +937,13 @@ but resume may fail until the CLI is installed.",
                 }
                 Err(e) => {
                     warn!(error = %e, "read-back verification failed");
-                    let rollback_detail =
-                        match rollback_written_session(target_provider.slug(), &written) {
-                            Ok(()) => "rollback succeeded".to_string(),
-                            Err(rollback_error) => {
-                                format!("rollback failed: {rollback_error}")
-                            }
-                        };
+                    let rollback_detail = match rollback_written_session(target_provider, &written)
+                    {
+                        Ok(()) => "rollback succeeded".to_string(),
+                        Err(rollback_error) => {
+                            format!("rollback failed: {rollback_error}")
+                        }
+                    };
                     return Err(CasrError::VerifyFailed {
                         provider: target_provider.slug().to_string(),
                         written_paths: written.paths.clone(),
@@ -1468,11 +1469,8 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
     let mut losses = Vec::new();
 
     // Roles the target writer has no slot for, grouped by what it emits
-    // instead: one target can fold two source roles onto two different things
-    // (Cursor sends `System`/`Other` to a human bubble and `Tool` to an AI one), and
-    // "became a user turn" and "became an assistant turn" are not the same
-    // news. Insertion-ordered rather than sorted, so the note order follows the
-    // conversation.
+    // instead. Insertion-ordered rather than sorted, so the note order follows
+    // the conversation.
     let mut folds: Vec<(&'static str, usize)> = Vec::new();
     for msg in &canonical.messages {
         let Some(emitted) = folded_role(target_slug, &msg.role) else {
@@ -1497,6 +1495,102 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
                  typed."
             ),
         });
+    }
+
+    if target_slug == "openclaw" {
+        let assistant_notes = canonical
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .count();
+        if assistant_notes > 0 {
+            losses.push(Loss {
+                kind: LossKind::Metadata,
+                events: assistant_notes,
+                capsules: 0,
+                bytes: 0,
+                grade: Fidelity::ConversationOnly,
+                note: format!(
+                    "{assistant_notes} assistant message(s) were written as gateway-injected \
+                     assistant notes labeled `agsx:v1:assistant`: the words and visible source \
+                     label survive, but OpenClaw does not treat them as original model output."
+                ),
+            });
+        }
+    }
+
+    if target_slug == "antigravity" {
+        let coalesced_user_messages = canonical
+            .messages
+            .windows(2)
+            .filter(|pair| {
+                pair[0].role != MessageRole::Assistant && pair[1].role != MessageRole::Assistant
+            })
+            .count();
+        let coalesced_assistant_messages = canonical
+            .messages
+            .windows(2)
+            .filter(|pair| {
+                pair[0].role == MessageRole::Assistant && pair[1].role == MessageRole::Assistant
+            })
+            .count();
+        let coalesced = coalesced_user_messages + coalesced_assistant_messages;
+        if coalesced > 0 {
+            losses.push(Loss {
+                kind: LossKind::Metadata,
+                events: coalesced,
+                capsules: 0,
+                bytes: 0,
+                grade: Fidelity::ConversationOnly,
+                note: format!(
+                    "{coalesced} adjacent message(s) were visibly labelled and coalesced into \
+                     neighbouring Antigravity user/model turns: the official SDK has no direct \
+                     message-injection API, so the words and source labels survive but those turn \
+                     boundaries do not."
+                ),
+            });
+        }
+    }
+
+    // Kiro's variants are channels as well as labels: only
+    // AssistantMessage replays toolUse, and ToolResults ignores ordinary
+    // text. The writer therefore moves calls from non-assistant messages, and
+    // non-duplicate text from Tool messages, through AssistantMessage. The
+    // content survives, but its visible speaker changes in the resumed model.
+    if target_slug == "kiro" {
+        let assistant_recasts = canonical
+            .messages
+            .iter()
+            .filter(|message| match message.role {
+                MessageRole::Assistant => false,
+                MessageRole::Tool => {
+                    let content_is_structural_result = !message.content.trim().is_empty()
+                        && message
+                            .tool_results
+                            .iter()
+                            .any(|result| result.content == message.content);
+                    !message.tool_calls.is_empty()
+                        || (!message.content.is_empty() && !content_is_structural_result)
+                }
+                MessageRole::User | MessageRole::System | MessageRole::Other(_) => {
+                    !message.tool_calls.is_empty()
+                }
+            })
+            .count();
+        if assistant_recasts > 0 {
+            losses.push(Loss {
+                kind: LossKind::Metadata,
+                events: assistant_recasts,
+                capsules: 0,
+                bytes: 0,
+                grade: Fidelity::ConversationOnly,
+                note: format!(
+                    "{assistant_recasts} non-assistant message(s) had text or calls written through \
+                     Kiro `AssistantMessage` records: Kiro has no other replayable channel for \
+                     them, so the content survives but its visible speaker changes."
+                ),
+            });
+        }
     }
 
     // Tool calls a text-only target can hold only as prose. Step 7b renders the
@@ -1554,13 +1648,12 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 /// Factory, Pi-Agent, ChatGPT and Codex write an unrecognised source role
 /// through under its own name, and casr's own `model::normalize_role` then maps
 /// `"developer"` back onto [`MessageRole::System`] — so a read-back would report
-/// a fold those files did not perform. Conversely Cursor and Kiro have no third
-/// bubble or journal variant to send a system turn to — Cursor's
-/// `aiserver.v1.ConversationMessage.MessageType` is `{UNSPECIFIED, HUMAN, AI}`
-/// and Kiro's `LogEntryV1` is `{Prompt, AssistantMessage, ToolResults,
-/// Compaction, ResetTo}` — so the operator arrives anonymised as the human. It
-/// used to arrive as the agent, which was not "the operator distinction was
-/// lost" but "the operator is now speaking as the agent" (defect #74).
+/// a fold those files did not perform. Kiro has no third journal variant to
+/// send a system turn to — `LogEntryV1` is `{Prompt, AssistantMessage,
+/// ToolResults, Compaction, ResetTo}` — so the operator arrives anonymised as
+/// the human. It used to arrive as the agent, which was not "the operator
+/// distinction was lost" but "the operator is now speaking as the agent"
+/// (defect #74).
 ///
 /// # Why `User` and `Assistant` are never folds
 ///
@@ -1578,26 +1671,33 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 /// the registry.
 pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str> {
     match role {
-        MessageRole::User | MessageRole::Assistant => None,
-        // `claude_code.rs:703`, `amp.rs:418`, `cursor.rs:1113`,
-        // `kiro.rs:1541`, `aider.rs:594`,
+        MessageRole::User => (target_slug == "openclaw")
+            .then_some("gateway-injected assistant notes labeled `agsx:v1:user`"),
+        MessageRole::Assistant => None,
+        // `claude_code.rs:703`, `amp.rs:418`, `kiro.rs:1541`,
+        // `aider.rs:594`, `cline.rs:build_hub_messages`,
+        // `opencode.rs:import_payload`,
         // Vibe persists both as plain user rows because its loader drops
         // system rows and rejects unknown roles.
         MessageRole::System => match target_slug {
-            "claude-code" | "vibe" => Some("plain user turns"),
+            "aider" | "claude-code" | "cline" | "grok" | "opencode" | "vibe" => {
+                Some("plain user turns")
+            }
+            "antigravity" => Some("labelled text inside Antigravity user turns"),
+            "openclaw" => Some("gateway-injected assistant notes labeled `agsx:v1:system`"),
             "amp" => Some("`info` records"),
-            "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
-            "aider" => Some("`>` blockquotes, the same channel tool output uses"),
             _ => None,
         },
         // Same writers, and the source's own name for the turn goes with it.
         MessageRole::Other(_) => match target_slug {
-            "claude-code" | "vibe" => Some("plain user turns"),
+            "aider" | "claude-code" | "cline" | "grok" | "opencode" | "vibe" => {
+                Some("plain user turns")
+            }
+            "antigravity" => Some("labelled text inside Antigravity user turns"),
+            "openclaw" => Some("gateway-injected assistant notes labeled `agsx:v1:other`"),
             "amp" => Some("`info` records"),
-            "cursor" => Some("human bubbles (`MESSAGE_TYPE_HUMAN`)"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
-            "aider" => Some("`>` blockquotes, the same channel tool output uses"),
             _ => None,
         },
         // A tool observation folded onto the target's user record is how
@@ -1607,14 +1707,12 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
         // developer/tool message(s) were written as user records"). Counted
         // here for the same reason, and only where the target has no
         // `toolResult`/`ToolResults`/`tool` record of its own.
-        // Aider is deliberately absent: `>` blockquotes *are* its tool-output
-        // channel, so a tool observation written there is where it belongs. It
-        // is the system and unrecognised turns above, sharing that channel, that
-        // arrive as something they are not.
         MessageRole::Tool => match target_slug {
-            "claude-code" => Some("plain user turns"),
+            "aider" | "claude-code" | "cline" | "opencode" => Some("plain user turns"),
+            "antigravity" => Some("labelled text inside Antigravity user turns"),
+            "grok" => Some("assistant tool events"),
+            "openclaw" => Some("gateway-injected assistant notes labeled `agsx:v1:tool`"),
             "amp" => Some("`info` records"),
-            "cursor" => Some("assistant bubbles"),
             _ => None,
         },
     }
@@ -1629,10 +1727,11 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 ///
 /// Measured by writing one session holding an assistant turn with a tool call
 /// through each writer and reading the artifact: Claude Code, Codex and Gemini
-/// emit `tool_use`, Amp emits `tool_use`, and Kiro emits `toolUse`. Cursor,
-/// Aider, ClawdBot, Vibe, Factory and Pi-Agent write the message text and
-/// nothing else. ChatGPT, Cline, OpenCode and OpenClaw refuse target writes
-/// before fidelity is calculated.
+/// emit `tool_use`, Amp emits `tool_use`, and Kiro emits `toolUse`. ClawdBot,
+/// Vibe, Factory and Pi-Agent write the message text and nothing else.
+/// ChatGPT and Cursor refuse target writes before fidelity is calculated.
+/// Cline, OpenCode and OpenClaw do so only when their official CLIs are
+/// unavailable. OpenClaw's Gateway import is text-only.
 ///
 /// `false` for an unknown slug, which is both the conservative answer — a
 /// rendered marker is redundant where the call survives, and the only record of
@@ -1641,7 +1740,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
 pub fn writer_carries_tool_calls(target_slug: &str) -> bool {
     matches!(
         target_slug,
-        "claude-code" | "codex" | "gemini" | "amp" | "kiro"
+        "claude-code" | "codex" | "gemini" | "amp" | "cline" | "grok" | "kiro"
     )
 }
 
@@ -1651,7 +1750,10 @@ pub fn writer_carries_tool_calls(target_slug: &str) -> bool {
 /// This is deliberately separate from [`writer_carries_tool_calls`]: formats
 /// can represent one half without the other.
 fn writer_carries_tool_results(target_slug: &str) -> bool {
-    matches!(target_slug, "claude-code" | "amp" | "kiro")
+    matches!(
+        target_slug,
+        "claude-code" | "amp" | "cline" | "grok" | "kiro"
+    )
 }
 
 /// Whether `block` already appears as one complete newline-delimited text
@@ -2064,14 +2166,9 @@ turn(s) between the task and the most recent history."
 /// so the conversion says what it changed instead of quietly agreeing with
 /// itself. Widen the bucket here and the declaration there together, or the
 /// next fold is silent again.
-fn readback_role_bucket(target_slug: &str, role: &MessageRole) -> &'static str {
+fn readback_role_bucket(role: &MessageRole) -> &'static str {
     match role {
         MessageRole::Assistant => "assistant",
-        // Cursor has only HUMAN/AI bubbles. Its writer deliberately emits Tool
-        // observations as AI, and `folded_role` reports that projection loss.
-        // Keep this exception target-specific: other writers must not silently
-        // turn a Tool observation into an assistant response.
-        MessageRole::Tool if target_slug == "cursor" => "assistant",
         // Everything else collapses into the "user" bucket because that is
         // the only non-assistant entry type Claude Code (and similar formats)
         // can represent.
@@ -2082,7 +2179,6 @@ fn readback_role_bucket(target_slug: &str, role: &MessageRole) -> &'static str {
 }
 
 fn readback_mismatch_detail(
-    target_slug: &str,
     canonical: &CanonicalSession,
     readback: &CanonicalSession,
 ) -> Option<String> {
@@ -2100,9 +2196,7 @@ fn readback_mismatch_detail(
         .zip(readback.messages.iter())
         .enumerate()
     {
-        if readback_role_bucket(target_slug, &orig.role)
-            != readback_role_bucket(target_slug, &rb.role)
-        {
+        if readback_role_bucket(&orig.role) != readback_role_bucket(&rb.role) {
             return Some(format!(
                 "message role mismatch at idx {i}: wrote {:?}, read back {:?}",
                 orig.role, rb.role
@@ -2118,19 +2212,6 @@ fn readback_mismatch_detail(
     }
 
     None
-}
-
-/// Remove a file that may already be gone.
-fn remove_if_present(path: &Path, provider_slug: &str, what: &str) -> Result<(), CasrError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CasrError::SessionWriteError {
-            path: path.to_path_buf(),
-            provider: provider_slug.to_string(),
-            detail: format!("{what}: {error}"),
-        }),
-    }
 }
 
 /// Undo a write that failed verification: take back every file it produced and
@@ -2154,37 +2235,10 @@ fn remove_if_present(path: &Path, provider_slug: &str, what: &str) -> Result<(),
 /// be special-cased and a future multi-file writer cannot reintroduce either
 /// shape.
 fn rollback_written_session(
-    provider_slug: &str,
+    provider: &dyn Provider,
     written: &WrittenSession,
-) -> Result<(), CasrError> {
-    // Outputs first. A displaced file may also be one of them (the ordinary
-    // `--force` case, where the write replaced the very file it backed up), and
-    // removing after restoring would delete what was just put back.
-    for path in &written.paths {
-        remove_if_present(path, provider_slug, "failed to remove unverified output")?;
-    }
-
-    for displaced in &written.backups {
-        warn!(
-            backup = %displaced.backup.display(),
-            target = %displaced.target.display(),
-            "restoring backup after verification failure"
-        );
-        remove_if_present(
-            &displaced.target,
-            provider_slug,
-            "failed to remove unverified output before restore",
-        )?;
-        std::fs::rename(&displaced.backup, &displaced.target).map_err(|error| {
-            CasrError::SessionWriteError {
-                path: displaced.target.clone(),
-                provider: provider_slug.to_string(),
-                detail: format!("failed to restore backup: {error}"),
-            }
-        })?;
-    }
-
-    Ok(())
+) -> anyhow::Result<()> {
+    provider.rollback_write(written)
 }
 
 /// Commit provider-owned shared state after read-back, rolling back only the
@@ -2195,7 +2249,7 @@ fn finalize_verified_write(
     opts: &WriteOptions,
 ) -> anyhow::Result<()> {
     if let Err(finalize_error) = provider.finalize_write(written, opts) {
-        let rollback_detail = match rollback_written_session(provider.slug(), written) {
+        let rollback_detail = match rollback_written_session(provider, written) {
             Ok(()) => "staged output rollback succeeded".to_string(),
             Err(rollback_error) => format!("staged output rollback failed: {rollback_error}"),
         };
@@ -2367,11 +2421,11 @@ pub fn atomic_write(
 
     // 4. Preserve the original alongside itself, without unlinking it.
     let backup_path = if displaces_existing {
-        let reserved = (|| -> std::io::Result<Option<PathBuf>> {
-            #[cfg(test)]
-            maybe_inject_atomic_write_failure(AtomicWriteFailStage::BackupRename)?;
-            preserve_original(target_path)
-        })();
+        #[cfg(test)]
+        let reserved = maybe_inject_atomic_write_failure(AtomicWriteFailStage::BackupRename)
+            .and_then(|()| preserve_original(target_path));
+        #[cfg(not(test))]
+        let reserved = preserve_original(target_path);
         match reserved {
             Ok(bak) => {
                 if let Some(bak) = &bak {
@@ -2398,11 +2452,11 @@ pub fn atomic_write(
 
     // 5. One rename installs the new content. The target held the old file
     //    until this instant and holds the new one after it.
-    let rename_result = (|| -> std::io::Result<()> {
-        #[cfg(test)]
-        maybe_inject_atomic_write_failure(AtomicWriteFailStage::FinalRename)?;
-        std::fs::rename(&temp_path, target_path)
-    })();
+    #[cfg(test)]
+    let rename_result = maybe_inject_atomic_write_failure(AtomicWriteFailStage::FinalRename)
+        .and_then(|()| std::fs::rename(&temp_path, target_path));
+    #[cfg(not(test))]
+    let rename_result = std::fs::rename(&temp_path, target_path);
 
     if let Err(e) = rename_result {
         let _ = std::fs::remove_file(&temp_path);
@@ -2848,6 +2902,60 @@ mod tests {
             metadata: serde_json::Value::Null,
             source_path: PathBuf::from("/tmp/x"),
             model_name: None,
+        }
+    }
+
+    #[test]
+    fn kiro_declares_only_model_visible_non_assistant_recasts() {
+        use crate::model::{ToolCall, ToolResult};
+
+        let mut user_call = budget_msg(MessageRole::User, "please inspect");
+        user_call.tool_calls.push(ToolCall {
+            id: Some("call-1".into()),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "file.txt"}),
+        });
+        let tool_text = budget_msg(MessageRole::Tool, "extra tool commentary");
+        let losses = target_projection_losses(&budget_session(vec![user_call, tool_text]), "kiro");
+        assert!(losses.iter().any(|loss| {
+            loss.kind == LossKind::Metadata
+                && loss.events == 2
+                && loss.note.contains("Kiro `AssistantMessage`")
+        }));
+
+        let mut structural = budget_msg(MessageRole::Tool, "file.txt");
+        structural.tool_results.push(ToolResult {
+            call_id: Some("call-1".into()),
+            content: "file.txt".into(),
+            is_error: false,
+        });
+        assert!(
+            target_projection_losses(&budget_session(vec![structural]), "kiro").is_empty(),
+            "a duplicate text view kept only in bounded read-back data is not model-visible"
+        );
+    }
+
+    #[test]
+    fn openclaw_declares_gateway_injected_role_projection() {
+        let losses = target_projection_losses(
+            &budget_session(vec![
+                budget_msg(MessageRole::User, "question"),
+                budget_msg(MessageRole::Assistant, "answer"),
+                budget_msg(MessageRole::System, "instruction"),
+                budget_msg(MessageRole::Tool, "observation"),
+            ]),
+            "openclaw",
+        );
+        assert!(losses.iter().any(|loss| {
+            loss.kind == LossKind::Metadata
+                && loss.events == 1
+                && loss.note.contains("agsx:v1:assistant")
+        }));
+        for marker in ["agsx:v1:user", "agsx:v1:system", "agsx:v1:tool"] {
+            assert!(
+                losses.iter().any(|loss| loss.note.contains(marker)),
+                "missing OpenClaw projection loss for {marker}"
+            );
         }
     }
 

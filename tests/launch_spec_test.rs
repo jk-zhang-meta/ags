@@ -110,10 +110,10 @@ fn session_targeting_is_reported_honestly() {
     untargeted.sort();
     assert_eq!(
         untargeted,
-        ["Aider", "Cline", "Cursor"],
+        ["Aider", "Cursor"],
         "the set of providers that cannot be launched at a specific session changed"
     );
-    assert!(targeted.len() >= 14);
+    assert!(targeted.len() >= 15);
 }
 
 #[test]

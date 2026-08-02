@@ -178,7 +178,7 @@ pub fn render(
                 || matches!(event.body, Body::SealedContext { .. })
         })
     } else {
-        (Vec::new(), visible.iter().copied().collect())
+        (Vec::new(), visible.to_vec())
     };
 
     let now_iso = now.to_rfc3339_opts(SecondsFormat::Millis, true);

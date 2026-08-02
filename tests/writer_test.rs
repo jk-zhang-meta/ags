@@ -574,6 +574,38 @@ fn writer_codex_registers_thread_in_state_db() {
     );
 }
 
+#[test]
+fn checkpoint_restored_codex_registers_thread_in_state_db() {
+    let _lock = CODEX_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let _env = EnvGuard::set("CODEX_HOME", tmp.path());
+
+    let written = Codex
+        .write_session(&simple_session(), &WriteOptions { force: false })
+        .expect("Codex rollout should be written before the state DB exists");
+    let db_path = tmp.path().join("state_5.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(CODEX_THREADS_SCHEMA).unwrap();
+    }
+
+    let cwd = tmp.path().join("restored-workspace");
+    casr::providers::codex::register_restored_thread(&written.session_id, &written.paths[0], &cwd)
+        .expect("checkpoint-restored rollout should be registered");
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (rollout_path, registered_cwd, model_provider): (String, String, String) = conn
+        .query_row(
+            "SELECT rollout_path, cwd, model_provider FROM threads WHERE id = ?1",
+            [&written.session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rollout_path, written.paths[0].to_string_lossy());
+    assert_eq!(registered_cwd, cwd.to_string_lossy());
+    assert_eq!(model_provider, "openai");
+}
+
 /// A missing Codex state DB must not fail the write; the rollout is still
 /// produced and a clear warning is surfaced.
 #[test]
@@ -1190,7 +1222,7 @@ fn writer_codex_default_workspace_uses_tmp() {
 }
 
 // ===========================================================================
-// Cline target refusal tests
+// Cline target capability tests
 // ===========================================================================
 
 #[test]
@@ -1198,21 +1230,24 @@ fn writer_cline_refuses_normal_and_force_without_creating_state() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
+    let _binary = EnvGuard::set("CLINE_BIN", &tmp.path().join("missing-cline"));
 
     let session = simple_session();
     let reason = Cline
         .write_refusal()
-        .expect("Cline must declare its target refusal");
+        .expect("Cline must declare its target refusal without the official CLI");
 
     for force in [false, true] {
         let error = Cline
             .write_session(&session, &WriteOptions { force })
-            .expect_err("Cline target writes must fail closed");
+            .expect_err("Cline target writes without the official CLI must fail closed");
         assert_eq!(error.to_string(), reason);
     }
 
     assert!(
-        !tmp.path().join("tasks").exists() && !tmp.path().join("state").exists(),
+        !tmp.path().join("tasks").exists()
+            && !tmp.path().join("sessions").exists()
+            && !tmp.path().join("state").exists(),
         "refusing a Cline import must not create any provider state"
     );
 }
@@ -2284,23 +2319,345 @@ fn writer_factory_message_structure() {
 }
 
 // ===========================================================================
-// OpenClaw target-refusal tests
+// OpenClaw Gateway writer tests
 // ===========================================================================
 
+const OPENCLAW_GATEWAY_SESSION_ID: &str = "18247f86-849f-4d3a-83d0-b70ecc0afbd6";
+
+#[cfg(unix)]
+fn write_openclaw_stub(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::write(
+        path,
+        r#"#!/bin/sh
+set -eu
+method=$3
+params=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--params" ]; then
+    params=$2
+    break
+  fi
+  shift
+done
+printf '%s\t%s\n' "$method" "$params" >> "$OPENCLAW_STUB_LOG"
+key_file="${OPENCLAW_STUB_LOG}.key"
+case "$method" in
+  sessions.create)
+    key=$(printf '%s\n' "$params" | sed -n 's/.*"key":"\([^"]*\)".*/\1/p')
+    printf '%s\n' "$key" > "$key_file"
+    printf '{"ok":true,"key":"%s","sessionId":"18247f86-849f-4d3a-83d0-b70ecc0afbd6"}\n' "$key"
+    ;;
+  chat.inject)
+    count_file="${OPENCLAW_STUB_LOG}.inject-count"
+    count=0
+    if [ -f "$count_file" ]; then count=$(cat "$count_file"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$count_file"
+    if [ "${OPENCLAW_STUB_FAIL_INJECT:-}" = "$count" ]; then
+      printf '%s\n' "${OPENCLAW_STUB_SECRET:-injection failed}" >&2
+      exit 9
+    fi
+    printf '{"ok":true,"messageId":"message-%s"}\n' "$count"
+    ;;
+  chat.history)
+    key=$(cat "$key_file")
+    history=${OPENCLAW_STUB_HISTORY:-}
+    case "$params" in
+      *'"offset":'*)
+        if [ -n "${OPENCLAW_STUB_PAGE1:-}" ]; then history=$OPENCLAW_STUB_PAGE1; fi
+        ;;
+      *)
+        if [ -n "${OPENCLAW_STUB_PAGE0:-}" ]; then history=$OPENCLAW_STUB_PAGE0; fi
+        ;;
+    esac
+    sed "s/__SESSION_KEY__/$key/g" "$history"
+    ;;
+  sessions.patch)
+    printf '{"ok":true}\n'
+    ;;
+  sessions.delete)
+    printf '{"ok":true,"deleted":true}\n'
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+fn openclaw_history_page(
+    messages: &[CanonicalMessage],
+    has_more: bool,
+    next_offset: Option<u64>,
+    total_messages: usize,
+) -> serde_json::Value {
+    let messages: Vec<_> = messages
+        .iter()
+        .map(|message| {
+            serde_json::json!({
+                "role": "assistant",
+                "provider": "openclaw",
+                "model": "gateway-injected",
+                "content": [{
+                    "type": "text",
+                    "text": format!(
+                        "[{}]\n\n{}",
+                        match message.role {
+                            MessageRole::User => "agsx:v1:user",
+                            MessageRole::Assistant => "agsx:v1:assistant",
+                            MessageRole::System => "agsx:v1:system",
+                            MessageRole::Tool => "agsx:v1:tool",
+                            MessageRole::Other(_) => "agsx:v1:other",
+                        },
+                        message.content
+                    ),
+                }],
+                "timestamp": message.timestamp,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "sessionKey": "__SESSION_KEY__",
+        "sessionId": OPENCLAW_GATEWAY_SESSION_ID,
+        "messages": messages,
+        "hasMore": has_more,
+        "nextOffset": next_offset,
+        "totalMessages": total_messages,
+    })
+}
+
 #[test]
-fn writer_openclaw_refuses_normal_and_force_without_creating_state() {
+#[cfg(unix)]
+fn writer_openclaw_uses_gateway_and_restores_marked_roles() {
+    let _lock = OPENCLAW_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state_dir = tmp.path().join("openclaw-state");
+    let binary = tmp.path().join("openclaw");
+    let log = tmp.path().join("gateway.log");
+    let history = tmp.path().join("history.json");
+    write_openclaw_stub(&binary);
+
+    let mut session = simple_session();
+    session.session_id = "../../../../../../must-not-reach-openclaw".to_string();
+    session.messages = vec![
+        simple_msg(0, MessageRole::User, "user text", 1_700_000_000_000),
+        simple_msg(
+            1,
+            MessageRole::Assistant,
+            "assistant text",
+            1_700_000_000_001,
+        ),
+        simple_msg(2, MessageRole::System, "system text", 1_700_000_000_002),
+        simple_msg(3, MessageRole::Tool, "tool text", 1_700_000_000_003),
+        simple_msg(
+            4,
+            MessageRole::Other("developer".to_string()),
+            "other text",
+            1_700_000_000_004,
+        ),
+    ];
+    std::fs::write(
+        &history,
+        serde_json::to_vec(&openclaw_history_page(
+            &session.messages,
+            false,
+            None,
+            session.messages.len(),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let _state = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &binary);
+    let _log = EnvGuard::set("OPENCLAW_STUB_LOG", &log);
+    let _history = EnvGuard::set("OPENCLAW_STUB_HISTORY", &history);
+
+    assert_eq!(OpenClaw.write_refusal(), None);
+    let written = OpenClaw
+        .write_session(&session, &WriteOptions { force: true })
+        .expect("OpenClaw Gateway import");
+    assert!(written.session_id.starts_with("agent:main:dashboard:agsx-"));
+    assert!(
+        written.paths[0].starts_with(state_dir.join(".agsx-gateway")),
+        "virtual locator must remain under the OpenClaw state root"
+    );
+    assert!(
+        !written.paths[0].exists(),
+        "Gateway locator is an address, not a fabricated store file"
+    );
+    assert!(
+        written
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("assistant note")),
+        "lossy role semantics must be explicit"
+    );
+
+    let readback = OpenClaw
+        .read_session(&written.paths[0])
+        .expect("official chat.history read-back");
+    assert_eq!(
+        readback
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        session
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(readback.messages[0].role, MessageRole::User);
+    assert_eq!(readback.messages[1].role, MessageRole::Assistant);
+    assert_eq!(readback.messages[2].role, MessageRole::System);
+    assert_eq!(readback.messages[3].role, MessageRole::Tool);
+    assert_eq!(
+        readback.messages[4].role,
+        MessageRole::Other("other".to_string())
+    );
+
+    OpenClaw
+        .rollback_write(&written)
+        .expect("official archive/delete rollback");
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(!calls.contains("../../../../../../must-not-reach-openclaw"));
+    let methods: Vec<_> = calls
+        .lines()
+        .filter_map(|line| line.split('\t').next())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "sessions.create",
+            "chat.inject",
+            "chat.inject",
+            "chat.inject",
+            "chat.inject",
+            "chat.inject",
+            "chat.history",
+            "chat.history",
+            "sessions.patch",
+            "sessions.delete",
+        ]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn writer_openclaw_injection_failure_rolls_back_without_echoing_secrets() {
+    let _lock = OPENCLAW_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state_dir = tmp.path().join("openclaw-state");
+    let binary = tmp.path().join("openclaw");
+    let log = tmp.path().join("gateway.log");
+    write_openclaw_stub(&binary);
+
+    let _state = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &binary);
+    let _log = EnvGuard::set("OPENCLAW_STUB_LOG", &log);
+    let _fail = EnvGuard::set("OPENCLAW_STUB_FAIL_INJECT", std::path::Path::new("2"));
+    let _secret = EnvGuard::set(
+        "OPENCLAW_STUB_SECRET",
+        std::path::Path::new("gateway-token-must-stay-secret"),
+    );
+
+    let error = OpenClaw
+        .write_session(&simple_session(), &WriteOptions { force: false })
+        .expect_err("second injection must fail");
+    let detail = format!("{error:#}");
+    assert!(detail.contains("rollback succeeded"), "{detail}");
+    assert!(
+        !detail.contains("gateway-token-must-stay-secret"),
+        "{detail}"
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("sessions.patch"));
+    assert!(calls.contains("sessions.delete"));
+}
+
+#[test]
+#[cfg(unix)]
+fn reader_openclaw_pages_oldest_to_newest_past_the_thousand_message_boundary() {
+    let _lock = OPENCLAW_ENV.lock().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let state_dir = tmp.path().join("openclaw-state");
+    let binary = tmp.path().join("openclaw");
+    let log = tmp.path().join("gateway.log");
+    let page0 = tmp.path().join("page0.json");
+    let page1 = tmp.path().join("page1.json");
+    write_openclaw_stub(&binary);
+
+    let older = simple_msg(0, MessageRole::User, "oldest", 1);
+    let newer = vec![
+        simple_msg(1, MessageRole::Assistant, "newer", 2),
+        simple_msg(2, MessageRole::User, "newest", 3),
+    ];
+    std::fs::write(
+        &page0,
+        serde_json::to_vec(&openclaw_history_page(&newer, true, Some(1000), 1001)).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        &page1,
+        serde_json::to_vec(&openclaw_history_page(
+            std::slice::from_ref(&older),
+            false,
+            None,
+            1001,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let session_key = "agent:main:dashboard:agsx-0123456789abcdef0123456789abcdef";
+    std::fs::write(PathBuf::from(format!("{}.key", log.display())), session_key).unwrap();
+    let locator = state_dir
+        .join(".agsx-gateway")
+        .join(urlencoding::encode(session_key).as_ref())
+        .join(OPENCLAW_GATEWAY_SESSION_ID);
+
+    let _state = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &binary);
+    let _log = EnvGuard::set("OPENCLAW_STUB_LOG", &log);
+    let _page0 = EnvGuard::set("OPENCLAW_STUB_PAGE0", &page0);
+    let _page1 = EnvGuard::set("OPENCLAW_STUB_PAGE1", &page1);
+    let readback = OpenClaw.read_session(&locator).expect("paged history");
+    assert_eq!(
+        readback
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        ["oldest", "newer", "newest"]
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.lines().any(|line| line.contains("\"offset\":1000")));
+}
+
+#[test]
+fn writer_openclaw_refuses_without_official_cli_or_creating_state() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let state_dir = tmp.path().join("openclaw-state");
     let _env = EnvGuard::set("OPENCLAW_STATE_DIR", &state_dir);
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
     for force in [false, true] {
         let error = OpenClaw
             .write_session(&simple_session(), &WriteOptions { force })
-            .expect_err("OpenClaw imports must use its gateway, not direct store mutation");
+            .expect_err("OpenClaw imports require the official CLI");
         assert!(
-            error.to_string().contains("gateway"),
-            "refusal should identify the safe import boundary: {error:#}"
+            error.to_string().contains("official `openclaw` CLI"),
+            "refusal should identify the missing official lifecycle: {error:#}"
         );
     }
 

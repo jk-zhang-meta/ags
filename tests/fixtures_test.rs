@@ -451,8 +451,31 @@ fn fixture_grok_simple() {
 
 #[test]
 fn fixture_agy_simple() {
-    let path = fixtures_dir()
-        .join("antigravity/antigravity-cli/conversations/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.db");
+    let fixtures = fixtures_dir();
+    let fixture = tempfile::tempdir().expect("an Antigravity fixture root");
+    let conversation_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let agy_root = fixture.path().join("antigravity-cli");
+    let path = agy_root
+        .join("conversations")
+        .join(format!("{conversation_id}.db"));
+    let transcript = agy_root
+        .join("brain")
+        .join(conversation_id)
+        .join(".system_generated/logs/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::copy(
+        fixtures
+            .join("antigravity/antigravity-cli/conversations")
+            .join(format!("{conversation_id}.db")),
+        &path,
+    )
+    .unwrap();
+    std::fs::copy(
+        fixtures.join("antigravity/transcripts/agy_simple.jsonl"),
+        &transcript,
+    )
+    .unwrap();
     let session = Antigravity
         .read_session(&path)
         .expect("agy_simple should parse");

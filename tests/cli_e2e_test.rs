@@ -33,6 +33,7 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("CLINE_HOME", tmp.path().join("cline"))
         .env("AIDER_HOME", tmp.path().join("aider"))
         .env("OPENCODE_HOME", tmp.path().join("opencode"))
+        .env("OPENCODE_BIN", tmp.path().join("missing-opencode"))
         .env("CHATGPT_HOME", tmp.path().join("chatgpt"))
         .env("CLAWDBOT_HOME", tmp.path().join("clawdbot"))
         .env("VIBE_HOME", tmp.path().join("vibe"))
@@ -53,6 +54,18 @@ fn casr_cmd(tmp: &TempDir) -> Command {
 /// `<claude_home>/projects/<project-key>/<session-id>.jsonl`
 fn setup_cc_fixture(tmp: &TempDir, fixture_name: &str) -> String {
     setup_cc_fixture_custom(tmp, fixture_name, None, None)
+}
+
+/// Set up a native Aider history fixture in the isolated provider home.
+fn setup_aider_fixture(tmp: &TempDir) -> String {
+    let target_dir = tmp.path().join("aider");
+    fs::create_dir_all(&target_dir).expect("create Aider fixture directory");
+    fs::copy(
+        fixtures_dir().join("aider/aider_simple.md"),
+        target_dir.join(".aider.chat.history.md"),
+    )
+    .expect("copy Aider fixture");
+    "2024-08-05T19-33-02".to_string()
 }
 
 /// Set up a Claude Code session fixture with optional workspace/session-id overrides.
@@ -304,7 +317,8 @@ fn cli_help_outputs_usage() {
         .stdout(predicate::str::contains("Cross Agent Session Resumer"))
         .stdout(predicate::str::contains("resume"))
         .stdout(predicate::str::contains("list"))
-        .stdout(predicate::str::contains("providers"));
+        .stdout(predicate::str::contains("providers"))
+        .stdout(predicate::str::contains("terminal-name").not());
 }
 
 #[test]
@@ -1251,57 +1265,45 @@ fn cli_list_provider_filter_accepts_claude_standard_name() {
 }
 
 #[test]
-fn cli_resume_cc_to_cursor_works_and_is_discoverable() {
+fn cli_resume_cc_to_cursor_refuses_real_and_dry_run_without_state() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
-        .args(["--json", "resume", "cur", &session_id])
-        .output()
-        .expect("resume should run");
+    for dry_run in [false, true] {
+        let mut args = vec!["--json", "resume", "cur", session_id.as_str()];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = casr_cmd(&tmp)
+            .env("CLINE_BIN", tmp.path().join("missing-cline"))
+            .args(args)
+            .output()
+            .expect("resume should run");
+        assert!(!output.status.success(), "Cursor target must refuse");
+        let error = parse_json_error(&output.stderr);
+        assert_eq!(error["ok"], false);
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("allComposers")),
+            "unexpected refusal: {error}"
+        );
+    }
     assert!(
-        output.status.success(),
-        "CC→Cursor conversion should succeed"
+        !tmp.path().join("cursor").exists(),
+        "real and dry-run refusals must not create Cursor state"
     );
-
-    let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("resume --json output should parse");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["target_provider"].as_str().unwrap(), "cursor");
-    let cursor_session_id = parsed["target_session_id"]
-        .as_str()
-        .expect("target_session_id should be present for non-dry-run");
-
-    let cursor_db = tmp.path().join("cursor/User/globalStorage/state.vscdb");
-    assert!(
-        cursor_db.exists(),
-        "Cursor DB should exist after CC→Cursor conversion"
-    );
-
-    casr_cmd(&tmp)
-        .args(["--json", "info", cursor_session_id])
-        .assert()
-        .success();
 }
 
 #[test]
 fn cli_resume_cursor_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
-    let source_id = setup_cc_fixture(&tmp, "cc_simple");
-
-    let cursor_result = casr_cmd(&tmp)
-        .args(["--json", "resume", "cur", &source_id])
-        .output()
-        .expect("CC→Cursor seed conversion should run");
-    assert!(cursor_result.status.success());
-    let cursor_json: serde_json::Value =
-        serde_json::from_slice(&cursor_result.stdout).expect("seed conversion JSON should parse");
-    let cursor_session_id = cursor_json["target_session_id"]
-        .as_str()
-        .expect("cursor target_session_id should be present");
+    let cursor_db = tmp.path().join("cursor/User/globalStorage/state.vscdb");
+    std::fs::create_dir_all(cursor_db.parent().unwrap()).unwrap();
+    std::fs::copy(fixtures_dir().join("cursor/state.vscdb"), &cursor_db).unwrap();
 
     casr_cmd(&tmp)
-        .args(["resume", "cc", cursor_session_id, "--source", "cur"])
+        .args(["resume", "cc", "cur-composer-001", "--source", "cur"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Converted"))
@@ -1320,6 +1322,7 @@ fn cli_resume_cc_to_cline_refuses_real_and_dry_run_without_state() {
             args.push("--dry-run");
         }
         let output = casr_cmd(&tmp)
+            .env("OPENCLAW_BIN", tmp.path().join("missing-openclaw"))
             .args(args)
             .output()
             .expect("resume should run");
@@ -1329,7 +1332,7 @@ fn cli_resume_cc_to_cline_refuses_real_and_dry_run_without_state() {
         assert!(
             error["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("taskHistory.json")),
+                .is_some_and(|message| message.contains("official `cline` CLI")),
             "unexpected refusal: {error}"
         );
     }
@@ -1421,9 +1424,19 @@ fn cli_resume_amp_to_cc_works_with_source_hint() {
 }
 
 #[test]
-fn cli_resume_cc_to_aider_works_and_is_discoverable() {
+fn cli_resume_cc_to_aider_writes_only_an_independent_history() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
+
+    let dry_run = casr_cmd(&tmp)
+        .args(["--json", "resume", "aid", &session_id, "--dry-run"])
+        .output()
+        .expect("dry run should run");
+    assert!(dry_run.status.success());
+    assert!(
+        !tmp.path().join("aider").exists(),
+        "Aider dry run created provider state"
+    );
 
     let output = casr_cmd(&tmp)
         .args(["--json", "resume", "aid", &session_id])
@@ -1431,55 +1444,42 @@ fn cli_resume_cc_to_aider_works_and_is_discoverable() {
         .expect("resume should run");
     assert!(
         output.status.success(),
-        "CC→Aider conversion should succeed"
+        "Aider conversion failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-
     let parsed: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("resume --json output should parse");
-    assert_eq!(parsed["ok"], true);
-    assert_eq!(parsed["target_provider"].as_str().unwrap(), "aider");
-    let aider_session_id = parsed["target_session_id"]
-        .as_str()
-        .expect("target_session_id should be present for non-dry-run");
-
-    let aider_history = tmp.path().join("aider/.aider.chat.history.md");
-    assert!(
-        aider_history.exists(),
-        "Aider history file should exist after CC→Aider conversion"
+        serde_json::from_slice(&output.stdout).expect("resume JSON should parse");
+    let written = PathBuf::from(
+        parsed["written_paths"][0]
+            .as_str()
+            .expect("Aider written path"),
     );
-
-    casr_cmd(&tmp)
-        .args([
-            "--json",
-            "resume",
-            "cc",
-            aider_session_id,
-            "--source",
-            "aid",
-            "--dry-run",
-        ])
-        .assert()
-        .success();
+    assert!(written.is_file());
+    assert!(
+        written
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".aider.chat.history.agsx-"))
+    );
+    assert!(
+        !tmp.path().join("aider/.aider.chat.history.md").exists(),
+        "Aider conversion appended to the shared history"
+    );
+    assert!(
+        parsed["resume_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--chat-history-file")
+                && command.contains("--restore-chat-history"))
+    );
 }
 
 #[test]
 fn cli_resume_aider_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
-    let source_id = setup_cc_fixture(&tmp, "cc_simple");
-
-    let aider_result = casr_cmd(&tmp)
-        .args(["--json", "resume", "aid", &source_id])
-        .output()
-        .expect("CC→Aider seed conversion should run");
-    assert!(aider_result.status.success());
-    let aider_json: serde_json::Value =
-        serde_json::from_slice(&aider_result.stdout).expect("seed conversion JSON should parse");
-    let aider_session_id = aider_json["target_session_id"]
-        .as_str()
-        .expect("aider target_session_id should be present");
+    let aider_session_id = setup_aider_fixture(&tmp);
 
     casr_cmd(&tmp)
-        .args(["resume", "cc", aider_session_id, "--source", "aid"])
+        .args(["resume", "cc", &aider_session_id, "--source", "aid"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Converted"))
@@ -1488,7 +1488,7 @@ fn cli_resume_aider_to_cc_works_with_source_hint() {
 }
 
 #[test]
-fn cli_resume_cc_to_opencode_refuses_real_and_dry_run_without_a_database() {
+fn cli_resume_cc_to_opencode_requires_the_official_cli_for_real_and_dry_run() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
@@ -1766,7 +1766,7 @@ fn cli_resume_factory_to_cc_works_with_source_hint() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cli_resume_cc_to_openclaw_refuses_real_and_dry_run_without_state() {
+fn cli_resume_cc_to_openclaw_refuses_without_official_cli() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
@@ -1785,7 +1785,7 @@ fn cli_resume_cc_to_openclaw_refuses_real_and_dry_run_without_state() {
         assert!(
             error["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("gateway")),
+                .is_some_and(|message| message.contains("official `openclaw` CLI")),
             "unexpected refusal: {error}"
         );
     }
@@ -1952,6 +1952,151 @@ fn empty_path(tmp: &TempDir) -> PathBuf {
     let dir = tmp.path().join("empty-bin");
     fs::create_dir_all(&dir).expect("create empty PATH dir");
     dir
+}
+
+#[cfg(unix)]
+fn write_executable(path: &std::path::Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, contents).expect("write executable");
+    let mut permissions = fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("mark executable");
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_terminal_name_prints_the_managed_session_name() {
+    let tmp = TempDir::new().unwrap();
+    casr_cmd(&tmp)
+        .args(["terminal-name", "conversation-1/runtime-1"])
+        .assert()
+        .success()
+        .stdout("ags-f87158c8f1c80f24283b\n")
+        .stderr("");
+    casr_cmd(&tmp).arg("terminal-name").assert().code(2);
+    casr_cmd(&tmp)
+        .args(["terminal-name", "one", "two"])
+        .assert()
+        .code(2);
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_terminal_launcher_passes_one_argv_payload_to_rmux() {
+    let tmp = TempDir::new().unwrap();
+    let bin = tmp.path().join("bin");
+    let log = tmp.path().join("rmux.args");
+    let payload_log = tmp.path().join("rmux.payload");
+    fs::create_dir(&bin).unwrap();
+    write_executable(
+        &bin.join("rmux"),
+        "#!/bin/sh\nif [ \"${1:-}\" = -V ]; then printf 'rmux 0.9.1\\n'; exit; fi\nprintf '%s\\n' \"$@\" > \"$RMUX_TEST_LOG\"\nprintf '%s' \"$AGS_RMUX_LAUNCH_PAYLOAD\" > \"$RMUX_PAYLOAD_LOG\"\n",
+    );
+
+    let output = casr_cmd(&tmp)
+        .env("PATH", &bin)
+        .env("RMUX_TEST_LOG", &log)
+        .env("RMUX_PAYLOAD_LOG", &payload_log)
+        .env("AGENT_SESSION_STORAGE_MODE", "remote:github")
+        .current_dir(tmp.path())
+        .args([
+            "terminal-launch",
+            "runtime-key",
+            "--",
+            "/opt/codex",
+            "resume",
+            "native id",
+            "--model",
+            "o3",
+        ])
+        .output()
+        .expect("terminal launcher should run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let args = fs::read_to_string(log)
+        .expect("fake RMUX log")
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &args[..7],
+        ["-L", "ags", "-f", "/dev/null", "new-session", "-A", "-s"]
+    );
+    assert!(args[7].starts_with("ags-"));
+    assert_eq!(args[8], "-c");
+    assert_eq!(args[9], tmp.path().display().to_string());
+    assert_eq!(args[10], "--");
+    assert_eq!(args[12], "terminal-payload");
+    assert!(
+        std::path::Path::new(&args[11]).is_absolute(),
+        "the RMUX command should contain only the trusted AGS runner"
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(payload_log).expect("managed payload"))
+            .expect("valid managed payload JSON");
+    assert_eq!(payload["program"], "/opt/codex");
+    assert_eq!(
+        payload["args"],
+        serde_json::json!(["resume", "native id", "--model", "o3"])
+    );
+    assert_eq!(
+        payload["env"],
+        serde_json::json!([["AGENT_SESSION_STORAGE_MODE", "remote:github"]])
+    );
+    assert!(
+        args.iter().all(|arg| arg != "native id"
+            && arg != "--model"
+            && arg != "AGENT_SESSION_STORAGE_MODE=remote:github"),
+        "Agent-controlled arguments and environment values must not reach RMUX's shell-parsed command vector"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hidden_terminal_payload_execs_literal_arguments_without_a_shell() {
+    let tmp = TempDir::new().unwrap();
+    let agent = tmp.path().join("fake agent");
+    let log = tmp.path().join("agent.args");
+    let marker = tmp.path().join("must-not-exist");
+    write_executable(
+        &agent,
+        "#!/bin/sh\nprintf '<%s>\\n' \"$@\" > \"$AGS_PAYLOAD_TEST_LOG\"\nprintf 'env=<%s>\\n' \"$AGS_TEST_ENV\" >> \"$AGS_PAYLOAD_TEST_LOG\"\nprintf 'payload=<%s>\\n' \"${AGS_RMUX_LAUNCH_PAYLOAD-unset}\" >> \"$AGS_PAYLOAD_TEST_LOG\"\n",
+    );
+    let hostile = format!("; touch {}; #", marker.display());
+    let payload = serde_json::json!({
+        "program": agent,
+        "args": ["a b", hostile],
+        "env": [["AGS_TEST_ENV", "literal env"]]
+    });
+
+    let output = casr_cmd(&tmp)
+        .env("AGS_RMUX_LAUNCH_PAYLOAD", payload.to_string())
+        .env("AGS_PAYLOAD_TEST_LOG", &log)
+        .arg("terminal-payload")
+        .output()
+        .expect("terminal payload should exec");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual = fs::read_to_string(log).expect("Agent argv log");
+    assert_eq!(
+        actual,
+        format!(
+            "<a b>\n<; touch {}; #>\nenv=<literal env>\npayload=<unset>\n",
+            marker.display()
+        )
+    );
+    assert!(!marker.exists(), "a shell interpreted the hostile argument");
 }
 
 #[test]
@@ -2152,11 +2297,15 @@ fn cli_launch_refusal_keeps_the_json_envelope_parseable() {
         parsed["fidelity"], "history_incomplete",
         "the grade a script would gate on must be in the envelope"
     );
-    assert!(parsed["written_paths"].as_array().is_some_and(|p| !p.is_empty()));
     assert!(
-        parsed["losses"]
+        parsed["written_paths"]
             .as_array()
-            .is_some_and(|losses| losses.iter().any(|loss| loss["kind"] == "sealed_context"
+            .is_some_and(|p| !p.is_empty())
+    );
+    assert!(
+        parsed["losses"].as_array().is_some_and(|losses| losses
+            .iter()
+            .any(|loss| loss["kind"] == "sealed_context"
                 && loss["capsules"].as_u64().is_some_and(|n| n > 0))),
         "the counts behind the grade have to reach a machine consumer: {parsed}"
     );
@@ -2175,35 +2324,34 @@ fn cli_launch_refusal_keeps_the_json_envelope_parseable() {
 }
 
 #[test]
-fn cli_launch_warns_when_the_agent_cannot_be_pointed_at_the_session() {
+fn cli_launch_dry_run_targets_the_independent_aider_history() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
     let output = casr_cmd(&tmp)
-        .args(["resume", "cur", &session_id, "--launch-dry-run"])
+        .args(["resume", "aid", &session_id, "--launch-dry-run"])
         .output()
         .expect("launch dry run should run");
     assert!(
         output.status.success(),
-        "an untargetable provider is a warning, not a refusal"
+        "Aider launch dry run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("no way to be pointed at a specific session")
-            && stdout.contains("without resuming the converted one"),
-        "Cursor cannot open the converted session and the user has to be told:\n{stdout}"
+        stdout.contains("--chat-history-file") && stdout.contains("--restore-chat-history"),
+        "launch dry-run did not target the independent history:\n{stdout}"
     );
-    let written = labelled(&stdout, "Written →");
     assert!(
-        stdout.contains(&format!("Converted session: {written}")),
-        "the warning must name the file so the user can open it themselves:\n{stdout}"
+        fs::read_dir(tmp.path().join("aider"))
+            .expect("Aider output directory")
+            .any(|entry| entry
+                .expect("Aider output")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aider.chat.history.agsx-"))
     );
-    assert_eq!(
-        last_line(&stdout),
-        "cursor .",
-        "the command is still printed; it just will not resume anything"
-    );
+    assert!(!tmp.path().join("aider/.aider.chat.history.md").exists());
 }
 
 #[test]
@@ -2227,6 +2375,67 @@ fn cli_launch_reports_a_missing_agent_as_missing_rather_than_as_a_failed_convers
     assert!(
         stderr.contains("is not installed") && stderr.contains("not on PATH"),
         "expected a missing-agent report, got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_launch_requires_rmux_and_never_falls_back_to_an_unmanaged_agent() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+    let bin = empty_path(&tmp);
+    write_executable(&bin.join("codex"), "#!/bin/sh\nexit 97\n");
+
+    let output = casr_cmd(&tmp)
+        .env("PATH", &bin)
+        .args(["resume", "cod", &session_id, "--launch"])
+        .output()
+        .expect("launch should run");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Converted"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("compatible RMUX 0.9.x release (0.9.1 or newer) is required")
+            && stderr.contains("no unmanaged agent was started"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn json_interactive_launch_is_refused_before_starting_rmux() {
+    let tmp = TempDir::new().unwrap();
+    let session_id = setup_cc_fixture(&tmp, "cc_simple");
+    let bin = empty_path(&tmp);
+    let marker = tmp.path().join("rmux-started");
+    write_executable(&bin.join("codex"), "#!/bin/sh\nexit 97\n");
+    write_executable(
+        &bin.join("rmux"),
+        "#!/bin/sh\nif [ \"${1:-}\" = -V ]; then printf 'rmux 0.9.1\\n'; exit; fi\ntouch \"$RMUX_LAUNCH_MARKER\"\nexit 98\n",
+    );
+
+    let output = casr_cmd(&tmp)
+        .env("PATH", &bin)
+        .env("RMUX_LAUNCH_MARKER", &marker)
+        .args(["--json", "resume", "cod", &session_id, "--launch"])
+        .output()
+        .expect("launch preflight should run");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let response: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("stdout must remain one JSON envelope: {error}\n{stdout}"));
+    assert_eq!(response["ok"], false);
+    assert!(
+        response["launch_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("--json cannot be combined")),
+        "{response}"
+    );
+    assert!(
+        !marker.exists(),
+        "RMUX must not be started after a non-interactive preflight failure"
     );
 }
 

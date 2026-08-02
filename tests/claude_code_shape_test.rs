@@ -337,25 +337,26 @@ fn write_shape() -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
-/// The live head is the newest `last-prompt.leafUuid`, not the last record.
+/// The live head comes from Claude's graph state, not the last file record.
 ///
 /// Seven record types in this transcript — `mode`, `permission-mode`,
 /// `last-prompt`, `ai-title`, `queue-operation`, `file-history-delta`,
 /// `file-history-snapshot` — carry neither `uuid` nor `parentUuid`, and the
 /// file *ends* on one of them. Claude Code's loader ignores all seven when it
 /// builds the graph (its transcript predicate admits only `user`, `assistant`,
-/// `attachment` and `system`) and takes its resume point from the recorded
-/// leaf. A reader that instead took the end of the file would begin its walk on
-/// a record with no parent and no ancestors and resolve the session to nothing.
+/// `attachment` and `system`). The recorded leaf is a non-explicit hint, so the
+/// loader advances from `inflight` to its newest main-chain descendant `a-4`.
+/// A reader that instead took the end of the file would begin its walk on a
+/// record with no parent and no ancestors and resolve the session to nothing.
 #[test]
-fn the_live_head_is_the_recorded_leaf_not_the_last_record() {
+fn the_live_head_comes_from_vendor_graph_not_the_last_file_record() {
     let (_dir, path) = write_shape();
     let ir = claude_code_ir::read(&path).unwrap();
 
     assert_eq!(
         ir.live_head.as_deref(),
-        Some("inflight"),
-        "the head is the newest `last-prompt.leafUuid`"
+        Some("a-4"),
+        "a non-explicit leaf advances to its newest main-chain descendant"
     );
 
     // The seven are captured — this reader reports rather than discards — but
@@ -408,10 +409,9 @@ fn the_compaction_summary_survives_a_bypassing_leaf() {
     assert_eq!(plan.checkpoints, ["cb-1", "cb-2"]);
     assert_eq!(
         plan.events,
-        ["a-3", "inflight", "sum-2", "a-4"],
-        "the newest boundary assigned `a-3`; `sum-2` is what that boundary \
-         wrote in place of everything it dropped; `inflight` and its reply are \
-         the live branch"
+        ["sum-2", "a-3", "inflight", "a-4"],
+        "`sum-2` is the boundary's anchor before its preserved tail `a-3`; \
+         `inflight` and its reply are the live branch"
     );
     assert!(
         !plan.excluded.iter().any(|excluded| excluded.id == "sum-2"),

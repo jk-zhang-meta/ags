@@ -114,6 +114,11 @@ status_fail() {
     log_to_file "FAIL: $1"
 }
 
+stage_fail() {
+    echo -e "  ${RED}FAIL${RESET}: $1"
+    log_to_file "FAIL: $1"
+}
+
 status_skip() {
     SKIP_COUNT=$((SKIP_COUNT + 1))
     echo -e "  ${YELLOW}SKIP${RESET}: $1"
@@ -574,10 +579,9 @@ check_fidelity() {
         return 1
     fi
 
-    # Use the conversion output message count (from casr) for comparison, not raw file line count.
-    # The source_msg_count from discovery is approximate (raw grep/wc count).
-    # casr filters out empty/system messages so the converted count is typically lower.
-    # We just verify the target has a reasonable number of messages (at least 50% of raw source count).
+    # Both counts come from casr's canonical readers. Provider files also contain
+    # metadata, reasoning and lifecycle events, so raw JSONL line counts are not
+    # a meaningful cross-provider fidelity oracle.
     if [[ "$source_msg_count" -gt 0 ]]; then
         local min_expected
         min_expected=$(( (source_msg_count * 50) / 100 ))
@@ -646,15 +650,47 @@ run_conversion_pair() {
 
     log_step "Seeded: $seeded_path"
 
-    # Save source info
+    # Establish the fidelity baseline with casr's source reader, not the raw
+    # provider file's line/message approximation used only for discovery.
+    local source_canonical_info="$pair_dir/source_canonical_info.json"
+    local source_canonical_stderr="$pair_dir/source_canonical_info.stderr.txt"
+    set +e
+    env \
+        CLAUDE_HOME="$sandbox/claude" \
+        CODEX_HOME="$sandbox/codex" \
+        GEMINI_HOME="$sandbox/gemini" \
+        "$CASR" --json info "$source_session_id" --source "$src" \
+        > "$source_canonical_info" 2> "$source_canonical_stderr"
+    local source_info_exit=$?
+    set -e
+    local source_canonical_count
+    source_canonical_count="$(
+        jq -r '.messages // 0' "$source_canonical_info" 2>/dev/null || echo 0
+    )"
+    if [[ "$source_info_exit" -ne 0 || "$source_canonical_count" -lt 1 ]]; then
+        status_fail "$pair — source canonical read failed"
+        printf "%s\tFAIL\t%s\t-\t%d\t0/4\t0\tsource canonical read failed\n" \
+            "$pair" "$source_session_id" "$source_info_exit" >> "$MATRIX_TSV"
+        rm -rf "$sandbox"
+        return
+    fi
     jq -n \
         --arg sid "$source_session_id" \
         --arg path "$source_path" \
-        --argjson msgs "$source_msg_count" \
+        --argjson raw_msgs "$source_msg_count" \
+        --argjson msgs "$source_canonical_count" \
         --arg ws "$source_workspace" \
         --arg seeded "$seeded_path" \
-        '{session_id: $sid, source_path: $path, messages: $msgs, workspace: $ws, seeded_path: $seeded}' \
-        > "$pair_dir/source_info.json"
+        '{
+            session_id: $sid,
+            source_path: $path,
+            raw_discovery_messages: $raw_msgs,
+            messages: $msgs,
+            workspace: $ws,
+            seeded_path: $seeded
+        }' > "$pair_dir/source_info.json"
+    source_msg_count="$source_canonical_count"
+    log_step "Canonical source messages: $source_msg_count"
 
     # --- Step B: Run conversion ---
     local convert_start
@@ -728,11 +764,11 @@ run_conversion_pair() {
             stages_passed=$((stages_passed + 1))
             log_step "Stage 2 PASS: $written_path exists (${file_size} bytes)"
         else
-            status_fail "$pair — stage 2: output file too small (${file_size} bytes)"
+            stage_fail "$pair — stage 2: output file too small (${file_size} bytes)"
             verify_notes="output file ${file_size}b < 100b"
         fi
     else
-        status_fail "$pair — stage 2: output file not found: $written_path"
+        stage_fail "$pair — stage 2: output file not found: $written_path"
         verify_notes="output file missing"
     fi
 
@@ -751,7 +787,7 @@ run_conversion_pair() {
         stages_passed=$((stages_passed + 1))
         log_step "Stage 3 PASS: structural validation ${struct_result#OK:}"
     else
-        status_fail "$pair — stage 3: structural validation ${struct_result#FAIL:}"
+        stage_fail "$pair — stage 3: structural validation ${struct_result#FAIL:}"
         verify_notes="${verify_notes:+$verify_notes; }struct: ${struct_result#FAIL:}"
     fi
 
@@ -766,7 +802,7 @@ run_conversion_pair() {
         stages_passed=$((stages_passed + 1))
         log_step "Stage 4 PASS: fidelity ${fidelity_result#OK:}"
     else
-        status_fail "$pair — stage 4: fidelity ${fidelity_result#FAIL:}"
+        stage_fail "$pair — stage 4: fidelity ${fidelity_result#FAIL:}"
         verify_notes="${verify_notes:+$verify_notes; }fidelity: ${fidelity_result#FAIL:}"
     fi
 

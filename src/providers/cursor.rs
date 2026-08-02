@@ -1,4 +1,4 @@
-//! Cursor AI provider — reads/writes sessions from SQLite `state.vscdb` databases.
+//! Cursor AI provider — reads sessions from SQLite `state.vscdb` databases.
 //!
 //! Cursor stores conversations in SQLite databases under its config directory:
 //! - Linux: `~/.config/Cursor/User/globalStorage/state.vscdb`
@@ -28,7 +28,15 @@
 //! resume command opens the workspace in Cursor (`cursor <workspace-path>`).
 //! `cursor-agent --resume <id>` does exist, but it addresses the separate
 //! `~/.cursor` agent store described below; it cannot open a composer casr
-//! wrote to the IDE's `state.vscdb`.
+//! reads from the IDE's `state.vscdb`.
+//!
+//! ## Writing
+//!
+//! A composer visible in Cursor's UI requires the workbench-managed
+//! `allComposers` index as well as the `composerData` and `bubbleId` records.
+//! casr can read the latter, but has no vendor-authoritative way to update the
+//! shared index without risking an invisible or damaged composer. Cursor is
+//! therefore read/resume-only until that lifecycle is verified end to end.
 //!
 //! # The second store: `cursor-agent`
 //!
@@ -97,7 +105,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::discovery::DetectionResult;
 use crate::model::{
@@ -111,6 +119,8 @@ use crate::providers::{
 
 /// Cursor AI provider implementation.
 pub struct Cursor;
+
+const CURSOR_WRITE_REFUSAL: &str = "Cursor is read/resume-only: writing composerData and bubbleId records without Cursor's allComposers index creates a session the IDE cannot show. A safe import needs Cursor's own composer lifecycle; use Cursor as a conversion source, not a target.";
 
 // ---------------------------------------------------------------------------
 // Bubble type constants (v0.40+ numeric message types)
@@ -138,8 +148,8 @@ pub struct Cursor;
 ///   : l.type === yo.AI && (o === void 0 && (o = {…}), o.messages.push(l))
 /// ```
 ///
-/// So every role has to arrive as one of these two, and which one is the whole
-/// question — see [`Cursor::write_session`].
+/// So every readable bubble has one of these two values. Cursor target imports
+/// refuse before they would need to project another provider's roles onto them.
 ///
 /// User message type in modern Cursor format.
 const BUBBLE_TYPE_USER: i64 = 1;
@@ -344,7 +354,7 @@ impl Cursor {
         Ok(conn)
     }
 
-    /// Open a SQLite database read-write (for writer).
+    #[cfg(test)]
     fn open_db_rw(path: &Path) -> anyhow::Result<Connection> {
         let conn = Connection::open_with_flags(
             path,
@@ -352,7 +362,7 @@ impl Cursor {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .with_context(|| format!("failed to open Cursor DB for writing: {}", path.display()))?;
+        .with_context(|| format!("failed to open Cursor DB for test: {}", path.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(conn)
     }
@@ -794,7 +804,10 @@ impl Cursor {
                 author: None,
                 tool_calls: Vec::new(),
                 tool_results: Vec::new(),
-                extra: composer.clone(),
+                // `composerData` now carries live encryption keys at its top
+                // level. This fallback already lifts every field it uses, so
+                // copying the vendor object would only republish unknown data.
+                extra: serde_json::Value::Null,
             });
         }
 
@@ -1042,141 +1055,14 @@ impl Provider for Cursor {
 
     fn write_session(
         &self,
-        session: &CanonicalSession,
-        opts: &WriteOptions,
+        _session: &CanonicalSession,
+        _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let target_composer_id = uuid::Uuid::new_v4().to_string();
-        let now_millis = chrono::Utc::now().timestamp_millis();
+        Err(anyhow::anyhow!(CURSOR_WRITE_REFUSAL))
+    }
 
-        // Determine target DB path.
-        let global_db = Self::config_dir()
-            .map(|c| c.join("User/globalStorage/state.vscdb"))
-            .ok_or_else(|| anyhow::anyhow!("cannot determine Cursor config directory"))?;
-
-        // If the DB doesn't exist, create it with the proper schema.
-        let db_dir = global_db
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("invalid Cursor DB path"))?;
-
-        std::fs::create_dir_all(db_dir)
-            .with_context(|| format!("failed to create directory: {}", db_dir.display()))?;
-
-        // Check for conflict.
-        if global_db.exists() && !opts.force {
-            // DB exists — we'll INSERT into it, no conflict.
-            // Only conflict if this specific composer ID already exists.
-            if let Ok(conn) = Self::open_db(&global_db) {
-                let ids = Self::list_composer_ids(&conn);
-                if ids.contains(&target_composer_id) {
-                    return Err(crate::error::CasrError::SessionConflict {
-                        session_id: target_composer_id,
-                        existing_path: global_db,
-                    }
-                    .into());
-                }
-            }
-        }
-
-        let mut conn = Self::open_db_rw(&global_db)?;
-
-        // Create table if needed.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);",
-        )
-        .context("failed to create cursorDiskKV table")?;
-
-        let tx = conn.transaction().context("failed to begin transaction")?;
-
-        // Build bubble entries and conversation headers.
-        let mut headers: Vec<serde_json::Value> = Vec::new();
-
-        for msg in &session.messages {
-            let bubble_id = uuid::Uuid::new_v4().to_string();
-            // Cursor has two bubble types and four roles to place in them (see
-            // `BUBBLE_TYPE_USER`), so two of these are folds. Which fold is not
-            // a matter of taste:
-            //
-            // * A system prompt and an unrecognised source role go to the human
-            //   bubble. Cursor has no operator channel, so their provenance is
-            //   lost either way — but an AI bubble does not lose it, it inverts
-            //   it, and the resumed model reads the operator's instruction as
-            //   something it said itself. `pipeline::folded_role` files the
-            //   anonymisation as a `Loss`; nothing can file back the authority
-            //   of a turn the file says the model spoke.
-            // * A tool observation goes to the AI bubble, because that is where
-            //   Cursor itself puts one. Every tool bubble the workbench builds
-            //   is AI-typed with empty text and the payload beside it —
-            //   `{...Qb(), codeBlocks: [], type: yo.AI, text: "",
-            //   capabilityType: Vs.TOOL_FORMER, toolFormerData: r}` in
-            //   `upsertToolCall`, and the same literal in
-            //   `getOrCreateToolFormerBubbleId` and
-            //   `populateConversationFromState.js`. Only the structure is lost
-            //   here, which is what `pipeline::writer_carries_tool_calls`
-            //   reports; the speaker is not.
-            let bubble_type = match msg.role {
-                MessageRole::User | MessageRole::System | MessageRole::Other(_) => BUBBLE_TYPE_USER,
-                MessageRole::Assistant | MessageRole::Tool => BUBBLE_TYPE_ASSISTANT,
-            };
-
-            let bubble = serde_json::json!({
-                "text": msg.content,
-                "type": bubble_type,
-                "timestamp": msg.timestamp.unwrap_or(now_millis),
-                "modelType": msg.author.as_deref().or(session.model_name.as_deref()),
-            });
-
-            let bubble_key = format!("bubbleId:{target_composer_id}:{bubble_id}");
-            let bubble_json = serde_json::to_string(&bubble)?;
-
-            tx.execute(
-                "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-                rusqlite::params![bubble_key, bubble_json],
-            )
-            .with_context(|| format!("failed to insert bubble {bubble_id}"))?;
-
-            headers.push(serde_json::json!({ "bubbleId": bubble_id }));
-        }
-
-        // Build composerData entry.
-        let composer_data = serde_json::json!({
-            "fullConversationHeadersOnly": headers,
-            "createdAt": session.started_at.unwrap_or(now_millis),
-            "lastUpdatedAt": session.ended_at.unwrap_or(now_millis),
-            "name": session.title.as_deref().unwrap_or(""),
-            "modelConfig": {
-                "modelName": session.model_name.as_deref().unwrap_or("unknown"),
-            },
-            "casr_converted": true,
-            "casr_source_provider": session.provider_slug,
-            "casr_source_session_id": session.session_id,
-        });
-
-        let composer_key = format!("composerData:{target_composer_id}");
-        let composer_json = serde_json::to_string(&composer_data)?;
-
-        tx.execute(
-            "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
-            rusqlite::params![composer_key, composer_json],
-        )
-        .context("failed to insert composerData")?;
-
-        tx.commit().context("failed to commit transaction")?;
-
-        info!(
-            target_composer_id,
-            path = %global_db.display(),
-            messages = session.messages.len(),
-            "Cursor session written"
-        );
-        let virtual_path = Self::virtual_session_path(&global_db, &target_composer_id);
-
-        Ok(WrittenSession {
-            paths: vec![virtual_path],
-            session_id: target_composer_id.clone(),
-            resume_command: self.resume_command(&target_composer_id),
-            backups: Vec::new(),
-            warnings: Vec::new(),
-        })
+    fn write_refusal(&self) -> Option<&'static str> {
+        Some(CURSOR_WRITE_REFUSAL)
     }
 
     fn resume_command(&self, _session_id: &str) -> String {
@@ -2163,6 +2049,31 @@ mod tests {
         let composer = json!({"workspacePath": "/data/projects/test"});
         let ws = extract_workspace_from_composer(&composer);
         assert_eq!(ws, Some(PathBuf::from("/data/projects/test")));
+    }
+
+    #[test]
+    fn simple_composer_fallback_does_not_copy_unknown_vendor_fields() {
+        let composer = json!({
+            "text": "legacy prompt",
+            "type": 1,
+            "timestamp": 1_700_000_000_000_i64,
+            "blobEncryptionKey": "planted-not-a-real-key",
+        });
+
+        let session = Cursor::parse_composer(
+            "legacy-composer",
+            &composer,
+            &std::collections::HashMap::new(),
+            Path::new("/tmp/state.vscdb"),
+        )
+        .expect("legacy composer should parse");
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].content, "legacy prompt");
+        assert!(
+            session.messages[0].extra.is_null(),
+            "fallback copied the whole composerData vendor object"
+        );
     }
 
     #[test]

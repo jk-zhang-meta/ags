@@ -2,8 +2,9 @@
 //!
 //! Writable targets follow: read source fixture → canonical → write to target
 //! (temp dir) → read back → compare canonical fields against original.
-//! ChatGPT, Cline, OpenCode and OpenClaw targets instead must refuse without
-//! creating state.
+//! ChatGPT and Cursor targets instead must refuse without creating state.
+//! Cline, OpenCode and OpenClaw are writable when their official lifecycle is
+//! available; Aider writes an independent native history file.
 //!
 //! Tests verify: `read_T(write_T(read_S(source))) ≈ read_S(source)` where
 //! S = source provider, T = target provider.
@@ -144,8 +145,16 @@ fn read_cline_fixture() -> CanonicalSession {
         .expect("Failed to read Cline fixture")
 }
 
-/// Read a native OpenClaw transcript. OpenClaw target imports require its
-/// gateway, so direct file writes cannot honestly seed this source.
+/// Read vendor-shaped Aider history instead of manufacturing a source through
+/// the isolated target writer under test.
+fn read_aider_fixture() -> CanonicalSession {
+    Aider
+        .read_session(&fixtures_dir().join("aider/aider_simple.md"))
+        .expect("Failed to read Aider fixture")
+}
+
+/// Read a native OpenClaw transcript. Target imports use the live Gateway, so
+/// direct file writes cannot honestly seed this source.
 fn read_openclaw_fixture() -> CanonicalSession {
     OpenClaw
         .read_session(&fixtures_dir().join("openclaw/openclaw_simple.jsonl"))
@@ -166,10 +175,9 @@ fn assert_target_refuses(
                     "[{label}] unexpected refusal: {error:#}"
                 );
             }
-            Ok(written) => panic!(
-                "[{label}] a read/resume-only target unexpectedly wrote {:?}",
-                written.paths
-            ),
+            Ok(written) => {
+                panic!("[{label}] a refusing target unexpectedly wrote {:?}", written.paths)
+            }
         }
     }
 }
@@ -213,6 +221,52 @@ fn assert_roundtrip_fidelity(
             &orig.content[..orig.content.len().min(80)],
             &rb.content[..rb.content.len().min(80)]
         );
+    }
+}
+
+fn assert_aider_roundtrip(
+    original: &CanonicalSession,
+    readback: &CanonicalSession,
+    path_label: &str,
+) {
+    assert_eq!(
+        original.messages.len(),
+        readback.messages.len(),
+        "[{path_label}] Aider message count changed"
+    );
+    for (index, (original, restored)) in original
+        .messages
+        .iter()
+        .zip(&readback.messages)
+        .enumerate()
+    {
+        let expected_role = if original.role == MessageRole::Assistant {
+            MessageRole::Assistant
+        } else {
+            MessageRole::User
+        };
+        assert_eq!(
+            restored.role, expected_role,
+            "[{path_label}] Aider role mismatch at message {index}"
+        );
+        assert!(
+            restored.content.contains(&original.content),
+            "[{path_label}] Aider lost message {index} text: {:?}",
+            restored.content
+        );
+        for call in &original.tool_calls {
+            assert!(
+                restored.content.contains(&format!("[Tool: {}]", call.name)),
+                "[{path_label}] Aider lost tool call {} at message {index}",
+                call.name
+            );
+        }
+        for result in &original.tool_results {
+            assert!(
+                restored.content.contains(&result.content),
+                "[{path_label}] Aider lost tool result text at message {index}"
+            );
+        }
     }
 }
 
@@ -291,26 +345,21 @@ fn roundtrip_cc_to_gemini() {
 }
 
 // ===========================================================================
-// Path 3: CC → Cursor
+// Path 3: CC → Cursor refusal
 // ===========================================================================
 
 #[test]
-fn roundtrip_cc_to_cursor() {
+fn cursor_refuses_cc_as_a_target() {
     let _lock = CURSOR_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CURSOR_HOME", tmp.path());
 
     let original = read_cc_fixture("cc_simple");
-    let written = Cursor
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("CC→Cur: write should succeed");
-
-    let readback = Cursor
-        .read_session(&written.paths[0])
-        .expect("CC→Cur: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "CC→Cur");
-    assert_new_session_id(&readback, "CC→Cur");
+    assert_target_refuses(&Cursor, &original, "allComposers", "CC→Cur");
+    assert!(
+        !tmp.path().join("User").exists(),
+        "Cursor refusal created target-store state"
+    );
 }
 
 // ===========================================================================
@@ -319,20 +368,9 @@ fn roundtrip_cc_to_cursor() {
 
 #[test]
 fn roundtrip_cursor_to_cc() {
-    let cursor_canonical = {
-        let _cursor_lock = CURSOR_ENV.lock().unwrap();
-        let cursor_tmp = tempfile::TempDir::new().unwrap();
-        let _cursor_env = EnvGuard::set("CURSOR_HOME", cursor_tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written_cursor = Cursor
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Cur write should succeed");
-
-        Cursor
-            .read_session(&written_cursor.paths[0])
-            .expect("seed Cur read-back should succeed")
-    };
+    let cursor_canonical = Cursor
+        .read_session(&fixtures_dir().join("cursor/state.vscdb"))
+        .expect("native Cursor fixture should parse");
 
     let _cc_lock = CC_ENV.lock().unwrap();
     let cc_tmp = tempfile::TempDir::new().unwrap();
@@ -355,16 +393,17 @@ fn roundtrip_cursor_to_cc() {
 // ===========================================================================
 
 #[test]
-fn opencode_refuses_cc_as_a_target() {
+fn opencode_without_cli_refuses_cc_as_a_target() {
     let _lock = OPENCODE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
+    let _binary = EnvGuard::set("OPENCODE_BIN", &tmp.path().join("missing-opencode"));
 
     let original = read_cc_fixture("cc_simple");
     assert_target_refuses(
         &OpenCode,
         &original,
-        "OpenCode is read/resume-only",
+        "official `opencode` CLI",
         "CC→Opc",
     );
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
@@ -403,9 +442,15 @@ fn cline_refuses_cc_as_a_target() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
+    let _binary = EnvGuard::set("CLINE_BIN", &tmp.path().join("missing-cline"));
 
     let original = read_cc_fixture("cc_simple");
-    assert_target_refuses(&Cline, &original, "taskHistory.json", "CC→Cline");
+    assert_target_refuses(
+        &Cline,
+        &original,
+        "official `cline` CLI",
+        "CC→Cline",
+    );
     assert_eq!(
         std::fs::read_dir(tmp.path()).unwrap().count(),
         0,
@@ -485,7 +530,7 @@ fn roundtrip_amp_to_cc() {
 }
 
 #[test]
-fn roundtrip_cc_to_aider() {
+fn roundtrip_cc_to_aider_uses_an_independent_history() {
     let _lock = AIDER_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("AIDER_HOME", tmp.path());
@@ -493,32 +538,21 @@ fn roundtrip_cc_to_aider() {
     let original = read_cc_fixture("cc_simple");
     let written = Aider
         .write_session(&original, &WriteOptions { force: false })
-        .expect("CC→Aid: write should succeed");
-
+        .expect("CC→Aider write");
     let readback = Aider
         .read_session(&written.paths[0])
-        .expect("CC→Aid: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "CC→Aid");
-    assert_new_session_id(&readback, "CC→Aid");
+        .expect("CC→Aider read-back");
+    assert_aider_roundtrip(&original, &readback, "CC→Aider");
+    assert_new_session_id(&readback, "CC→Aider");
+    assert!(
+        !tmp.path().join(".aider.chat.history.md").exists(),
+        "Aider must not append to the shared history"
+    );
 }
 
 #[test]
 fn roundtrip_aider_to_cc() {
-    let aider_canonical = {
-        let _aider_lock = AIDER_ENV.lock().unwrap();
-        let aider_tmp = tempfile::TempDir::new().unwrap();
-        let _aider_env = EnvGuard::set("AIDER_HOME", aider_tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written_aider = Aider
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Aid write should succeed");
-
-        Aider
-            .read_session(&written_aider.paths[0])
-            .expect("seed Aid read-back should succeed")
-    };
+    let aider_canonical = read_aider_fixture();
 
     let _cc_lock = CC_ENV.lock().unwrap();
     let cc_tmp = tempfile::TempDir::new().unwrap();
@@ -1018,9 +1052,10 @@ fn openclaw_refuses_cc_as_a_target() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCLAW_STATE_DIR", tmp.path());
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
     let original = read_cc_fixture("cc_simple");
-    assert_target_refuses(&OpenClaw, &original, "gateway", "CC→OpenClaw");
+    assert_target_refuses(&OpenClaw, &original, "official `openclaw` CLI", "CC→OpenClaw");
     assert_eq!(
         std::fs::read_dir(tmp.path()).unwrap().count(),
         0,
@@ -1110,17 +1145,9 @@ fn roundtrip_piagent_to_cc() {
 
 #[test]
 fn roundtrip_cursor_to_codex() {
-    let cursor_session = {
-        let _lock = CURSOR_ENV.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("CURSOR_HOME", tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written = Cursor
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Cursor");
-        Cursor.read_session(&written.paths[0]).expect("read Cursor")
-    };
+    let cursor_session = Cursor
+        .read_session(&fixtures_dir().join("cursor/state.vscdb"))
+        .expect("native Cursor fixture should parse");
 
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1156,17 +1183,7 @@ fn roundtrip_cline_to_codex() {
 
 #[test]
 fn roundtrip_aider_to_codex() {
-    let aider_session = {
-        let _lock = AIDER_ENV.lock().unwrap();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _env = EnvGuard::set("AIDER_HOME", tmp.path());
-
-        let seed = read_cc_fixture("cc_simple");
-        let written = Aider
-            .write_session(&seed, &WriteOptions { force: false })
-            .expect("seed CC→Aider");
-        Aider.read_session(&written.paths[0]).expect("read Aider")
-    };
+    let aider_session = read_aider_fixture();
 
     let _lock = CODEX_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1387,22 +1404,17 @@ fn roundtrip_piagent_to_codex() {
 // ===========================================================================
 
 #[test]
-fn roundtrip_codex_to_cursor() {
+fn cursor_refuses_codex_as_a_target() {
     let _lock = CURSOR_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CURSOR_HOME", tmp.path());
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    let written = Cursor
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Cod→Cursor: write should succeed");
-
-    let readback = Cursor
-        .read_session(&written.paths[0])
-        .expect("Cod→Cursor: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Cod→Cursor");
-    assert_new_session_id(&readback, "Cod→Cursor");
+    assert_target_refuses(&Cursor, &original, "allComposers", "Cod→Cursor");
+    assert!(
+        !tmp.path().join("User").exists(),
+        "Cursor refusal created target-store state"
+    );
 }
 
 #[test]
@@ -1410,9 +1422,10 @@ fn cline_refuses_codex_as_a_target() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
+    let _binary = EnvGuard::set("CLINE_BIN", &tmp.path().join("missing-cline"));
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    assert_target_refuses(&Cline, &original, "taskHistory.json", "Codex→Cline");
+    assert_target_refuses(&Cline, &original, "official `cline` CLI", "Codex→Cline");
     assert_eq!(
         std::fs::read_dir(tmp.path()).unwrap().count(),
         0,
@@ -1421,7 +1434,7 @@ fn cline_refuses_codex_as_a_target() {
 }
 
 #[test]
-fn roundtrip_codex_to_aider() {
+fn roundtrip_codex_to_aider_uses_an_independent_history() {
     let _lock = AIDER_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("AIDER_HOME", tmp.path());
@@ -1429,14 +1442,15 @@ fn roundtrip_codex_to_aider() {
     let original = read_codex_fixture("codex_modern", "jsonl");
     let written = Aider
         .write_session(&original, &WriteOptions { force: false })
-        .expect("Cod→Aider: write should succeed");
-
+        .expect("Codex→Aider write");
     let readback = Aider
         .read_session(&written.paths[0])
-        .expect("Cod→Aider: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Cod→Aider");
-    assert_new_session_id(&readback, "Cod→Aider");
+        .expect("Codex→Aider read-back");
+    assert_aider_roundtrip(&original, &readback, "Codex→Aider");
+    assert!(
+        !tmp.path().join(".aider.chat.history.md").exists(),
+        "Aider must not append to the shared history"
+    );
 }
 
 #[test]
@@ -1459,16 +1473,17 @@ fn roundtrip_codex_to_amp() {
 }
 
 #[test]
-fn opencode_refuses_codex_as_a_target() {
+fn opencode_without_cli_refuses_codex_as_a_target() {
     let _lock = OPENCODE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
+    let _binary = EnvGuard::set("OPENCODE_BIN", &tmp.path().join("missing-opencode"));
 
     let original = read_codex_fixture("codex_modern", "jsonl");
     assert_target_refuses(
         &OpenCode,
         &original,
-        "OpenCode is read/resume-only",
+        "official `opencode` CLI",
         "Cod→OpenCode",
     );
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
@@ -1552,9 +1567,15 @@ fn openclaw_refuses_codex_as_a_target() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCLAW_STATE_DIR", tmp.path());
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
     let original = read_codex_fixture("codex_modern", "jsonl");
-    assert_target_refuses(&OpenClaw, &original, "gateway", "Cod→OpenClaw");
+    assert_target_refuses(
+        &OpenClaw,
+        &original,
+        "official `openclaw` CLI",
+        "Cod→OpenClaw",
+    );
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
@@ -1649,22 +1670,17 @@ fn roundtrip_codex_exec_tool_results_to_piagent() {
 // ===========================================================================
 
 #[test]
-fn roundtrip_gemini_to_cursor() {
+fn cursor_refuses_gemini_as_a_target() {
     let _lock = CURSOR_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CURSOR_HOME", tmp.path());
 
     let original = read_gemini_fixture("gmi_simple");
-    let written = Cursor
-        .write_session(&original, &WriteOptions { force: false })
-        .expect("Gmi→Cursor: write should succeed");
-
-    let readback = Cursor
-        .read_session(&written.paths[0])
-        .expect("Gmi→Cursor: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Gmi→Cursor");
-    assert_new_session_id(&readback, "Gmi→Cursor");
+    assert_target_refuses(&Cursor, &original, "allComposers", "Gmi→Cursor");
+    assert!(
+        !tmp.path().join("User").exists(),
+        "Cursor refusal created target-store state"
+    );
 }
 
 #[test]
@@ -1672,9 +1688,10 @@ fn cline_refuses_gemini_as_a_target() {
     let _lock = CLINE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CLINE_HOME", tmp.path());
+    let _binary = EnvGuard::set("CLINE_BIN", &tmp.path().join("missing-cline"));
 
     let original = read_gemini_fixture("gmi_simple");
-    assert_target_refuses(&Cline, &original, "taskHistory.json", "Gemini→Cline");
+    assert_target_refuses(&Cline, &original, "official `cline` CLI", "Gemini→Cline");
     assert_eq!(
         std::fs::read_dir(tmp.path()).unwrap().count(),
         0,
@@ -1683,7 +1700,7 @@ fn cline_refuses_gemini_as_a_target() {
 }
 
 #[test]
-fn roundtrip_gemini_to_aider() {
+fn roundtrip_gemini_to_aider_uses_an_independent_history() {
     let _lock = AIDER_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("AIDER_HOME", tmp.path());
@@ -1691,14 +1708,15 @@ fn roundtrip_gemini_to_aider() {
     let original = read_gemini_fixture("gmi_simple");
     let written = Aider
         .write_session(&original, &WriteOptions { force: false })
-        .expect("Gmi→Aider: write should succeed");
-
+        .expect("Gemini→Aider write");
     let readback = Aider
         .read_session(&written.paths[0])
-        .expect("Gmi→Aider: read-back should succeed");
-
-    assert_roundtrip_fidelity(&original, &readback, "Gmi→Aider");
-    assert_new_session_id(&readback, "Gmi→Aider");
+        .expect("Gemini→Aider read-back");
+    assert_aider_roundtrip(&original, &readback, "Gemini→Aider");
+    assert!(
+        !tmp.path().join(".aider.chat.history.md").exists(),
+        "Aider must not append to the shared history"
+    );
 }
 
 #[test]
@@ -1721,16 +1739,17 @@ fn roundtrip_gemini_to_amp() {
 }
 
 #[test]
-fn opencode_refuses_gemini_as_a_target() {
+fn opencode_without_cli_refuses_gemini_as_a_target() {
     let _lock = OPENCODE_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCODE_HOME", tmp.path());
+    let _binary = EnvGuard::set("OPENCODE_BIN", &tmp.path().join("missing-opencode"));
 
     let original = read_gemini_fixture("gmi_simple");
     assert_target_refuses(
         &OpenCode,
         &original,
-        "OpenCode is read/resume-only",
+        "official `opencode` CLI",
         "Gmi→OpenCode",
     );
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
@@ -1814,9 +1833,15 @@ fn openclaw_refuses_gemini_as_a_target() {
     let _lock = OPENCLAW_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("OPENCLAW_STATE_DIR", tmp.path());
+    let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
     let original = read_gemini_fixture("gmi_simple");
-    assert_target_refuses(&OpenClaw, &original, "gateway", "Gmi→OpenClaw");
+    assert_target_refuses(
+        &OpenClaw,
+        &original,
+        "official `openclaw` CLI",
+        "Gmi→OpenClaw",
+    );
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
@@ -1843,8 +1868,8 @@ fn roundtrip_gemini_to_piagent() {
 // Cross-provider pairs (representative selection among non-CC/Codex/Gemini)
 // ===========================================================================
 
-/// Exercise a source/target pair. Read/resume-only sources come from vendor
-/// fixtures; read/resume-only targets must refuse without filesystem effects.
+/// Exercise a source/target pair. Providers that cannot currently write come
+/// from vendor fixtures and must refuse without filesystem effects.
 fn cross_provider_roundtrip(
     source: &dyn Provider,
     source_env_key: &'static str,
@@ -1855,8 +1880,12 @@ fn cross_provider_roundtrip(
     label: &str,
 ) {
     let source_session = match source.slug() {
+        "aider" => read_aider_fixture(),
         "chatgpt" => read_chatgpt_fixture(),
         "cline" => read_cline_fixture(),
+        "cursor" => Cursor
+            .read_session(&fixtures_dir().join("cursor/state.vscdb"))
+            .expect("native Cursor fixture should parse"),
         "opencode" => read_opencode_fixture(),
         "openclaw" => read_openclaw_fixture(),
         _ => {
@@ -1877,6 +1906,10 @@ fn cross_provider_roundtrip(
     let _lock = target_lock.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set(target_env_key, tmp.path());
+    let _opencode_binary = (target.slug() == "opencode")
+        .then(|| EnvGuard::set("OPENCODE_BIN", &tmp.path().join("missing-opencode")));
+    let _openclaw_binary = (target.slug() == "openclaw")
+        .then(|| EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw")));
 
     if let Some(reason) = target.write_refusal() {
         let error = target
@@ -1898,7 +1931,11 @@ fn cross_provider_roundtrip(
         .read_session(&written.paths[0])
         .unwrap_or_else(|e| panic!("[{label}] target read-back failed: {e}"));
 
-    assert_roundtrip_fidelity(&source_session, &readback, label);
+    if target.slug() == "aider" {
+        assert_aider_roundtrip(&source_session, &readback, label);
+    } else {
+        assert_roundtrip_fidelity(&source_session, &readback, label);
+    }
     assert_new_session_id(&readback, label);
 }
 
@@ -1942,7 +1979,7 @@ fn roundtrip_aider_to_amp() {
 }
 
 #[test]
-fn opencode_refuses_amp_as_a_target() {
+fn opencode_without_cli_refuses_amp_as_a_target() {
     cross_provider_roundtrip(
         &Amp,
         "XDG_DATA_HOME",
@@ -2154,7 +2191,7 @@ fn roundtrip_factory_to_amp() {
 }
 
 #[test]
-fn opencode_refuses_openclaw_as_a_target() {
+fn opencode_without_cli_refuses_openclaw_as_a_target() {
     cross_provider_roundtrip(
         &OpenClaw,
         "OPENCLAW_HOME",
@@ -2449,36 +2486,16 @@ fn roundtrip_openclaw_to_aider() {
 }
 
 #[test]
-fn roundtrip_openclaw_to_cursor() {
+fn cursor_refuses_openclaw_as_a_target() {
     let source_session = read_openclaw_fixture();
-    let tool_count = source_session
-        .messages
-        .iter()
-        .filter(|message| message.role == MessageRole::Tool)
-        .count();
-    assert!(
-        tool_count > 0,
-        "the native OpenClaw oracle must exercise Cursor's Tool role fold"
-    );
-
     let _lock = CURSOR_ENV.lock().unwrap();
     let tmp = tempfile::TempDir::new().unwrap();
     let _env = EnvGuard::set("CURSOR_HOME", tmp.path());
-    let written = Cursor
-        .write_session(&source_session, &WriteOptions { force: false })
-        .expect("OpenClaw→Cursor: target write should succeed");
-    let readback = Cursor
-        .read_session(&written.paths[0])
-        .expect("OpenClaw→Cursor: target read-back should succeed");
-
-    let mut expected_projection = source_session;
-    for message in &mut expected_projection.messages {
-        if message.role == MessageRole::Tool {
-            message.role = MessageRole::Assistant;
-        }
-    }
-    assert_roundtrip_fidelity(&expected_projection, &readback, "OpenClaw→Cursor");
-    assert_new_session_id(&readback, "OpenClaw→Cursor");
+    assert_target_refuses(&Cursor, &source_session, "allComposers", "OpenClaw→Cursor");
+    assert!(
+        !tmp.path().join("User").exists(),
+        "Cursor refusal created target-store state"
+    );
 }
 
 #[test]
