@@ -74,7 +74,7 @@ ags codex                   # start Codex in an AGS terminal
 ags claude --model opus     # everything after "claude" belongs to Claude Code
 ags codex --model o3        # everything after "codex" belongs to Codex
 ags save release-fix "Continue the release fix"
-ags list
+ags list                    # pick a saved session and open it
 ags show release-fix
 ags resume release-fix
 ags resume release-fix --to claude -- --model sonnet
@@ -86,6 +86,24 @@ precede an independent `--`; arguments after it are forwarded to the restored
 Agent in their original order. Direct launch has no mixed namespace:
 even a token named `--to`, `--cwd`, or `--profile` after `ags claude` or
 `ags codex` is an Agent token and is never consumed by AGS.
+
+### Agent arguments are remembered
+
+A checkpoint records the Agent arguments its session was started with, so a
+session started as `ags codex --dangerously-bypass-approvals-and-sandbox` comes
+back with that flag rather than under different permissions than it was working
+under.
+
+`ags resume ID` replays them. Passing `--` is how you decide instead: arguments
+after it replace the saved ones, and `--` with nothing after it starts the
+session with none. `ags show ID` prints what a checkpoint carries.
+
+`ags list` opens a picker — Up/Down or `j`/`k` to move, Enter to open, `a` to
+edit the arguments for this launch, Del to delete, Esc to quit. The arguments
+for the highlighted session are always shown, because checkpoints synchronize
+between machines and a replayed command line is another machine's decision
+taking effect here. Replayed arguments pass the same Context Mode checks a typed
+one does; a synchronized record is not a way around them.
 
 Every managed launch selects one checkpoint storage mode:
 

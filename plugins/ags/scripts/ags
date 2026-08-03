@@ -23,7 +23,13 @@ remote_retirement_marker=".ags-retired/ags-v1.retired"
 remote_retirement_pending_marker=".ags-retired/ags-v1.retiring"
 declare -A merge_verified_revision=()
 declare -a terminal_menu_ids=() terminal_menu_labels=()
+# Parallel to the two above: the Agent arguments each row was saved with, as the
+# JSON array the manifest stores, plus the one-line form the menu draws. Bash has
+# no array of arrays, so the argv stays encoded until the row is actually chosen.
+declare -a terminal_menu_args=() terminal_menu_details=()
 terminal_menu_selected=
+terminal_menu_selected_args='[]'
+terminal_menu_header=
 terminal_menu_notice=
 ags_state_lock_depth=0
 ags_consolidation_lock_depth=0
@@ -100,6 +106,74 @@ render_columns() {
     sed $'s/\t/  /g'
 }
 
+# Everything that decorates terminal output resolves its escape sequences here,
+# so no other function carries one and there is a single place that answers
+# "is this a terminal that should be decorated at all".
+#
+# Colour is off unless stdout is a terminal that advertises it, and NO_COLOR
+# always wins (https://no-color.org). The glyphs need a UTF-8 locale for the
+# same reason render_columns does: without one they print as mojibake.
+init_terminal_style() {
+    local colors
+    [[ -z "${ags_style_ready:-}" ]] || return 0
+    ags_style_ready=1
+    style_reset= style_dim= style_bold= style_accent= style_select=
+    style_pointer='> ' style_rule='-' style_separator='  ' style_more='...'
+    style_hint_move='Up/Down move' style_hint_open='Enter open'
+    if [[ -n "$(resolve_utf8_locale || true)" ]]; then
+        style_pointer='❯ '
+        style_rule='─'
+        style_separator='   '
+        style_more='⋯'
+        style_hint_move='↑↓ move'
+        style_hint_open='⏎ open'
+    fi
+    [[ -z "${NO_COLOR:-}" && -t 1 && "${TERM:-dumb}" != dumb ]] || return 0
+    colors="$(tput colors 2>/dev/null || printf 0)"
+    [[ "$colors" =~ ^[0-9]+$ ]] && (( colors >= 8 )) || return 0
+    style_reset=$'\033[0m'
+    style_dim=$'\033[2m'
+    style_bold=$'\033[1m'
+    style_accent=$'\033[36m'
+    # Reverse video rather than a chosen background colour: it inverts whichever
+    # palette the terminal already uses, so the selected row stays legible on a
+    # light theme and a dark one alike without AGS guessing which is in use.
+    style_select=$'\033[7m'
+    style_pointer="$style_accent$style_pointer$style_reset"
+}
+
+# Terminal columns available for output, or 0 when that cannot be established.
+# COLUMNS first because a caller may set it deliberately, including the tests.
+terminal_width() {
+    local width="${COLUMNS:-}"
+    if [[ ! "$width" =~ ^[0-9]+$ ]] && [[ -t 1 ]] && command -v tput >/dev/null; then
+        width="$(tput cols 2>/dev/null || true)"
+    fi
+    [[ "$width" =~ ^[0-9]+$ ]] && (( width >= 40 )) || width=0
+    printf '%s\n' "$width"
+}
+
+# Terminal rows available for output. Unlike the width, a wrong answer here only
+# costs layout, so an unknowable terminal falls back to the classic 24 rather
+# than to "unlimited" — which would scroll the frame off the top.
+terminal_height() {
+    local height="${LINES:-}"
+    if [[ ! "$height" =~ ^[0-9]+$ ]] && [[ -t 1 ]] && command -v tput >/dev/null; then
+        height="$(tput lines 2>/dev/null || true)"
+    fi
+    [[ "$height" =~ ^[0-9]+$ ]] && (( height >= 10 )) || height=24
+    printf '%s\n' "$height"
+}
+
+# Repeat the rule glyph. Width is a count of terminal columns, and every glyph
+# this draws with is single-width, so the count is also the byte-safe repeat.
+style_rule_line() {
+    local width="$1" line=
+    (( width > 0 )) || return 0
+    printf -v line '%*s' "$width" ''
+    printf '%s' "${line// /$style_rule}"
+}
+
 if [[ "$platform" == Darwin ]]; then
     homebrew_prefix="${AGENT_SESSION_HOMEBREW_PREFIX:-}"
     if [[ -z "$homebrew_prefix" ]] && command -v brew >/dev/null; then
@@ -145,7 +219,9 @@ Usage:
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
   ags set ABSOLUTE_DIR                 Configure local checkpoint storage
-  ags list                             List local checkpoints
+  ags list                             Pick a local checkpoint and open it
+                                       (Up/Down or j/k, Enter open, a edit the
+                                       Agent arguments, Del delete, Esc quit)
   ags show ID|AGENT/RECORD_ID          Show complete local checkpoint details
   ags save ID DESCRIPTION              Save this active Codex or Claude session
   ags resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH]
@@ -195,6 +271,10 @@ Public-IP location is best effort and is stored only inside the encrypted checkp
 After `ags claude` or `ags codex`, every argument belongs to that Agent. For
 `ags resume`, AGS options go before `--`; every argument after `--` belongs to
 the restored Agent. Mandatory Context Mode may reject Agent options that disable it.
+A checkpoint remembers the Agent arguments its session was started with, and
+`ags resume` replays them. Pass `--` to decide instead: with arguments after it
+they replace the saved ones, and with nothing after it the session starts with
+none. `ags show` prints what a checkpoint carries.
 Claude `--settings` may contain only provider authentication and model fields.
 EOF
 }
@@ -8012,38 +8092,219 @@ agent_display_name() {
     esac
 }
 
+# The Agent arguments a session was started with, as a JSON array.
+#
+# JSON rather than a quoted command line because these records synchronize
+# between machines, so decoding must never be `eval` — that would make a
+# synchronized checkpoint a remote code execution primitive. A JSON array also
+# survives the line-oriented manifest intact, which a raw argv would not.
+#
+# Only arguments the user supplied are captured. The ones AGS injects itself —
+# `resume`, `--resume`, `--profile`, `--settings` — are rebuilt from the
+# checkpoint on every resume, and replaying a stale session id or a temporary
+# settings path would be wrong on the next machine.
+encode_launch_args() {
+    local argument
+    (( $# > 0 )) && command -v jq >/dev/null || { printf '[]\n'; return 0; }
+    for argument in "$@"; do
+        # A line break cannot round-trip through the manifest. Recording nothing
+        # is the safe end of that: the session still resumes, only without a
+        # remembered command line.
+        [[ "$argument" != *$'\n'* && "$argument" != *$'\r'* ]] ||
+            { printf '[]\n'; return 0; }
+    done
+    printf '%s\n' "$@" | jq -Rsc 'split("\n")[:-1]'
+}
+
+# Decode into `launch_args_decoded`. Fails for anything that is not a flat array
+# of single-line strings, so a corrupted or hostile record cannot smuggle an
+# extra argument past the caller through an embedded line break.
+decode_launch_args() {
+    local json="${1:-}"
+    launch_args_decoded=()
+    [[ -n "$json" && "$json" != '[]' ]] || return 0
+    command -v jq >/dev/null || return 1
+    jq -e '
+        type == "array" and
+        (map(type == "string" and (test("[\n\r]") | not)) | all)
+    ' <<< "$json" >/dev/null 2>&1 || return 1
+    mapfile -t launch_args_decoded < <(jq -r '.[]' <<< "$json")
+}
+
+# One line describing an encoded argv.
+#
+# The output is deliberately also the *input* format: what the menu shows is
+# exactly what can be typed back into it, because both sides go through the same
+# `xargs` word splitting. Anything outside the unambiguous character set is
+# single-quoted, which is what makes that round trip hold for an argument like
+# `Bash(git:*)` — and keeps the line safe to paste into a shell as well.
+format_launch_args() {
+    local json="${1:-}" argument line=
+    decode_launch_args "$json" || { printf 'unreadable\n'; return 0; }
+    for argument in "${launch_args_decoded[@]}"; do
+        argument="${argument//$'\t'/ }"
+        if [[ -z "$argument" || "$argument" == *[^[:alnum:]_@%+=:,./-]* ]]; then
+            argument="'${argument//\'/\'\\\'\'}'"
+        fi
+        line+="${line:+ }$argument"
+    done
+    printf '%s\n' "$line"
+}
+
+# Split a typed command line into `launch_args_decoded` without eval. `xargs`
+# applies the quoting rules format_launch_args prints with, and rejects an
+# unmatched quote instead of guessing at it.
+parse_launch_args() {
+    local line="$1"
+    launch_args_decoded=()
+    [[ -n "${line//[[:space:]]/}" ]] || return 0
+    command -v xargs >/dev/null || return 1
+    mapfile -t launch_args_decoded < <(
+        printf '%s\n' "$line" | xargs printf '%s\n' 2>/dev/null
+    ) || return 1
+    (( ${#launch_args_decoded[@]} > 0 )) || return 1
+}
+
+# Hand the captured argv to the session being started. `ags save` runs as a child
+# of the Agent, so the environment is the only channel that reaches it — the
+# arguments themselves are consumed by `exec` and gone.
+export_launch_args() {
+    AGS_LAUNCH_ARGS="$(encode_launch_args "$@")"
+    export AGS_LAUNCH_ARGS
+}
+
+# Leave the alternate drawing state the menu sets up. Every exit path goes
+# through this, including the ones that hand the terminal straight to an Agent:
+# `launch_managed_agent` ends in `exec`, so a cursor left hidden here would stay
+# hidden for the whole session that follows.
+terminal_menu_leave() {
+    printf '\033[?25h\033[H\033[2J'
+}
+
+terminal_menu_edit_args() {
+    local index="$1" edited= prefill=
+    # Only offer a prefill that decoded. A record whose arguments are unreadable
+    # displays as the word "unreadable", and prefilling that would let one Enter
+    # turn it into a literal argument handed to the Agent.
+    decode_launch_args "${terminal_menu_args[$index]}" &&
+        prefill="${terminal_menu_details[$index]}"
+    printf '\033[?25h'
+    printf '\n  %sAgent arguments for this session%s — empty clears them\n' \
+        "$style_dim" "$style_reset"
+    IFS= read -r -e -p '  ' -i "$prefill" edited || {
+        printf '\033[?25l'
+        return 0
+    }
+    if parse_launch_args "$edited"; then
+        terminal_menu_args[index]="$(encode_launch_args "${launch_args_decoded[@]}")"
+        terminal_menu_details[index]="$(format_launch_args "${terminal_menu_args[index]}")"
+        terminal_menu_notice=
+    else
+        terminal_menu_notice='Could not read those arguments; check the quoting.'
+    fi
+    printf '\033[?25l'
+}
+
 terminal_menu() {
     local title="$1" allow_delete="$2" key second third fourth confirm
-    local index=0 row
+    local index=0 row width height body count hint pad
+    local total chrome visible first=0
     (( ${#terminal_menu_ids[@]} > 0 )) || return 1
+    init_terminal_style
+    width="$(terminal_width)"
+    (( width > 0 )) || width=80
+    height="$(terminal_height)"
+    body=$((width - 2))
+    total=${#terminal_menu_labels[@]}
+    printf -v count '%d saved' "${#terminal_menu_ids[@]}"
+    printf '\033[?25l'
     while true; do
-        printf '\033[H\033[2J%s\n' "$title"
-        if [[ "$allow_delete" == 1 ]]; then
-            printf 'Up/Down select  Enter open  Del delete  Esc exit\n\n'
+        # Everything the frame draws besides the rows themselves, so a store
+        # with more sessions than the terminal has lines scrolls inside the
+        # frame instead of pushing its own header off the top.
+        chrome=9
+        [[ -z "$terminal_menu_notice" ]] || chrome=$((chrome + 2))
+        visible=$((height - chrome))
+        (( visible >= 3 )) || visible=3
+        if (( total > visible )); then
+            visible=$((visible - 2))
+            (( visible >= 3 )) || visible=3
         else
-            printf 'Up/Down select  Enter open  Esc exit\n\n'
+            visible=$total
         fi
-        for row in "${!terminal_menu_labels[@]}"; do
+        (( index >= first )) || first=$index
+        (( index < first + visible )) || first=$((index - visible + 1))
+        (( first + visible <= total )) || first=$((total - visible))
+        (( first >= 0 )) || first=0
+        pad=$((body - ${#title} - ${#count}))
+        (( pad >= 1 )) || pad=1
+        printf '\033[H\033[2J'
+        printf '  %s%s%s%*s%s%s%s\n\n' \
+            "$style_bold" "$title" "$style_reset" "$pad" '' \
+            "$style_dim" "$count" "$style_reset"
+        [[ -z "$terminal_menu_header" ]] ||
+            printf '  %s%s%s\n' "$style_dim" "$terminal_menu_header" "$style_reset"
+        printf '  %s%s%s\n' \
+            "$style_dim" "$(style_rule_line "$body")" "$style_reset"
+        (( first == 0 )) ||
+            printf '  %s%s %d more above%s\n' \
+                "$style_dim" "$style_more" "$first" "$style_reset"
+        for ((row = first; row < first + visible; row++)); do
             if (( row == index )); then
-                printf '\033[7m> %s\033[0m\n' "${terminal_menu_labels[$row]}"
+                printf '%s%s%s%s\n' "$style_pointer" "$style_select" \
+                    "${terminal_menu_labels[$row]}" "$style_reset"
             else
                 printf '  %s\n' "${terminal_menu_labels[$row]}"
             fi
         done
-        [[ -z "$terminal_menu_notice" ]] || printf '\n%s\n' "$terminal_menu_notice"
+        (( first + visible >= total )) ||
+            printf '  %s%s %d more below%s\n' \
+                "$style_dim" "$style_more" "$((total - first - visible))" "$style_reset"
+        if (( ${#terminal_menu_details[@]} > 0 )); then
+            if [[ -n "${terminal_menu_details[$index]}" ]]; then
+                printf '\n  %sargs%s  %s\n' \
+                    "$style_dim" "$style_reset" "${terminal_menu_details[$index]}"
+            else
+                printf '\n  %sargs%s  %snone — press a to add%s\n' \
+                    "$style_dim" "$style_reset" "$style_dim" "$style_reset"
+            fi
+        fi
+        hint="$style_hint_move$style_separator$style_hint_open"
+        (( ${#terminal_menu_details[@]} == 0 )) || hint+="${style_separator}a args"
+        [[ "$allow_delete" != 1 ]] || hint+="${style_separator}del delete"
+        hint+="${style_separator}esc quit"
+        printf '\n  %s%s%s\n' "$style_dim" "$hint" "$style_reset"
+        [[ -z "$terminal_menu_notice" ]] ||
+            printf '\n  %s%s%s\n' "$style_accent" "$terminal_menu_notice" "$style_reset"
         if ! IFS= read -rsn1 key; then
-            printf '\033[H\033[2J'
+            terminal_menu_leave
             return 1
         fi
         if [[ -z "$key" ]]; then
             terminal_menu_selected="${terminal_menu_ids[$index]}"
-            printf '\033[H\033[2J'
+            terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+            terminal_menu_leave
             return 0
         fi
+        case "$key" in
+            # j/k alongside the arrow keys: the muscle memory every other
+            # terminal picker in this workflow already trains.
+            k) (( index > 0 )) && index=$((index - 1)); continue ;;
+            j) (( index + 1 < ${#terminal_menu_ids[@]} )) && index=$((index + 1)); continue ;;
+            a|A)
+                (( ${#terminal_menu_details[@]} > 0 )) || continue
+                terminal_menu_edit_args "$index"
+                continue
+                ;;
+            q|Q)
+                terminal_menu_leave
+                return 1
+                ;;
+        esac
         [[ "$key" == $'\177' ]] && continue
         [[ "$key" == $'\033' ]] || continue
         if ! IFS= read -rsn1 -t 0.05 second; then
-            printf '\033[H\033[2J'
+            terminal_menu_leave
             return 1
         fi
         [[ "$second" == '[' || "$second" == O ]] || continue
@@ -8055,12 +8316,14 @@ terminal_menu() {
                 [[ "$second" == '[' ]] || continue
                 IFS= read -rsn1 -t 0.05 fourth || continue
                 [[ "$fourth" == '~' && "$allow_delete" == 1 ]] || continue
-                printf '\nDelete selected session? [y/N] '
+                printf '\n  %sDelete this saved session?%s [y/N] ' \
+                    "$style_bold" "$style_reset"
                 IFS= read -rsn1 confirm || confirm=
                 printf '\n'
                 if [[ "$confirm" == y || "$confirm" == Y ]]; then
                     terminal_menu_selected="${terminal_menu_ids[$index]}"
-                    printf '\033[H\033[2J'
+                    terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                    terminal_menu_leave
                     return 2
                 fi
                 ;;
@@ -8118,6 +8381,9 @@ start_managed_agent() {
     local agent="$1" launch_binary audit_cwd profile=
     shift
     scrub_transport_password_environment
+    # Here "$@" is exactly what the user typed, before AGS adds anything of its
+    # own — which is the only point in the program where that is true.
+    export_launch_args "$@"
     prepare_storage_for_launch
     launch_binary="$(resolve_agent_binary "$agent")"
     audit_cwd="$(pwd -P)"
@@ -9098,6 +9364,11 @@ prepare_checkpoint() {
     checkpoint_target="$target"
     checkpoint_agent="$agent"
     capture_binary_provenance "$agent"
+    # `ags save` runs as a child of the Agent, so this is the launch AGS itself
+    # performed, inherited across `exec`. A session started outside AGS simply
+    # has none, and records no arguments.
+    checkpoint_launch_args="${AGS_LAUNCH_ARGS:-[]}"
+    decode_launch_args "$checkpoint_launch_args" || checkpoint_launch_args='[]'
     checkpoint_session_id="$id"
     checkpoint_description="$description"
     checkpoint_id="$requested_id"
@@ -9305,6 +9576,13 @@ write_checkpoint_archive() {
             "$checkpoint_artifact_count" "$checkpoint_artifact_size" "$artifact_index_sha256"
         printf 'public_ip=%s\nip_location=%s\ngeo_provider=%s\n' \
             "$checkpoint_public_ip" "$checkpoint_ip_location" "$checkpoint_geo_provider"
+        # Deliberately not a `format` bump. Every reader here pulls fields with
+        # `sed -n 's/^key=//p'`, so an older AGS ignores this line and resumes
+        # exactly as it does today, while a newer AGS reading an older record
+        # finds no line and also resumes as it does today. Raising `format` to 5
+        # would instead make every machine that has not updated yet reject these
+        # checkpoints outright at the format gate, and these records synchronize.
+        printf 'launch_args=%s\n' "${checkpoint_launch_args:-[]}"
         printf 'device_id=%s\ncli_version=%s\n' \
             "$(hostname -s)-$(machine_id_fragment)" \
             "$checkpoint_binary_version"
@@ -9565,7 +9843,8 @@ queue_checkpoint() {
         --arg cwd "$checkpoint_cwd" --arg public_ip "$checkpoint_public_ip" \
         --arg ip_location "$checkpoint_ip_location" --arg geo_provider "$checkpoint_geo_provider" \
         --arg storage_mode "$storage_mode" \
-        '{target:$target,agent:$agent,agent_binary:$agent_binary,binary_invoked_path:$binary_invoked_path,binary_real_path:$binary_real_path,binary_version:$binary_version,binary_resolution:$binary_resolution,binary_sha256:$binary_sha256,binary_os:$binary_os,binary_arch:$binary_arch,session_id:$session_id,description:$description,checkpoint_id:$checkpoint_id,record_id:$record_id,created_utc:$created_utc,source:$source,source_home:$source_home,relative:$relative,destination_root:$destination_root,cwd:$cwd,public_ip:$public_ip,ip_location:$ip_location,geo_provider:$geo_provider,storage_mode:$storage_mode,archived:false}' \
+        --argjson launch_args "$checkpoint_launch_args" \
+        '{target:$target,agent:$agent,agent_binary:$agent_binary,binary_invoked_path:$binary_invoked_path,binary_real_path:$binary_real_path,binary_version:$binary_version,binary_resolution:$binary_resolution,binary_sha256:$binary_sha256,binary_os:$binary_os,binary_arch:$binary_arch,session_id:$session_id,description:$description,checkpoint_id:$checkpoint_id,record_id:$record_id,created_utc:$created_utc,source:$source,source_home:$source_home,relative:$relative,destination_root:$destination_root,cwd:$cwd,public_ip:$public_ip,ip_location:$ip_location,geo_provider:$geo_provider,storage_mode:$storage_mode,launch_args:$launch_args,archived:false}' \
         > "$pending_tmp"
     mv -- "$pending_tmp" "$pending"
     unlock
@@ -9603,6 +9882,8 @@ finalize_pending_file() {
     checkpoint_public_ip="$(jq -r '.public_ip // "unknown"' "$pending")"
     checkpoint_ip_location="$(jq -r '.ip_location // "unknown"' "$pending")"
     checkpoint_geo_provider="$(jq -r '.geo_provider // "unknown"' "$pending")"
+    checkpoint_launch_args="$(jq -c '.launch_args // []' "$pending")"
+    decode_launch_args "$checkpoint_launch_args" || checkpoint_launch_args='[]'
     storage_mode="$(jq -r '.storage_mode // "local"' "$pending")"
     archived="$(jq -r '(.archived // false) | select(type == "boolean")' "$pending")" ||
         die "pending checkpoint has an invalid archive state"
@@ -10191,7 +10472,7 @@ print_checkpoint_row() {
     local target="$1" agent="$2" record_id="$3" manifest="${4:-}"
     local include_selector="${5:-0}"
     local checkpoint_id="$record_id"
-    local saved_agent description created_utc saved_date
+    local saved_agent description created_utc saved_date launch_args='[]'
     [[ "$agent" == codex || "$agent" == claude ]] || return 0
     checkpoint_id_valid "$record_id" || return 0
     if [[ -n "$manifest" ]]; then
@@ -10200,6 +10481,14 @@ print_checkpoint_row() {
         [[ "$saved_agent" == codex || "$saved_agent" == claude ]] && agent="$saved_agent"
         description="$(sed -n 's/^description=//p' <<< "$manifest")"
         created_utc="$(sed -n 's/^created_utc=//p' <<< "$manifest")"
+        launch_args="$(sed -n 's/^launch_args=//p' <<< "$manifest")"
+        # Anything that is not one bracketed line becomes "no arguments". A
+        # value carrying a tab or a line break would not just render wrong, it
+        # would break the row apart and pair a selector with another row's data.
+        [[ "$launch_args" == '['*']' &&
+           "$launch_args" != *$'\t'* &&
+           "$launch_args" != *$'\n'* &&
+           "$launch_args" != *$'\r'* ]] || launch_args='[]'
         [[ -n "$checkpoint_id" ]] || checkpoint_id="$record_id"
         [[ -n "$description" ]] || description=unknown
         [[ -n "$created_utc" ]] || created_utc=unknown
@@ -10214,9 +10503,9 @@ print_checkpoint_row() {
     text_has_no_control_characters "$checkpoint_id" || checkpoint_id=unknown
     text_has_no_control_characters "$description" || description=unavailable
     if [[ "$include_selector" == 1 ]]; then
-        printf '%s\t%s\t%s\t%s\t%s/%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s/%s\t%s\n' \
             "$checkpoint_id" "${agent^^}" "$saved_date" "$description" \
-            "$agent" "$record_id"
+            "$agent" "$record_id" "$launch_args"
     else
         printf '%s\t%s\t%s\t%s\n' \
             "$checkpoint_id" "${agent^^}" "$saved_date" "$description"
@@ -10243,33 +10532,67 @@ list_checkpoint_root() {
     done < <(find "$root" -mindepth 2 -maxdepth 2 -type f -name '*.checkpoint.tar.gz.age' -print0)
 }
 
+# Lay out a checkpoint table.
+#
+# `reserve` is the number of columns the caller draws outside the table itself —
+# the menu's selection pointer — and `pad` asks `column` to fill the remaining
+# width so every row comes back the same *display* width. That padding is the
+# whole reason the menu renders through here: descriptions are routinely Chinese,
+# where a character is two columns wide and one byte-counted `printf '%-*s'`
+# would leave the table ragged and the highlight bar torn. `column` measures in
+# characters, so it is the one thing on this machine that already knows.
 render_checkpoint_table() {
-    local width="${COLUMNS:-}"
-    if [[ ! "$width" =~ ^[0-9]+$ ]] && [[ -t 1 ]] && command -v tput >/dev/null; then
-        width="$(tput cols 2>/dev/null || true)"
-    fi
-    if [[ "$width" =~ ^[0-9]+$ ]] && (( width >= 40 )) &&
-       column --help 2>&1 | grep -q -- '--table-truncate'; then
-        render_columns -t -s $'\t' -T 4 -c "$width"
+    local reserve="${1:-0}" pad="${2:-0}" width
+    width="$(terminal_width)"
+    (( width == 0 )) || width=$((width - reserve))
+    if (( width >= 40 )) && column --help 2>&1 | grep -q -- '--table-truncate'; then
+        if [[ "$pad" == 1 ]]; then
+            render_columns -t -s $'\t' -T 4 -c "$width" -m
+        else
+            render_columns -t -s $'\t' -T 4 -c "$width"
+        fi
     else
         render_columns -t -s $'\t'
     fi
 }
 
 load_local_checkpoint_menu() {
-    local checkpoint_id agent saved_date description selector
+    local checkpoint_id agent saved_date description selector args
+    local -a rows=() rendered=()
     terminal_menu_ids=()
     terminal_menu_labels=()
-    while IFS=$'\t' read -r checkpoint_id agent saved_date description selector; do
+    terminal_menu_args=()
+    terminal_menu_details=()
+    terminal_menu_header=
+    while IFS=$'\t' read -r checkpoint_id agent saved_date description selector args; do
         [[ -n "$selector" ]] || continue
+        [[ -n "$args" ]] || args='[]'
         terminal_menu_ids+=("$selector")
-        terminal_menu_labels+=(
-            "$checkpoint_id  $agent  $saved_date  $description"
-        )
+        terminal_menu_args+=("$args")
+        terminal_menu_details+=("$(format_launch_args "$args")")
+        rows+=("$checkpoint_id"$'\t'"$agent"$'\t'"$saved_date"$'\t'"$description")
     done < <(
         list_checkpoint_root local "$local_checkpoints" 1 |
             LC_ALL=C sort -t $'\t' -k1,1 -k2,2 -k5,5
     )
+    (( ${#rows[@]} > 0 )) || return 0
+    # The menu draws through the same renderer the piped table uses, so the two
+    # cannot drift apart in alignment or truncation. `column` emits rows in input
+    # order, which is what keeps each label paired with the selector collected
+    # for it above — the count check below is what makes that assumption fail
+    # loudly rather than open somebody else's session.
+    mapfile -t rendered < <(
+        {
+            printf 'ID\tAGENT\tSAVED\tDESCRIPTION\n'
+            printf '%s\n' "${rows[@]}"
+        } | render_checkpoint_table 2 1
+    )
+    if (( ${#rendered[@]} == ${#rows[@]} + 1 )); then
+        terminal_menu_header="${rendered[0]}"
+        terminal_menu_labels=("${rendered[@]:1}")
+    else
+        terminal_menu_labels=("${rows[@]//$'\t'/  }")
+    fi
 }
 
 list_local_checkpoints() {
@@ -10287,7 +10610,14 @@ list_local_checkpoints() {
         fi
         while (( ${#terminal_menu_ids[@]} > 0 )); do
             if terminal_menu "Saved AGS sessions" 1; then
-                resume_checkpoint local "$terminal_menu_selected"
+                # Always explicit, including when the menu holds no arguments:
+                # `--` is what tells resume the caller decided, so clearing the
+                # arguments in the menu is honoured instead of being refilled
+                # from the checkpoint.
+                decode_launch_args "$terminal_menu_selected_args" ||
+                    die "saved Agent arguments are unreadable; resume with -- ARGS"
+                resume_checkpoint local "$terminal_menu_selected" \
+                    -- "${launch_args_decoded[@]}"
                 return
             else
                 menu_status=$?
@@ -10374,6 +10704,7 @@ show_local_checkpoint() {
     local binary_invoked binary_real binary_version binary_resolution
     local binary_sha binary_os binary_arch
     local selected_binary=unavailable configured_remotes=none archive_sha public_ip ip_location
+    local launch_args launch_args_display
     local -A seen_artifacts=()
 
     (( $# == 1 )) || die "usage: ags show ID"
@@ -10404,6 +10735,9 @@ show_local_checkpoint() {
     relative="$(sed -n 's/^relative_path=//p' "$manifest")"
     public_ip="$(sed -n 's/^public_ip=//p' "$manifest")"
     ip_location="$(sed -n 's/^ip_location=//p' "$manifest")"
+    launch_args="$(sed -n 's/^launch_args=//p' "$manifest")"
+    launch_args_display="$(format_launch_args "${launch_args:-[]}")"
+    [[ -n "$launch_args_display" ]] || launch_args_display=none
     [[ "$kind" == checkpoint && ( "$agent" == codex || "$agent" == claude ) ]] ||
         die "checkpoint manifest is invalid"
     [[ "$(basename "$(dirname "$checkpoint_match")")" == "$agent" ]] ||
@@ -10499,6 +10833,7 @@ show_local_checkpoint() {
         "Native session" "$session_id" \
         Description "${description:-unknown}" \
         Saved "${created_utc:-unknown}" \
+        "Agent arguments" "$launch_args_display" \
         Workspace "${saved_pwd:-unknown}" \
         "Native path" "$relative" \
         Format "$format" \
@@ -11264,6 +11599,7 @@ resume_checkpoint() {
     local runtime_selected_record_id
     local runtime_effective_agent runtime_effective_cwd
     local storage_reconciled=0
+    local runtime_saved_args client_args_explicit=0
     local -a client_args=()
     scrub_transport_password_environment
     (( $# >= 1 )) || {
@@ -11326,6 +11662,10 @@ resume_checkpoint() {
                 shift
                 ;;
             --)
+                # `--` on its own is a decision, not an omission: it means run
+                # this session with no Agent arguments, which is how a cleared
+                # argument line in the menu survives the checkpoint's own.
+                client_args_explicit=1
                 shift
                 client_args+=("$@")
                 break
@@ -11366,6 +11706,16 @@ resume_checkpoint() {
     [[ ( "$runtime_source_agent" == codex || "$runtime_source_agent" == claude ) &&
        "$runtime_record_id" == "$checkpoint_record_id" ]] ||
         die "checkpoint manifest does not match its managed resume identity"
+    if (( client_args_explicit == 0 )); then
+        # Replay what the session was started with. These records synchronize
+        # between machines, so this is another machine's command line being run
+        # here: it goes through the same validators a typed one does, and the
+        # line is printed below so it is never applied silently.
+        runtime_saved_args="$(sed -n 's/^launch_args=//p' <<< "$runtime_manifest")"
+        decode_launch_args "${runtime_saved_args:-[]}" ||
+            die "saved Agent arguments are unreadable; resume with -- ARGS"
+        client_args=("${launch_args_decoded[@]}")
+    fi
     runtime_effective_agent="${resume_target_agent:-$runtime_source_agent}"
     if [[ "$runtime_effective_agent" == codex ]]; then
         validate_codex_context_args "${client_args[@]}"
@@ -11415,6 +11765,13 @@ resume_checkpoint() {
         "${restored_binary_os:-}" "${restored_binary_arch:-}"
     assert_native_session_inactive \
         "$restored_agent" "$restored_native_home" "$restored_session_id"
+    # Carry the arguments into the resumed session so the next `ags save` records
+    # the command line this session is actually running under, rather than losing
+    # it at the first resume. The AGS-injected `resume`/`--settings` arguments
+    # below stay out of it: they belong to this launch, not to the session.
+    export_launch_args "${client_args[@]}"
+    (( ${#client_args[@]} == 0 )) ||
+        log "$restored_agent arguments: $(format_launch_args "$AGS_LAUNCH_ARGS")"
     case "$restored_agent" in
         codex)
             if [[ -n "$profile" ]]; then

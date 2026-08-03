@@ -12,6 +12,23 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ### AGS Runtime
 
+- **Checkpoints remember their Agent arguments**: a session started as
+  `ags codex --dangerously-bypass-approvals-and-sandbox` is saved with that
+  flag and resumes under it, instead of silently coming back with different
+  permissions than it was working under. The launch exports the argv it was
+  given, `ags save` records it in the manifest as a JSON array, and
+  `ags resume` replays it — `--` overrides, and `--` with nothing after it
+  means "no arguments". Replayed arguments face the same Context Mode
+  validation a typed one does, and are printed before the Agent starts, because
+  these records synchronize between machines. Decoding is never `eval`, and the
+  manifest `format` is deliberately not bumped so an AGS that has not updated
+  yet still reads these checkpoints.
+- **`ags list` is a picker, not a dump**: it renders through the same
+  width-aware layout the piped table uses, so Chinese descriptions no longer
+  leave the columns ragged, scrolls within the frame when there are more
+  sessions than terminal rows, and shows the highlighted session's Agent
+  arguments with `a` to edit them for this launch. `j`/`k` and `q` join the
+  arrow keys and Esc.
 - **Mandatory managed terminals**: `ags`, `ags claude`, `ags codex`, and
   checkpoint resume now use a private RMUX server for detachable live PTYs.
   Agent argv and environment overrides cross RMUX only in the structured

@@ -968,6 +968,7 @@ printf 'LAUNCH=%s %s\n' "$0" "$*" >> "$log"
 printf 'FAKE_CODEX'
 for argument in "$@"; do printf ' <%s>' "$argument"; done
 printf '\nFAKE_PWD=%s\n' "$PWD"
+printf 'FAKE_AGS_LAUNCH_ARGS=%s\n' "${AGS_LAUNCH_ARGS-unset}"
 EOF
 chmod +x "$tmp/home/.local/bin/codex"
 cat > "$tmp/home/.local/bin/claude" <<'EOF'
@@ -1715,7 +1716,16 @@ fresh_codex="$(
         2> "$tmp/fresh-codex.err"
 )"
 grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$fresh_codex"
+# The launch hands its own arguments to the session it starts, because `ags save`
+# runs as a child of the Agent and the environment is the only channel that
+# reaches it — the argv itself is consumed by exec.
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$fresh_codex"
 [[ ! -s "$tmp/fresh-codex.err" ]]
+# An argument carrying a line break cannot round-trip the line-oriented
+# manifest, so the launch records none of them rather than a truncated command
+# line. The Agent still receives it unchanged.
+newline_codex="$(env "${managed_env[@]}" "$tool" codex --model $'a\nb')"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$newline_codex"
 mkdir -p "$tmp/source/codex"
 printf '%s\n' 'model_provider = "sub2api"' \
     > "$tmp/source/codex/sub2api.config.toml"
@@ -3664,6 +3674,51 @@ layout_output="$(
 )"
 grep -Fqx "description=$layout_description" <<< "$layout_output"
 layout_record_id="$(sed -n 's/^record_id=//p' <<< "$layout_output")"
+
+# A session saved with Agent arguments. The environment is where they come from,
+# because that is what `ags codex` exports before exec and what `ags save`
+# inherits from inside the Agent.
+launch_args_session=22222222-3333-4444-8555-666666666666
+launch_args_rel="sessions/2026/01/02/rollout-test-$launch_args_session.jsonl"
+mkdir -p "$tmp/source/codex/$(dirname "$launch_args_rel")"
+printf '%s\n' '{"type":"session_meta"}' '{"type":"event_msg"}' \
+    > "$tmp/source/codex/$launch_args_rel"
+launch_args_output="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_DISABLE_GEO=1 \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        AGS_LAUNCH_ARGS='["--yolo","--model","o3 mini"]' \
+        "$tool" save-now local codex "$launch_args_session" with-args '带启动参数的会话'
+)"
+launch_args_record_id="$(sed -n 's/^record_id=//p' <<< "$launch_args_output")"
+launch_args_path="$(sed -n 's/^path=//p' <<< "$launch_args_output")"
+# The variable is inherited, so it can hold anything. A value that does not
+# decode records no arguments rather than reaching the manifest.
+launch_args_junk="$(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_DISABLE_GEO=1 \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        AGS_LAUNCH_ARGS='not json at all' \
+        "$tool" save-now local codex "$launch_args_session" args-junk 'Junk in the environment'
+)"
+grep -Fqx 'checkpoint_id=args-junk' <<< "$launch_args_junk"
+grep -Eq '^Agent arguments +none$' <<< "$(
+    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" show args-junk
+)"
+# Saving records what the session ran with; whether those arguments are allowed
+# is decided at launch. Kept in its own store so the resume below is the only
+# thing that can select it.
+(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_DISABLE_GEO=1 \
+        AGENT_SESSION_LOCAL_DIR="$tmp/forbidden-args-checkpoints" \
+        AGS_LAUNCH_ARGS='["--add-dir","/tmp"]' \
+        "$tool" save-now local codex "$launch_args_session" with-args 'Forbidden argument'
+) > /dev/null
 assert_format4_archive "$checkpoint_path" "$tmp/extracted/codex"
 grep -Fqx "agent=codex" "$tmp/extracted/codex/manifest"
 grep -Fqx "relative_path=$session_rel" "$tmp/extracted/codex/manifest"
@@ -3729,12 +3784,58 @@ EOF
         "$tmp/local-checkpoints"
     run_checkpoint_pty $'\033[3~n\033' "$tmp/checkpoint-delete-no.out" \
         "$tmp/local-checkpoints"
-    grep -Fq 'Delete selected session? [y/N]' \
+    grep -Fq 'Delete this saved session? [y/N]' \
         "$tmp/checkpoint-delete-no.out"
     [[ "$checkpoint_root_before" == "$(
         find "$tmp/local-checkpoints" -type f -print0 |
             LC_ALL=C sort -z | xargs -0 sha256sum
     )" ]]
+
+    strip_terminal_control() {
+        sed -e 's/\x1b\[[?0-9;]*[a-zA-Z]//g' -e 's/\r//g'
+    }
+    args_menu_root="$tmp/args-menu-checkpoints"
+    mkdir -p "$args_menu_root/codex"
+    cp -- "$launch_args_path" \
+        "$args_menu_root/codex/$launch_args_record_id.checkpoint.tar.gz.age"
+
+    # The picker draws through the same renderer the piped table uses, so every
+    # row comes back padded to one display width. Only the frame can show that:
+    # the piped table is not padded, and a Chinese description is two columns
+    # per character, which is exactly what a byte-counted layout gets wrong.
+    run_checkpoint_pty $'\033' "$tmp/checkpoint-args-frame.out" \
+        "$args_menu_root" COLUMNS=100 LINES=30
+    args_frame="$(strip_terminal_control < "$tmp/checkpoint-args-frame.out")"
+    grep -Eq '^  ID +AGENT +SAVED +DESCRIPTION *$' <<< "$args_frame"
+    grep -Eq '^. with-args +CODEX +[0-9-]+ +带启动参数的会话 *$' <<< "$args_frame"
+    (( $(LC_ALL="$test_utf8_locale" wc -L <<< "$args_frame") <= 100 ))
+    # The heading is ASCII and the row ends in Chinese. Equal *display* width is
+    # therefore the whole claim: a byte- or character-counted layout gets this
+    # pair wrong by exactly the number of wide characters in the description.
+    [[ "$(
+        grep -E '^  ID +AGENT' <<< "$args_frame" |
+            LC_ALL="$test_utf8_locale" wc -L
+      )" == "$(
+        grep -E '^. with-args +CODEX' <<< "$args_frame" |
+            LC_ALL="$test_utf8_locale" wc -L
+      )" ]]
+    # The saved arguments are shown before anything is launched with them.
+    grep -Fq "args  --yolo --model 'o3 mini'" <<< "$args_frame"
+
+    # `a` replaces them for this launch, and Enter opens with what was typed.
+    # Ctrl-U first: the prompt opens prefilled with what is saved.
+    run_checkpoint_pty $'a\025--model o3\n\n' "$tmp/checkpoint-args-edit.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/args-menu-target/codex"
+    args_edit_frame="$(strip_terminal_control < "$tmp/checkpoint-args-edit.out")"
+    grep -Fq "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
+        <<< "$args_edit_frame"
+
+    # Clearing the line means no arguments, not "fall back to the saved ones".
+    run_checkpoint_pty $'a\025\n\n' "$tmp/checkpoint-args-cleared.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/args-menu-cleared/codex"
+    args_cleared_frame="$(strip_terminal_control < "$tmp/checkpoint-args-cleared.out")"
+    grep -Fq "FAKE_CODEX <resume> <$launch_args_session>" <<< "$args_cleared_frame"
+    ! grep -Fq '<--yolo>' <<< "$args_cleared_frame"
 
     unsafe_selector_root="$tmp/unsafe-checkpoint-selector"
     unsafe_selector_id=$'0000\033]52;c;AGS_CHECKPOINT\a'
@@ -3797,6 +3898,47 @@ record_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-targe
     "$tool" resume "$checkpoint_record_id" --profile=exact-record)"
 grep -Fqx "FAKE_CODEX <resume> <$session_id> <--profile> <exact-record>" <<< "$record_resume"
 cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-record-target/codex/$session_rel"
+
+# The saved arguments come back, and they are announced rather than applied
+# silently — these records synchronize, so this can be another machine's
+# command line running here.
+resume_saved_args="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-target/codex" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" resume with-args 2> "$tmp/resume-saved-args.err"
+)"
+grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--yolo> <--model> <o3 mini>" \
+    <<< "$resume_saved_args"
+grep -Fq "codex arguments: --yolo --model 'o3 mini'" "$tmp/resume-saved-args.err"
+# ...and they carry into the resumed session, so the next save records the
+# command line this session is really running under instead of losing it here.
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--yolo","--model","o3 mini"]' <<< "$resume_saved_args"
+
+# `--` with nothing after it is a decision, not an omission: run this session
+# with no Agent arguments. Without that distinction a cleared argument line in
+# the picker would be refilled from the checkpoint it was cleared on.
+resume_cleared_args="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-cleared/codex" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" resume with-args --
+)"
+grep -Fqx "FAKE_CODEX <resume> <$launch_args_session>" <<< "$resume_cleared_args"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$resume_cleared_args"
+
+resume_override_args="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-override/codex" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" resume with-args -- --model o3
+)"
+grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
+    <<< "$resume_override_args"
+
+# Replayed arguments face the same Context Mode gate a typed one does. A
+# synchronized record must not be a way around it.
+env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-forbidden/codex" \
+    AGENT_SESSION_LOCAL_DIR="$tmp/forbidden-args-checkpoints" \
+    "$tool" resume with-args > "$tmp/forbidden-args.out" 2> "$tmp/forbidden-args.err" && exit 1
+grep -Fq 'cannot be forwarded' "$tmp/forbidden-args.err"
 mkdir -p "$tmp/symlinked-codex-home-real"
 ln -s "$tmp/symlinked-codex-home-real" "$tmp/symlinked-codex-home"
 env "${source_env[@]}" CODEX_HOME="$tmp/symlinked-codex-home" \
