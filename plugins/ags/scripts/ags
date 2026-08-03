@@ -1848,6 +1848,25 @@ install_context_mode_candidate() {
     fi
 }
 
+# Only "is it switched on", with none of the version or byte checks
+# `context_mode_claude_plugin_ready` also makes.
+#
+# Those two answer *whether* to act; this one answers *which* act. Conflating
+# them is how a byte mismatch ended up being treated as "not enabled" and
+# remediated with `plugin enable`, which is a hard error when it already is.
+context_mode_claude_plugin_is_enabled() {
+    local binary="$1" plugins
+    plugins="$("$binary" plugin list --json 8>&- 9>&- </dev/null 2>/dev/null)" ||
+        return 1
+    jq -e '
+        any(.[];
+          .id == "context-mode@context-mode" and
+          .scope == "user" and
+          .enabled == true
+        )
+    ' <<< "$plugins" >/dev/null 2>&1
+}
+
 context_mode_claude_plugin_ready() {
     local binary="$1" plugins install_path resolved_install resolved_package
     local expected_cache
@@ -2046,6 +2065,18 @@ NODE
     rm -rf -- "$probe_root"
     repair_context_mode_claude_runtime_rewrite || exit_status=1
     return "$exit_status"
+}
+
+# Whether Codex has an entry for the plugin at all, ignoring version, source
+# path and enabled state — the things `context_mode_codex_plugin_installed`
+# checks. `plugin add` refuses when an entry exists, so "there is one, but it
+# is not the one we want" has to be told apart from "there is none".
+context_mode_codex_plugin_present() {
+    local binary="$1" plugins
+    plugins="$("$binary" plugin list --json 8>&- 9>&- </dev/null 2>/dev/null)" ||
+        return 1
+    jq -e 'any(.installed[]; .pluginId == "context-mode@context-mode")' \
+        <<< "$plugins" >/dev/null 2>&1
 }
 
 context_mode_codex_plugin_ready() {
@@ -3343,7 +3374,7 @@ reset_context_mode_change_tracking() {
     context_mode_claude_marketplace_preexisting=0
     context_mode_claude_plugin_added=0
     context_mode_claude_marketplace_added=0
-    context_mode_claude_plugin_was_enabled=0
+    context_mode_claude_plugin_was_ready=0
     context_mode_claude_plugin_enabled=0
     context_mode_codex_plugin_preexisting=0
     context_mode_codex_marketplace_preexisting=0
@@ -4263,7 +4294,7 @@ configure_context_mode_claude() {
         context_mode_claude_plugin_preexisting=1
     fi
     if context_mode_claude_plugin_ready "$binary"; then
-        context_mode_claude_plugin_was_enabled=1
+        context_mode_claude_plugin_was_ready=1
     fi
     if context_mode_claude_marketplace_ready "$binary"; then
         context_mode_claude_marketplace_preexisting=1
@@ -4292,7 +4323,30 @@ configure_context_mode_claude() {
             8>&- 9>&- </dev/null >/dev/null ||
             return 1
         context_mode_claude_plugin_added=1
-    elif (( context_mode_claude_plugin_was_enabled == 0 )); then
+    elif (( context_mode_claude_plugin_was_ready == 1 )); then
+        : # installed, enabled, and the bytes are the ones we verified
+    elif context_mode_claude_plugin_is_enabled "$binary"; then
+        # Installed and switched on, yet not ready: what Claude has cached is
+        # not what the manifest says it should be. The same plugin *version*
+        # drifts — its transitive dependencies float, so two npm resolutions
+        # weeks apart differ (measured: 8 files of `hono` at 1.0.169).
+        #
+        # `plugin update` refuses when the version already matches, and
+        # `plugin enable` is a hard error on something already enabled — that
+        # was this branch before, and it failed every reinstall on a host whose
+        # AGS state had been cleared while Claude's config survived. Uninstall
+        # and install is the only thing that makes Claude re-copy.
+        #
+        # No rollback flag: this ends with the plugin installed and enabled,
+        # exactly as it was found. Only the cached bytes changed, and they came
+        # from the marketplace the user already had.
+        "$binary" plugin uninstall context-mode@context-mode \
+            --scope user --keep-data 8>&- 9>&- </dev/null >/dev/null ||
+            return 1
+        "$binary" plugin install context-mode@context-mode --scope user \
+            8>&- 9>&- </dev/null >/dev/null ||
+            return 1
+    else
         "$binary" plugin enable context-mode@context-mode --scope user \
             8>&- 9>&- </dev/null >/dev/null ||
             return 1
@@ -4368,10 +4422,34 @@ configure_context_mode_codex() {
         context_mode_codex_marketplace_added=1
     fi
     if (( context_mode_codex_plugin_preexisting == 0 )); then
+        # An entry that exists but did not validate — wrong version, a source
+        # path from a previous Context Mode runtime, or disabled — has to go
+        # first: `plugin add` refuses when one is already there. This is the
+        # same drift the Claude branch above handles, arriving through Codex's
+        # stricter `plugin_installed`, which pins the source path too.
+        if context_mode_codex_plugin_present "$binary"; then
+            "$binary" plugin remove context-mode@context-mode --json \
+                8>&- 9>&- </dev/null >/dev/null ||
+                return 1
+        fi
         "$binary" plugin add context-mode@context-mode --json \
             8>&- 9>&- </dev/null >/dev/null ||
             return 1
         context_mode_codex_plugin_added=1
+    elif ! context_mode_codex_plugin_ready "$binary"; then
+        # The entry is right — version, source path, enabled — but Codex's own
+        # cache holds different bytes than the manifest describes. Same drift as
+        # the Claude branch, and the built-in rewrite repair does not cover it
+        # (measured: 44 files at 1.0.169, all transitive `hono`).
+        #
+        # No rollback flag, for the same reason: this leaves the plugin
+        # installed and enabled exactly as it was found.
+        "$binary" plugin remove context-mode@context-mode --json \
+            8>&- 9>&- </dev/null >/dev/null ||
+            return 1
+        "$binary" plugin add context-mode@context-mode --json \
+            8>&- 9>&- </dev/null >/dev/null ||
+            return 1
     fi
     context_mode_codex_marketplace_ready "$binary" &&
         context_mode_codex_plugin_ready "$binary" &&
