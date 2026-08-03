@@ -72,6 +72,8 @@ CONTEXT_MODE_RUNTIME_ROOT="$CONTEXT_MODE_RUNTIME_BASE"
 CONTEXT_MODE_ACTIVE_MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ags/context-mode.json"
 CONTEXT_MODE_PENDING_MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ags/context-mode.pending.json"
 CONTEXT_MODE_STATUS="not-attempted"
+CODEXT_STATUS="not-attempted"
+CODEXT_RELEASE_STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/ags/codext-release"
 INSTALL_TRANSACTION_FILE=""
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_CORE_COMMITTED=0
@@ -1284,6 +1286,38 @@ configure_context_mode_only() {
   fi
   CONTEXT_MODE_RUNTIME_ROOT="$root"
   CONTEXT_MODE_STATUS="initialized ($version)"
+}
+
+# Bring codext to the current release, installing it if this host has none.
+#
+# codext is Codex with the credential pool wired in, and AGS launches it in
+# preference to stock Codex whenever it is on PATH — so an install that skips it
+# leaves every session quietly running on the machine's own account.
+#
+# It rides its own release train, which is why this runs after the core install
+# transaction has been committed and can only report, never fail the install.
+# `ags codext-update` is the same function `ags update` calls; reaching for
+# `ags update` here instead would also self-update casr and undo an explicit
+# `--version` seconds after it landed.
+configure_codext_only() {
+  if [ "$NO_CONFIGURE" -eq 1 ]; then
+    CODEXT_STATUS="skipped (--no-configure)"
+    return 0
+  fi
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    CODEXT_STATUS="skipped (--offline)"
+    return 0
+  fi
+  run_checkpoint_runtime codext-update || true
+  # The stamp, not `codext --version`: that reports the upstream Codex version
+  # the fork is built on, so two codext releases can read as the same thing.
+  if [ -s "$CODEXT_RELEASE_STAMP" ]; then
+    CODEXT_STATUS="$(head -n 1 "$CODEXT_RELEASE_STAMP")"
+  elif command -v codext >/dev/null 2>&1; then
+    CODEXT_STATUS="installed (release unknown)"
+  else
+    CODEXT_STATUS="not installed"
+  fi
 }
 
 configure_checkpoints() {
@@ -2686,6 +2720,7 @@ if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
   }
 fi
 INSTALL_CORE_COMMITTED=1
+configure_codext_only
 maybe_add_path
 maybe_install_completions
 configure_agents
@@ -2736,6 +2771,7 @@ summary_lines=(
   "AGS vault:        $AGS_INIT_STATUS"
   "AGS terminal:     $AGS_TERMINAL_STATUS"
   "Context Mode:     $CONTEXT_MODE_STATUS"
+  "codext:           $CODEXT_STATUS"
   ""
   "Get started:"
   "  casr providers"

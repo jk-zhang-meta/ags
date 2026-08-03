@@ -13780,14 +13780,38 @@ update_codext() {
     local owner="${CODEXT_UPDATE_OWNER:-jk-zhang-meta}"
     local repo="${CODEXT_UPDATE_REPO:-codext}"
     local binary destination current tag response status asset url workspace stamp
-    local token asset_id
+    local token asset_id codex_binary fresh=0
     local -a candidates=() auth=()
 
     binary="$(command -v codext 2>/dev/null || true)"
-    [[ -n "$binary" ]] || return 0
+    if [[ -z "$binary" ]]; then
+        # Not installed yet: put it exactly where the native Codex lives.
+        # `resolve_agent_binary` decides by nothing more than whether `codext`
+        # is on PATH, so landing in that same directory is what makes every
+        # launch path start going through the pool.
+        #
+        # The directory of the path `command -v` reported, deliberately not the
+        # resolved one: Codex installs itself as a symlink into
+        # ~/.codex/packages/standalone/current/bin, and that directory is not on
+        # PATH. Following the link would install into a place nothing looks.
+        codex_binary="$(command -v codex 2>/dev/null || true)"
+        if [[ -n "$codex_binary" ]]; then
+            binary="$(dirname "$codex_binary")/codext"
+        else
+            # No Codex at all on this host. codext is a complete Codex, so
+            # installing it is still the right answer — next to casr, which is
+            # the installer's --dest and the one directory install.sh's
+            # maybe_add_path puts on PATH. Anywhere else and `codext` would not
+            # be a command the user can type.
+            binary="${AGSX_CONVERTER_BINARY:-}"
+            [[ -n "$binary" ]] || return 0
+            binary="$(dirname "$binary")/codext"
+        fi
+        fresh=1
+    fi
     destination="$(dirname "$binary")"
     [[ -w "$destination" ]] || {
-        log "codext 装在不可写的目录里，跳过：$destination"
+        log "codext 的目标目录不可写，跳过：$destination"
         return 0
     }
 
@@ -13795,16 +13819,24 @@ update_codext() {
     # binary's own `--version`, which reports the upstream Codex version the
     # fork is based on: two codext releases can share one upstream version, and
     # comparing against `--version` would make the second one invisible.
+    #
+    # A first install ignores the stamp entirely. It outlives an uninstalled
+    # binary, and trusting it there would report "already current" about a
+    # codext that is not on the disk.
     stamp="$state/codext-release"
-    if [[ -s "$stamp" ]]; then
-        IFS= read -r current < "$stamp" || current=
-        current="${current#v}"
+    if (( fresh == 1 )); then
+        current=none
+    else
+        if [[ -s "$stamp" ]]; then
+            IFS= read -r current < "$stamp" || current=
+            current="${current#v}"
+        fi
+        if [[ -z "${current:-}" ]]; then
+            current="$("$binary" --version 2>/dev/null || true)"
+            current="${current##* }"
+        fi
+        [[ -n "$current" ]] || current=unknown
     fi
-    if [[ -z "${current:-}" ]]; then
-        current="$("$binary" --version 2>/dev/null || true)"
-        current="${current##* }"
-    fi
-    [[ -n "$current" ]] || current=unknown
 
     mapfile -t candidates < <(codext_asset_names) || true
     (( ${#candidates[@]} > 0 )) || {
@@ -13842,7 +13874,11 @@ update_codext() {
         return 0
     fi
     if (( check_only == 1 )); then
-        log "update available: codext $current -> $tag"
+        if (( fresh == 1 )); then
+            log "codext 还没装；ags update 会把 $tag 装到 $destination"
+        else
+            log "update available: codext $current -> $tag"
+        fi
         return 0
     fi
 
@@ -13862,7 +13898,11 @@ update_codext() {
     }
     url="https://api.github.com/repos/$owner/$repo/releases/assets/$asset_id"
 
-    log "updating codext $current -> $tag"
+    if (( fresh == 1 )); then
+        log "installing codext $tag into $destination"
+    else
+        log "updating codext $current -> $tag"
+    fi
     workspace="$(mktemp -d "${TMPDIR:-/tmp}/codext-update.XXXXXX")" ||
         die "cannot create a temporary directory for the codext download"
     curl -fsSL --connect-timeout 5 --max-time 900 \
@@ -13894,7 +13934,21 @@ update_codext() {
     rm -rf -- "$workspace"
     install -d -m700 "$state"
     printf '%s\n' "$tag" > "$stamp"
-    log "updated codext to $tag"
+    if (( fresh == 1 )); then
+        # Without a pool configured codext is exactly stock Codex, and it says
+        # nothing about it. Someone who never runs codex-init would keep using
+        # their own account and never learn why.
+        #
+        # The directory is already on PATH — it is the one Codex itself is in,
+        # or the one casr is in. What is not is zsh's command table: it is built
+        # once and a binary that appears afterwards stays invisible until
+        # `rehash`. AGS launches codext by absolute path and does not care, but
+        # someone typing `codext` in the shell they ran this from does.
+        log "installed codext $tag at $binary；跑 ags codex-init 配置凭据池"
+        log "直接敲 codext 需要新开一个终端（zsh 里 rehash 也行）"
+    else
+        log "updated codext to $tag"
+    fi
 }
 
 # Re-converge Context Mode, which ships on npm rather than in an AGS release.
@@ -14088,6 +14142,15 @@ case "${1:-}" in
         shift
         (( $# == 0 )) || die "usage: ags codex-pool"
         codex_pool_status
+        ;;
+    codext-update)
+        # install.sh's hook into the same function `ags update` uses, so a
+        # fresh install lands codext too. Deliberately not `ags update` itself:
+        # that one would also self-update casr, and would therefore undo an
+        # explicit `install.sh --version` seconds after it landed.
+        shift
+        (( $# == 0 )) || die "usage: ags codext-update"
+        update_codext 0
         ;;
     context-init)
         shift
