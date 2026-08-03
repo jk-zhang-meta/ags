@@ -3,10 +3,10 @@
 # casr installer — Cross Agent Session Resumer
 #
 # One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?$(date +%s)" | bash
 #
 # Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh | bash
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -2322,7 +2322,7 @@ Environment:
 
 Examples:
   # Install latest release
-  curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?\$(date +%s)" | bash
+  curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?\$(date +%s)" | bash
 
   # Install specific version with self-test
   bash install.sh --version v0.2.0 --verify

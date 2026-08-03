@@ -13,7 +13,7 @@ Cross Agent Session Resumer for coding agents: resume a session created in one p
 ## Quick Install (Recommended)
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?$(date +%s)" | bash
 ```
 
 That installer is the primary distribution path. It handles platform detection, secure artifact verification, fallback source builds, shell completions, and agent-oriented local setup in one step.
@@ -326,7 +326,7 @@ Notes:
 ### Primary Path: Hardened `curl | bash` Installer
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/agsx/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?$(date +%s)" | bash
 ```
 
 What this installer does for you:
