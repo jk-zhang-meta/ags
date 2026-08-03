@@ -2,7 +2,7 @@
 
 ## This is a fork
 
-`agsx-convert` is a fork of **casr (Cross Agent Session Resumer)** by Jeffrey Emanuel.
+`ags` is a fork of **casr (Cross Agent Session Resumer)** by Jeffrey Emanuel.
 
 | | |
 |---|---|

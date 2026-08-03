@@ -26,54 +26,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-
 use crate::store::{Record, SessionKey};
-
-/// AGS uses a private RMUX endpoint so its sessions do not mix with sessions
-/// the user manages directly with RMUX.
-pub const RMUX_SOCKET_NAME: &str = "ags";
-pub const RMUX_PAYLOAD_ENV: &str = "AGS_RMUX_LAUNCH_PAYLOAD";
-pub const STORAGE_MODE_ENV: &str = "AGENT_SESSION_STORAGE_MODE";
-
-/// Whether `rmux -V` reports a release with AGS's required CLI contract.
-///
-/// Prereleases are intentionally rejected. AGS relies on `new-session -A`,
-/// client-environment forwarding, and the legacy command boundary verified
-/// against stable RMUX 0.9.1.
-pub fn rmux_version_supported(output: &str) -> bool {
-    let Some(version) = output.trim().strip_prefix("rmux ") else {
-        return false;
-    };
-    if version.contains('-') {
-        return false;
-    }
-    let core = version.split_once('+').map_or(version, |(core, _)| core);
-    let mut parts = core.split('.');
-    let Some(major) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
-        return false;
-    };
-    let Some(minor) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
-        return false;
-    };
-    let Some(patch) = parts.next().and_then(|part| part.parse::<u64>().ok()) else {
-        return false;
-    };
-    parts.next().is_none() && major == 0 && minor == 9 && patch >= 1
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ManagedPayload {
-    program: String,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-}
 
 /// The provider session a store record id stands for, when the target is
 /// `target_slug`.
 ///
-/// `agsx resume cc <record-id>` has to become a provider session somewhere: the
+/// `ags resume cc <record-id>` has to become a provider session somewhere: the
 /// record id is ours, and no agent has ever heard of it. So the identifier the
 /// user has — one id for the whole conversation, however many providers it has
 /// been through — is translated here into the one the pipeline resolves and the
@@ -273,59 +231,6 @@ impl LaunchSpec {
         command
     }
 
-    /// Run this agent payload inside AGS's private RMUX server.
-    ///
-    /// `new-session -A` is the whole lifecycle contract: create and attach
-    /// when the runtime does not exist, or attach to the existing PTY without
-    /// running the payload again. The explicit empty config prevents a user's
-    /// RMUX or tmux configuration from changing that persistence contract.
-    pub fn managed_command(&self, rmux: &Path, runner: &Path, runtime_key: &str) -> Command {
-        let payload = serde_json::to_string(&ManagedPayload {
-            program: self.program.clone(),
-            args: self.args.clone(),
-            env: self.env.clone(),
-        })
-        .expect("a managed launch payload contains only JSON strings");
-        let mut command = Command::new(rmux);
-        command.env(RMUX_PAYLOAD_ENV, payload);
-        command
-            .arg("-L")
-            .arg(RMUX_SOCKET_NAME)
-            .arg("-f")
-            .arg(rmux_empty_config())
-            .arg("new-session")
-            .arg("-A")
-            .arg("-s")
-            .arg(managed_session_name(runtime_key));
-        if let Some(cwd) = &self.cwd {
-            command.arg("-c").arg(cwd);
-        }
-        // RMUX 0.9.1's Unix CLI turns its legacy command vector into a quoted
-        // shell command. Keep all Agent-controlled values out of that vector:
-        // the fixed trampoline reads their JSON, including environment
-        // overrides, from the requesting client's environment and performs
-        // the final shell-free exec. In particular, do not duplicate values
-        // into RMUX `-e KEY=VALUE` arguments where process listings expose
-        // them.
-        command.arg("--").arg(runner).arg("terminal-payload");
-        command
-    }
-
-    /// Reconstruct the Agent payload inside the RMUX pane.
-    ///
-    /// The pane already starts in `self.cwd` because `managed_command` gives
-    /// RMUX `-c`; omitting cwd here also avoids encoding an OS path as JSON.
-    pub fn from_managed_payload(payload: &str) -> Result<Self, serde_json::Error> {
-        let payload: ManagedPayload = serde_json::from_str(payload)?;
-        Ok(Self {
-            program: payload.program,
-            args: payload.args,
-            cwd: None,
-            env: payload.env,
-            targets: None,
-        })
-    }
-
     /// Whether the program can be found on `PATH`.
     ///
     /// Checked before launching so that a missing agent is reported as a
@@ -338,30 +243,6 @@ impl LaunchSpec {
         }
         which::which(&self.program).ok()
     }
-}
-
-/// A stable, non-sensitive RMUX name for one AGS live runtime.
-///
-/// The opaque suffix prevents cwd, checkpoint labels, native session IDs, and
-/// agent arguments from leaking through `rmux list-sessions`.
-pub fn managed_session_name(runtime_key: &str) -> String {
-    let digest = format!("{:x}", Sha256::digest(runtime_key.as_bytes()));
-    format!("ags-{}", &digest[..20])
-}
-
-#[cfg(unix)]
-fn rmux_empty_config() -> &'static str {
-    "/dev/null"
-}
-
-#[cfg(windows)]
-fn rmux_empty_config() -> &'static str {
-    "NUL"
-}
-
-#[cfg(not(any(unix, windows)))]
-fn rmux_empty_config() -> &'static str {
-    ""
 }
 
 /// Why a launch could not be prepared.
@@ -490,86 +371,5 @@ mod tests {
         assert_eq!(command.get_current_dir(), Some(Path::new("/work")));
         let envs: Vec<_> = command.get_envs().collect();
         assert_eq!(envs.len(), 1);
-    }
-
-    #[test]
-    fn managed_command_uses_one_private_attach_or_create_session() {
-        let spec = LaunchSpec::new(
-            "/opt/Agent Bin/codex",
-            ["resume".into(), "native id".into()],
-        )
-        .in_dir("/work tree")
-        .with_env("CODEX_HOME", "/tmp/codex home");
-        let command = spec.managed_command(
-            Path::new("/opt/rmux"),
-            Path::new("/opt/AGS Bin/casr"),
-            "conversation-1/runtime-1",
-        );
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(command.get_program(), "/opt/rmux");
-        assert_eq!(
-            args,
-            [
-                "-L",
-                "ags",
-                "-f",
-                rmux_empty_config(),
-                "new-session",
-                "-A",
-                "-s",
-                "ags-f87158c8f1c80f24283b",
-                "-c",
-                "/work tree",
-                "--",
-                "/opt/AGS Bin/casr",
-                "terminal-payload",
-            ]
-        );
-        let payload = command
-            .get_envs()
-            .find_map(|(key, value)| {
-                (key == RMUX_PAYLOAD_ENV)
-                    .then_some(value)
-                    .flatten()
-                    .map(|value| value.to_string_lossy().into_owned())
-            })
-            .expect("managed payload environment");
-        let reconstructed = LaunchSpec::from_managed_payload(&payload).expect("payload JSON");
-        assert_eq!(reconstructed.program, "/opt/Agent Bin/codex");
-        assert_eq!(reconstructed.args, ["resume", "native id"]);
-        assert_eq!(
-            reconstructed.env,
-            [("CODEX_HOME".into(), "/tmp/codex home".into())]
-        );
-        assert_eq!(reconstructed.cwd, None);
-    }
-
-    #[test]
-    fn managed_session_identity_is_stable_without_leaking_its_key() {
-        let first = managed_session_name("secret/cwd/native-session");
-        let again = managed_session_name("secret/cwd/native-session");
-        let other = managed_session_name("secret/cwd/other-session");
-
-        assert_eq!(first, again);
-        assert_ne!(first, other);
-        assert!(first.starts_with("ags-"));
-        assert!(!first.contains("secret"));
-        assert!(!first.contains("native"));
-    }
-
-    #[test]
-    fn rmux_version_gate_requires_compatible_stable_0_9_x() {
-        assert!(rmux_version_supported("rmux 0.9.1\n"));
-        assert!(rmux_version_supported("rmux 0.9.9+build.4"));
-        assert!(!rmux_version_supported("rmux 0.9.0"));
-        assert!(!rmux_version_supported("rmux 0.9.1-rc.1"));
-        assert!(!rmux_version_supported("rmux 0.10.0"));
-        assert!(!rmux_version_supported("rmux 1.0.0"));
-        assert!(!rmux_version_supported("rmux unknown"));
-        assert!(!rmux_version_supported("tmux 3.5"));
     }
 }

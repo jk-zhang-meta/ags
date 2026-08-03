@@ -318,7 +318,7 @@ fn cli_help_outputs_usage() {
         .stdout(predicate::str::contains("resume"))
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("providers"))
-        .stdout(predicate::str::contains("terminal-name").not());
+        .stdout(predicate::str::contains("checkpoint-asset").not());
 }
 
 #[test]
@@ -1459,7 +1459,7 @@ fn cli_resume_cc_to_aider_writes_only_an_independent_history() {
         written
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".aider.chat.history.agsx-"))
+            .is_some_and(|name| name.starts_with(".aider.chat.history.ags-"))
     );
     assert!(
         !tmp.path().join("aider/.aider.chat.history.md").exists(),
@@ -1966,139 +1966,6 @@ fn write_executable(path: &std::path::Path, contents: &str) {
     fs::set_permissions(path, permissions).expect("mark executable");
 }
 
-#[cfg(unix)]
-#[test]
-fn hidden_terminal_name_prints_the_managed_session_name() {
-    let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
-        .args(["terminal-name", "conversation-1/runtime-1"])
-        .assert()
-        .success()
-        .stdout("ags-f87158c8f1c80f24283b\n")
-        .stderr("");
-    casr_cmd(&tmp).arg("terminal-name").assert().code(2);
-    casr_cmd(&tmp)
-        .args(["terminal-name", "one", "two"])
-        .assert()
-        .code(2);
-}
-
-#[cfg(unix)]
-#[test]
-fn hidden_terminal_launcher_passes_one_argv_payload_to_rmux() {
-    let tmp = TempDir::new().unwrap();
-    let bin = tmp.path().join("bin");
-    let log = tmp.path().join("rmux.args");
-    let payload_log = tmp.path().join("rmux.payload");
-    fs::create_dir(&bin).unwrap();
-    write_executable(
-        &bin.join("rmux"),
-        "#!/bin/sh\nif [ \"${1:-}\" = -V ]; then printf 'rmux 0.9.1\\n'; exit; fi\nprintf '%s\\n' \"$@\" > \"$RMUX_TEST_LOG\"\nprintf '%s' \"$AGS_RMUX_LAUNCH_PAYLOAD\" > \"$RMUX_PAYLOAD_LOG\"\n",
-    );
-
-    let output = casr_cmd(&tmp)
-        .env("PATH", &bin)
-        .env("RMUX_TEST_LOG", &log)
-        .env("RMUX_PAYLOAD_LOG", &payload_log)
-        .env("AGENT_SESSION_STORAGE_MODE", "remote:github")
-        .current_dir(tmp.path())
-        .args([
-            "terminal-launch",
-            "runtime-key",
-            "--",
-            "/opt/codex",
-            "resume",
-            "native id",
-            "--model",
-            "o3",
-        ])
-        .output()
-        .expect("terminal launcher should run");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let args = fs::read_to_string(log)
-        .expect("fake RMUX log")
-        .lines()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        &args[..7],
-        ["-L", "ags", "-f", "/dev/null", "new-session", "-A", "-s"]
-    );
-    assert!(args[7].starts_with("ags-"));
-    assert_eq!(args[8], "-c");
-    assert_eq!(args[9], tmp.path().display().to_string());
-    assert_eq!(args[10], "--");
-    assert_eq!(args[12], "terminal-payload");
-    assert!(
-        std::path::Path::new(&args[11]).is_absolute(),
-        "the RMUX command should contain only the trusted AGS runner"
-    );
-
-    let payload: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(payload_log).expect("managed payload"))
-            .expect("valid managed payload JSON");
-    assert_eq!(payload["program"], "/opt/codex");
-    assert_eq!(
-        payload["args"],
-        serde_json::json!(["resume", "native id", "--model", "o3"])
-    );
-    assert_eq!(
-        payload["env"],
-        serde_json::json!([["AGENT_SESSION_STORAGE_MODE", "remote:github"]])
-    );
-    assert!(
-        args.iter().all(|arg| arg != "native id"
-            && arg != "--model"
-            && arg != "AGENT_SESSION_STORAGE_MODE=remote:github"),
-        "Agent-controlled arguments and environment values must not reach RMUX's shell-parsed command vector"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn hidden_terminal_payload_execs_literal_arguments_without_a_shell() {
-    let tmp = TempDir::new().unwrap();
-    let agent = tmp.path().join("fake agent");
-    let log = tmp.path().join("agent.args");
-    let marker = tmp.path().join("must-not-exist");
-    write_executable(
-        &agent,
-        "#!/bin/sh\nprintf '<%s>\\n' \"$@\" > \"$AGS_PAYLOAD_TEST_LOG\"\nprintf 'env=<%s>\\n' \"$AGS_TEST_ENV\" >> \"$AGS_PAYLOAD_TEST_LOG\"\nprintf 'payload=<%s>\\n' \"${AGS_RMUX_LAUNCH_PAYLOAD-unset}\" >> \"$AGS_PAYLOAD_TEST_LOG\"\n",
-    );
-    let hostile = format!("; touch {}; #", marker.display());
-    let payload = serde_json::json!({
-        "program": agent,
-        "args": ["a b", hostile],
-        "env": [["AGS_TEST_ENV", "literal env"]]
-    });
-
-    let output = casr_cmd(&tmp)
-        .env("AGS_RMUX_LAUNCH_PAYLOAD", payload.to_string())
-        .env("AGS_PAYLOAD_TEST_LOG", &log)
-        .arg("terminal-payload")
-        .output()
-        .expect("terminal payload should exec");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let actual = fs::read_to_string(log).expect("Agent argv log");
-    assert_eq!(
-        actual,
-        format!(
-            "<a b>\n<; touch {}; #>\nenv=<literal env>\npayload=<unset>\n",
-            marker.display()
-        )
-    );
-    assert!(!marker.exists(), "a shell interpreted the hostile argument");
-}
-
 #[test]
 fn cli_launch_dry_run_prints_a_command_that_parses_back_to_the_spec() {
     let tmp = TempDir::new().unwrap();
@@ -2349,7 +2216,7 @@ fn cli_launch_dry_run_targets_the_independent_aider_history() {
                 .expect("Aider output")
                 .file_name()
                 .to_string_lossy()
-                .starts_with(".aider.chat.history.agsx-"))
+                .starts_with(".aider.chat.history.ags-"))
     );
     assert!(!tmp.path().join("aider/.aider.chat.history.md").exists());
 }
@@ -2380,44 +2247,19 @@ fn cli_launch_reports_a_missing_agent_as_missing_rather_than_as_a_failed_convers
 
 #[cfg(unix)]
 #[test]
-fn cli_launch_requires_rmux_and_never_falls_back_to_an_unmanaged_agent() {
+fn json_interactive_launch_is_refused_before_starting_the_agent() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
     let bin = empty_path(&tmp);
-    write_executable(&bin.join("codex"), "#!/bin/sh\nexit 97\n");
-
-    let output = casr_cmd(&tmp)
-        .env("PATH", &bin)
-        .args(["resume", "cod", &session_id, "--launch"])
-        .output()
-        .expect("launch should run");
-
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("Converted"));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("compatible RMUX 0.9.x release (0.9.1 or newer) is required")
-            && stderr.contains("no unmanaged agent was started"),
-        "{stderr}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn json_interactive_launch_is_refused_before_starting_rmux() {
-    let tmp = TempDir::new().unwrap();
-    let session_id = setup_cc_fixture(&tmp, "cc_simple");
-    let bin = empty_path(&tmp);
-    let marker = tmp.path().join("rmux-started");
-    write_executable(&bin.join("codex"), "#!/bin/sh\nexit 97\n");
+    let marker = tmp.path().join("agent-started");
     write_executable(
-        &bin.join("rmux"),
-        "#!/bin/sh\nif [ \"${1:-}\" = -V ]; then printf 'rmux 0.9.1\\n'; exit; fi\ntouch \"$RMUX_LAUNCH_MARKER\"\nexit 98\n",
+        &bin.join("codex"),
+        "#!/bin/sh\ntouch \"$AGENT_LAUNCH_MARKER\"\nexit 97\n",
     );
 
     let output = casr_cmd(&tmp)
         .env("PATH", &bin)
-        .env("RMUX_LAUNCH_MARKER", &marker)
+        .env("AGENT_LAUNCH_MARKER", &marker)
         .args(["--json", "resume", "cod", &session_id, "--launch"])
         .output()
         .expect("launch preflight should run");
@@ -2435,7 +2277,7 @@ fn json_interactive_launch_is_refused_before_starting_rmux() {
     );
     assert!(
         !marker.exists(),
-        "RMUX must not be started after a non-interactive preflight failure"
+        "the Agent must not be started after a non-interactive preflight failure"
     );
 }
 
@@ -2897,7 +2739,7 @@ fn cli_resume_by_record_id_says_which_session_it_converted() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let records_dir = tmp.path().join("xdg-data/agsx/records");
+    let records_dir = tmp.path().join("xdg-data/ags/records");
     let record_id = fs::read_dir(&records_dir)
         .unwrap_or_else(|e| panic!("store records at {}: {e}", records_dir.display()))
         .filter_map(Result::ok)

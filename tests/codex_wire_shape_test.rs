@@ -24,7 +24,7 @@
 //! is absent, matching `roundtrip_ir_test.rs`:
 //!
 //! ```bash
-//! AGSX_CLAUDE_CORPUS="$HOME/.claude/projects" \
+//! AGS_CLAUDE_CORPUS="$HOME/.claude/projects" \
 //!   cargo test --test codex_wire_shape_test -- --ignored --nocapture
 //! ```
 //!
@@ -432,8 +432,8 @@ fn event_msg_payloads(lines: &[String]) -> Vec<Value> {
 // ---------------------------------------------------------------------------
 
 fn claude_corpus() -> Vec<PathBuf> {
-    let Ok(root) = std::env::var("AGSX_CLAUDE_CORPUS") else {
-        eprintln!("AGSX_CLAUDE_CORPUS unset; skipping");
+    let Ok(root) = std::env::var("AGS_CLAUDE_CORPUS") else {
+        eprintln!("AGS_CLAUDE_CORPUS unset; skipping");
         return Vec::new();
     };
     let mut files: Vec<PathBuf> = walkdir::WalkDir::new(root)

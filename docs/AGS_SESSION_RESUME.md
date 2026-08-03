@@ -50,7 +50,7 @@ Codex reads both plain and compressed rollouts, but current releases resolve
   state;
 - `state_5.sqlite`, `-wal`, and `-shm` must not be copied over another
   machine's shared database;
-- AGS restores the rollout transactionally, then asks agsx to validate the
+- AGS restores the rollout transactionally, then asks ags to validate the
   final file and upsert only that UUID's row using the live database schema;
   registration failure rolls the restored rollout back.
 
@@ -120,7 +120,7 @@ Primary evidence:
 
 ## Cross-Agent Conversion
 
-Cross-Agent resume is a separate path implemented by agsx's structured
+Cross-Agent resume is a separate path implemented by ags's structured
 Claude/Codex converter. It creates a fresh target-native UUID and reports both
 its claimed and independently verified fidelity. Provider trust boundaries
 still impose real limits:
@@ -135,7 +135,7 @@ AGS never points the converter at a real Agent home. It invokes the current
 single reported target transcript, normalizes the selected target working
 directory and Codex `model_provider`, parses the final native file again, then
 sends only that main transcript through AGS's existing restore transaction.
-Warnings and structured loss records from agsx are surfaced to the user.
+Warnings and structured loss records from ags are surfaced to the user.
 
 The selected Codex profile—whether supplied as an AGS option before `--` or a
 native Codex option after `--`—is also passed to `codex resume`, so custom
@@ -268,7 +268,7 @@ synchronization, compact list/show output, and the Codex/Claude adapters are
 implemented in the current worktree. Storage selection, most-recently-used
 ordering, pre-launch reconciliation, post-save remote synchronization, and
 verified merge/retirement are also implemented. The RMUX vertical slice is
-implemented: `ags claude`, `ags codex`, checkpoint resume, and agsx
+implemented: `ags claude`, `ags codex`, checkpoint resume, and ags
 `--launch` all cross one structured RMUX boundary; bare `ags` attaches the
 only private AGS session or presents an activity-ordered keyboard picker. Plain FTP,
 a generic database payload adapter, and a dynamic plugin framework remain
@@ -370,7 +370,7 @@ detail, while `ags attach ID` provides precise recovery. Read-only and
 automation commands such as non-TTY `list`, `show`, `status`,
 `sync`, hooks, JSON output, and launch dry-runs do not allocate a terminal.
 The mandatory-terminal contract covers interactive launches made through
-`ags` and agsx `--launch`. Raw `claude`/`codex` invocations and the installer's
+`ags` and ags `--launch`. Raw `claude`/`codex` invocations and the installer's
 optional `cc`/`cod` compatibility aliases remain direct Agent commands, so
 scripts and non-interactive Agent modes are not silently moved into a PTY.
 

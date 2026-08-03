@@ -222,14 +222,14 @@ tier is `#[ignore]`d because the corpus is machine-local and private, and it
 prints a skip banner rather than passing quietly:
 
 ```bash
-AGSX_CODEX_CORPUS="$HOME/.codex/sessions" \
-AGSX_CLAUDE_CORPUS="$HOME/.claude/projects" \
+AGS_CODEX_CORPUS="$HOME/.codex/sessions" \
+AGS_CLAUDE_CORPUS="$HOME/.claude/projects" \
   cargo test --release --test conformance_test -- --ignored --nocapture
 ```
 
-Any `AGSX_<anything>_CORPUS` variable is picked up, by shape rather than by
+Any `AGS_<anything>_CORPUS` variable is picked up, by shape rather than by
 name, so a new provider's corpus root needs no edit either.
-`AGSX_CONFORMANCE_LIMIT` caps the files taken per root.
+`AGS_CONFORMANCE_LIMIT` caps the files taken per root.
 
 The corpus is only ever read. Every structured write goes through
 `Provider::write_session_ir`, which places the file under the provider's *own*

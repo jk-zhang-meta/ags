@@ -1,10 +1,10 @@
 [package]
 name = "cross_agent_session_resumer"
-version = "0.3.0-agsx.3"
+version = "0.4.0"
 edition = "2024"
 description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: casr)"
 license-file = "LICENSE"
-repository = "https://github.com/jk-zhang-meta/agsx-convert"
+repository = "https://github.com/jk-zhang-meta/ags"
 keywords = ["cli", "agent", "session", "resume", "claude"]
 categories = ["command-line-utilities"]
 readme = "README.md"

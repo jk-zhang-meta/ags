@@ -10,7 +10,7 @@
 //! private; run them explicitly:
 //!
 //! ```bash
-//! AGSX_CODEX_CORPUS="$HOME/.codex/sessions" \
+//! AGS_CODEX_CORPUS="$HOME/.codex/sessions" \
 //!   cargo test --release --test corpus_test -- --ignored --nocapture
 //! ```
 //!
@@ -59,12 +59,12 @@ struct Totals {
 }
 
 fn scan_codex(limit: usize) -> Option<Totals> {
-    scan("AGSX_CODEX_CORPUS", limit, codex_ir::read, |_| true)
+    scan("AGS_CODEX_CORPUS", limit, codex_ir::read, |_| true)
 }
 
 fn scan_claude(limit: usize) -> Option<Totals> {
     scan(
-        "AGSX_CLAUDE_CORPUS",
+        "AGS_CLAUDE_CORPUS",
         limit,
         claude_code_ir::read,
         is_claude_transcript,
@@ -192,7 +192,7 @@ fn report(totals: &Totals) {
 }
 
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_corpus_parses_without_unknown_events() {
     let Some(totals) = scan_codex(400) else {
         return;
@@ -216,7 +216,7 @@ fn codex_corpus_parses_without_unknown_events() {
 }
 
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_corpus_preserves_reasoning_capsules() {
     let Some(totals) = scan_codex(400) else {
         return;
@@ -268,11 +268,11 @@ fn codex_corpus_preserves_reasoning_capsules() {
 /// compacted session replays as a preamble promising a summary that is not
 /// there. This asserts the replay carries the blob instead.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_compacted_history_is_not_replayed_as_an_empty_message() {
-    let files = corpus_files("AGSX_CODEX_CORPUS", "jsonl", 400);
+    let files = corpus_files("AGS_CODEX_CORPUS", "jsonl", 400);
     if files.is_empty() {
-        eprintln!("AGSX_CODEX_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CODEX_CORPUS unset or empty; skipping");
         return;
     }
 
@@ -322,11 +322,11 @@ fn codex_compacted_history_is_not_replayed_as_an_empty_message() {
 }
 
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_corpus_compaction_shrinks_model_history() {
-    let files = corpus_files("AGSX_CODEX_CORPUS", "jsonl", 400);
+    let files = corpus_files("AGS_CODEX_CORPUS", "jsonl", 400);
     if files.is_empty() {
-        eprintln!("AGSX_CODEX_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CODEX_CORPUS unset or empty; skipping");
         return;
     }
 
@@ -383,10 +383,10 @@ fn codex_corpus_compaction_shrinks_model_history() {
 }
 
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_largest_rollout_stays_within_memory_budget() {
-    let Ok(root) = std::env::var("AGSX_CODEX_CORPUS") else {
-        eprintln!("AGSX_CODEX_CORPUS unset; skipping");
+    let Ok(root) = std::env::var("AGS_CODEX_CORPUS") else {
+        eprintln!("AGS_CODEX_CORPUS unset; skipping");
         return;
     };
     let largest = walkdir::WalkDir::new(root)
@@ -432,7 +432,7 @@ fn codex_largest_rollout_stays_within_memory_budget() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_parses_without_unknown_events() {
     let Some(totals) = scan_claude(200) else {
         return;
@@ -452,15 +452,15 @@ fn claude_corpus_parses_without_unknown_events() {
 }
 
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_preserves_thinking_signatures() {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 400)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 400)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .take(200)
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
         return;
     }
 
@@ -506,15 +506,15 @@ fn claude_corpus_preserves_thinking_signatures() {
 }
 
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_compaction_drops_only_unpreserved_messages() {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 400)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 400)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .take(200)
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
         return;
     }
 
@@ -575,14 +575,14 @@ fn claude_corpus_compaction_drops_only_unpreserved_messages() {
 ///    differs is kept under a minted `<id>#dup<n>` and counted separately, so
 ///    `restated` can never be hiding a real edit.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_re_emissions_are_restated_not_duplicated() {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 800)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 800)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
         return;
     }
 
@@ -639,15 +639,15 @@ fn claude_corpus_re_emissions_are_restated_not_duplicated() {
 }
 
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_parent_links_resolve() {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 400)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 400)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .take(200)
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
         return;
     }
 
@@ -769,21 +769,21 @@ fn assert_summaries_derivable(
 }
 
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_corpus_summaries_are_derivable() {
     assert_summaries_derivable(
         "codex",
-        corpus_files("AGSX_CODEX_CORPUS", "jsonl", 400),
+        corpus_files("AGS_CODEX_CORPUS", "jsonl", 400),
         codex_ir::read,
     );
 }
 
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_summaries_are_derivable() {
     assert_summaries_derivable(
         "claude-code",
-        corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 1600)
+        corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 1600)
             .into_iter()
             .filter(|path| is_claude_transcript(path))
             .take(400)
@@ -860,27 +860,27 @@ fn assert_live_diverges_from_all(
 }
 
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_corpus_live_summary_diverges_from_summary() {
     // Measured 0%. Compaction alone is in 303 of 400, and the visibility gate
     // moves `control`, `env_snapshot` and `turn_config` in all 400.
     assert_live_diverges_from_all(
         "codex",
-        corpus_files("AGSX_CODEX_CORPUS", "jsonl", 400),
+        corpus_files("AGS_CODEX_CORPUS", "jsonl", 400),
         codex_ir::read,
         20,
     );
 }
 
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_corpus_live_summary_diverges_from_summary() {
     // Measured 0% (1 of 200). Claude's live fraction is much higher than
     // Codex's — median 97% — but "nearly all" is not "all", and 5,054 of 8,837
     // messages across the sample are not live.
     assert_live_diverges_from_all(
         "claude-code",
-        corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 1600)
+        corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 1600)
             .into_iter()
             .filter(|path| is_claude_transcript(path))
             .take(400)
@@ -906,15 +906,15 @@ mod into_openclaw {
     use super::{corpus_files, is_claude_transcript};
 
     #[test]
-    #[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+    #[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
     fn claude_corpus_is_refused_without_creating_openclaw_state() {
-        let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", "jsonl", 1600)
+        let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", "jsonl", 1600)
             .into_iter()
             .filter(|path| is_claude_transcript(path))
             .take(400)
             .collect();
         if files.is_empty() {
-            eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+            eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
             return;
         }
 

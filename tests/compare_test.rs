@@ -13,8 +13,8 @@
 //! they skip rather than fail when it is absent. Run them explicitly:
 //!
 //! ```bash
-//! AGSX_CODEX_CORPUS="$HOME/.codex/sessions" \
-//! AGSX_CLAUDE_CORPUS="$HOME/.claude/projects" \
+//! AGS_CODEX_CORPUS="$HOME/.codex/sessions" \
+//! AGS_CLAUDE_CORPUS="$HOME/.claude/projects" \
 //!   cargo test --release --test compare_test -- --ignored --nocapture
 //! ```
 //!
@@ -75,21 +75,21 @@ fn is_claude_transcript(path: &Path) -> bool {
 }
 
 fn codex_corpus() -> Vec<PathBuf> {
-    let files = corpus_files("AGSX_CODEX_CORPUS", 600);
+    let files = corpus_files("AGS_CODEX_CORPUS", 600);
     if files.is_empty() {
-        eprintln!("AGSX_CODEX_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CODEX_CORPUS unset or empty; skipping");
     }
     files
 }
 
 fn claude_corpus() -> Vec<PathBuf> {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", 800)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", 800)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .take(200)
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
     }
     files
 }
@@ -327,7 +327,7 @@ impl Totals {
 /// on conservation rather than on those literals, so the test stays true as the
 /// corpus grows; the numbers are printed so a drift is visible.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_into_itself_is_clean() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -372,7 +372,7 @@ fn codex_into_itself_is_clean() {
 ///
 /// Measured ground truth: 175 transcripts, 20,073 events, 3,897 capsules.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_into_itself_is_clean() {
     let files = claude_corpus();
     if files.is_empty() {
@@ -415,7 +415,7 @@ fn claude_into_itself_is_clean() {
 /// the entire distinction this comparator exists to draw — a verifier that
 /// called this conversion damaged would be wrong about the case that matters.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_to_claude_loses_only_what_fits_predicted() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -465,7 +465,7 @@ fn codex_to_claude_loses_only_what_fits_predicted() {
 /// downgraded on the way out, and Claude never seals its history, so no
 /// conversation goes missing.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_to_codex_loses_only_the_thinking_signatures() {
     let files = claude_corpus();
     if files.is_empty() {

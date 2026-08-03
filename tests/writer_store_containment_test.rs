@@ -151,7 +151,7 @@ const VENDOR_OVERRIDES: &[&str] = &[
     "OPENCODE_DB_PATH",
     "XDG_CONFIG_HOME",
     "AIDER_CHAT_HISTORY_FILE",
-    "AGSX_STORE",
+    "AGS_STORE",
 ];
 
 struct EnvGuard {

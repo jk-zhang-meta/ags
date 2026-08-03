@@ -7,7 +7,7 @@ binary="${CASR_TEST_BINARY:-$cargo_target/debug/casr}"
 platform="$(uname -s)"
 test_tmp_root=/tmp
 [[ "$platform" != Darwin ]] || test_tmp_root=/private/tmp
-tmp="$(mktemp -d "$test_tmp_root/agsx-install-smoke.XXXXXX")"
+tmp="$(mktemp -d "$test_tmp_root/ags-install-smoke.XXXXXX")"
 export FAKE_REAL_NODE_BINARY="$(command -v node)"
 [[ -x "$FAKE_REAL_NODE_BINARY" ]]
 export FAKE_CONTEXT_RUNTIME_PLATFORM="$(
@@ -28,7 +28,7 @@ export FAKE_CONTEXT_RUNTIME_TARGET="$(
 
 cleanup() {
     case "$tmp" in
-        /tmp/agsx-install-smoke.*|/private/tmp/agsx-install-smoke.*) rm -rf -- "$tmp" ;;
+        /tmp/ags-install-smoke.*|/private/tmp/ags-install-smoke.*) rm -rf -- "$tmp" ;;
     esac
 }
 trap cleanup EXIT
@@ -557,7 +557,7 @@ run_installer() {
         PATH="$offline_guard_bin:$bin_dir:$PATH" \
         FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1 \
         OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-        VERSION=v0.3.0-agsx.1 \
+        VERSION=v0.3.0-ags.1 \
         "$project_root/install.sh" --offline "$artifact" --dest "$bin_dir" \
         --no-verify --quiet
 }
@@ -718,7 +718,7 @@ if env HOME="$rollback_home" \
     PATH="$offline_guard_bin:$rollback_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
     FAKE_CONTEXT_HEALTH_FAIL=codex \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$artifact" --dest "$rollback_bin" \
     --no-verify --quiet > "$tmp/rollback.out" 2> "$tmp/rollback.err"; then
     printf 'installer ignored a mandatory Context Mode health failure\n' >&2
@@ -794,7 +794,7 @@ if env HOME="$interrupted_home" \
     XDG_STATE_HOME="$interrupted_home/.local/state" \
     PATH="$offline_guard_bin:$interrupted_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$interrupted_missing_artifact" \
     --dest "$interrupted_bin" --no-verify \
     > "$tmp/interrupted.out" 2> "$tmp/interrupted.err"; then
@@ -865,7 +865,7 @@ if env HOME="$rmux_partial_home" \
     XDG_STATE_HOME="$rmux_partial_home/.local/state" \
     PATH="$offline_guard_bin:$rmux_partial_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$rmux_partial_missing" \
     --dest "$rmux_partial_bin" --no-verify \
     > "$tmp/rmux-partial.out" 2> "$tmp/rmux-partial.err"; then
@@ -968,7 +968,7 @@ env HOME="$rmux_resume_home" \
     XDG_STATE_HOME="$rmux_resume_home/.local/state" \
     PATH="$offline_guard_bin:$rmux_resume_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$rmux_resume_missing" \
     --dest "$rmux_resume_bin" --no-verify \
     > "$tmp/rmux-resume.out" 2> "$tmp/rmux-resume.err"
@@ -1011,7 +1011,7 @@ if env HOME="$new_failure_home" \
     PATH="$offline_guard_bin:$new_failure_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
     FAKE_CONTEXT_HEALTH_FAIL=codex \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$artifact" --dest "$new_failure_bin" \
     --no-verify --quiet > "$tmp/new-failure.out" \
     2> "$tmp/new-failure.err"; then
@@ -1041,7 +1041,7 @@ env HOME="$unmanaged_home" \
     XDG_STATE_HOME="$unmanaged_home/.local/state" \
     PATH="$offline_guard_bin:$unmanaged_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$artifact" --dest "$unmanaged_bin" \
     --no-verify --quiet > "$tmp/unmanaged.out" 2> "$tmp/unmanaged.err"
 grep -Fqx 'unmanaged' "$unmanaged_bin/ags"
@@ -1064,7 +1064,7 @@ env HOME="$symlink_home" \
     XDG_STATE_HOME="$symlink_home/.local/state" \
     PATH="$symlink_tools:$symlink_bin:/usr/bin:/bin" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$artifact" --dest "$symlink_bin" \
     --no-verify > "$tmp/symlink.out" 2> "$tmp/symlink.err"
 [[ ! -e "$skill_outside/SKILL.md" ]]
@@ -1081,7 +1081,7 @@ if env HOME="$missing_context_home" \
     XDG_STATE_HOME="$missing_context_home/.local/state" \
     PATH="$offline_guard_bin:$missing_context_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$artifact" --dest "$missing_context_bin" \
     --no-verify --quiet > "$tmp/missing-context.out" \
     2> "$tmp/missing-context.err"; then
@@ -1106,7 +1106,7 @@ if env HOME="$old_node_home" \
     PATH="$offline_guard_bin:$old_node_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
     FAKE_NODE_VERSION=v22.4.0 \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --offline "$artifact" --dest "$old_node_bin" \
     --no-verify --quiet > "$tmp/old-node.out" 2> "$tmp/old-node.err"; then
     printf 'installer accepted Node older than Context Mode requires\n' >&2
@@ -1262,7 +1262,7 @@ env HOME="$online_home" \
     )" \
     FAKE_ONLINE_ARTIFACT="$artifact" \
     ARTIFACT_URL=https://example.invalid/casr.tar.xz \
-    VERSION=v0.3.0-agsx.1 \
+    VERSION=v0.3.0-ags.1 \
     "$project_root/install.sh" --dest "$online_bin" --no-verify \
     --no-configure --no-skill --quiet \
     > "$tmp/online.out" 2> "$tmp/online.err"
@@ -1298,4 +1298,4 @@ if (( EUID == 0 )); then
     grep -Fq -- '--system cannot run as root' "$tmp/system-root.err"
 fi
 
-printf 'agsx install smoke passed (%s/%s)\n' "$platform" "$(uname -m)"
+printf 'ags install smoke passed (%s/%s)\n' "$platform" "$(uname -m)"

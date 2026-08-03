@@ -1501,7 +1501,7 @@ fn capsules_of(ir: &SessionIr) -> usize {
 /// constant was written — a fixed marker is a string the corpus already contains,
 /// so "the delivered session holds the appended work" would sometimes be true of
 /// a session nothing was appended to.
-const APPENDED_MARKER: &str = "agsx-second-hop-appended-work";
+const APPENDED_MARKER: &str = "ags-second-hop-appended-work";
 
 /// Synthesised user/assistant exchanges appended to each intermediate.
 ///

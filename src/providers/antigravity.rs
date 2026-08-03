@@ -112,9 +112,9 @@ pub struct Antigravity;
 const ANTIGRAVITY_SDK_REQUIRED: &str = "Antigravity target writes require Python and the official \
 `google-antigravity>=0.1.9` SDK. Install it with \
 `python3 -m pip install \"google-antigravity>=0.1.9\"`, or point \
-`AGSX_ANTIGRAVITY_PYTHON` at a Python interpreter where it is installed.";
+`AGS_ANTIGRAVITY_PYTHON` at a Python interpreter where it is installed.";
 
-const ANTIGRAVITY_PYTHON_ENV: &str = "AGSX_ANTIGRAVITY_PYTHON";
+const ANTIGRAVITY_PYTHON_ENV: &str = "AGS_ANTIGRAVITY_PYTHON";
 
 const SDK_PROBE: &str = r#"
 import importlib.metadata
@@ -159,10 +159,10 @@ class ReplayHandler(BaseHTTPRequestHandler):
       self.send_json({
           "object": "list",
           "data": [{
-              "id": "agsx-import",
+              "id": "ags-import",
               "object": "model",
               "created": 0,
-              "owned_by": "agsx",
+              "owned_by": "ags",
           }],
       })
       return
@@ -191,10 +191,10 @@ class ReplayHandler(BaseHTTPRequestHandler):
       self.end_headers()
       chunks = [
           {
-              "id": "chatcmpl-agsx",
+              "id": "chatcmpl-ags",
               "object": "chat.completion.chunk",
               "created": int(time.time()),
-              "model": "agsx-import",
+              "model": "ags-import",
               "choices": [{
                   "index": 0,
                   "delta": {"role": "assistant", "content": content},
@@ -202,10 +202,10 @@ class ReplayHandler(BaseHTTPRequestHandler):
               }],
           },
           {
-              "id": "chatcmpl-agsx",
+              "id": "chatcmpl-ags",
               "object": "chat.completion.chunk",
               "created": int(time.time()),
-              "model": "agsx-import",
+              "model": "ags-import",
               "choices": [{
                   "index": 0,
                   "delta": {},
@@ -220,10 +220,10 @@ class ReplayHandler(BaseHTTPRequestHandler):
       return
 
     self.send_json({
-        "id": "chatcmpl-agsx",
+        "id": "chatcmpl-ags",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": "agsx-import",
+        "model": "ags-import",
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
@@ -247,7 +247,7 @@ class ReplayHandler(BaseHTTPRequestHandler):
 
 def make_config(port, token, save_dir, app_data_dir, conversation_id=None):
   return LocalOpenAIAgentConfig(
-      model="agsx-import",
+      model="ags-import",
       base_url=f"http://127.0.0.1:{port}/{token}/v1",
       capabilities=types.CapabilitiesConfig(
           enabled_tools=types.BuiltinTools.none(),
@@ -333,7 +333,7 @@ def main():
   committed = False
   try:
     with tempfile.TemporaryDirectory(
-        prefix=".agsx-antigravity-", dir=cli_dir
+        prefix=".ags-antigravity-", dir=cli_dir
     ) as staging:
       staging = Path(staging)
       save_dir = staging / "conversations"
@@ -501,7 +501,7 @@ fn render_user_batch(messages: &[&CanonicalMessage]) -> String {
         .iter()
         .map(|message| {
             format!(
-                "[agsx imported {} message]\n{}",
+                "[ags imported {} message]\n{}",
                 role_label(&message.role),
                 message.content
             )
@@ -538,7 +538,7 @@ fn project_replay(session: &CanonicalSession) -> anyhow::Result<ReplayProjection
             };
             previous
                 .assistant
-                .push_str("\n\n[agsx imported assistant continuation]\n");
+                .push_str("\n\n[ags imported assistant continuation]\n");
             previous.assistant.push_str(&message.content);
             coalesced_assistant_messages += 1;
             continue;
@@ -673,8 +673,8 @@ fn render_import_transcript(session: &CanonicalSession) -> anyhow::Result<Vec<u8
             "status": "DONE",
             "content": content,
             "tool_calls": message.tool_calls,
-            "agsx_imported": true,
-            "agsx_original_role": role_label(&message.role),
+            "ags_imported": true,
+            "ags_original_role": role_label(&message.role),
         });
         if let Some(timestamp) = message.timestamp {
             step["created_at"] = serde_json::Value::Number(timestamp.into());
@@ -1396,17 +1396,17 @@ mod tests {
         assert!(
             projection.turns[0]
                 .user
-                .contains("[agsx imported system message]")
+                .contains("[ags imported system message]")
         );
         assert!(
             projection.turns[0]
                 .user
-                .contains("[agsx imported user message]")
+                .contains("[ags imported user message]")
         );
         assert!(
             projection.turns[0]
                 .assistant
-                .contains("[agsx imported assistant continuation]")
+                .contains("[ags imported assistant continuation]")
         );
     }
 

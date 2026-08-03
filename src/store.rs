@@ -136,7 +136,7 @@ pub enum StoreError {
 /// A session as the provider that owns it names it.
 ///
 /// The pair is the store's only external identifier for a session, because it
-/// is the only thing two `agsx` runs can agree on without reading a file:
+/// is the only thing two `ags` runs can agree on without reading a file:
 /// paths move, and session ids are unique only within a provider.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionKey {
@@ -538,7 +538,7 @@ impl Record {
     /// The incarnation a provider owns, if any.
     ///
     /// This is what turns a record id into something a provider can resume:
-    /// `agsx resume <record-id> --launch cc` needs the Claude Code session id,
+    /// `ags resume <record-id> --launch cc` needs the Claude Code session id,
     /// not ours.
     pub fn for_provider(&self, provider: &str) -> Option<&Incarnation> {
         self.incarnations
@@ -604,25 +604,25 @@ struct Manifest {
     created_by: String,
 }
 
-/// Where the store lives: `$AGSX_STORE`, else `dirs::data_dir()/agsx`, else
-/// `~/.agsx`.
+/// Where the store lives: `$AGS_STORE`, else `dirs::data_dir()/ags`, else
+/// `~/.ags`.
 pub fn default_root() -> anyhow::Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os("AGSX_STORE").filter(|value| !value.is_empty()) {
+    if let Some(explicit) = std::env::var_os("AGS_STORE").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(explicit));
     }
     if let Some(data) = dirs::data_dir() {
-        return Ok(data.join("agsx"));
+        return Ok(data.join("ags"));
     }
     if let Some(home) = dirs::home_dir() {
-        return Ok(home.join(".agsx"));
+        return Ok(home.join(".ags"));
     }
-    anyhow::bail!("cannot locate a session store: set AGSX_STORE to a directory")
+    anyhow::bail!("cannot locate a session store: set AGS_STORE to a directory")
 }
 
 /// A session store rooted at one directory.
 ///
 /// Holds no open handles. Every operation opens what it needs and closes it,
-/// so two `agsx` invocations can use one store without either holding a lock
+/// so two `ags` invocations can use one store without either holding a lock
 /// across a conversion.
 ///
 /// # Two invocations at once
@@ -770,7 +770,7 @@ impl Store {
     /// not about which file is freshest.
     ///
     /// The lookup and the write are one step against another invocation — see
-    /// [`locked`] — so two `agsx` runs ingesting one session converge on
+    /// [`locked`] — so two `ags` runs ingesting one session converge on
     /// one record instead of minting two and racing to claim the same key.
     pub fn ingest_origin(
         &self,
@@ -1924,7 +1924,7 @@ fn tally(ir: &SessionIr, target_vendor: Option<&str>) -> Inventory {
 ///
 /// A mutation runs as `BEGIN IMMEDIATE` … `COMMIT` on `index.sqlite`, which
 /// takes SQLite's write lock at the first statement rather than at the first
-/// write. That is what serialises two `agsx` invocations: the second blocks in
+/// write. That is what serialises two `ags` invocations: the second blocks in
 /// `BEGIN` for up to the connection's `busy_timeout`, and by the time it reads
 /// the index the first one's record is already there. Nothing expensive belongs
 /// inside it — hashing an origin and the conversion itself both happen outside.
@@ -2041,10 +2041,10 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "store-file".to_string());
     let staging = path.with_file_name(format!(
-        "{name}.agsx-new-{}",
+        "{name}.ags-new-{}",
         uuid::Uuid::new_v4().as_simple()
     ));
-    crate::pipeline::atomic_write(&staging, &bytes, false, "agsx-store")?;
+    crate::pipeline::atomic_write(&staging, &bytes, false, "ags-store")?;
     if let Err(err) = fs::rename(&staging, path) {
         let _ = fs::remove_file(&staging);
         return Err(err.into());
@@ -2407,7 +2407,7 @@ mod tests {
         let cache = store.record_dir(&record.id).join(IR_FILE);
         let mut raw: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&cache).expect("read")).expect("parse");
-        raw["ir_version"] = serde_json::Value::String("agsx-ir/1".to_string());
+        raw["ir_version"] = serde_json::Value::String("ags-ir/1".to_string());
         fs::write(&cache, serde_json::to_vec(&raw).expect("encode")).expect("plant");
 
         assert_eq!(store.load_ir(&record.id).expect("load"), None);

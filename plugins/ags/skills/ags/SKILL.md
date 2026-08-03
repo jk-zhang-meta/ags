@@ -179,8 +179,7 @@ and model fields accepted for profiles. Claude client arguments cannot forward
 `--agent`, `--agents`, `--setting-sources`, `--mcp-config`, `--plugin-dir`,
 `--plugin-url`, `--disallowedTools`, `--disallowed-tools`, `--safe-mode`, `--bare`, or
 `--strict-mcp-config`, because they can replace or disable the mandatory
-Context Mode configuration or tool set after AGS validates it. Claude `--tmux`
-is rejected because AGS already owns the RMUX terminal, and
+Context Mode configuration or tool set after AGS validates it.
 `--no-session-persistence` is rejected because it disables session recovery.
 `CLAUDE_CODE_SAFE_MODE` and `CLAUDE_CODE_SIMPLE` must also be unset or false.
 Any `apiKeyHelper` in Claude's active managed, user, project, local,
@@ -212,10 +211,10 @@ For Claude, `--cwd` also remaps the restored project transcript and UUID
 sidecar tree to the new workspace.
 
 Use `--to` only when the user explicitly asks to continue the record in the
-other Agent. Cross-Agent resume creates a new target UUID through agsx's
+other Agent. Cross-Agent resume creates a new target UUID through ags's
 structured converter, reads the target back with its native parser, and
 restores only the converted target main transcript. Report the fidelity and
-loss details printed by agsx. Provider-signed thinking, encrypted reasoning,
+loss details printed by ags. Provider-signed thinking, encrypted reasoning,
 and native sidecars cannot cross provider trust boundaries; never describe a
 cross-Agent conversion as lossless unless its reported fidelity says so.
 

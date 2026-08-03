@@ -38,7 +38,7 @@ fn fixtures_dir() -> PathBuf {
 
 /// Run `casr` with a disposable store and the given provider home variables.
 ///
-/// `AGSX_STORE` is removed rather than set: it overrides the `XDG_DATA_HOME`
+/// `AGS_STORE` is removed rather than set: it overrides the `XDG_DATA_HOME`
 /// redirect, so a value inherited from the developer's shell would aim these
 /// tests at the real session store.
 fn run(args: &[&str], envs: &[(&str, &Path)], store: &Path) -> String {
@@ -47,7 +47,7 @@ fn run(args: &[&str], envs: &[(&str, &Path)], store: &Path) -> String {
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    cmd.env_remove("AGSX_STORE");
+    cmd.env_remove("AGS_STORE");
     let out = cmd.output().expect("failed to run casr");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

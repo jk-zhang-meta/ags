@@ -16,7 +16,7 @@
 //!
 //! Aider has no native session IDs. casr derives a deterministic ID from the
 //! session start timestamp: `YYYY-MM-DDThh-mm-ss`. Histories written by casr
-//! carry an ignored metadata comment with a unique `agsx-<uuid>` ID.
+//! carry an ignored metadata comment with a unique `ags-<uuid>` ID.
 //!
 //! ## Multi-session files
 //!
@@ -47,7 +47,7 @@
 //! ## Writing
 //!
 //! casr never appends to Aider's shared history. Each conversion gets a
-//! dedicated `.aider.chat.history.agsx-<uuid>.md`, and the launch specification
+//! dedicated `.aider.chat.history.ags-<uuid>.md`, and the launch specification
 //! passes that exact path through `--chat-history-file` together with
 //! `--restore-chat-history`.
 
@@ -73,10 +73,10 @@ pub struct Aider;
 /// The fixed basename aider gives its Markdown chat history
 /// (`aider/args.py:274-287`).
 const HISTORY_FILE_NAME: &str = ".aider.chat.history.md";
-const GENERATED_HISTORY_PREFIX: &str = ".aider.chat.history.agsx-";
-const SESSION_ID_PREFIX: &str = "# agsx-convert session id: ";
-const WORKSPACE_PREFIX: &str = "# agsx-convert workspace: ";
-const MESSAGE_BOUNDARY: &str = "agsx-convert message boundary";
+const GENERATED_HISTORY_PREFIX: &str = ".aider.chat.history.ags-";
+const SESSION_ID_PREFIX: &str = "# ags session id: ";
+const WORKSPACE_PREFIX: &str = "# ags workspace: ";
+const MESSAGE_BOUNDARY: &str = "ags message boundary";
 
 /// Represents a single parsed session within an Aider history file.
 struct ParsedSession {
@@ -762,7 +762,7 @@ impl Provider for Aider {
         let root = Self::write_root()?;
         std::fs::create_dir_all(&root)
             .with_context(|| format!("failed to create Aider history directory {}", root.display()))?;
-        let session_id = format!("agsx-{}", uuid::Uuid::new_v4().simple());
+        let session_id = format!("ags-{}", uuid::Uuid::new_v4().simple());
         let target_path = root.join(format!(".aider.chat.history.{session_id}.md"));
         let workspace = session
             .workspace
@@ -1547,7 +1547,7 @@ Response three
             model_name: Some("claude-3".to_string()),
         };
 
-        let session_id = "agsx-test-session";
+        let session_id = "ags-test-session";
         let history = Aider::render_history(&session, session_id, tmp_dir.path())
             .expect("render independent history");
         let path = tmp_dir

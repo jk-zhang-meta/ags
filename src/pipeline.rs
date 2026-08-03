@@ -1512,7 +1512,7 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
                 grade: Fidelity::ConversationOnly,
                 note: format!(
                     "{assistant_notes} assistant message(s) were written as gateway-injected \
-                     assistant notes labeled `agsx:v1:assistant`: the words and visible source \
+                     assistant notes labeled `ags:v1:assistant`: the words and visible source \
                      label survive, but OpenClaw does not treat them as original model output."
                 ),
             });
@@ -1672,7 +1672,7 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str> {
     match role {
         MessageRole::User => (target_slug == "openclaw")
-            .then_some("gateway-injected assistant notes labeled `agsx:v1:user`"),
+            .then_some("gateway-injected assistant notes labeled `ags:v1:user`"),
         MessageRole::Assistant => None,
         // `claude_code.rs:703`, `amp.rs:418`, `kiro.rs:1541`,
         // `aider.rs:594`, `cline.rs:build_hub_messages`,
@@ -1684,7 +1684,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
                 Some("plain user turns")
             }
             "antigravity" => Some("labelled text inside Antigravity user turns"),
-            "openclaw" => Some("gateway-injected assistant notes labeled `agsx:v1:system`"),
+            "openclaw" => Some("gateway-injected assistant notes labeled `ags:v1:system`"),
             "amp" => Some("`info` records"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
             _ => None,
@@ -1695,7 +1695,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
                 Some("plain user turns")
             }
             "antigravity" => Some("labelled text inside Antigravity user turns"),
-            "openclaw" => Some("gateway-injected assistant notes labeled `agsx:v1:other`"),
+            "openclaw" => Some("gateway-injected assistant notes labeled `ags:v1:other`"),
             "amp" => Some("`info` records"),
             "kiro" => Some("`Prompt` records, which Kiro replays as the user"),
             _ => None,
@@ -1711,7 +1711,7 @@ pub fn folded_role(target_slug: &str, role: &MessageRole) -> Option<&'static str
             "aider" | "claude-code" | "cline" | "opencode" => Some("plain user turns"),
             "antigravity" => Some("labelled text inside Antigravity user turns"),
             "grok" => Some("assistant tool events"),
-            "openclaw" => Some("gateway-injected assistant notes labeled `agsx:v1:tool`"),
+            "openclaw" => Some("gateway-injected assistant notes labeled `ags:v1:tool`"),
             "amp" => Some("`info` records"),
             _ => None,
         },
@@ -2949,9 +2949,9 @@ mod tests {
         assert!(losses.iter().any(|loss| {
             loss.kind == LossKind::Metadata
                 && loss.events == 1
-                && loss.note.contains("agsx:v1:assistant")
+                && loss.note.contains("ags:v1:assistant")
         }));
-        for marker in ["agsx:v1:user", "agsx:v1:system", "agsx:v1:tool"] {
+        for marker in ["ags:v1:user", "ags:v1:system", "ags:v1:tool"] {
             assert!(
                 losses.iter().any(|loss| loss.note.contains(marker)),
                 "missing OpenClaw projection loss for {marker}"

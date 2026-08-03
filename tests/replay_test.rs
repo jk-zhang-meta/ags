@@ -11,8 +11,8 @@
 //! absent. Run them explicitly:
 //!
 //! ```bash
-//! AGSX_CODEX_CORPUS="$HOME/.codex/sessions" \
-//! AGSX_CLAUDE_CORPUS="$HOME/.claude/projects" \
+//! AGS_CODEX_CORPUS="$HOME/.codex/sessions" \
+//! AGS_CLAUDE_CORPUS="$HOME/.claude/projects" \
 //!   cargo test --release --test replay_test -- --ignored --nocapture
 //! ```
 //!
@@ -60,21 +60,21 @@ fn is_claude_transcript(path: &Path) -> bool {
 }
 
 fn codex_corpus() -> Vec<PathBuf> {
-    let files = corpus_files("AGSX_CODEX_CORPUS", 600);
+    let files = corpus_files("AGS_CODEX_CORPUS", 600);
     if files.is_empty() {
-        eprintln!("AGSX_CODEX_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CODEX_CORPUS unset or empty; skipping");
     }
     files
 }
 
 fn claude_corpus() -> Vec<PathBuf> {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", 800)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", 800)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .take(200)
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
     }
     files
 }
@@ -178,7 +178,7 @@ fn assert_plan_is_well_formed(path: &Path, ir: &SessionIr, plan: &ReplayPlan) {
 /// it, so a resolver that models compaction as "remove these ids" ends up
 /// replaying a preamble and nothing else.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_compacted_rollouts_replay_at_least_their_last_context() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -226,7 +226,7 @@ fn codex_compacted_rollouts_replay_at_least_their_last_context() {
 /// that is asserted below, because with any one of them wrong the rule fires on
 /// zero of 714 real rollbacks while the unit tests stay green.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_rollback_is_bounded_and_aborts_remove_nothing() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -320,7 +320,7 @@ fn codex_rollback_is_bounded_and_aborts_remove_nothing() {
 /// naive one truncates a compacted transcript to the handful of records
 /// written after the boundary, because compaction re-roots the graph.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_compacted_transcripts_survive_the_fork_prune() {
     let files = claude_corpus();
     if files.is_empty() {
@@ -368,7 +368,7 @@ fn claude_compacted_transcripts_survive_the_fork_prune() {
 /// forks are rare: 79 events across 173 transcripts when this was written. A
 /// prune that started eating live turns would move this by orders of magnitude.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_fork_prune_stays_a_minority_of_the_transcript() {
     let files = claude_corpus();
     if files.is_empty() {
@@ -418,7 +418,7 @@ fn claude_fork_prune_stays_a_minority_of_the_transcript() {
 /// `live_head: None` — and a future reader that started synthesising a head
 /// would break it silently.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_never_loses_events_to_the_fork_prune() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -455,7 +455,7 @@ fn codex_never_loses_events_to_the_fork_prune() {
 
 /// `model_visible()` and `resolve()` must not drift apart again.
 #[test]
-#[ignore = "requires a local corpus; set AGSX_CODEX_CORPUS and AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local corpus; set AGS_CODEX_CORPUS and AGS_CLAUDE_CORPUS"]
 fn model_visible_agrees_with_the_resolver() {
     let mut checked = 0usize;
     for path in codex_corpus() {
@@ -502,7 +502,7 @@ fn model_visible_agrees_with_the_resolver() {
 /// means this measurement is stale and the ordering is now load-bearing. Do not
 /// "fix" it by sorting the replay again.
 #[test]
-#[ignore = "requires a local corpus; set AGSX_CODEX_CORPUS and AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local corpus; set AGS_CODEX_CORPUS and AGS_CLAUDE_CORPUS"]
 fn compactions_are_recorded_in_file_order_and_marked_model_visible() {
     let mut compactions = 0usize;
     let mut out_of_order = 0usize;
@@ -596,7 +596,7 @@ fn compactions_are_recorded_in_file_order_and_marked_model_visible() {
 /// chain cannot reach the boundary is a fact about the graph, not a licence to
 /// delete the post-compaction session.
 #[test]
-#[ignore = "requires a local corpus; set AGSX_CODEX_CORPUS and AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local corpus; set AGS_CODEX_CORPUS and AGS_CLAUDE_CORPUS"]
 fn the_newest_checkpoint_context_is_never_pruned() {
     let mut compacted = 0usize;
     let mut pruned_sessions = 0usize;
@@ -669,10 +669,10 @@ fn the_newest_checkpoint_context_is_never_pruned() {
 /// without. Both numbers were established by measurement rather than by
 /// argument, so they are pinned here rather than restated in a comment.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn measured_transcripts_keep_their_replay_size() {
-    let Ok(root) = std::env::var("AGSX_CLAUDE_CORPUS") else {
-        eprintln!("AGSX_CLAUDE_CORPUS unset; skipping");
+    let Ok(root) = std::env::var("AGS_CLAUDE_CORPUS") else {
+        eprintln!("AGS_CLAUDE_CORPUS unset; skipping");
         return;
     };
     let by_stem: HashMap<String, PathBuf> = walkdir::WalkDir::new(root)
@@ -2001,7 +2001,7 @@ fn claude_non_explicit_head_advances_with_vendor_main_chain() {
 /// comes from an independent reimplementation of the vendor's graph rewrite
 /// and leaf walk. The corpus remains private and read-only.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_replay_matches_vendor_record_for_record() {
     let files = claude_corpus();
     if files.is_empty() {

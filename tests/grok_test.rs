@@ -275,11 +275,11 @@ fn cli_convert_into_grok_is_refused_without_official_cli() {
         .env("GROK_BIN", &missing_bin)
         .env("CLAUDE_HOME", tmp.path().join("claude"))
         // `resume` consults the session store, which defaults to the real
-        // `dirs::data_dir()/agsx`. Without this the refusal below still happens,
+        // `dirs::data_dir()/ags`. Without this the refusal below still happens,
         // but only after the store has filed this fixture as the origin of a new
         // conversation in the developer's own store, referencing a path inside a
         // `tempfile` directory that is about to be deleted.
-        .env("AGSX_STORE", tmp.path().join("agsx-store"))
+        .env("AGS_STORE", tmp.path().join("ags-store"))
         .output()
         .expect("run casr resume grok");
 

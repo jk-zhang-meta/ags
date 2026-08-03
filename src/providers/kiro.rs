@@ -1478,7 +1478,7 @@ fn rfc3339_micros(dt: chrono::DateTime<chrono::Utc>) -> String {
 fn generated_message_group(envelope: &serde_json::Value) -> Option<(String, u8, MessageRole)> {
     let id = envelope.pointer("/data/message_id")?.as_str()?;
     let mut parts = id.split(':');
-    if parts.next() != Some("agsx") {
+    if parts.next() != Some("ags") {
         return None;
     }
     let role_code = parts.next()?;
@@ -1596,7 +1596,7 @@ fn message_to_envelopes(msg: &CanonicalMessage) -> Vec<serde_json::Value> {
         result_payloads.push((content, results));
     }
 
-    let message_id = format!("agsx:{role_code}:{}", uuid::Uuid::new_v4());
+    let message_id = format!("ags:{role_code}:{}", uuid::Uuid::new_v4());
     let envelope =
         |kind: &str,
          content: Vec<serde_json::Value>,
@@ -1862,7 +1862,7 @@ mod tests {
             a_env["data"]["message_id"]
                 .as_str()
                 .unwrap()
-                .starts_with("agsx:a:")
+                .starts_with("ags:a:")
         );
         assert_eq!(
             a_env["data"]["message_id"], result_env["data"]["message_id"],
@@ -1887,7 +1887,7 @@ mod tests {
 
     #[test]
     fn native_or_malformed_group_ids_do_not_merge_messages() {
-        for id in ["00000000-0000-4000-8000-000000000001", "agsx:a:not-a-uuid"] {
+        for id in ["00000000-0000-4000-8000-000000000001", "ags:a:not-a-uuid"] {
             let mut journal = tempfile::NamedTempFile::with_suffix(".jsonl").unwrap();
             writeln!(
                 journal,
@@ -1933,7 +1933,7 @@ mod tests {
 
     #[test]
     fn generated_groups_do_not_merge_across_non_message_records() {
-        let id = "agsx:a:00000000-0000-4000-8000-000000000001";
+        let id = "ags:a:00000000-0000-4000-8000-000000000001";
         for separator in [
             "this is not json at all",
             r#"{"version":"v1","kind":"Compaction","data":{"summary":"older context","messages_snapshot":[]}}"#,

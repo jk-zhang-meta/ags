@@ -20,8 +20,7 @@ use casr::budget::ContextBudget;
 use casr::discovery::ProviderRegistry;
 use casr::ir::Fidelity;
 use casr::launch::{
-    LaunchSpec, RMUX_PAYLOAD_ENV, RMUX_SOCKET_NAME, STORAGE_MODE_ENV, SessionTargeting,
-    managed_session_name, rmux_version_supported,
+    LaunchSpec, SessionTargeting,
 };
 use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
 use casr::providers::{Provider, SessionListing, read_dir_reporting, walk_entry_reporting};
@@ -82,27 +81,6 @@ enum Command {
     /// Print an embedded checkpoint installer asset.
     #[command(hide = true)]
     CheckpointAsset { name: String },
-
-    /// Enter one AGS-owned RMUX runtime and run the payload only if it is new.
-    #[command(hide = true, trailing_var_arg = true)]
-    TerminalLaunch {
-        runtime_key: String,
-        program: String,
-        #[arg(value_name = "AGENT_ARGS", num_args = 0.., allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Execute the shell-free Agent payload inside an AGS RMUX pane.
-    #[command(hide = true)]
-    TerminalPayload,
-
-    /// Attach an existing AGS runtime, or exit 3 when it is not live.
-    #[command(hide = true)]
-    TerminalAttach { runtime_key: String },
-
-    /// Print the opaque RMUX session name for an AGS runtime key.
-    #[command(hide = true)]
-    TerminalName { runtime_key: String },
 
     /// Convert and resume a session from another provider.
     ///
@@ -411,17 +389,6 @@ fn main() -> ExitCode {
                 Ok(ExitCode::SUCCESS)
             },
         ),
-        Command::TerminalLaunch {
-            runtime_key,
-            program,
-            args,
-        } => cmd_terminal_launch(&runtime_key, program, args),
-        Command::TerminalPayload => cmd_terminal_payload(),
-        Command::TerminalAttach { runtime_key } => cmd_terminal_attach(&runtime_key),
-        Command::TerminalName { runtime_key } => {
-            println!("{}", managed_session_name(&runtime_key));
-            Ok(ExitCode::SUCCESS)
-        }
         Command::Resume {
             target,
             session_id,
@@ -520,93 +487,6 @@ fn cmd_checkpoint(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn cmd_terminal_launch(
-    runtime_key: &str,
-    program: String,
-    args: Vec<String>,
-) -> anyhow::Result<ExitCode> {
-    let mut spec = LaunchSpec::new(program, args).in_dir(std::env::current_dir()?);
-    if let Ok(mode) = std::env::var(STORAGE_MODE_ENV)
-        && !mode.is_empty()
-    {
-        spec = spec.with_env(STORAGE_MODE_ENV, mode);
-    }
-    launch_agent(&spec, runtime_key)
-}
-
-fn cmd_terminal_payload() -> anyhow::Result<ExitCode> {
-    let payload = std::env::var(RMUX_PAYLOAD_ENV)
-        .map_err(|_| anyhow::anyhow!("managed RMUX payload is missing"))?;
-    let spec = LaunchSpec::from_managed_payload(&payload)
-        .map_err(|error| anyhow::anyhow!("managed RMUX payload is invalid: {error}"))?;
-    launch_payload(&spec)
-}
-
-fn cmd_terminal_attach(runtime_key: &str) -> anyhow::Result<ExitCode> {
-    let rmux = resolve_rmux()?;
-    let session_name = managed_session_name(runtime_key);
-    let output = std::process::Command::new(&rmux)
-        .args([
-            "-L",
-            RMUX_SOCKET_NAME,
-            "-f",
-            rmux_empty_config_for_cli(),
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ])
-        .output()
-        .map_err(|error| anyhow::anyhow!("failed to query RMUX sessions: {error}"))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        if error.contains("No such file or directory") {
-            return Ok(ExitCode::from(3));
-        }
-        anyhow::bail!("failed to query RMUX sessions: {}", error.trim());
-    }
-    if !String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|candidate| candidate == session_name)
-    {
-        return Ok(ExitCode::from(3));
-    }
-
-    attach_rmux(&rmux, &session_name)
-}
-
-fn rmux_empty_config_for_cli() -> &'static str {
-    if cfg!(windows) { "NUL" } else { "/dev/null" }
-}
-
-fn resolve_rmux() -> anyhow::Result<PathBuf> {
-    let bundled = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|directory| directory.join("rmux")))
-        .filter(|path| path.is_file());
-    let rmux = bundled.or_else(|| which::which("rmux").ok()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "A compatible RMUX 0.9.x release (0.9.1 or newer) is required for every interactive AGS session but is not installed"
-        )
-    })?;
-    let output = std::process::Command::new(&rmux)
-        .arg("-V")
-        .output()
-        .map_err(|error| anyhow::anyhow!("cannot read the RMUX version: {error}"))?;
-    let version = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() || !rmux_version_supported(&version) {
-        let found = version.trim();
-        anyhow::bail!(
-            "A compatible RMUX 0.9.x release (0.9.1 or newer) is required; found {}",
-            if found.is_empty() {
-                "an unrecognized RMUX version"
-            } else {
-                found
-            }
-        );
-    }
-    Ok(rmux)
-}
-
 /// Extract a short error type name for JSON output.
 fn error_type_name(e: &anyhow::Error) -> &'static str {
     if let Some(casr_err) = e.downcast_ref::<casr::error::CasrError>() {
@@ -685,7 +565,7 @@ fn open_store(no_store: bool, dry_run: bool) -> Option<casr::store::Store> {
 
 /// Turn one of our record ids into a session the pipeline can resolve.
 ///
-/// `agsx resume cc <record-id>` is the point of having our own identifier: one id
+/// `ags resume cc <record-id>` is the point of having our own identifier: one id
 /// for a conversation however many providers it has been through. No provider has
 /// heard of it, so it is translated here, and the pair returned is `(session_id,
 /// source_hint)` — the hint pins the provider so that a native session id that
@@ -1030,17 +910,10 @@ fn launch_blocker(
             spec.program
         ));
     }
-    if !launch.dry_run
-        && let Err(error) = resolve_rmux()
-    {
-        return Some(format!(
-            "{error}. The session was converted and written; no unmanaged agent was started."
-        ));
-    }
     if !launch.dry_run && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
         return Some(
             "an interactive AGS launch requires a real terminal on stdin and stdout. The session \
-             was converted and written; no RMUX session or unmanaged agent was started."
+             was converted and written; no agent was started."
                 .to_string(),
         );
     }
@@ -1055,7 +928,7 @@ fn launch_blocker(
     {
         return Some(format!(
             "mandatory Context Mode verification failed for {}: {error}. The session was \
-             converted and written; no RMUX session or unmanaged agent was started",
+             converted and written; no agent was started",
             provider.name()
         ));
     }
@@ -1111,10 +984,7 @@ fn run_launch(
         return Ok(ExitCode::SUCCESS);
     }
 
-    launch_agent(
-        &spec,
-        &format!("conversion/{}/{}", provider.slug(), written.session_id),
-    )
+    launch_agent(&spec)
 }
 
 /// Emit a launch-time line, unless the JSON envelope already carries it.
@@ -1128,115 +998,32 @@ fn launch_line(json_mode: bool, line: &str) {
     }
 }
 
-/// Enter the agent's AGS-owned RMUX runtime, replacing this process where the
-/// OS allows it.
+/// Replace this process with the Agent, in the very shell AGS was started from.
 ///
-/// `new-session -A` attaches when the runtime is already alive and creates it
-/// otherwise. RMUX owns the Agent PTY, so the process survives when this outer
-/// terminal disconnects.
+/// AGS deliberately owns no terminal of its own: the Agent inherits this PTY
+/// unchanged, so nothing re-emulates the terminal underneath it.
 #[cfg(unix)]
-fn launch_agent(spec: &LaunchSpec, runtime_key: &str) -> anyhow::Result<ExitCode> {
+fn launch_agent(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
     use std::os::unix::process::CommandExt;
 
     // exec discards anything still buffered, including the written paths.
     let _ = std::io::stdout().flush();
-    let rmux = resolve_rmux()?;
-    let runner = std::env::current_exe()
-        .map_err(|error| anyhow::anyhow!("cannot resolve the AGS launcher binary: {error}"))?;
-    let error = spec.managed_command(&rmux, &runner, runtime_key).exec();
+    let error = spec.command().exec();
     Err(anyhow::anyhow!(
-        "failed to enter the managed RMUX session for `{}`: {error}",
+        "failed to start `{}`: {error}",
         spec.program
-    ))
-}
-
-#[cfg(unix)]
-fn launch_payload(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
-    use std::os::unix::process::CommandExt;
-
-    let mut command = spec.command();
-    command.env_remove(RMUX_PAYLOAD_ENV);
-    let error = command.exec();
-    Err(anyhow::anyhow!(
-        "failed to start managed Agent payload `{}`: {error}",
-        spec.program
-    ))
-}
-
-#[cfg(unix)]
-fn attach_rmux(rmux: &Path, session_name: &str) -> anyhow::Result<ExitCode> {
-    use std::os::unix::process::CommandExt;
-
-    let error = std::process::Command::new(rmux)
-        .args([
-            "-L",
-            RMUX_SOCKET_NAME,
-            "-f",
-            rmux_empty_config_for_cli(),
-            "attach-session",
-            "-t",
-            session_name,
-        ])
-        .exec();
-    Err(anyhow::anyhow!(
-        "failed to attach RMUX session `{session_name}`: {error}"
     ))
 }
 
 #[cfg(not(unix))]
-fn launch_agent(spec: &LaunchSpec, runtime_key: &str) -> anyhow::Result<ExitCode> {
+fn launch_agent(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
     let _ = std::io::stdout().flush();
-    let rmux = resolve_rmux()?;
-    let runner = std::env::current_exe()
-        .map_err(|error| anyhow::anyhow!("cannot resolve the AGS launcher binary: {error}"))?;
-    let status = spec
-        .managed_command(&rmux, &runner, runtime_key)
-        .status()
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to enter the managed RMUX session for `{}`: {error}",
-                spec.program
-            )
-        })?;
-    // A signal death carries no code; reporting it as success would tell a
-    // script the session ended cleanly when it was killed.
-    Ok(status
-        .code()
-        .map_or(ExitCode::FAILURE, |code| ExitCode::from(code as u8)))
-}
-
-#[cfg(not(unix))]
-fn launch_payload(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
     let status = spec
         .command()
-        .env_remove(RMUX_PAYLOAD_ENV)
         .status()
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to start managed Agent payload `{}`: {error}",
-                spec.program
-            )
-        })?;
-    Ok(status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from))
-}
-
-#[cfg(not(unix))]
-fn attach_rmux(rmux: &Path, session_name: &str) -> anyhow::Result<ExitCode> {
-    let status = std::process::Command::new(rmux)
-        .args([
-            "-L",
-            RMUX_SOCKET_NAME,
-            "-f",
-            rmux_empty_config_for_cli(),
-            "attach-session",
-            "-t",
-            session_name,
-        ])
-        .status()
-        .map_err(|error| anyhow::anyhow!("failed to attach RMUX session: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("failed to start `{}`: {error}", spec.program))?;
+    // A signal death carries no code; reporting it as success would tell a
+    // script the session ended cleanly when it was killed.
     Ok(status
         .code()
         .and_then(|code| u8::try_from(code).ok())

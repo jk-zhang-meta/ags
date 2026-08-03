@@ -10,8 +10,8 @@
 //! it is absent. Run them explicitly:
 //!
 //! ```bash
-//! AGSX_CODEX_CORPUS="$HOME/.codex/sessions" \
-//! AGSX_CLAUDE_CORPUS="$HOME/.claude/projects" \
+//! AGS_CODEX_CORPUS="$HOME/.codex/sessions" \
+//! AGS_CLAUDE_CORPUS="$HOME/.claude/projects" \
 //!   cargo test --release --test roundtrip_ir_test -- --ignored --nocapture
 //! ```
 //!
@@ -75,21 +75,21 @@ fn is_claude_transcript(path: &Path) -> bool {
 }
 
 fn codex_corpus() -> Vec<PathBuf> {
-    let files = corpus_files("AGSX_CODEX_CORPUS", 600);
+    let files = corpus_files("AGS_CODEX_CORPUS", 600);
     if files.is_empty() {
-        eprintln!("AGSX_CODEX_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CODEX_CORPUS unset or empty; skipping");
     }
     files
 }
 
 fn claude_corpus() -> Vec<PathBuf> {
-    let files: Vec<PathBuf> = corpus_files("AGSX_CLAUDE_CORPUS", 800)
+    let files: Vec<PathBuf> = corpus_files("AGS_CLAUDE_CORPUS", 800)
         .into_iter()
         .filter(|path| is_claude_transcript(path))
         .take(200)
         .collect();
     if files.is_empty() {
-        eprintln!("AGSX_CLAUDE_CORPUS unset or empty; skipping");
+        eprintln!("AGS_CLAUDE_CORPUS unset or empty; skipping");
     }
     files
 }
@@ -405,7 +405,7 @@ fn assert_identical(path: &Path, source: &SessionIr, target: &SessionIr) {
 /// catalogue payload, and `encrypted_content` blocks buried in `agent_message`
 /// content. All four are in the corpus and none is in a fixture.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_round_trips_into_itself_without_loss() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -445,7 +445,7 @@ fn codex_round_trips_into_itself_without_loss() {
 /// up to three events (`thinking`, `tool_use`, coalesced text), so the writer
 /// has to put them back into one record without merging two records into one.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_round_trips_into_itself_without_loss() {
     let files = claude_corpus();
     if files.is_empty() {
@@ -486,7 +486,7 @@ fn claude_round_trips_into_itself_without_loss() {
 /// blob costs a train of thought Anthropic would have stripped anyway, while a
 /// dropped `SealedContext` blob costs the conversation itself.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_to_claude_loses_only_what_cannot_cross() {
     let files = codex_corpus();
     if files.is_empty() {
@@ -564,7 +564,7 @@ fn codex_to_claude_loses_only_what_cannot_cross() {
 /// one calling convention, so nothing is downgraded on the way out, and Claude
 /// never seals its history, so no conversation goes missing.
 #[test]
-#[ignore = "requires a local Claude corpus; set AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local Claude corpus; set AGS_CLAUDE_CORPUS"]
 fn claude_to_codex_loses_only_the_thinking_signatures() {
     let files = claude_corpus();
     if files.is_empty() {

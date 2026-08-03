@@ -376,19 +376,19 @@ fn withheld_rollouts_are_still_resolvable_by_id() {
 ///
 /// The corpus is only ever read.
 #[test]
-#[ignore = "requires a local Codex corpus; set AGSX_CODEX_CORPUS"]
+#[ignore = "requires a local Codex corpus; set AGS_CODEX_CORPUS"]
 fn codex_corpus_listing_withholds_every_subagent_rollout() {
-    let Ok(corpus) = std::env::var("AGSX_CODEX_CORPUS") else {
-        eprintln!("AGSX_CODEX_CORPUS unset; skipping");
+    let Ok(corpus) = std::env::var("AGS_CODEX_CORPUS") else {
+        eprintln!("AGS_CODEX_CORPUS unset; skipping");
         return;
     };
     let corpus = PathBuf::from(corpus);
     if corpus.file_name().and_then(|n| n.to_str()) != Some("sessions") {
-        eprintln!("AGSX_CODEX_CORPUS must name <CODEX_HOME>/sessions; skipping");
+        eprintln!("AGS_CODEX_CORPUS must name <CODEX_HOME>/sessions; skipping");
         return;
     }
     let Some(home) = corpus.parent().map(Path::to_path_buf) else {
-        eprintln!("AGSX_CODEX_CORPUS has no parent to use as CODEX_HOME; skipping");
+        eprintln!("AGS_CODEX_CORPUS has no parent to use as CODEX_HOME; skipping");
         return;
     };
 

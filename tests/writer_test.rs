@@ -2410,11 +2410,11 @@ fn openclaw_history_page(
                     "text": format!(
                         "[{}]\n\n{}",
                         match message.role {
-                            MessageRole::User => "agsx:v1:user",
-                            MessageRole::Assistant => "agsx:v1:assistant",
-                            MessageRole::System => "agsx:v1:system",
-                            MessageRole::Tool => "agsx:v1:tool",
-                            MessageRole::Other(_) => "agsx:v1:other",
+                            MessageRole::User => "ags:v1:user",
+                            MessageRole::Assistant => "ags:v1:assistant",
+                            MessageRole::System => "ags:v1:system",
+                            MessageRole::Tool => "ags:v1:tool",
+                            MessageRole::Other(_) => "ags:v1:other",
                         },
                         message.content
                     ),
@@ -2484,9 +2484,9 @@ fn writer_openclaw_uses_gateway_and_restores_marked_roles() {
     let written = OpenClaw
         .write_session(&session, &WriteOptions { force: true })
         .expect("OpenClaw Gateway import");
-    assert!(written.session_id.starts_with("agent:main:dashboard:agsx-"));
+    assert!(written.session_id.starts_with("agent:main:dashboard:ags-"));
     assert!(
-        written.paths[0].starts_with(state_dir.join(".agsx-gateway")),
+        written.paths[0].starts_with(state_dir.join(".ags-gateway")),
         "virtual locator must remain under the OpenClaw state root"
     );
     assert!(
@@ -2618,10 +2618,10 @@ fn reader_openclaw_pages_oldest_to_newest_past_the_thousand_message_boundary() {
     )
     .unwrap();
 
-    let session_key = "agent:main:dashboard:agsx-0123456789abcdef0123456789abcdef";
+    let session_key = "agent:main:dashboard:ags-0123456789abcdef0123456789abcdef";
     std::fs::write(PathBuf::from(format!("{}.key", log.display())), session_key).unwrap();
     let locator = state_dir
-        .join(".agsx-gateway")
+        .join(".ags-gateway")
         .join(urlencoding::encode(session_key).as_ref())
         .join(OPENCLAW_GATEWAY_SESSION_ID);
 

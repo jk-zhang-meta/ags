@@ -127,16 +127,16 @@ const OPENCLAW_CLI_REQUIRED: &str = "OpenClaw is read/resume-only on this machin
 require the official `openclaw` CLI in PATH (or OPENCLAW_BIN), a running authenticated Gateway \
 granting `operator.admin`, \
 and Gateway RPCs `sessions.create`, `chat.inject`, `chat.history`, `sessions.patch`, and \
-`sessions.delete` (introduced in OpenClaw 2026.7.2). agsx-convert never edits OpenClaw's database \
+`sessions.delete` (introduced in OpenClaw 2026.7.2). ags never edits OpenClaw's database \
 or session index directly.";
-const GATEWAY_LOCATOR_DIR: &str = ".agsx-gateway";
-const IMPORT_SESSION_PREFIX: &str = "agent:main:dashboard:agsx-";
-const IMPORT_LABEL_PREFIX: &str = "agsx:v1:";
+const GATEWAY_LOCATOR_DIR: &str = ".ags-gateway";
+const IMPORT_SESSION_PREFIX: &str = "agent:main:dashboard:ags-";
+const IMPORT_LABEL_PREFIX: &str = "ags:v1:";
 const GATEWAY_TIMEOUT_MS: &str = "30000";
 const HISTORY_PAGE_LIMIT: u64 = 1000;
 const LOSSY_IMPORT_WARNING: &str = "OpenClaw stores every imported turn as a native \
-gateway-injected assistant note. Visible `agsx:v1:<role>` labels preserve the source role for \
-agsx-convert read-back, but OpenClaw's model sees assistant-role notes rather than the original \
+gateway-injected assistant note. Visible `ags:v1:<role>` labels preserve the source role for \
+ags read-back, but OpenClaw's model sees assistant-role notes rather than the original \
 user/system/tool role semantics.";
 
 /// OpenClaw's default agent id. Native sessions are keyed by agent, and an
@@ -949,7 +949,7 @@ impl OpenClaw {
         gateway_session_id: Option<&str>,
     ) -> anyhow::Result<()> {
         if !is_import_session_key(session_key) {
-            anyhow::bail!("refusing to delete a non-agsx OpenClaw session key");
+            anyhow::bail!("refusing to delete a non-ags OpenClaw session key");
         }
         let mut patch = serde_json::json!({
             "key": session_key,
@@ -1240,11 +1240,11 @@ fn is_uuid(candidate: &str) -> bool {
 
 fn import_role_label(role: &MessageRole) -> &'static str {
     match role {
-        MessageRole::User => "agsx:v1:user",
-        MessageRole::Assistant => "agsx:v1:assistant",
-        MessageRole::System => "agsx:v1:system",
-        MessageRole::Tool => "agsx:v1:tool",
-        MessageRole::Other(_) => "agsx:v1:other",
+        MessageRole::User => "ags:v1:user",
+        MessageRole::Assistant => "ags:v1:assistant",
+        MessageRole::System => "ags:v1:system",
+        MessageRole::Tool => "ags:v1:tool",
+        MessageRole::Other(_) => "ags:v1:other",
     }
 }
 

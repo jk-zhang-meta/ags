@@ -64,7 +64,7 @@ claude --resume <new-session-id>
 
 ## Encrypted Checkpoints
 
-`agsx` includes AGS's encrypted checkpoint, identity, Git/SFTP synchronization,
+`ags` includes AGS's encrypted checkpoint, identity, Git/SFTP synchronization,
 tombstone, transactional restore runtime, and RMUX-managed live terminals:
 
 ```bash
@@ -230,7 +230,7 @@ the record. Cleanup is exact-record and retryable after interruption: a newer
 checkpoint may reuse the old logical ID without being selected, and the active
 encrypted archive is moved last so every partial move remains recoverable.
 
-AGS forces RMUX for interactive Agent launches made through `ags` and agsx
+AGS forces RMUX for interactive Agent launches made through `ags` and ags
 `--launch`. Direct `claude`/`codex` commands and the optional `cc`/`cod`
 compatibility wrappers remain direct executables for scripts and
 non-interactive modes; using them explicitly opts out of AGS terminal
@@ -292,13 +292,13 @@ Notes:
   no direct system/tool/assistant injection API, so adjacent messages are
   visibly labelled and coalesced where necessary; a trailing unanswered
   user-side turn is refused instead of inventing an assistant reply. Set
-  `AGSX_ANTIGRAVITY_PYTHON` when the SDK is installed in a non-default Python
+  `AGS_ANTIGRAVITY_PYTHON` when the SDK is installed in a non-default Python
   environment.
 - `OpenCode` target writes require its official `opencode` CLI in `PATH` (or
   `OPENCODE_BIN`). casr delegates import and rollback to the vendor CLI and
   never edits `opencode.db` directly.
 - Aider target writes create a dedicated
-  `.aider.chat.history.agsx-<session-id>.md` and launch Aider with that exact
+  `.aider.chat.history.ags-<session-id>.md` and launch Aider with that exact
   file. They never append to the shared `.aider.chat.history.md`.
 - Grok target writes require the official `grok` CLI in `PATH` (or `GROK_BIN`).
   casr writes Grok's documented authoritative `summary.json` and
@@ -309,11 +309,11 @@ Notes:
   `OPENCLAW_BIN`), a running authenticated Gateway granting `operator.admin`,
   and the `sessions.create`,
   `chat.inject`, `chat.history`, `sessions.patch`, and `sessions.delete` RPCs
-  introduced in OpenClaw 2026.7.2. agsx-convert creates the session and verifies
+  introduced in OpenClaw 2026.7.2. ags creates the session and verifies
   it through the Gateway, then uses archive-and-delete for rollback; it never
   edits OpenClaw's SQLite database or session index. This import is deliberately
   marked lossy: OpenClaw stores every imported turn as a gateway-injected
-  assistant note with a visible `agsx:v1:<role>` label, so the text and labels
+  assistant note with a visible `ags:v1:<role>` label, so the text and labels
   survive but the original user/system/tool role semantics do not.
 - Cline target writes require the official `cline` CLI in `PATH` (or
   `CLINE_BIN`). casr uses Cline's local Hub `client.register` →
@@ -377,7 +377,7 @@ Run `bash install.sh --help` for the full option set.
 ### Alternative: From Source
 
 ```bash
-git clone -b agsx https://github.com/jk-zhang-meta/ags
+git clone -b ags https://github.com/jk-zhang-meta/ags
 cd ags
 cargo build --release
 ./target/release/casr --help

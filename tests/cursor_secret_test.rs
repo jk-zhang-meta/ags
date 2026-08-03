@@ -66,7 +66,7 @@ fn run(args: &[&str], root: &Path, store: &Path) -> String {
         .env("CURSOR_CONFIG_DIR", root)
         .env("CURSOR_DATA_DIR", root)
         .env("XDG_DATA_HOME", store)
-        .env_remove("AGSX_STORE");
+        .env_remove("AGS_STORE");
     let out = cmd.output().expect("failed to run casr");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

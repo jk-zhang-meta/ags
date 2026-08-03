@@ -589,7 +589,7 @@ fn no_store_consults_nothing_and_creates_nothing() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let _redirect = redirect(tmp.path());
     let would_be = tmp.path().join("store");
-    let _store_env = EnvGuard::set("AGSX_STORE", &would_be);
+    let _store_env = EnvGuard::set("AGS_STORE", &would_be);
 
     let result = convert(&pipeline(None), "cc", &fixture(CODEX_WITH_CAPSULES))
         .expect("codex -> claude with no store");
@@ -887,7 +887,7 @@ fn a_record_id_resolves_to_the_session_a_provider_can_resume() {
 /// session store.
 ///
 /// The store is on by default, so `casr resume …` writes to
-/// `dirs::data_dir()/agsx` — a real store belonging to whoever is running the
+/// `dirs::data_dir()/ags` — a real store belonging to whoever is running the
 /// suite — unless the test says otherwise. That is not hypothetical: turning the
 /// store on made `grok_test::cli_convert_into_grok_is_refused` file a fixture as
 /// the origin of a new conversation in the author's own store, pointing at a path
@@ -922,7 +922,7 @@ fn every_cli_test_that_resumes_redirects_the_store() {
             continue;
         }
         checked += 1;
-        let redirects = source.contains("AGSX_STORE")
+        let redirects = source.contains("AGS_STORE")
             || source.contains("XDG_DATA_HOME")
             || source.contains("--no-store");
         if !redirects {
@@ -942,8 +942,8 @@ fn every_cli_test_that_resumes_redirects_the_store() {
     assert!(
         offenders.is_empty(),
         "{offenders:?} run `casr resume` in a child process without redirecting the session \
-         store, so they write into the real one at `dirs::data_dir()/agsx`. Set \
-         `AGSX_STORE` or `XDG_DATA_HOME` to a temp directory on the command, or pass \
+         store, so they write into the real one at `dirs::data_dir()/ags`. Set \
+         `AGS_STORE` or `XDG_DATA_HOME` to a temp directory on the command, or pass \
          `--no-store`."
     );
 }

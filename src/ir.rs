@@ -67,7 +67,7 @@ use crate::model::MessageRole;
 /// The enforcement point arrives with the session store, which is the first
 /// thing that will persist an IR and therefore the first thing that can read a
 /// stale one.
-pub const IR_VERSION: &str = "agsx-ir/2";
+pub const IR_VERSION: &str = "ags-ir/2";
 
 // ---------------------------------------------------------------------------
 // Session

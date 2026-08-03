@@ -22,12 +22,12 @@
 //! prints a skip reason rather than passing quietly:
 //!
 //! ```bash
-//! AGSX_CODEX_CORPUS="$HOME/.codex/sessions" \
-//! AGSX_CLAUDE_CORPUS="$HOME/.claude/projects" \
+//! AGS_CODEX_CORPUS="$HOME/.codex/sessions" \
+//! AGS_CLAUDE_CORPUS="$HOME/.claude/projects" \
 //!   cargo test --release --test conformance_test -- --ignored --nocapture
 //! ```
 //!
-//! Any `AGSX_<anything>_CORPUS` variable is picked up, by suffix rather than by
+//! Any `AGS_<anything>_CORPUS` variable is picked up, by suffix rather than by
 //! name, so a new provider's corpus root needs no edit here either.
 //!
 //! # The corpus is read-only
@@ -150,7 +150,7 @@ fn structured_providers_conform_on_the_fixtures() {
 // Tier 2: the real corpus. Skips loudly.
 // ---------------------------------------------------------------------------
 
-/// Every root named by an `AGSX_<something>_CORPUS` variable.
+/// Every root named by an `AGS_<something>_CORPUS` variable.
 ///
 /// Selected by shape rather than by name so that a new provider's corpus root
 /// is picked up without an edit; the battery works out which reader owns each
@@ -158,7 +158,7 @@ fn structured_providers_conform_on_the_fixtures() {
 fn corpus_roots() -> Vec<(String, PathBuf)> {
     let mut roots: Vec<(String, PathBuf)> = std::env::vars()
         .filter(|(key, value)| {
-            key.starts_with("AGSX_") && key.ends_with("_CORPUS") && !value.trim().is_empty()
+            key.starts_with("AGS_") && key.ends_with("_CORPUS") && !value.trim().is_empty()
         })
         .map(|(key, value)| (key, PathBuf::from(value)))
         .collect();
@@ -170,9 +170,9 @@ fn corpus_roots() -> Vec<(String, PathBuf)> {
 ///
 /// The cap exists because the largest single rollout in the local corpus is
 /// 281 MiB and every source session is written once per structured target;
-/// `AGSX_CONFORMANCE_LIMIT` raises or lowers it.
+/// `AGS_CONFORMANCE_LIMIT` raises or lowers it.
 fn corpus_files() -> Vec<PathBuf> {
-    let limit: usize = std::env::var("AGSX_CONFORMANCE_LIMIT")
+    let limit: usize = std::env::var("AGS_CONFORMANCE_LIMIT")
         .ok()
         .and_then(|raw| raw.parse().ok())
         .unwrap_or(700);
@@ -206,12 +206,12 @@ fn corpus_files() -> Vec<PathBuf> {
 /// `agent_message`, the record split that turns one native line into three
 /// events. None of those is in a fixture.
 #[test]
-#[ignore = "requires a local session corpus; set AGSX_CODEX_CORPUS / AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local session corpus; set AGS_CODEX_CORPUS / AGS_CLAUDE_CORPUS"]
 fn structured_providers_conform_on_the_corpus() {
     let files = corpus_files();
     if files.is_empty() {
         eprintln!(
-            "\n════ conformance tier \"corpus\": DID NOT RUN — no AGSX_*_CORPUS root is set, so \
+            "\n════ conformance tier \"corpus\": DID NOT RUN — no AGS_*_CORPUS root is set, so \
              nothing below was checked against a real session. The fixtures tier is the only \
              evidence this run produced.\n"
         );
@@ -245,12 +245,12 @@ fn the_second_hop_does_not_lose_what_the_store_could_have_supplied() {
 
 /// The same chain on real sessions.
 #[test]
-#[ignore = "requires a local session corpus; set AGSX_CODEX_CORPUS / AGSX_CLAUDE_CORPUS"]
+#[ignore = "requires a local session corpus; set AGS_CODEX_CORPUS / AGS_CLAUDE_CORPUS"]
 fn the_second_hop_recovers_the_corpus_capsules_the_first_hop_could_not_carry() {
     let files = corpus_files();
     if files.is_empty() {
         eprintln!(
-            "\n════ second hop, tier \"corpus\": DID NOT RUN — no AGSX_*_CORPUS root is set, so \
+            "\n════ second hop, tier \"corpus\": DID NOT RUN — no AGS_*_CORPUS root is set, so \
              the payoff below was not measured against a real session.\n"
         );
         return;

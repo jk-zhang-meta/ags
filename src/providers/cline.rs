@@ -111,7 +111,7 @@ const HUB_DISCOVERY_PATH: &str = "locks/hub/production.json";
 const HUB_AUTH_PROTOCOL_PREFIX: &str = "cline-hub-auth.";
 
 const CLINE_CLI_REQUIRED: &str = "Cline is read/resume-only on this machine: target writes require \
-the official `cline` CLI in PATH (or CLINE_BIN). agsx uses the vendor's local Hub create, read, \
+the official `cline` CLI in PATH (or CLINE_BIN). ags uses the vendor's local Hub create, read, \
 and delete lifecycle and will not modify Cline's database or session indexes directly.";
 
 type HubSocket = WebSocket<TcpStream>;
@@ -145,7 +145,7 @@ impl HubClient {
                 .as_deref()
                 .is_some_and(|version| version != "v1")
         {
-            anyhow::bail!("Cline Hub protocol is incompatible (agsx requires protocol v1)");
+            anyhow::bail!("Cline Hub protocol is incompatible (ags requires protocol v1)");
         }
         if discovery.url.trim().is_empty()
             || discovery.auth_token.trim().is_empty()
@@ -211,7 +211,7 @@ impl HubClient {
 
         Ok(Self {
             socket,
-            client_id: format!("agsx-{}", uuid::Uuid::new_v4().simple()),
+            client_id: format!("ags-{}", uuid::Uuid::new_v4().simple()),
         })
     }
 
@@ -221,7 +221,7 @@ impl HubClient {
         payload: serde_json::Value,
         session_id: Option<&str>,
     ) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
-        let request_id = format!("agsx-{}", uuid::Uuid::new_v4().simple());
+        let request_id = format!("ags-{}", uuid::Uuid::new_v4().simple());
         let mut envelope = serde_json::json!({
             "version": "v1",
             "command": command,
@@ -325,8 +325,8 @@ impl HubClient {
             "client.register",
             serde_json::json!({
                 "clientId": self.client_id,
-                "clientType": "agsx-convert",
-                "displayName": "agsx-convert",
+                "clientType": "ags",
+                "displayName": "ags",
                 "transport": "native",
                 "actorKind": "client",
                 "workspaceContext": {
@@ -879,7 +879,7 @@ impl Cline {
                     .as_deref()
                     .filter(|id| !id.trim().is_empty())
                     .map(String::from)
-                    .unwrap_or_else(|| format!("agsx-call-{message_index}-{call_index}"));
+                    .unwrap_or_else(|| format!("ags-call-{message_index}-{call_index}"));
                 let tool_name = if call.name.trim().is_empty() {
                     "tool".to_string()
                 } else {
@@ -927,7 +927,7 @@ impl Cline {
                         .map(String::from)
                         .or_else(|| unmatched_calls.pop_front())
                         .unwrap_or_else(|| {
-                            format!("agsx-result-{message_index}-{result_index}")
+                            format!("ags-result-{message_index}-{result_index}")
                         });
                     if let Some(position) = unmatched_calls
                         .iter()
@@ -1678,7 +1678,7 @@ impl Provider for Cline {
         let data_dir = Self::write_data_dir()?;
         let (workspace, warnings) = Self::workspace_for_write(session)?;
         let mut hub = Self::connected_hub(&binary, &data_dir, &workspace)?;
-        let session_id = format!("agsx-{}", uuid::Uuid::new_v4().simple());
+        let session_id = format!("ags-{}", uuid::Uuid::new_v4().simple());
         if hub.session_exists(&session_id)? {
             anyhow::bail!("Cline Hub already contains generated session ID {session_id}");
         }
@@ -1702,10 +1702,10 @@ impl Provider for Cline {
                     "enableAgentTeams": false,
                 },
                 "metadata": {
-                    "source": "agsx-convert",
+                    "source": "ags",
                     "interactive": false,
                     "title": title,
-                    "importedBy": "agsx-convert",
+                    "importedBy": "ags",
                     "sourceProvider": session.provider_slug,
                     "sourceModel": session.model_name,
                 },
@@ -2403,8 +2403,8 @@ mod tests {
     #[test]
     fn writer_resume_command() {
         assert_eq!(
-            Cline.resume_command("agsx-session"),
-            "cline --id agsx-session"
+            Cline.resume_command("ags-session"),
+            "cline --id ags-session"
         );
     }
 

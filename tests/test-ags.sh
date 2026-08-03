@@ -577,7 +577,7 @@ chmod +x "$tmp/home/.local/bin/npm"
 cat > "$tmp/home/.local/bin/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-log="${BASH_SOURCE[0]%/*}/../agsx.log"
+log="${BASH_SOURCE[0]%/*}/../ags.log"
 state="${FAKE_CONTEXT_PLUGIN_STATE_DIR:-}"
 fake_codex_config_append() {
     local block="$1" config_home config_file
@@ -964,6 +964,7 @@ fi
 case "${1:-}" in
     resume) [[ ! -e "/dev/fd/9" ]] || { printf 'FD9_OPEN\n'; exit 99; } ;;
 esac
+printf 'LAUNCH=%s %s\n' "$0" "$*" >> "$log"
 printf 'FAKE_CODEX'
 for argument in "$@"; do printf ' <%s>' "$argument"; done
 printf '\nFAKE_PWD=%s\n' "$PWD"
@@ -972,7 +973,7 @@ chmod +x "$tmp/home/.local/bin/codex"
 cat > "$tmp/home/.local/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-log="${BASH_SOURCE[0]%/*}/../agsx.log"
+log="${BASH_SOURCE[0]%/*}/../ags.log"
 state="${FAKE_CONTEXT_PLUGIN_STATE_DIR:-}"
 if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
       -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
@@ -1150,6 +1151,7 @@ fi
 case "${1:-}" in
     --resume) [[ ! -e "/dev/fd/9" ]] || { printf 'FD9_OPEN\n'; exit 99; } ;;
 esac
+printf 'LAUNCH=%s %s\n' "$0" "$*" >> "$log"
 printf 'FAKE_CLAUDE'
 for argument in "$@"; do printf ' <%s>' "$argument"; done
 printf '\nFAKE_PWD=%s\n' "$PWD"
@@ -1166,7 +1168,7 @@ cat > "$tmp/home/.local/bin/casr" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-log="${BASH_SOURCE[0]%/*}/../agsx.log"
+log="${BASH_SOURCE[0]%/*}/../ags.log"
 if [[ "${1:-}" == --version ]]; then
     printf 'casr 0.3.0-test\n'
     exit
@@ -1176,46 +1178,10 @@ fi
 if [[ "${1:-}" == checkpoint-register-codex ]]; then
     [[ $# == 4 && -f "$3" && "$4" == /* ]]
     printf 'REGISTER=%s\t%s\t%s\n' "$2" "$3" "$4" >> "$log"
-    [[ "${AGSX_REGISTER_FAIL:-0}" == 0 ]]
+    [[ "${AGS_REGISTER_FAIL:-0}" == 0 ]]
     exit
 fi
 
-if [[ "${1:-}" == terminal-name ]]; then
-    [[ $# == 2 ]]
-    printf 'ags-%s\n' "$(printf '%s' "$2" | sha256sum | cut -c1-20)"
-    exit
-fi
-
-if [[ "${1:-}" == terminal-launch ]]; then
-    [[ $# -ge 4 && "${3:-}" == -- ]]
-    runtime_key="$2"
-    shift 3
-    printf 'TERMINAL=%s\t%s\n' "$runtime_key" "$*" >> "$log"
-    exec "$@"
-fi
-
-if [[ "${1:-}" == terminal-attach ]]; then
-    [[ $# == 2 ]]
-    if [[ -n "${FAKE_TERMINAL_ATTACH_AFTER:-}" ]]; then
-        count_file="${FAKE_TERMINAL_ATTACH_COUNT_FILE:?}"
-        count=0
-        [[ ! -f "$count_file" ]] || count="$(<"$count_file")"
-        count=$((count + 1))
-        printf '%s\n' "$count" > "$count_file"
-        if (( count > FAKE_TERMINAL_ATTACH_AFTER )); then
-            printf 'ATTACH_PROBE=%s\n' "$2" >> "$log"
-            printf 'FAKE_TERMINAL_ATTACHED %s\n' "$2"
-            exit 0
-        fi
-        exit 3
-    fi
-    if [[ "${FAKE_TERMINAL_ATTACH:-0}" == 1 ]]; then
-        printf 'ATTACH_PROBE=%s\n' "$2" >> "$log"
-        printf 'FAKE_TERMINAL_ATTACHED %s\n' "$2"
-        exit 0
-    fi
-    exit 3
-fi
 
 [[ "${1:-}" == --json ]]
 shift
@@ -1299,77 +1265,6 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$tmp/home/.local/bin/casr"
-cat > "$tmp/home/.local/bin/rmux" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${1:-}" == -V ]]; then
-    printf 'rmux %s\n' "${FAKE_RMUX_VERSION:-0.9.1}"
-    exit
-fi
-if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
-      -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
-      -n "${RCLONE_SFTP_PASS:-}" ]]; then
-    printf 'RMUX_TRANSPORT_SECRET_LEAK\n' >&2
-    exit 98
-fi
-printf 'RMUX=%s\n' "$*" >> "${BASH_SOURCE[0]%/*}/../agsx.log"
-target=
-previous=
-for argument in "$@"; do
-    if [[ "$previous" == -t ]]; then
-        target="$argument"
-        break
-    fi
-    previous="$argument"
-done
-case " $* " in
-    *" list-sessions "*)
-        if [[ "${FAKE_RMUX_LIST_ERROR:-0}" == 1 ]]; then
-            printf 'rmux: synthetic protocol failure\n' >&2
-            exit 64
-        fi
-        if [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" ]]; then
-            [[ -f "$FAKE_RMUX_SESSIONS_FILE" ]] && cut -f1 "$FAKE_RMUX_SESSIONS_FILE"
-        elif [[ -n "${FAKE_RMUX_LIVE_SESSION:-}" ]]; then
-            printf '%s\n' "$FAKE_RMUX_LIVE_SESSION"
-        fi
-        ;;
-    *" display-message "*)
-        [[ -n "$target" ]]
-        [[ "$target" != "${FAKE_RMUX_STALE_SESSION:-}" ]] || exit 1
-        if [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" ]]; then
-            awk -F '\t' -v target="$target" '
-                $1 == target { print $2 "\t" $3; found=1; exit }
-                END { if (!found) exit 1 }
-            ' "$FAKE_RMUX_SESSIONS_FILE"
-        else
-            printf 'codex\t/test/workspace\n'
-        fi
-        ;;
-    *" attach-session "*)
-        [[ -n "$target" ]]
-        [[ "${FAKE_RMUX_ATTACH_FAIL:-0}" == 0 ]]
-        if [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" ]]; then
-            awk -F '\t' -v target="$target" '$1 == target { found=1 } END { exit !found }' \
-                "$FAKE_RMUX_SESSIONS_FILE"
-        fi
-        printf 'FAKE_RMUX_ATTACHED %s\n' "$*"
-        ;;
-    *" kill-session "*)
-        [[ -n "$target" ]]
-        [[ "${FAKE_RMUX_KILL_FAIL:-0}" == 0 ]]
-        [[ -n "${FAKE_RMUX_SESSIONS_FILE:-}" && -f "$FAKE_RMUX_SESSIONS_FILE" ]]
-        awk -F '\t' -v target="$target" '
-            $1 == target { found=1; next }
-            { print }
-            END { if (!found) exit 1 }
-        ' "$FAKE_RMUX_SESSIONS_FILE" > "$FAKE_RMUX_SESSIONS_FILE.tmp"
-        mv -f -- "$FAKE_RMUX_SESSIONS_FILE.tmp" "$FAKE_RMUX_SESSIONS_FILE"
-        ;;
-    *) exit 64 ;;
-esac
-EOF
-chmod +x "$tmp/home/.local/bin/rmux"
 cat > "$tmp/home/.local/bin/rm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1692,8 +1587,8 @@ source_env=(
     AGENT_SESSION_DIR="$tmp/store"
     AGENT_SESSION_STATE_DIR="$tmp/state"
     AGENT_SESSION_SSH_KEY="$tmp/key"
-    AGSX_CONVERTER_BINARY="$tmp/home/.local/bin/casr"
-    AGSX_CONVERTER_VERSION=0.3.0-test
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/casr"
+    AGS_CONVERTER_VERSION=0.3.0-test
     FAKE_RCLONE_ROOT="$tmp/remote"
 )
 
@@ -1799,7 +1694,7 @@ jq -n --arg root "$context_runtime_root" \
 converted_claude_id=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff
 converted_codex_id=01999999-aaaa-7bbb-8ccc-dddddddddddd
 
-terminal_count_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+launch_count_before="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
 if env "${managed_env[@]}" \
     FAKE_CONTEXT_PLUGIN_STATE_DIR="$tmp/missing-context-plugin" \
     "$tool" codex > "$tmp/missing-context-plugin.out" \
@@ -1812,8 +1707,8 @@ if ! grep -Fq 'Context Mode is not enabled for Codex; run ags init' \
     sed -n '1,120p' "$tmp/missing-context-plugin.err" >&2
     exit 1
 fi
-terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 
 fresh_codex="$(
     env "${managed_env[@]}" "$tool" codex --model o3 \
@@ -1842,96 +1737,20 @@ assert_fresh_codex_profile \
 assert_fresh_codex_profile \
     'FAKE_CODEX <--yolo> <-psub2api>' \
     --yolo -psub2api
-described_codex="$(
-    env "${managed_env[@]}" "$tool" \
-        --description 'Profile investigation' \
-        codex --yolo --profile sub2api
-)"
-grep -Fqx 'FAKE_CODEX <--yolo> <--profile> <sub2api>' <<< "$described_codex"
-described_runtime="$(
-    grep '^TERMINAL=fresh/codex/' "$tmp/home/.local/agsx.log" | tail -n 1
-)"
-described_runtime="${described_runtime#TERMINAL=}"
-described_runtime="${described_runtime%%$'\t'*}"
-described_session="$(
-    "$tmp/home/.local/bin/casr" terminal-name "$described_runtime"
-)"
-described_metadata="$tmp/state/live-sessions/$described_session.json"
-jq -e '
-    .schema == 1 and .session_name == $session and
-    .description == "Profile investigation" and
-    .agent == "codex" and .source == "fresh" and
-    (.cwd | startswith("/"))
-' --arg session "$described_session" "$described_metadata" >/dev/null
-[[ "$(stat -c %a "$tmp/state/live-sessions")" == 700 ]]
-[[ "$(stat -c %a "$described_metadata")" == 600 ]]
-
 agent_owned_description="$(
     env "${managed_env[@]}" "$tool" codex --description native-description
 )"
 grep -Fqx 'FAKE_CODEX <--description> <native-description>' \
     <<< "$agent_owned_description"
-long_live_basename="$(printf '界%.0s' {1..60})$(printf 'x%.0s' {1..35})"
-long_live_cwd="$tmp/$long_live_basename"
-mkdir -p "$long_live_cwd"
-for default_agent in codex claude; do
-    case "$default_agent" in
-        codex)
-            default_suffix=' - Codex'
-            default_output='FAKE_CODEX <--model> <long-default-description>'
-            ;;
-        claude)
-            default_suffix=' - Claude'
-            default_output='FAKE_CLAUDE <--model> <long-default-description>'
-            ;;
-    esac
-    long_default_output="$(
-        cd "$long_live_cwd"
-        env "${managed_env[@]}" LC_ALL=C "$tool" "$default_agent" \
-            --model long-default-description
-    )"
-    grep -Fqx "$default_output" <<< "$long_default_output"
-    long_default_runtime="$(
-        grep "^TERMINAL=fresh/$default_agent/" \
-            "$tmp/home/.local/agsx.log" | tail -n 1
-    )"
-    long_default_runtime="${long_default_runtime#TERMINAL=}"
-    long_default_runtime="${long_default_runtime%%$'\t'*}"
-    long_default_session="$(
-        "$tmp/home/.local/bin/casr" terminal-name "$long_default_runtime"
-    )"
-    expected_default_description="$(
-        printf '%s' "$long_live_basename" | jq -Rsr --arg suffix "$default_suffix" '
-            .[0:(80 - ($suffix | length))] + $suffix
-        '
-    )"
-    jq -e --arg description "$expected_default_description" \
-        --arg cwd "$long_live_cwd" --arg agent "$default_agent" '
-          .description == $description and (.description | length) == 80 and
-          .cwd == $cwd and .agent == $agent and .source == "fresh"
-        ' "$tmp/state/live-sessions/$long_default_session.json" >/dev/null
-done
-terminal_count_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
-for invalid_description in '' $'line\nbreak' "$(printf 'x%.0s' {1..81})"; do
-    if env "${managed_env[@]}" "$tool" \
-        --description "$invalid_description" codex \
-        > "$tmp/invalid-live-description.out" \
-        2> "$tmp/invalid-live-description.err"; then
-        echo 'managed Codex accepted an invalid live description' >&2
-        exit 1
-    fi
-done
-terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
 if grep -Eq '^CODEX_APP_SERVER=.*(^|[[:space:]])(-p|--profile)' \
-    "$tmp/home/.local/agsx.log"; then
+    "$tmp/home/.local/ags.log"; then
     echo 'managed Codex leaked a runtime profile into app-server' >&2
     exit 1
 fi
 printf '%s\n' '[features]' 'hooks = false' \
     > "$tmp/source/codex/hooks-off.config.toml"
-terminal_count_before="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
+launch_count_before="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
 if env "${managed_env[@]}" "$tool" codex --profile hooks-off \
     > "$tmp/codex-profile-hooks-off.out" \
     2> "$tmp/codex-profile-hooks-off.err"; then
@@ -1940,9 +1759,9 @@ if env "${managed_env[@]}" "$tool" codex --profile hooks-off \
 fi
 grep -Fq 'Context Mode hook source or shape does not match' \
     "$tmp/codex-profile-hooks-off.err"
-terminal_count_after="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 scrubbed_codex="$(
     env "${managed_env[@]}" \
         AGENT_SESSION_REMOTE_PASSWORD=remote-secret \
@@ -1951,8 +1770,8 @@ scrubbed_codex="$(
         "$tool" codex --model scrubbed
 )"
 grep -Fqx 'FAKE_CODEX <--model> <scrubbed>' <<< "$scrubbed_codex"
-grep -Eq '^TERMINAL=fresh/codex/[^[:space:]]+[[:space:]].*/codex --model o3$' \
-    "$tmp/home/.local/agsx.log"
+grep -Eq '^LAUNCH=.*/codex --model o3$' \
+    "$tmp/home/.local/ags.log"
 fresh_codex_owned_args="$(
     env "${managed_env[@]}" "$tool" codex --to claude --model o3
 )"
@@ -1970,8 +1789,8 @@ fresh_claude="$(
     env "${managed_env[@]}" "$tool" claude --model sonnet
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$fresh_claude"
-grep -Eq '^TERMINAL=fresh/claude/[^[:space:]]+[[:space:]].*/claude --model sonnet$' \
-    "$tmp/home/.local/agsx.log"
+grep -Eq '^LAUNCH=.*/claude --model sonnet$' \
+    "$tmp/home/.local/ags.log"
 fresh_claude_owned_args="$(
     env "${managed_env[@]}" "$tool" claude --to codex --model sonnet
 )"
@@ -2023,8 +1842,8 @@ grep -Fqx \
 unsafe_claude_settings="$tmp/unsafe-claude.settings.json"
 jq -n '{enabledPlugins:{"context-mode@context-mode":false}}' \
     > "$unsafe_claude_settings"
-terminal_count_before="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
+launch_count_before="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
 if env "${managed_env[@]}" "$tool" claude \
     --settings "$unsafe_claude_settings" \
     >"$tmp/unsafe-claude-settings.out" \
@@ -2034,14 +1853,14 @@ if env "${managed_env[@]}" "$tool" claude \
 fi
 grep -Fq 'Claude --settings may contain only' \
     "$tmp/unsafe-claude-settings.err"
-terminal_count_after="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 
 assert_managed_claude_settings_rejected() {
     local label="$1" settings="$2" expected="$3" forbidden="${4:-}"
-    terminal_count_before="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_before="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
     if env "${managed_env[@]}" "$tool" claude --settings "$settings" \
         >"$tmp/claude-settings-$label.out" \
@@ -2055,10 +1874,10 @@ assert_managed_claude_settings_rejected() {
         echo "managed Claude leaked rejected settings: $label" >&2
         exit 1
     fi
-    terminal_count_after="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_after="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
-    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+    [[ "$launch_count_after" == "$launch_count_before" ]]
 }
 
 multi_document_claude_settings="$tmp/multi-document-claude.settings.json"
@@ -2106,8 +1925,8 @@ assert_managed_claude_settings_rejected \
 
 assert_managed_claude_source_settings_rejected() {
     local label="$1" workdir="$2" expected="$3" forbidden="${4:-}"
-    terminal_count_before="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_before="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
     if (
         cd -- "$workdir"
@@ -2123,10 +1942,10 @@ assert_managed_claude_source_settings_rejected() {
         echo "managed Claude leaked rejected source settings: $label" >&2
         exit 1
     fi
-    terminal_count_after="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_after="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
-    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+    [[ "$launch_count_after" == "$launch_count_before" ]]
 }
 
 claude_settings_repo="$tmp/claude-settings-repo"
@@ -2197,8 +2016,8 @@ jq -n --arg command "touch $managed_helper_side_effect" \
 sed "s|\"/etc/claude-code/managed-settings.json\"|\"$managed_settings_fixture\"|" \
     "$tool" > "$managed_settings_tool"
 chmod +x "$managed_settings_tool"
-terminal_count_before="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
+launch_count_before="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
 if (
     cd -- "$claude_settings_repo/subdir"
     env "${managed_env[@]}" "$managed_settings_tool" claude \
@@ -2210,9 +2029,9 @@ if (
 fi
 grep -Fq 'Claude managed settings must be one JSON object and apiKeyHelper' \
     "$tmp/claude-source-settings-managed.err"
-terminal_count_after="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 [[ ! -e "$managed_helper_side_effect" ]]
 
 printf '%s\n%s\n' '{}' '{}' > "$tmp/source/claude/settings.json"
@@ -2244,10 +2063,10 @@ replacement_claude_settings="$tmp/replacement-claude.settings.json"
 replacement_helper_side_effect="$tmp/replacement-helper-side-effect"
 jq -n --arg command "touch $replacement_helper_side_effect" \
     '{apiKeyHelper:$command}' > "$replacement_claude_settings"
-terminal_count_before="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
+launch_count_before="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
 claude_probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 if env "${managed_env[@]}" \
     FAKE_CLAUDE_REPLACE_SETTINGS_WITH="$replacement_claude_settings" \
     "$tool" claude --model replacement-race \
@@ -2258,11 +2077,11 @@ if env "${managed_env[@]}" \
 fi
 grep -Fq 'Claude user settings must be one JSON object and apiKeyHelper' \
     "$tmp/claude-replacement-race.err"
-terminal_count_after="$(grep -c '^TERMINAL=' \
-    "$tmp/home/.local/agsx.log" || true)"
+launch_count_after="$(grep -c '^LAUNCH=' \
+    "$tmp/home/.local/ags.log" || true)"
 claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+    "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 [[ "$claude_probe_count_after" == $((claude_probe_count_before + 1)) ]]
 [[ ! -e "$replacement_helper_side_effect" ]]
 rm -f -- "$tmp/source/claude/settings.json"
@@ -2270,8 +2089,8 @@ rm -f -- "$tmp/source/claude/settings.json"
 assert_managed_claude_arg_rejected() {
     local label="$1" expected="$2"
     shift 2
-    terminal_count_before="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_before="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
     if env "${managed_env[@]}" "$tool" claude "$@" \
         >"$tmp/claude-arg-$label.out" \
@@ -2281,10 +2100,10 @@ assert_managed_claude_arg_rejected() {
     fi
     grep -Fq "Claude $expected cannot be forwarded" \
         "$tmp/claude-arg-$label.err"
-    terminal_count_after="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_after="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
-    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+    [[ "$launch_count_after" == "$launch_count_before" ]]
 }
 
 assert_managed_claude_arg_rejected \
@@ -2310,9 +2129,6 @@ assert_managed_claude_arg_rejected \
     agents --agents --agents '{"restricted":{"tools":["Bash"]}}'
 assert_managed_claude_arg_rejected \
     agents-equals --agents '--agents={"restricted":{"tools":["Bash"]}}'
-assert_managed_claude_arg_rejected tmux --tmux --tmux
-assert_managed_claude_arg_rejected \
-    tmux-equals --tmux --tmux=classic
 assert_managed_claude_arg_rejected \
     no-session-persistence --no-session-persistence --no-session-persistence
 assert_managed_claude_arg_rejected \
@@ -2320,8 +2136,8 @@ assert_managed_claude_arg_rejected \
     --no-session-persistence=true
 
 for effective_failure in hooks mcp; do
-    terminal_count_before="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_before="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
     if env "${managed_env[@]}" \
         FAKE_CONTEXT_EFFECTIVE_FAIL="$effective_failure" \
@@ -2332,13 +2148,13 @@ for effective_failure in hooks mcp; do
     fi
     grep -Fq 'Context Mode is not enabled for Claude; run ags init' \
         "$tmp/claude-effective-$effective_failure.err"
-    terminal_count_after="$(
-        grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true
+    launch_count_after="$(
+        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
-    [[ "$terminal_count_after" == "$terminal_count_before" ]]
+    [[ "$launch_count_after" == "$launch_count_before" ]]
 done
 
-terminal_count_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
+launch_count_before="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
 if env "${managed_env[@]}" FAKE_CONTEXT_TRUST_STATUS=untrusted "$tool" codex \
     > "$tmp/untrusted-context.out" 2> "$tmp/untrusted-context.err"; then
     echo 'managed Codex launch ignored untrusted Context Mode hooks' >&2
@@ -2346,8 +2162,8 @@ if env "${managed_env[@]}" FAKE_CONTEXT_TRUST_STATUS=untrusted "$tool" codex \
 fi
 grep -Fq "Context Mode hooks are not trusted for this workspace" \
     "$tmp/untrusted-context.err"
-terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 
 if env "${managed_env[@]}" FAKE_CONTEXT_CORRUPT_CACHE=1 "$tool" codex \
     > "$tmp/corrupt-context.out" 2> "$tmp/corrupt-context.err"; then
@@ -2356,8 +2172,8 @@ if env "${managed_env[@]}" FAKE_CONTEXT_CORRUPT_CACHE=1 "$tool" codex \
 fi
 grep -Fq "Context Mode hook verification failed for this workspace" \
     "$tmp/corrupt-context.err"
-terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 cp -- "$context_runtime_root/.codex-plugin/hooks.json" \
     "$tmp/source/codex/plugins/cache/context-mode/context-mode/1.0.169/.codex-plugin/hooks.json"
 
@@ -2370,191 +2186,10 @@ if env "${managed_env[@]}" \
 fi
 grep -Fq "Context Mode hook verification failed for this workspace" \
     "$tmp/corrupt-context-server.err"
-terminal_count_after="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log" || true)"
-[[ "$terminal_count_after" == "$terminal_count_before" ]]
+launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
+[[ "$launch_count_after" == "$launch_count_before" ]]
 cp -- "$context_runtime_root/server.bundle.mjs" \
     "$tmp/source/codex/plugins/cache/context-mode/context-mode/1.0.169/server.bundle.mjs"
-
-bare_attach="$(
-    env "${managed_env[@]}" \
-        AGENT_SESSION_REMOTE_PASSWORD=remote-secret \
-        AGENT_SESSION_CLOUD_PASSWORD=cloud-secret \
-        RCLONE_SFTP_PASS=rclone-secret \
-        FAKE_RMUX_LIVE_SESSION=$'manual-user-session\nags-0123456789abcdefabcd' \
-        "$tool"
-)"
-grep -Fq 'FAKE_RMUX_ATTACHED -L ags -f /dev/null attach-session -t ags-0123456789abcdefabcd' \
-    <<< "$bare_attach"
-[[ "$bare_attach" != *manual-user-session* ]]
-bare_list_call="$(
-    grep '^RMUX=.* list-sessions ' "$tmp/home/.local/agsx.log" | tail -1
-)"
-[[ "$bare_list_call" == *" -O activity "* && "$bare_list_call" != *" -r "* ]]
-
-if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
-    live_one=ags-11111111111111111111
-    live_two=ags-22222222222222222222
-    live_sessions_file="$tmp/live-rmux.tsv"
-    printf '%s\tcodex\t/test/one\n%s\tclaude\t/test/two\n' \
-        "$live_one" "$live_two" > "$live_sessions_file"
-    mkdir -p "$tmp/state/live-sessions"
-    chmod 700 "$tmp/state/live-sessions"
-    write_fake_live_metadata() {
-        local session_name="$1" description="$2" agent="$3" cwd="$4"
-        jq -n --arg session_name "$session_name" \
-            --arg description "$description" --arg agent "$agent" \
-            --arg cwd "$cwd" '{
-              schema:1,session_name:$session_name,description:$description,
-              agent:$agent,cwd:$cwd,source:"fresh",
-              created_utc:"2026-08-01T00:00:00.000Z"
-            }' > "$tmp/state/live-sessions/$session_name.json"
-        chmod 600 "$tmp/state/live-sessions/$session_name.json"
-    }
-    write_fake_live_metadata "$live_one" 'Codex investigation' codex /test/one
-    write_fake_live_metadata "$live_two" 'Claude review' claude /test/two
-    write_fake_live_metadata \
-        ags-33333333333333333333 'Stale metadata' codex /test/stale
-
-    live_table="$(
-        env "${managed_env[@]}" \
-            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
-            "$tool" sessions
-    )"
-    grep -Fq "$live_one" <<< "$live_table"
-    grep -Fq 'Codex investigation' <<< "$live_table"
-    grep -Fq "$live_two" <<< "$live_table"
-    grep -Fq 'Claude review' <<< "$live_table"
-    [[ "$live_table" != *'Stale metadata'* ]]
-
-    prefix_attach="$(
-        env "${managed_env[@]}" \
-            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
-            "$tool" attach 1111
-    )"
-    grep -Fq "attach-session -t $live_one" <<< "$prefix_attach"
-    described_live="$(
-        env "${managed_env[@]}" \
-            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
-            "$tool" describe 1111 'Renamed Codex session'
-    )"
-    grep -Fqx 'status=described' <<< "$described_live"
-    jq -e '.description == "Renamed Codex session" and .source == "fresh"' \
-        "$tmp/state/live-sessions/$live_one.json" >/dev/null
-    [[ "$(stat -c %a "$tmp/state/live-sessions/$live_one.json")" == 600 ]]
-
-    ambiguous_sessions_file="$tmp/live-rmux-ambiguous.tsv"
-    printf '%s\tcodex\t/test/a\n%s\tclaude\t/test/b\n' \
-        ags-abcd0000000000000000 ags-abcd1111111111111111 \
-        > "$ambiguous_sessions_file"
-    if env "${managed_env[@]}" \
-        FAKE_RMUX_SESSIONS_FILE="$ambiguous_sessions_file" \
-        "$tool" attach abcd > "$tmp/live-ambiguous.out" \
-        2> "$tmp/live-ambiguous.err"; then
-        echo 'live attach accepted an ambiguous ID prefix' >&2
-        exit 1
-    fi
-    grep -Fq 'expected one live session matching abcd; found 2' \
-        "$tmp/live-ambiguous.err"
-
-    cat > "$tmp/stty-guard" <<'EOF'
-#!/usr/bin/env bash
-set -u
-before="$(stty -g)"
-"$@"
-child_status=$?
-after="$(stty -g)"
-[[ "$before" == "$after" ]] || exit 90
-printf 'STTY_UNCHANGED\n'
-exit "$child_status"
-EOF
-    chmod +x "$tmp/stty-guard"
-    run_live_pty() {
-        local input="$1" output="$2" pty_command
-        shift 2
-        printf -v pty_command '%q ' \
-            env "${managed_env[@]}" \
-            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" "$@"
-        printf '%s' "$input" | \
-            SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
-                > "$output" 2>&1
-    }
-
-    run_live_pty $'\033[B\n' "$tmp/live-down-enter.out" \
-        "$tmp/stty-guard" "$tool"
-    grep -Fq "attach-session -t $live_two" "$tmp/live-down-enter.out"
-    grep -Fq 'STTY_UNCHANGED' "$tmp/live-down-enter.out"
-
-    live_state_before="$(sha256sum "$live_sessions_file")"
-    run_live_pty $'\033' "$tmp/live-escape.out" \
-        "$tmp/stty-guard" "$tool"
-    [[ "$live_state_before" == "$(sha256sum "$live_sessions_file")" ]]
-    [[ "$(<"$tmp/live-escape.out")" != *FAKE_RMUX_ATTACHED* ]]
-    run_live_pty $'\177\033' "$tmp/live-backspace.out" \
-        "$tmp/stty-guard" "$tool"
-    [[ "$live_state_before" == "$(sha256sum "$live_sessions_file")" ]]
-    run_live_pty $'\033[3~n\033' "$tmp/live-delete-no.out" \
-        "$tmp/stty-guard" "$tool"
-    [[ "$live_state_before" == "$(sha256sum "$live_sessions_file")" ]]
-
-    cp -- "$tmp/state/live-sessions/$live_one.json" "$tmp/live-one-metadata.json"
-    run_live_pty $'\033[3~y\033' "$tmp/live-delete-yes.out" \
-        "$tmp/stty-guard" "$tool"
-    ! grep -Fq "$live_one" "$live_sessions_file"
-    grep -Fq "$live_two" "$live_sessions_file"
-    [[ ! -e "$tmp/state/live-sessions/$live_one.json" ]]
-    [[ -f "$tmp/state/live-sessions/$live_two.json" ]]
-
-    printf '%s\tcodex\t/test/one\n%s\tclaude\t/test/two\n' \
-        "$live_one" "$live_two" > "$live_sessions_file"
-    cp -- "$tmp/live-one-metadata.json" \
-        "$tmp/state/live-sessions/$live_one.json"
-    chmod 600 "$tmp/state/live-sessions/$live_one.json"
-    run_live_pty $'\033[3~y\033' "$tmp/live-delete-fail.out" \
-        FAKE_RMUX_KILL_FAIL=1 "$tmp/stty-guard" "$tool"
-    grep -Fq "$live_one" "$live_sessions_file"
-    [[ -f "$tmp/state/live-sessions/$live_one.json" ]]
-
-    stale_attach="$(
-        env "${managed_env[@]}" \
-            FAKE_RMUX_SESSIONS_FILE="$live_sessions_file" \
-            FAKE_RMUX_STALE_SESSION="$live_one" "$tool"
-    )"
-    grep -Fq "attach-session -t $live_two" <<< "$stale_attach"
-
-    live_sessions_file="$tmp/live-rmux-single.tsv"
-    printf '%s\tclaude\t/test/two\n' "$live_two" > "$live_sessions_file"
-    run_live_pty $'\033[3~y' "$tmp/live-sessions-delete-one.out" \
-        "$tmp/stty-guard" "$tool" sessions
-    [[ ! -s "$live_sessions_file" ]]
-    [[ ! -e "$tmp/state/live-sessions/$live_two.json" ]]
-    grep -Fq 'STTY_UNCHANGED' "$tmp/live-sessions-delete-one.out"
-fi
-
-if env "${managed_env[@]}" FAKE_RMUX_LIST_ERROR=1 "$tool" \
-    >"$tmp/rmux-list-error.out" 2>"$tmp/rmux-list-error.err"; then
-    echo 'bare ags ignored an RMUX list failure' >&2
-    exit 1
-fi
-grep -Fq 'cannot query live RMUX sessions: rmux: synthetic protocol failure' \
-    "$tmp/rmux-list-error.err"
-
-if env "${managed_env[@]}" FAKE_RMUX_VERSION=0.9.0 "$tool" \
-    >"$tmp/rmux-version.out" 2>"$tmp/rmux-version.err"; then
-    echo 'bare ags accepted an unsupported RMUX version' >&2
-    exit 1
-fi
-grep -Fq 'compatible RMUX 0.9.x release (0.9.1 or newer) is required; found rmux 0.9.0' \
-    "$tmp/rmux-version.err"
-for unsupported_rmux in 0.10.0 1.0.0; do
-    if env "${managed_env[@]}" FAKE_RMUX_VERSION="$unsupported_rmux" "$tool" \
-        >"$tmp/rmux-version-$unsupported_rmux.out" \
-        2>"$tmp/rmux-version-$unsupported_rmux.err"; then
-        echo "bare ags accepted unsupported RMUX $unsupported_rmux" >&2
-        exit 1
-    fi
-    grep -Fq "found rmux $unsupported_rmux" \
-        "$tmp/rmux-version-$unsupported_rmux.err"
-done
 
 extract_checkpoint() {
     local archive="$1" destination="$2"
@@ -2664,7 +2299,7 @@ assert_context_command_rejects_unsafe_claude_settings() {
         "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then touch $side_effect; fi; /usr/bin/printenv TEST_CLAUDE_API_KEY" \
         '{apiKeyHelper:$command}' > "$unsafe_home/.claude/settings.json"
     probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-        "$tmp/home/.local/agsx.log" || true)"
+        "$tmp/home/.local/ags.log" || true)"
     if env HOME="$unsafe_home" \
         PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         CODEX_HOME="$unsafe_home/.codex" \
@@ -2681,7 +2316,7 @@ assert_context_command_rejects_unsafe_claude_settings() {
         'Claude user settings must be one JSON object and apiKeyHelper' \
         "$tmp/context-unsafe-$label.err"
     probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-        "$tmp/home/.local/agsx.log" || true)"
+        "$tmp/home/.local/ags.log" || true)"
     [[ "$probe_count_after" == "$probe_count_before" ]]
     [[ ! -e "$side_effect" ]]
     [[ ! -e "$unsafe_home/.local/state/ags/context-mode.json" ]]
@@ -2752,15 +2387,15 @@ context_root_169="$(
 )"
 context_package_root="$context_root_169/node_modules/context-mode"
 claude_market_before="$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 claude_plugin_before="$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 codex_market_before="$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 codex_plugin_before="$(grep -c '^CODEX_CONTEXT=plugin add ' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 codex_hooks_before="$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 prepare_context_mode_runtime "$context_init_home"
 context_init_env=(
     HOME="$context_init_home"
@@ -2820,17 +2455,17 @@ env "${context_init_env[@]}" "$tool" init \
 [[ "$(grep -c '^NPM_CONTEXT=install ' \
     "$context_init_home/.context-mode-npm.log")" == 1 ]]
 [[ "$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/agsx.log")" == $((claude_market_before + 1)) ]]
+    "$tmp/home/.local/ags.log")" == $((claude_market_before + 1)) ]]
 [[ "$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
-    "$tmp/home/.local/agsx.log")" == $((claude_plugin_before + 1)) ]]
+    "$tmp/home/.local/ags.log")" == $((claude_plugin_before + 1)) ]]
 [[ "$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/agsx.log")" == $((codex_market_before + 1)) ]]
+    "$tmp/home/.local/ags.log")" == $((codex_market_before + 1)) ]]
 [[ "$(grep -c '^CODEX_CONTEXT=plugin add ' \
-    "$tmp/home/.local/agsx.log")" == $((codex_plugin_before + 1)) ]]
+    "$tmp/home/.local/ags.log")" == $((codex_plugin_before + 1)) ]]
 [[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/agsx.log")" == $((codex_hooks_before + 1)) ]]
+    "$tmp/home/.local/ags.log")" == $((codex_hooks_before + 1)) ]]
 if grep -Fq -- '--dangerously-bypass-hook-trust' \
-    "$tmp/home/.local/agsx.log" "$tmp/context-init.out" "$tmp/context-init.err"; then
+    "$tmp/home/.local/ags.log" "$tmp/context-init.out" "$tmp/context-init.err"; then
     echo 'Context Mode integration bypassed Codex hook trust' >&2
     exit 1
 fi
@@ -2840,7 +2475,7 @@ jq -n --arg command \
     '{apiKeyHelper:$command}' \
     > "$context_init_home/.claude/settings.json"
 claude_probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 if env "${context_init_env[@]}" \
     "$tool" context-check claude "$tmp/home/.local/bin/claude" \
     > "$tmp/context-claude-unsafe-helper.out" \
@@ -2851,7 +2486,7 @@ fi
 grep -Fq 'Claude user settings must be one JSON object and apiKeyHelper' \
     "$tmp/context-claude-unsafe-helper.err"
 claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/agsx.log" || true)"
+    "$tmp/home/.local/ags.log" || true)"
 [[ "$claude_probe_count_after" == "$claude_probe_count_before" ]]
 [[ ! -e "$context_check_helper_side_effect" ]]
 rm -f -- "$context_init_home/.claude/settings.json"
@@ -3239,7 +2874,7 @@ chmod --reference="$context_codex_config" \
 mv -- "$context_codex_config.implicit" "$context_codex_config"
 context_hooks_before_implicit_upgrade="$(
     grep -c '^CODEX_CONTEXT=features enable hooks$' \
-        "$tmp/home/.local/agsx.log"
+        "$tmp/home/.local/ags.log"
 )"
 env "${context_init_env[@]}" \
     FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
@@ -3271,7 +2906,7 @@ jq -e --arg root "$context_package_root_170" \
     "$context_package_root_170" ]]
 grep -Fqx 'hooks = true' "$context_codex_config"
 [[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/agsx.log")" == \
+    "$tmp/home/.local/ags.log")" == \
     $((context_hooks_before_implicit_upgrade + 1)) ]]
 grep -Fq -- '--registry=https://registry.npmjs.org' \
     "$context_init_home/.context-mode-npm.log"
@@ -3403,7 +3038,7 @@ mv -- "$context_codex_config.disabled" "$context_codex_config"
 grep -Fqx 'hooks = false' "$context_codex_config"
 context_hooks_before_disabled_upgrade="$(
     grep -c '^CODEX_CONTEXT=features enable hooks$' \
-        "$tmp/home/.local/agsx.log"
+        "$tmp/home/.local/ags.log"
 )"
 env "${context_init_env[@]}" \
     FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
@@ -3423,7 +3058,7 @@ grep -Fq '1.0.170 remains active' "$tmp/context-upgrade-health-fail.err"
 grep -Fqx 'hooks = true' "$context_codex_config"
 ! grep -Fqx 'hooks = false' "$context_codex_config"
 [[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/agsx.log")" == \
+    "$tmp/home/.local/ags.log")" == \
     $((context_hooks_before_disabled_upgrade + 1)) ]]
 
 context_concurrent_hooks_pending="$context_init_home/.local/state/ags/context-mode.pending.json"
@@ -3611,9 +3246,9 @@ done
 [[ ! -e "$disabled_home/.codex/config.toml" ]]
 [[ ! -e "$disabled_home/.local/state/ags/context-mode.pending.json" ]]
 grep -Fq 'CLAUDE_CONTEXT=plugin enable context-mode@context-mode --scope user' \
-    "$tmp/home/.local/agsx.log"
+    "$tmp/home/.local/ags.log"
 grep -Fq 'CLAUDE_CONTEXT=plugin disable context-mode@context-mode --scope user' \
-    "$tmp/home/.local/agsx.log"
+    "$tmp/home/.local/ags.log"
 [[ ! -e "$disabled_home/.config/ags/identity.agekey" ]]
 [[ ! -e "$disabled_home/.local/state/ags/storage.json" ]]
 [[ ! -e "$disabled_home/.local/state/ags/context-mode.json" ]]
@@ -4060,6 +3695,18 @@ for terminal_width in 80 120; do
 done
 
 if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
+    cat > "$tmp/stty-guard" <<'EOF'
+#!/usr/bin/env bash
+set -u
+before="$(stty -g)"
+"$@"
+child_status=$?
+after="$(stty -g)"
+[[ "$before" == "$after" ]] || exit 90
+printf 'STTY_UNCHANGED\n'
+exit "$child_status"
+EOF
+    chmod +x "$tmp/stty-guard"
     run_checkpoint_pty() {
         local input="$1" output="$2" checkpoint_root="$3" pty_command
         shift 3
@@ -4071,12 +3718,6 @@ if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
             SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
                 > "$output" 2>&1
     }
-
-    run_checkpoint_pty $'\033[B\n' "$tmp/checkpoint-enter.out" \
-        "$tmp/local-checkpoints" FAKE_TERMINAL_ATTACH=1
-    grep -Fq "FAKE_TERMINAL_ATTACHED checkpoint/$layout_record_id/" \
-        "$tmp/checkpoint-enter.out"
-    grep -Fq 'STTY_UNCHANGED' "$tmp/checkpoint-enter.out"
 
     checkpoint_root_before="$(
         find "$tmp/local-checkpoints" -type f -print0 |
@@ -4156,38 +3797,6 @@ record_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-targe
     "$tool" resume "$checkpoint_record_id" --profile=exact-record)"
 grep -Fqx "FAKE_CODEX <resume> <$session_id> <--profile> <exact-record>" <<< "$record_resume"
 cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-record-target/codex/$session_rel"
-record_runtime_key="$(
-    sed -n 's/^TERMINAL=\([^	]*\)	.*/\1/p' "$tmp/home/.local/agsx.log" | tail -1
-)"
-terminal_launches_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")"
-ln -s "$tmp/checkpoint-record-target/codex" \
-    "$tmp/checkpoint-record-target/codex-equivalent"
-record_reattach="$(
-    env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-target/codex-equivalent" \
-        CLAUDE_CONFIG_DIR="$tmp/irrelevant-claude-home" \
-        FAKE_TERMINAL_ATTACH=1 \
-        "$tool" resume "$checkpoint_record_id" --to codex --cwd "$tmp/work" \
-            --profile exact-record
-)"
-grep -Fqx "FAKE_TERMINAL_ATTACHED $record_runtime_key" <<< "$record_reattach"
-grep -Fqx "ATTACH_PROBE=$record_runtime_key" "$tmp/home/.local/agsx.log"
-[[ "$terminal_launches_before" == \
-   "$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")" ]]
-
-race_attach_count="$tmp/race-attach-count"
-race_launches_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")"
-write_codex_profile "$tmp/checkpoint-race-target/codex" exact-record
-race_reattach="$(
-    env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-race-target/codex" \
-        FAKE_TERMINAL_ATTACH_AFTER=1 \
-        FAKE_TERMINAL_ATTACH_COUNT_FILE="$race_attach_count" \
-        "$tool" resume "$checkpoint_record_id" --profile exact-record
-)"
-grep -Fq 'FAKE_TERMINAL_ATTACHED checkpoint/' <<< "$race_reattach"
-[[ "$(<"$race_attach_count")" == 2 ]]
-[[ "$race_launches_before" == \
-   "$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")" ]]
-
 mkdir -p "$tmp/symlinked-codex-home-real"
 ln -s "$tmp/symlinked-codex-home-real" "$tmp/symlinked-codex-home"
 env "${source_env[@]}" CODEX_HOME="$tmp/symlinked-codex-home" \
@@ -4280,9 +3889,9 @@ grep -Fqx \
     "FAKE_CLAUDE <--resume> <$converted_claude_id> <--model> <converted-zstd>" \
     <<< "$zst_cross"
 [[ -f "$zst_cross_home/projects/$zst_cross_key/$converted_claude_id.jsonl" ]]
-grep -Fq $'CONVERT=codex\tclaude-code\t' "$tmp/home/.local/agsx.log"
-grep -F $'CONVERT=codex\tclaude-code\t' "$tmp/home/.local/agsx.log" |
-    grep -Fq '/agsx/source.jsonl'
+grep -Fq $'CONVERT=codex\tclaude-code\t' "$tmp/home/.local/ags.log"
+grep -F $'CONVERT=codex\tclaude-code\t' "$tmp/home/.local/ags.log" |
+    grep -Fq '/ags/source.jsonl'
 
 (
     cd "$tmp/work"
@@ -4932,7 +4541,7 @@ grep -Fq 'unknown AGS resume argument: --model; put Agent arguments after --' \
     "$tmp/resume-boundary.err"
 [[ ! -e "$tmp/resume-boundary-target" ]]
 
-conversion_log="$tmp/home/.local/agsx.log"
+conversion_log="$tmp/home/.local/ags.log"
 conversion_log_lines="$(wc -l < "$conversion_log")"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/version-gate-target/claude" \
     "$tool" resume "$queued_id" --to claude --force-unsupported-version \
@@ -4971,7 +4580,7 @@ grep -Fqx 'source_agent=codex' <<< "$codex_to_claude"
 grep -Fqx 'agent=claude' <<< "$codex_to_claude"
 grep -Fqx "source_session_id=$session_id" <<< "$codex_to_claude"
 grep -Fqx "session_id=$converted_claude_id" <<< "$codex_to_claude"
-grep -Fqx 'conversion=agsx-0.3.0-test' <<< "$codex_to_claude"
+grep -Fqx 'conversion=ags-0.3.0-test' <<< "$codex_to_claude"
 codex_to_claude_file="$codex_to_claude_home/projects/$codex_to_claude_key/$converted_claude_id.jsonl"
 [[ -f "$codex_to_claude_file" ]]
 jq -s -e --arg cwd "$codex_to_claude_work" \
@@ -4980,9 +4589,9 @@ jq -s -e --arg cwd "$codex_to_claude_work" \
 grep -Fq 'converted reasoning summary' "$codex_to_claude_file"
 ! grep -Fq '"type":"thinking"' "$codex_to_claude_file"
 [[ ! -e "$codex_to_claude_home/history.jsonl" ]]
-grep -Eq "^HOME=$tmp/state/restore\\.[^/]+/agsx/home$" "$conversion_log"
-grep -Eq "^CODEX_HOME=$tmp/state/restore\\.[^/]+/agsx/codex-home$" "$conversion_log"
-grep -Eq "^CLAUDE_CONFIG_DIR=$tmp/state/restore\\.[^/]+/agsx/claude-home$" \
+grep -Eq "^HOME=$tmp/state/restore\\.[^/]+/ags/home$" "$conversion_log"
+grep -Eq "^CODEX_HOME=$tmp/state/restore\\.[^/]+/ags/codex-home$" "$conversion_log"
+grep -Eq "^CLAUDE_CONFIG_DIR=$tmp/state/restore\\.[^/]+/ags/claude-home$" \
     "$conversion_log"
 grep -Fqx 'NO_STORE=1' "$conversion_log"
 
@@ -5445,7 +5054,7 @@ register_failure_home="$tmp/register-failure-target/codex"
 seed_context_mode_agent_cache "$register_failure_home" codex
 register_failure_file="$register_failure_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
 if env "${source_env[@]}" CODEX_HOME="$register_failure_home" \
-    AGSX_REGISTER_FAIL=1 \
+    AGS_REGISTER_FAIL=1 \
     "$tool" resume claude-window --to codex --cwd "$claude_hook_work" \
     >"$tmp/register-failure.out" 2>"$tmp/register-failure.err"; then
     echo 'Codex resume ignored a failed thread-index registration' >&2
@@ -5519,13 +5128,13 @@ EOF
 chmod +x "$tmp/home/.local/bin/casr-fail"
 seed_context_mode_agent_cache "$tmp/conversion-failure-target/codex" codex
 if env "${source_env[@]}" CODEX_HOME="$tmp/conversion-failure-target/codex" \
-    AGSX_CONVERTER_BINARY="$tmp/home/.local/bin/casr-fail" \
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/casr-fail" \
     "$tool" resume claude-window --to codex \
     >"$tmp/conversion-failure.out" 2>"$tmp/conversion-failure.err"; then
-    echo 'resume ignored an agsx conversion failure' >&2
+    echo 'resume ignored an ags conversion failure' >&2
     exit 1
 fi
-grep -Fq 'agsx conversion failed: synthetic conversion failure' "$tmp/conversion-failure.err"
+grep -Fq 'ags conversion failed: synthetic conversion failure' "$tmp/conversion-failure.err"
 [[ ! -e "$tmp/conversion-failure-target/codex/sessions" ]]
 
 legacy_id='Legacy_描述--20260101T000000.000000000Z'
@@ -5896,7 +5505,7 @@ env "${source_env[@]}" \
     "$tool" remote add broken-launch git "$tmp/git/missing-launch.git" \
         --branch main >/dev/null
 mv -- "$tmp/git/missing-launch.git" "$tmp/git/unavailable-launch.git"
-broken_launches_before="$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")"
+broken_launches_before="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log")"
 if env "${source_env[@]}" \
     AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
     AGENT_SESSION_LOCAL_DIR="$quiet_launch_local" \
@@ -5910,7 +5519,7 @@ fi
 [[ ! -s "$tmp/broken-remote-launch.out" ]]
 grep -Eq 'fatal:|\[ags\] error:' "$tmp/broken-remote-launch.err"
 [[ "$broken_launches_before" == \
-   "$(grep -c '^TERMINAL=' "$tmp/home/.local/agsx.log")" ]]
+   "$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log")" ]]
 
 env "${sync_b_env[@]}" "$tool" set "$tmp/sync-b/local" >/dev/null
 env "${sync_b_env[@]}" "$tool" remote add backup git \

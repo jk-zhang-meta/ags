@@ -24,7 +24,7 @@ use tempfile::TempDir;
 ///
 /// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* casr's own
 /// session store, so leaving it unset would have these tests create
-/// `~/.local/share/agsx` on the machine running them.
+/// `~/.local/share/ags` on the machine running them.
 fn casr_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("casr").expect("casr binary should be built");

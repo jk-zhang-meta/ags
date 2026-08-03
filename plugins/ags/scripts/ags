@@ -12,7 +12,6 @@ ssh_key="${AGENT_SESSION_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 claude_home="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 local_checkpoints="${AGENT_SESSION_LOCAL_DIR:-$state/checkpoints}"
-live_sessions_dir="$state/live-sessions"
 storage_config="$state/storage.json"
 cloud_password_file="$state/cloud-password.age"
 remote_password_dir="$state/remote-passwords"
@@ -24,11 +23,8 @@ remote_retirement_marker=".ags-retired/ags-v1.retired"
 remote_retirement_pending_marker=".ags-retired/ags-v1.retiring"
 declare -A merge_verified_revision=()
 declare -a terminal_menu_ids=() terminal_menu_labels=()
-declare -a live_session_agents=() live_session_descriptions=() live_session_cwds=()
 terminal_menu_selected=
 terminal_menu_notice=
-live_rmux=
-live_menu_result=
 ags_state_lock_depth=0
 ags_consolidation_lock_depth=0
 ags_remote_operation_lock_depth=0
@@ -36,7 +32,7 @@ ags_remote_operation_lock_name=
 ags_remote_operation_lock_fd=
 ags_checkpoint_lock_depth=0
 ags_checkpoint_lock_root=
-agsx_converter_version="${AGSX_CONVERTER_VERSION:-unknown}"
+ags_converter_version="${AGS_CONVERTER_VERSION:-unknown}"
 context_mode_registry="https://registry.npmjs.org"
 context_mode_runtime_base="$data_home/ags/context-mode"
 context_mode_version=
@@ -141,14 +137,9 @@ machine_id_fragment() {
 usage() {
     cat <<'EOF'
 Usage:
-  ags                                  Continue the most recent live session
-  ags --description TEXT claude [CLAUDE_ARGS...]
-  ags --description TEXT codex [CODEX_ARGS...]
-  ags claude [CLAUDE_ARGS...]          Start Claude in a managed terminal
-  ags codex [CODEX_ARGS...]            Start Codex in a managed terminal
-  ags sessions                         List live managed terminals
-  ags attach ID                        Enter a live managed terminal
-  ags describe ID DESCRIPTION          Change a live terminal description
+  ags                                  Choose an Agent and start it
+  ags claude [CLAUDE_ARGS...]          Start Claude
+  ags codex [CODEX_ARGS...]            Start Codex
   ags context review-codex             Open Codex's official hook review UI
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
@@ -205,7 +196,6 @@ After `ags claude` or `ags codex`, every argument belongs to that Agent. For
 `ags resume`, AGS options go before `--`; every argument after `--` belongs to
 the restored Agent. Mandatory Context Mode may reject Agent options that disable it.
 Claude `--settings` may contain only provider authentication and model fields.
-`--description` is an AGS option only when it appears before `claude` or `codex`.
 EOF
 }
 
@@ -5162,7 +5152,7 @@ initialize_context_mode() {
 }
 
 review_context_mode_codex() {
-    local binary runtime_key
+    local binary
     need jq
     need node
     need realpath
@@ -5174,10 +5164,8 @@ review_context_mode_codex() {
     context_mode_codex_marketplace_ready "$binary" &&
         context_mode_codex_plugin_ready "$binary" ||
         die "Context Mode is not enabled for Codex; run ags init"
-    runtime_key="context-review/codex/$(pwd -P)"
     log "Use Review hooks, inspect Plugin - context-mode@context-mode, trust those six hooks only, then exit Codex"
-    launch_managed_agent \
-        "$runtime_key" "$binary" "Context Mode hook review" codex context-review
+    launch_managed_agent "$binary" codex
 }
 
 initialize_ags() {
@@ -7944,17 +7932,17 @@ codex_pool_status() {
     fi
 }
 
-resolve_agsx_converter_binary() {
-    local binary="${AGSX_CONVERTER_BINARY:-}" version
+resolve_ags_converter_binary() {
+    local binary="${AGS_CONVERTER_BINARY:-}" version
     if [[ -z "$binary" ]]; then
         binary="$(command -v casr 2>/dev/null || true)"
     fi
     valid_local_binary_path "$binary" ||
-        die "cannot find an executable casr binary; reinstall agsx"
-    if [[ "$agsx_converter_version" == unknown ]]; then
+        die "cannot find an executable casr binary; reinstall ags"
+    if [[ "$ags_converter_version" == unknown ]]; then
         version="$("$binary" --version 8>&- 9>&- </dev/null 2>/dev/null || true)"
         if [[ "$version" =~ ^casr[[:space:]]+([^[:space:]]+) ]]; then
-            agsx_converter_version="${BASH_REMATCH[1]}"
+            ags_converter_version="${BASH_REMATCH[1]}"
         fi
     fi
     printf '%s\n' "$binary"
@@ -7963,7 +7951,7 @@ resolve_agsx_converter_binary() {
 scrub_transport_password_environment() {
     # These variables are accepted only while configuring or invoking an SFTP
     # transport. They are never Agent credentials and must not cross the
-    # Context Mode, RMUX, Claude, or Codex process boundary.
+    # Context Mode, Claude, or Codex process boundary.
     unset AGENT_SESSION_CLOUD_PASSWORD
     unset AGENT_SESSION_REMOTE_PASSWORD
     unset RCLONE_SFTP_PASS
@@ -7996,218 +7984,6 @@ agent_display_name() {
         claude) printf 'Claude\n' ;;
         *) printf 'Session\n' ;;
     esac
-}
-
-default_live_session_description() {
-    local agent="$1" cwd="$2" base suffix
-    need jq
-    base="${cwd%/}"
-    base="${base##*/}"
-    [[ -n "$base" ]] || base=/
-    suffix=" - $(agent_display_name "$agent")"
-    printf '%s' "$base" | jq -Rsr --arg suffix "$suffix" '
-        gsub("[\u0000-\u001f\u007f-\u009f]"; " ") |
-        if test("[^[:space:]]") then . else "Session" end |
-        .[0:(80 - ($suffix | length))] + $suffix
-    '
-}
-
-persist_live_session_metadata() {
-    local session_name="$1" description="$2" agent="$3" cwd="$4"
-    local source="$5" created_utc="$6" metadata tmp
-    [[ "$session_name" =~ ^ags-[0-9a-f]{20}$ ]] ||
-        die "managed terminal returned an invalid session ID"
-    need jq
-    validate_live_session_description "$description"
-    [[ "$agent" == codex || "$agent" == claude || "$agent" == unknown ]] ||
-        die "managed terminal metadata has an invalid Agent"
-    [[ "$cwd" == /* ]] && text_has_no_control_characters "$cwd" ||
-        die "managed terminal metadata has an invalid cwd"
-    [[ "$source" == fresh || "$source" == checkpoint ||
-       "$source" == context-review || "$source" == legacy ]] ||
-        die "managed terminal metadata has an invalid source"
-    lock
-    [[ ! -L "$live_sessions_dir" ]] ||
-        die "managed terminal metadata directory cannot be a symbolic link"
-    mkdir -p -- "$live_sessions_dir" ||
-        die "cannot create managed terminal metadata directory"
-    chmod 700 "$live_sessions_dir" ||
-        die "cannot protect managed terminal metadata directory"
-    metadata="$live_sessions_dir/$session_name.json"
-    tmp="$(mktemp "$live_sessions_dir/.$session_name.XXXXXX")" ||
-        die "cannot stage managed terminal metadata"
-    if ! jq -n \
-        --arg session_name "$session_name" \
-        --arg description "$description" \
-        --arg agent "$agent" \
-        --arg cwd "$cwd" \
-        --arg source "$source" \
-        --arg created_utc "$created_utc" \
-        '{schema:1,session_name:$session_name,description:$description,
-          agent:$agent,cwd:$cwd,source:$source,created_utc:$created_utc}' \
-        > "$tmp"; then
-        rm -f -- "$tmp"
-        unlock
-        die "cannot encode managed terminal metadata"
-    fi
-    chmod 600 "$tmp" || {
-        rm -f -- "$tmp"
-        unlock
-        die "cannot protect managed terminal metadata"
-    }
-    mv -f -- "$tmp" "$metadata" || {
-        rm -f -- "$tmp"
-        unlock
-        die "cannot publish managed terminal metadata"
-    }
-    unlock
-}
-
-live_session_metadata_valid() {
-    local session_name="$1" metadata
-    metadata="$live_sessions_dir/$session_name.json"
-    [[ -f "$metadata" && ! -L "$metadata" ]] && jq -e --arg session_name "$session_name" '
-        .schema == 1 and .session_name == $session_name and
-        (.description | type) == "string" and
-        (.description | length) > 0 and (.description | length) <= 80 and
-        (.agent == "codex" or .agent == "claude" or .agent == "unknown") and
-        (.cwd | type) == "string" and (.cwd | startswith("/")) and
-        (.source == "fresh" or .source == "checkpoint" or
-         .source == "context-review" or .source == "legacy") and
-        (.created_utc | type) == "string"
-    ' "$metadata" >/dev/null 2>&1
-}
-
-write_live_session_metadata() {
-    local terminal_binary="$1" runtime_key="$2" description="$3"
-    local agent="$4" source="$5" cwd="$6" session_name created_utc
-    session_name="$("$terminal_binary" terminal-name "$runtime_key")" ||
-        die "cannot derive the managed terminal ID"
-    [[ "$session_name" =~ ^ags-[0-9a-f]{20}$ ]] ||
-        die "managed terminal returned an invalid session ID"
-    if live_session_metadata_valid "$session_name"; then
-        return
-    fi
-    created_utc="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" ||
-        die "cannot timestamp managed terminal metadata"
-    persist_live_session_metadata \
-        "$session_name" "$description" "$agent" "$cwd" "$source" "$created_utc"
-}
-
-resolve_live_rmux() {
-    local terminal_binary rmux_version
-    terminal_binary="$(resolve_agsx_converter_binary)"
-    live_rmux="$(dirname "$terminal_binary")/rmux"
-    if ! valid_local_binary_path "$live_rmux"; then
-        live_rmux="$(command -v rmux 2>/dev/null || true)"
-    fi
-    valid_local_binary_path "$live_rmux" ||
-        die "RMUX is required for every interactive AGS session; install a compatible RMUX 0.9.x release (0.9.1 or newer)"
-    rmux_version="$("$live_rmux" -V 2>/dev/null || true)"
-    rmux_version_supported "$rmux_version" ||
-        die "A compatible RMUX 0.9.x release (0.9.1 or newer) is required; found ${rmux_version:-an unrecognized version}"
-}
-
-load_live_session_details() {
-    local session_name="$1" details metadata pane_command pane_path fields metadata_cwd
-    details="$(
-        "$live_rmux" -L ags -f /dev/null display-message -p \
-            -t "$session_name" $'#{pane_current_command}\t#{pane_current_path}' \
-            2>/dev/null
-    )" || return 1
-    IFS=$'\t' read -r pane_command pane_path <<< "$details"
-    pane_command="${pane_command//$'\n'/ }"
-    pane_command="${pane_command//$'\r'/ }"
-    pane_path="${pane_path//$'\n'/ }"
-    pane_path="${pane_path//$'\r'/ }"
-    [[ "$pane_path" == /* ]] && text_has_no_control_characters "$pane_path" ||
-        pane_path=unknown
-
-    live_detail_description=
-    live_detail_agent=
-    live_detail_cwd="$pane_path"
-    metadata="$live_sessions_dir/$session_name.json"
-    if live_session_metadata_valid "$session_name"; then
-        fields="$(jq -r '[.description,.agent,.cwd] | @tsv' "$metadata")" || return 1
-        IFS=$'\t' read -r live_detail_description live_detail_agent metadata_cwd <<< "$fields"
-        [[ "$live_detail_cwd" != unknown ]] || live_detail_cwd="$metadata_cwd"
-    fi
-    if [[ -z "$live_detail_agent" ]]; then
-        case "${pane_command,,}" in
-            *claude*) live_detail_agent=claude ;;
-            *codex*) live_detail_agent=codex ;;
-            *) live_detail_agent=unknown ;;
-        esac
-    fi
-    if [[ -z "$live_detail_description" ]]; then
-        live_detail_description="$(
-            default_live_session_description "$live_detail_agent" "$pane_path"
-        )"
-    fi
-    live_session_description_valid "$live_detail_description" ||
-        live_detail_description="$(
-            default_live_session_description "$live_detail_agent" "$pane_path"
-        )"
-    [[ "$live_detail_cwd" == /* ]] &&
-        text_has_no_control_characters "$live_detail_cwd" ||
-        live_detail_cwd=unknown
-}
-
-collect_live_sessions() {
-    local output session_name
-    local -A seen=()
-    terminal_menu_ids=()
-    terminal_menu_labels=()
-    live_session_agents=()
-    live_session_descriptions=()
-    live_session_cwds=()
-    need jq
-    resolve_live_rmux
-    if ! output="$(
-        "$live_rmux" -L ags -f /dev/null list-sessions -O activity \
-            -F '#{session_name}' 2>&1
-    )"; then
-        [[ "$output" == *"No such file or directory"* ]] && return 0
-        die "cannot query live RMUX sessions: $output"
-    fi
-    while IFS= read -r session_name; do
-        [[ "$session_name" =~ ^ags-[0-9a-f]{20}$ ]] || continue
-        [[ -z "${seen[$session_name]:-}" ]] || continue
-        seen["$session_name"]=1
-        load_live_session_details "$session_name" || continue
-        terminal_menu_ids+=("$session_name")
-        terminal_menu_labels+=(
-            "$session_name  $(agent_display_name "$live_detail_agent")  $live_detail_description  $live_detail_cwd"
-        )
-        live_session_agents+=("$live_detail_agent")
-        live_session_descriptions+=("$live_detail_description")
-        live_session_cwds+=("$live_detail_cwd")
-    done <<< "$output"
-}
-
-resolve_live_session_id() {
-    local selector="${1:-}" prefix candidate match= count=0
-    if [[ "$selector" =~ ^[0-9a-f]{4,20}$ ]]; then
-        prefix="ags-$selector"
-    elif [[ "$selector" =~ ^ags-[0-9a-f]{4,20}$ ]]; then
-        prefix="$selector"
-    else
-        die "live session ID is invalid"
-    fi
-    collect_live_sessions
-    for candidate in "${terminal_menu_ids[@]}"; do
-        if [[ "$candidate" == "$selector" ]]; then
-            resolved_live_session="$candidate"
-            return
-        fi
-        if [[ "$candidate" == "$prefix"* ]]; then
-            match="$candidate"
-            count=$((count + 1))
-        fi
-    done
-    (( count == 1 )) ||
-        die "expected one live session matching $selector; found $count"
-    resolved_live_session="$match"
 }
 
 terminal_menu() {
@@ -8266,138 +8042,19 @@ terminal_menu() {
     done
 }
 
-kill_live_session() {
-    local session_name="$1"
-    if "$live_rmux" -L ags -f /dev/null kill-session -t "$session_name"; then
-        rm -f -- "$live_sessions_dir/$session_name.json" ||
-            log "warning: deleted session left stale metadata: $session_name"
-        return 0
-    fi
-    log "warning: live session changed before it could be deleted: $session_name"
-    return 1
-}
-
-interactive_live_sessions() {
-    local menu_status
-    live_menu_result=empty
-    terminal_menu_notice=
-    while (( ${#terminal_menu_ids[@]} > 0 )); do
-        if terminal_menu "Live AGS sessions" 1; then
-            exec "$live_rmux" -L ags -f /dev/null attach-session \
-                -t "$terminal_menu_selected"
-        else
-            menu_status=$?
-        fi
-        case "$menu_status" in
-            1)
-                live_menu_result=escaped
-                return 0
-                ;;
-            2)
-                if kill_live_session "$terminal_menu_selected"; then
-                    terminal_menu_notice="Deleted $terminal_menu_selected."
-                else
-                    terminal_menu_notice="Session was already changing; list refreshed."
-                fi
-                collect_live_sessions
-                ;;
-            *) die "managed terminal selector failed" ;;
-        esac
-    done
-}
-
-list_live_sessions() {
-    local index
-    (( $# == 0 )) || die "usage: ags sessions"
-    scrub_transport_password_environment
-    need column
-    collect_live_sessions
-    if [[ -t 0 && -t 1 ]]; then
-        if (( ${#terminal_menu_ids[@]} == 0 )); then
-            log "no live sessions"
-            return 0
-        fi
-        interactive_live_sessions
-        return 0
-    fi
-    {
-        printf 'ID\tAGENT\tDESCRIPTION\tCWD\n'
-        for index in "${!terminal_menu_ids[@]}"; do
-            printf '%s\t%s\t%s\t%s\n' \
-                "${terminal_menu_ids[$index]}" \
-                "${live_session_agents[$index]^^}" \
-                "${live_session_descriptions[$index]}" \
-                "${live_session_cwds[$index]}"
-        done
-    } | render_columns -t -s $'\t'
-}
-
-attach_live_session() {
-    (( $# == 1 )) || die "usage: ags attach ID"
-    scrub_transport_password_environment
-    resolve_live_session_id "$1"
-    exec "$live_rmux" -L ags -f /dev/null attach-session -t "$resolved_live_session"
-}
-
-describe_live_session() {
-    local selector="${1:-}" description metadata fields agent cwd source created_utc
-    (( $# >= 2 )) || die "usage: ags describe ID DESCRIPTION"
-    shift
-    description="$*"
-    validate_live_session_description "$description"
-    scrub_transport_password_environment
-    resolve_live_session_id "$selector"
-    load_live_session_details "$resolved_live_session" ||
-        die "live session changed before its description could be updated"
-    agent="$live_detail_agent"
-    cwd="$live_detail_cwd"
-    source=legacy
-    created_utc="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" ||
-        die "cannot timestamp managed terminal metadata"
-    metadata="$live_sessions_dir/$resolved_live_session.json"
-    if live_session_metadata_valid "$resolved_live_session"; then
-        fields="$(jq -r '[.source,.created_utc] | @tsv' "$metadata")" ||
-            die "cannot read managed terminal metadata"
-        IFS=$'\t' read -r source created_utc <<< "$fields"
-    fi
-    persist_live_session_metadata \
-        "$resolved_live_session" "$description" "$agent" "$cwd" \
-        "$source" "$created_utc"
-    printf 'status=described\nsession_id=%s\ndescription=%s\n' \
-        "$resolved_live_session" "$description"
-}
-
 launch_managed_agent() {
-    local runtime_key="$1" launch_binary="$2" description="$3"
-    local agent="$4" source="$5" terminal_binary launch_cwd
-    shift 5
+    local launch_binary="$1" agent="$2" launch_cwd
+    shift 2
     scrub_transport_password_environment
-    terminal_binary="$(resolve_agsx_converter_binary)"
     launch_cwd="$(pwd -P)"
     if [[ "$agent" == claude ]]; then
-        # The effective probe is intentionally slow. Re-read mutable settings
-        # immediately before handing the command to RMUX as well.
+        # The effective probe is intentionally slow, so both Claude checks run
+        # as late as possible — immediately before the process is handed over —
+        # and a settings file edited during the probe still gets caught.
         validate_claude_context_args "$@"
-    fi
-    write_live_session_metadata \
-        "$terminal_binary" "$runtime_key" "$description" "$agent" "$source" "$launch_cwd"
-    if [[ "$agent" == claude ]]; then
         validate_claude_settings_sources "$launch_cwd"
     fi
-    exec "$terminal_binary" terminal-launch "$runtime_key" -- "$launch_binary" "$@"
-}
-
-attach_managed_agent_if_live() {
-    local runtime_key="$1" terminal_binary exit_status
-    scrub_transport_password_environment
-    terminal_binary="$(resolve_agsx_converter_binary)"
-    if "$terminal_binary" terminal-attach "$runtime_key"; then
-        return 0
-    else
-        exit_status=$?
-    fi
-    (( exit_status == 3 )) && return 1
-    die "cannot query or attach the managed RMUX session"
+    exec "$launch_binary" "$@"
 }
 
 resolve_checkpoint_record_for_live() {
@@ -8432,8 +8089,8 @@ read_checkpoint_runtime_manifest() {
 }
 
 start_managed_agent() {
-    local agent="$1" description="$2" launch_binary runtime_key audit_cwd profile=
-    shift 2
+    local agent="$1" launch_binary audit_cwd profile=
+    shift
     scrub_transport_password_environment
     prepare_storage_for_launch
     launch_binary="$(resolve_agent_binary "$agent")"
@@ -8444,62 +8101,34 @@ start_managed_agent() {
     else
         validate_claude_context_args "$@"
     fi
-    if [[ -z "$description" ]]; then
-        description="$(default_live_session_description "$agent" "$audit_cwd")"
-    fi
-    validate_live_session_description "$description"
     context_mode_require_agent "$agent" "$launch_binary" "$audit_cwd" "$profile"
-    runtime_key="fresh/$agent/$(machine_id_fragment)/$$/$RANDOM/$(date -u +%s%N)"
-    launch_managed_agent "$runtime_key" "$launch_binary" \
-        "$description" "$agent" fresh "$@"
-}
-
-rmux_version_supported() {
-    local output="$1" major minor patch
-    [[ "$output" =~ ^rmux[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+)(\+[A-Za-z0-9._-]+)?$ ]] ||
-        return 1
-    major="${BASH_REMATCH[1]}"
-    minor="${BASH_REMATCH[2]}"
-    patch="${BASH_REMATCH[3]}"
-    (( major == 0 && minor == 9 && patch >= 1 ))
+    launch_managed_agent "$launch_binary" "$agent" "$@"
 }
 
 enter_ags() {
     local choice
     scrub_transport_password_environment
-    collect_live_sessions
-    if (( ${#terminal_menu_ids[@]} == 1 )); then
-        exec "$live_rmux" -L ags -f /dev/null attach-session \
-            -t "${terminal_menu_ids[0]}"
-    fi
-    if (( ${#terminal_menu_ids[@]} > 1 )); then
-        [[ -t 0 && -t 1 ]] ||
-            die "multiple live sessions need an interactive terminal; run ags from a terminal"
-        interactive_live_sessions
-        [[ "$live_menu_result" != escaped ]] || return 0
-    fi
-
     prepare_storage_for_launch
     if command -v claude >/dev/null && command -v codex >/dev/null; then
         [[ -t 0 && -t 1 ]] ||
-            die "no live session; run ags claude or ags codex"
+            die "choosing an Agent needs a terminal; run ags claude or ags codex"
         printf 'Start:\n  1) Claude\n  2) Codex\nChoose [1]: '
         IFS= read -r choice
         case "${choice:-1}" in
-            1) start_managed_agent claude "" ;;
-            2) start_managed_agent codex "" ;;
+            1) start_managed_agent claude ;;
+            2) start_managed_agent codex ;;
             *) die "invalid Agent selection" ;;
         esac
     elif command -v claude >/dev/null; then
-        start_managed_agent claude ""
+        start_managed_agent claude
     elif command -v codex >/dev/null; then
-        start_managed_agent codex ""
+        start_managed_agent codex
     else
         die "cannot find an executable Claude or Codex binary"
     fi
 }
 
-run_agsx_isolated() {
+run_ags_isolated() {
     local binary="$1" sandbox="$2"
     shift 2
     env -i \
@@ -8783,9 +8412,6 @@ validate_claude_context_args() {
             --setting-sources|--setting-sources=*|--mcp-config|--mcp-config=*|--plugin-dir|--plugin-dir=*|--plugin-url|--plugin-url=*|--disallowedTools|--disallowedTools=*|--disallowed-tools|--disallowed-tools=*)
                 die "Claude ${argument%%=*} cannot be forwarded because it changes settings, MCP, plugins, or tool availability after Context Mode validation"
                 ;;
-            --tmux|--tmux=*)
-                die "Claude --tmux cannot be forwarded because AGS already owns the RMUX terminal"
-                ;;
             --no-session-persistence|--no-session-persistence=*)
                 die "Claude --no-session-persistence cannot be forwarded because it disables AGS session recovery"
                 ;;
@@ -8856,14 +8482,14 @@ validate_cross_codex_client_args() {
 prepare_cross_agent_restore() {
     local source_agent="$1" source_session_id="$2" source_main="$3"
     local target_agent="$4" target_cwd="$5" work="$6" codex_provider="${7:-}"
-    local sandbox="$work/agsx" source_input="$source_main" target_root
+    local sandbox="$work/ags" source_input="$source_main" target_root
     local binary result_file stderr error_message target_main relative normalized target_project
     local source_slug target_slug target_alias conversion_fidelity readback produced message
 
     umask 077
     mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/xdg-data" \
         "$sandbox/xdg-state" "$sandbox/codex-home" "$sandbox/claude-home"
-    binary="$(resolve_agsx_converter_binary)"
+    binary="$(resolve_ags_converter_binary)"
     conversion_result_binary="$binary"
 
     if [[ "$source_main" == *.jsonl.zst ]]; then
@@ -8895,14 +8521,14 @@ prepare_cross_agent_restore() {
     esac
     result_file="$sandbox/convert.json"
     stderr="$sandbox/convert.err"
-    if ! run_agsx_isolated "$binary" "$sandbox" \
+    if ! run_ags_isolated "$binary" "$sandbox" \
         --json resume "$target_alias" "$source_session_id" \
         --source "$source_input" --force --no-store \
         > "$result_file" 2> "$stderr"; then
         error_message="$(jq -r '.message // empty' "$stderr" 2>/dev/null || true)"
         [[ -n "$error_message" ]] ||
             error_message="$(sed -n '/[^[:space:]]/h; ${x;p;}' "$stderr")"
-        die "agsx conversion failed: ${error_message:-unknown error}"
+        die "ags conversion failed: ${error_message:-unknown error}"
     fi
     jq -e --arg source "$source_slug" --arg target "$target_slug" \
         --arg source_id "$source_session_id" '
@@ -8922,28 +8548,28 @@ prepare_cross_agent_restore() {
         (.written_paths | type == "array" and length == 1) and
         (.written_paths[0] | type == "string")
     ' "$result_file" >/dev/null ||
-        die "agsx returned an invalid conversion result"
+        die "ags returned an invalid conversion result"
     conversion_result_session_id="$(jq -r '.target_session_id' "$result_file")"
     validate_session_id "$conversion_result_session_id"
     [[ "$conversion_result_session_id" != "$source_session_id" ]] ||
-        die "agsx reused the source session UUID"
+        die "ags reused the source session UUID"
     target_main="$(jq -r '.written_paths[0]' "$result_file")"
     [[ "$target_main" == "$target_root/"* && -f "$target_main" && ! -L "$target_main" ]] ||
-        die "agsx target transcript escaped its output root"
+        die "ags target transcript escaped its output root"
 
     [[ -z "$(find "$target_root" -type l -print -quit)" ]] ||
-        die "agsx output contains a symbolic link"
+        die "ags output contains a symbolic link"
     [[ -z "$(find "$target_root" -mindepth 1 ! -type d ! -type f -print -quit)" ]] ||
-        die "agsx output contains a special file"
+        die "ags output contains a special file"
     relative="${target_main#"$target_root/"}"
     [[ "$relative" != "$target_main" ]] ||
-        die "agsx target transcript escaped its output root"
+        die "ags target transcript escaped its output root"
     validate_native_main_path "$target_agent" "$conversion_result_session_id" "$relative" ||
-        die "agsx produced an unsupported target transcript path"
+        die "ags produced an unsupported target transcript path"
 
     while IFS= read -r -d '' produced; do
         [[ "$produced" == "$target_main" ]] ||
-            die "agsx produced an unexpected target artifact: ${produced#"$target_root/"}"
+            die "ags produced an unexpected target artifact: ${produced#"$target_root/"}"
     done < <(find "$target_root" -type f -print0)
 
     conversion_result_main="$target_main"
@@ -8986,24 +8612,24 @@ prepare_cross_agent_restore() {
     validate_converted_transcript_identity "$target_agent" \
         "$conversion_result_session_id" "$conversion_result_main" "$codex_provider"
     readback="$sandbox/readback.json"
-    if ! run_agsx_isolated "$binary" "$sandbox" \
+    if ! run_ags_isolated "$binary" "$sandbox" \
         --json info "$conversion_result_main" --from "$target_alias" \
         > "$readback" 2> "$stderr"; then
-        die "agsx cannot read back the normalized $target_agent transcript"
+        die "ags cannot read back the normalized $target_agent transcript"
     fi
     jq -e --arg id "$conversion_result_session_id" --arg format "$target_slug" '
         .session_id == $id and .detected_format == $format
     ' "$readback" >/dev/null ||
-        die "agsx read-back identity does not match the normalized transcript"
+        die "ags read-back identity does not match the normalized transcript"
     conversion_fidelity="$(
         jq -r '.verified_fidelity // .fidelity' "$result_file"
     )"
-    log "warning: cross-Agent resume fidelity reported by agsx: $conversion_fidelity"
+    log "warning: cross-Agent resume fidelity reported by ags: $conversion_fidelity"
     while IFS= read -r message; do
-        [[ -z "$message" ]] || log "warning: agsx: $message"
+        [[ -z "$message" ]] || log "warning: ags: $message"
     done < <(jq -r '.warnings[]?' "$result_file")
     while IFS= read -r message; do
-        [[ -z "$message" ]] || log "warning: agsx loss: $message"
+        [[ -z "$message" ]] || log "warning: ags loss: $message"
     done < <(jq -r '.losses[]? | "\(.kind): \(.note)"' "$result_file")
 }
 
@@ -11482,7 +11108,7 @@ restore_checkpoint_file() {
 
     if (( commit_failed == 0 )) && [[ "$restore_agent" == codex ]]; then
         conversion_result_binary="${conversion_result_binary:-$(
-            resolve_agsx_converter_binary
+            resolve_ags_converter_binary
         )}"
         if ! env CODEX_HOME="$destination_home" \
             "$conversion_result_binary" checkpoint-register-codex \
@@ -11575,8 +11201,8 @@ restore_checkpoint_file() {
         "$saved_pwd" "$target_cwd" "$fidelity" "$public_ip" "$ip_location" \
         "$added" "$updated" "$same" "$conflicts"
     if (( cross_restore == 1 )); then
-        printf 'source_agent=%s\nsource_session_id=%s\nconversion=agsx-%s\n' \
-            "$agent" "$source_session_id" "$agsx_converter_version"
+        printf 'source_agent=%s\nsource_session_id=%s\nconversion=ags-%s\n' \
+            "$agent" "$source_session_id" "$ags_converter_version"
     fi
 }
 
@@ -11608,11 +11234,9 @@ resume_checkpoint() {
     shift
     local checkpoint_id="${1:-}" launch_binary resume_cwd= resume_target_agent=
     local profile= agent_profile= effective_profile=
-    local checkpoint_runtime_key profile_marker client_args_digest
     local runtime_manifest runtime_source_agent runtime_record_id runtime_saved_cwd
-    local runtime_description
     local runtime_selected_record_id
-    local runtime_effective_agent runtime_effective_cwd runtime_effective_home
+    local runtime_effective_agent runtime_effective_cwd
     local storage_reconciled=0
     local -a client_args=()
     scrub_transport_password_environment
@@ -11658,7 +11282,7 @@ resume_checkpoint() {
                 shift
                 ;;
             --force-unsupported-version)
-                die "--force-unsupported-version was removed; agsx validates current formats directly"
+                die "--force-unsupported-version was removed; ags validates current formats directly"
                 ;;
             --profile)
                 (( $# >= 2 )) || die "--profile requires a profile name"
@@ -11689,8 +11313,8 @@ resume_checkpoint() {
         load_local_storage
         if ! local_checkpoint_selector_exists "$local_checkpoints" "$checkpoint_id"; then
             # A new machine may have no local copy yet. Only that case needs
-            # reconciliation before the formal resolve; an existing local
-            # record still gets a network-free live-RMUX attach attempt first.
+            # reconciliation before the formal resolve, so an existing local
+            # record still resumes without touching the network.
             prepare_storage_for_launch
             storage_reconciled=1
         fi
@@ -11713,7 +11337,6 @@ resume_checkpoint() {
     [[ -n "$runtime_record_id" ]] ||
         runtime_record_id="$(sed -n 's/^checkpoint_id=//p' <<< "$runtime_manifest")"
     runtime_saved_cwd="$(sed -n 's/^cwd=//p' <<< "$runtime_manifest")"
-    runtime_description="$(sed -n 's/^description=//p' <<< "$runtime_manifest")"
     [[ ( "$runtime_source_agent" == codex || "$runtime_source_agent" == claude ) &&
        "$runtime_record_id" == "$checkpoint_record_id" ]] ||
         die "checkpoint manifest does not match its managed resume identity"
@@ -11740,52 +11363,16 @@ resume_checkpoint() {
        -d "$runtime_effective_cwd" ]] ||
         die "checkpoint needs an existing cwd; use --cwd PATH"
     runtime_effective_cwd="$(cd -- "$runtime_effective_cwd" && pwd -P)"
-    if ! live_session_description_valid "$runtime_description"; then
-        runtime_description="$(
-            default_live_session_description \
-                "$runtime_effective_agent" "$runtime_effective_cwd"
-        )"
-    fi
-    case "$runtime_effective_agent" in
-        codex)
-            runtime_effective_home="$(
-                canonical_native_home "${CODEX_HOME:-$HOME/.codex}"
-            )" || die "cannot canonicalize Codex native home"
-            ;;
-        claude)
-            runtime_effective_home="$(
-                canonical_native_home "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
-            )" || die "cannot canonicalize Claude native home"
-            ;;
-        *) die "conversion target must be codex or claude" ;;
-    esac
-    profile_marker="${effective_profile:-default}"
-    if (( ${#client_args[@]} > 0 )); then
-        client_args_digest="$(
-            printf '%s\0' "${client_args[@]}" | sha256sum | cut -d' ' -f1
-        )"
-    else
-        client_args_digest="$(printf '' | sha256sum | cut -d' ' -f1)"
-    fi
-    checkpoint_runtime_key="checkpoint/$checkpoint_record_id/agent/$runtime_effective_agent"
-    checkpoint_runtime_key+="/cwd/$runtime_effective_cwd/home/$runtime_effective_home"
-    checkpoint_runtime_key+="/profile/$profile_marker/args/$client_args_digest"
-    if attach_managed_agent_if_live "$checkpoint_runtime_key"; then
-        return 0
-    fi
+    [[ "$runtime_effective_agent" == codex || "$runtime_effective_agent" == claude ]] ||
+        die "conversion target must be codex or claude"
     if [[ "$target" == local && "$storage_reconciled" == 0 ]]; then
         runtime_selected_record_id="$checkpoint_record_id"
         prepare_storage_for_launch
-        # A live RMUX session must remain attachable while a selected remote is
-        # offline. Only a miss reaches synchronization. Resolve again after
-        # reconciliation so a tombstone or newly ambiguous logical ID cannot
-        # restore the stale pre-sync selection.
+        # Resolve again after reconciliation so a tombstone or a newly ambiguous
+        # logical ID cannot restore the stale pre-sync selection.
         resolve_checkpoint_record_for_live "$target" "$checkpoint_id"
         [[ "$checkpoint_record_id" == "$runtime_selected_record_id" ]] ||
             die "checkpoint selection changed during storage reconciliation"
-        if attach_managed_agent_if_live "$checkpoint_runtime_key"; then
-            return 0
-        fi
     fi
     launch_binary="$(resolve_agent_binary "$runtime_effective_agent")"
     context_mode_require_agent \
@@ -11800,43 +11387,25 @@ resume_checkpoint() {
         "${restored_binary_invoked:-}" "${restored_binary_real:-}" \
         "${restored_binary_version:-}" "${restored_binary_sha256:-}" \
         "${restored_binary_os:-}" "${restored_binary_arch:-}"
-    # Another caller may have created this logical runtime while this caller
-    # was restoring. Recheck before native-process exclusion; if both callers
-    # still miss, RMUX's `new-session -A` remains the atomic final gate.
-    if attach_managed_agent_if_live "$checkpoint_runtime_key"; then
-        return 0
-    fi
     assert_native_session_inactive \
         "$restored_agent" "$restored_native_home" "$restored_session_id"
     case "$restored_agent" in
         codex)
             if [[ -n "$profile" ]]; then
-                launch_managed_agent \
-                    "$checkpoint_runtime_key" \
-                    "$launch_binary" "$runtime_description" \
-                    "$restored_agent" checkpoint \
+                launch_managed_agent "$launch_binary" "$restored_agent" \
                     resume "$restored_session_id" \
                     --profile "$profile" "${client_args[@]}"
             fi
-            launch_managed_agent \
-                "$checkpoint_runtime_key" \
-                "$launch_binary" "$runtime_description" \
-                "$restored_agent" checkpoint \
+            launch_managed_agent "$launch_binary" "$restored_agent" \
                 resume "$restored_session_id" "${client_args[@]}"
             ;;
         claude)
             if [[ -n "$profile" ]]; then
-                launch_managed_agent \
-                    "$checkpoint_runtime_key" \
-                    "$launch_binary" "$runtime_description" \
-                    "$restored_agent" checkpoint \
+                launch_managed_agent "$launch_binary" "$restored_agent" \
                     --resume "$restored_session_id" \
                     --settings "$restored_claude_settings" "${client_args[@]}"
             fi
-            launch_managed_agent \
-                "$checkpoint_runtime_key" \
-                "$launch_binary" "$runtime_description" \
-                "$restored_agent" checkpoint \
+            launch_managed_agent "$launch_binary" "$restored_agent" \
                 --resume "$restored_session_id" "${client_args[@]}"
             ;;
         *) die "unsupported restored agent: $restored_agent" ;;
@@ -12854,7 +12423,7 @@ merge_storage_modes() {
     rm -rf -- "$merge_workspace"
     trap - EXIT
     # Keep merged source replicas recoverable until the user retires them, but
-    # immediately route every future save (including already-running RMUX
+    # immediately route every future save (including already-running Agent
     # sessions that still export the old mode) into the verified destination.
     redirect_merged_storage_sources "$destination" "${sources[@]}"
     promote_storage_mode "$destination"
@@ -13881,7 +13450,7 @@ update_codext() {
             # the installer's --dest and the one directory install.sh's
             # maybe_add_path puts on PATH. Anywhere else and `codext` would not
             # be a command the user can type.
-            binary="${AGSX_CONVERTER_BINARY:-}"
+            binary="${AGS_CONVERTER_BINARY:-}"
             [[ -n "$binary" ]] || return 0
             binary="$(dirname "$binary")/codext"
         fi
@@ -14082,8 +13651,8 @@ update_context_mode() {
 # all, and hand over to the installer that shipped with the target release.
 update_ags() {
     local check_only=0
-    local owner="${AGSX_UPDATE_OWNER:-jk-zhang-meta}"
-    local repo="${AGSX_UPDATE_REPO:-ags}"
+    local owner="${AGS_UPDATE_OWNER:-jk-zhang-meta}"
+    local repo="${AGS_UPDATE_REPO:-ags}"
     local binary destination current tag response status workspace
 
     while (( $# > 0 )); do
@@ -14104,11 +13673,11 @@ update_ags() {
     # already current — and Context Mode's release train is npm's, not AGS's.
     update_context_mode "$check_only"
 
-    binary="$(resolve_agsx_converter_binary)"
+    binary="$(resolve_ags_converter_binary)"
     destination="$(dirname "$binary")"
-    current="$agsx_converter_version"
+    current="$ags_converter_version"
     [[ "$current" != unknown ]] ||
-        die "cannot read the installed casr version from $binary; reinstall agsx"
+        die "cannot read the installed casr version from $binary; reinstall ags"
 
     # Deliberately not `curl -f`: with it, "no such release", "this repository
     # is private and you are not authenticated", and "the network is down" all
@@ -14136,7 +13705,7 @@ update_ags() {
     # tag is the crate version with a leading `v` and comparing the two as
     # strings is exact. Ordering is deliberately not computed: `ags update`
     # means "match the latest release", and a bash semver comparator that has
-    # to understand `0.3.0-agsx.1` is how install.sh grew its own version bug.
+    # to understand `0.3.0-ags.1` is how install.sh grew its own version bug.
     # A move in either direction is printed, so a downgrade is never silent.
     if [[ "$tag" == "v$current" ]]; then
         log "already current: casr $current is the latest release ($tag)"
@@ -14175,35 +13744,10 @@ update_ags() {
     log "updated to $tag"
 }
 
-launch_description=
-launch_description_set=0
-case "${1:-}" in
-    --description)
-        (( $# >= 3 )) || die "usage: ags --description TEXT claude|codex [AGENT_ARGS...]"
-        launch_description="$2"
-        launch_description_set=1
-        validate_live_session_description "$launch_description"
-        shift 2
-        ;;
-    --description=*)
-        launch_description="${1#--description=}"
-        launch_description_set=1
-        validate_live_session_description "$launch_description"
-        shift
-        ;;
-esac
-if (( launch_description_set == 1 )) &&
-   [[ "${1:-}" != claude && "${1:-}" != codex ]]; then
-    die "--description must appear immediately before claude or codex"
-fi
-
 case "${1:-}" in
     '') enter_ags ;;
-    claude) shift; start_managed_agent claude "$launch_description" "$@" ;;
-    codex) shift; start_managed_agent codex "$launch_description" "$@" ;;
-    sessions) shift; list_live_sessions "$@" ;;
-    attach) shift; attach_live_session "$@" ;;
-    describe) shift; describe_live_session "$@" ;;
+    claude) shift; start_managed_agent claude "$@" ;;
+    codex) shift; start_managed_agent codex "$@" ;;
     context)
         shift
         [[ "${1:-}" == review-codex && $# == 1 ]] ||

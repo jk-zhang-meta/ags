@@ -130,7 +130,7 @@ Three things follow, and they are the whole reason the design is small:
 
 - **The stored IR is a cache.** `ir_version` is written into every serialised
   IR and, until now, read by nobody — `IR_VERSION` has been bumped once
-  (`agsx-ir/1` → `/2`) with no enforcement anywhere. The store is that
+  (`ags-ir/1` → `/2`) with no enforcement anywhere. The store is that
   enforcement point, and the enforcement is *deletion*: on read, a mismatched
   `ir_version` discards the cached IR and re-derives it from origin bytes.
   There is no migration path and there must never be one. This is what keeps
@@ -142,7 +142,7 @@ Three things follow, and they are the whole reason the design is small:
   so the index is `index.sqlite` with the schema version in `PRAGMA
   user_version`. A single-file index invites the objection that it is a single
   point of corruption. It is not, because it is rebuildable from the record
-  directories: `agsx store fsck --rebuild-index`. Only content is
+  directories: `ags store fsck --rebuild-index`. Only content is
   authoritative.
 - **Losses are records, not caches.** `Fidelity` and `Vec<Loss>` describe an
   event that happened at a point in time to a specific pair of files. They
@@ -215,8 +215,8 @@ syscall trace of one conversion showed the asymmetry plainly:
 
 ```
 fsync  records/<id>/.casr-tmp-…          # the staging file's contents
-rename .casr-tmp-…  -> record.json.agsx-new-…
-rename record.json.agsx-new-… -> record.json     # publication: not durable
+rename .casr-tmp-…  -> record.json.ags-new-…
+rename record.json.ags-new-… -> record.json     # publication: not durable
 fsync  index.sqlite-wal                  # SQLite's COMMIT: durable
 ```
 
@@ -324,7 +324,7 @@ after its live file is gone*.
 ## Shape
 
 ```
-$AGSX_STORE  (default: dirs::data_dir()/agsx, else ~/.agsx)
+$AGS_STORE  (default: dirs::data_dir()/ags, else ~/.ags)
   store.json                 # store_version; refuse to WRITE a newer store
   index.sqlite               # cache: (provider, session_id) -> record; rebuildable
   records/<uuid>/

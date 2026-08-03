@@ -676,7 +676,7 @@ fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<
                 serde_json::Value::String(model.to_string()),
             );
             meta.insert(
-                "agsxMessageIndex".into(),
+                "agsMessageIndex".into(),
                 serde_json::Value::Number((message.idx as u64).into()),
             );
             if is_user {
@@ -712,7 +712,7 @@ fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<
             let call_id = call
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("agsx-{target_id}-{}-{call_index}", message.idx));
+                .unwrap_or_else(|| format!("ags-{target_id}-{}-{call_index}", message.idx));
             emitted_calls.insert(call_id.clone());
             updates.push(update_envelope(
                 target_id,
@@ -723,7 +723,7 @@ fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<
                     "kind": "function",
                     "status": "in_progress",
                     "rawInput": call.arguments,
-                    "_meta": {"agsxMessageIndex": message.idx}
+                    "_meta": {"agsMessageIndex": message.idx}
                 }),
                 timestamp,
             ));
@@ -739,7 +739,7 @@ fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<
                         .get(result_index)
                         .and_then(|call| call.id.clone())
                 })
-                .unwrap_or_else(|| format!("agsx-{target_id}-{}-{result_index}", message.idx));
+                .unwrap_or_else(|| format!("ags-{target_id}-{}-{result_index}", message.idx));
             if emitted_calls.insert(call_id.clone()) {
                 updates.push(update_envelope(
                     target_id,
@@ -750,7 +750,7 @@ fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<
                         "kind": "function",
                         "status": "in_progress",
                         "rawInput": serde_json::Value::Null,
-                        "_meta": {"agsxMessageIndex": message.idx}
+                        "_meta": {"agsMessageIndex": message.idx}
                     }),
                     timestamp,
                 ));
@@ -763,7 +763,7 @@ fn build_updates(session: &CanonicalSession, target_id: &str) -> anyhow::Result<
                     "status": if result.is_error { "failed" } else { "completed" },
                     "content": tool_content(&result.content),
                     "rawOutput": result.content,
-                    "_meta": {"agsxMessageIndex": message.idx}
+                    "_meta": {"agsMessageIndex": message.idx}
                 }),
                 timestamp,
             ));
@@ -1012,8 +1012,12 @@ impl Provider for Grok {
                 };
 
                 let ts = line_timestamp(&val, update);
+                // The old spelling is still read because it is on disk: this
+                // marker is written into the converted transcript, so every
+                // Grok session converted before the rename carries it.
                 let imported_index = update
-                    .pointer("/_meta/agsxMessageIndex")
+                    .pointer("/_meta/agsMessageIndex")
+                    .or_else(|| update.pointer("/_meta/agsxMessageIndex"))
                     .and_then(|value| value.as_u64())
                     .map(|value| value as usize);
                 if let Some(t) = ts {
@@ -1746,7 +1750,7 @@ mod tests {
                 json!({
                     "sessionUpdate": "user_message_chunk",
                     "content": {"type": "text", "text": "first"},
-                    "_meta": {"agsxMessageIndex": 0}
+                    "_meta": {"agsMessageIndex": 0}
                 }),
                 100,
             ),
@@ -1754,7 +1758,7 @@ mod tests {
                 json!({
                     "sessionUpdate": "user_message_chunk",
                     "content": {"type": "text", "text": "second"},
-                    "_meta": {"agsxMessageIndex": 1}
+                    "_meta": {"agsMessageIndex": 1}
                 }),
                 101,
             ),
@@ -1770,7 +1774,7 @@ mod tests {
     #[test]
     fn long_workspace_group_matches_grok_slug_and_blake3_rule() {
         let workspace = PathBuf::from(format!(
-            "/root/.agent-work/agsx-grok-boundary-probe.ww9QFb/long/{}/{}/{}",
+            "/root/.agent-work/ags-grok-boundary-probe.ww9QFb/long/{}/{}/{}",
             "a".repeat(80),
             "b".repeat(80),
             "c".repeat(80)
@@ -1780,7 +1784,7 @@ mod tests {
         assert!(shortened);
         assert_eq!(
             group,
-            "cccccccccccccccccccccccccccccccccccccccc-764bdab3e4f7b6a3"
+            "cccccccccccccccccccccccccccccccccccccccc-ebbcdbab40fb44f4"
         );
     }
 

@@ -179,16 +179,16 @@ fn corpus_session_with_capsules(
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_store_creates_itself_under_agsx_store() {
+fn the_store_creates_itself_under_ags_store() {
     let _lock = ENV.lock().expect("env lock");
     let home = tempfile::tempdir().expect("temp home");
     let root = home.path().join("chosen-root");
-    let _guard = EnvGuard::set("AGSX_STORE", &root);
+    let _guard = EnvGuard::set("AGS_STORE", &root);
 
     assert_eq!(
         casr::store::default_root().expect("root"),
         root,
-        "$AGSX_STORE wins over every default"
+        "$AGS_STORE wins over every default"
     );
     let store = Store::open().expect("open the default store");
     assert_eq!(store.root(), root.as_path());
@@ -308,13 +308,13 @@ fn an_ir_cache_stamped_with_an_older_version_is_deleted_not_migrated() {
         "a current cache is served"
     );
 
-    // Plant the version that IR_VERSION superseded. `agsx-ir/1` predates
+    // Plant the version that IR_VERSION superseded. `ags-ir/1` predates
     // `Body::Rollback`, `Body::Abort` and `SessionIr::live_head`, so a reader
     // that "migrated" it would be inventing history.
     let mut raw: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&cache).expect("read")).expect("parse");
     assert_eq!(raw["ir_version"], serde_json::json!(IR_VERSION));
-    raw["ir_version"] = serde_json::json!("agsx-ir/1");
+    raw["ir_version"] = serde_json::json!("ags-ir/1");
     std::fs::write(&cache, serde_json::to_vec(&raw).expect("encode")).expect("plant");
 
     assert_eq!(

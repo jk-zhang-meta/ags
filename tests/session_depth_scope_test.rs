@@ -33,7 +33,7 @@ use tempfile::TempDir;
 ///
 /// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* casr's own
 /// session store, so leaving it unset would have these tests create
-/// `~/.local/share/agsx` on the machine running them. `current_dir` is set for
+/// `~/.local/share/ags` on the machine running them. `current_dir` is set for
 /// the same class of reason: casr subcommands write relative to the cwd.
 fn casr_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]

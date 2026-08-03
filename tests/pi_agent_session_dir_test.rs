@@ -43,7 +43,7 @@ use tempfile::TempDir;
 ///
 /// `XDG_DATA_HOME` matters twice over — it is Amp's store *and* casr's own
 /// session store — so leaving it unset would have these tests write into
-/// `~/.local/share/agsx` on the machine running them.
+/// `~/.local/share/ags` on the machine running them.
 fn casr_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("casr").expect("casr binary should be built");
@@ -71,7 +71,7 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
         .env("XDG_DATA_HOME", tmp.path().join("xdg-data"))
         .env("NO_COLOR", "1")
-        .env_remove("AGSX_STORE")
+        .env_remove("AGS_STORE")
         .env_remove("PI_AGENT_HOME")
         .env_remove("PI_CODING_AGENT_DIR")
         .env_remove("PI_CODING_AGENT_SESSION_DIR")

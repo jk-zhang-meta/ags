@@ -93,11 +93,6 @@ AGS_CODEX_SKILL_STATUS="not-attempted"
 AGS_CLAUDE_SKILL_STATUS="not-attempted"
 AGS_HOOK_STATUS="not-attempted"
 AGS_INIT_STATUS="not-attempted"
-AGS_TERMINAL_STATUS="not-attempted"
-RMUX_VERSION="0.9.1"
-RMUX_RELEASE_BASE="https://github.com/Helvesec/rmux/releases/download/v${RMUX_VERSION}"
-RMUX_TRANSACTION_FILE=""
-RMUX_TRANSACTION_ACTIVE=0
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Output System (Gum + ANSI Dual-Path)
@@ -640,7 +635,7 @@ checkpoint_path_has_symlink() {
 
 install_checkpoint_wrapper() {
   local wrapper_path="$DEST/ags"
-  local marker="# agsx-installer-checkpoint-wrapper"
+  local marker="# ags-installer-checkpoint-wrapper"
   local temporary
 
   if [ "$NO_CONFIGURE" -eq 1 ]; then
@@ -655,7 +650,7 @@ install_checkpoint_wrapper() {
   temporary="$(mktemp "$DEST/.ags-wrapper.XXXXXX")"
   cat > "$temporary" <<'EOF'
 #!/bin/sh
-# agsx-installer-checkpoint-wrapper
+# ags-installer-checkpoint-wrapper
 script_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
 exec "$script_dir/casr" checkpoint "$@"
 EOF
@@ -709,7 +704,7 @@ write_checkpoint_hooks() {
     printf '{}\n' > "$source"
   fi
 
-  temporary="$(mktemp "$directory/.agsx-hooks.XXXXXX")"
+  temporary="$(mktemp "$directory/.ags-hooks.XXXXXX")"
   jq --arg command "$command" --arg legacy_ags "$legacy_ags" \
     --arg legacy_session "$legacy_session" --arg kind "$kind" '
       .hooks = (.hooks // {}) |
@@ -755,509 +750,6 @@ checkpoint_dependencies_ready() {
     return 1
   fi
   return 0
-}
-
-rmux_version_supported() {
-  local version="$1" major minor patch
-  if [[ "$version" =~ ^rmux[[:space:]]+([0-9]+)\.([0-9]+)\.([0-9]+)(\+[A-Za-z0-9._-]+)?$ ]]; then
-    major="${BASH_REMATCH[1]}"
-    minor="${BASH_REMATCH[2]}"
-    patch="${BASH_REMATCH[3]}"
-    (( major == 0 && minor == 9 && patch >= 1 ))
-    return
-  fi
-  return 1
-}
-
-rmux_install_layout() {
-  local prefix
-  prefix="${RMUX_INSTALL_PREFIX:-}"
-  if [ -z "$prefix" ]; then
-    case "$DEST" in
-      */bin) prefix="${DEST%/bin}" ;;
-      *) prefix="$DEST" ;;
-    esac
-  fi
-  RMUX_CLIENT_PATH="$DEST/rmux"
-  RMUX_DAEMON_PATH="$DEST/rmux-daemon"
-  RMUX_HELPER_PATH="$prefix/libexec/rmux/rmux"
-}
-
-rmux_stage_path() {
-  printf '%s.install-transaction.\n' "$1"
-}
-
-rmux_backup_path() {
-  printf '%s/.rmux.rollback.%s.\n' "$DEST" "$1"
-}
-
-validate_rmux_transaction() {
-  local index path stage backup previous_existed
-  local -a destinations
-  rmux_install_layout
-  destinations=("$RMUX_CLIENT_PATH" "$RMUX_DAEMON_PATH" "$RMUX_HELPER_PATH")
-  [[ -f "$RMUX_TRANSACTION_FILE" &&
-     ! -L "$RMUX_TRANSACTION_FILE" ]] || return 1
-  jq -e --arg version "$RMUX_VERSION" '
-    (keys | sort) == ["entries","managed_by","schema","version"] and
-    .schema == 1 and
-    .managed_by == "ags-rmux-installer" and
-    .version == $version and
-    (.entries | type == "array" and length == 3) and
-    all(.entries[];
-      (keys | sort) ==
-        ["candidate_sha256","path","previous","stage_path"] and
-      (.path | type == "string" and startswith("/")) and
-      (.stage_path | type == "string" and startswith("/")) and
-      (.candidate_sha256 | test("^[0-9a-f]{64}$")) and
-      (.previous | keys | sort) ==
-        ["backup_path","existed","sha256"] and
-      (.previous.existed | type == "boolean") and
-      (
-        if .previous.existed then
-          (.previous.sha256 | test("^[0-9a-f]{64}$")) and
-          (.previous.backup_path | type == "string" and startswith("/"))
-        else
-          .previous.sha256 == null and .previous.backup_path == null
-        end
-      )
-    )
-  ' "$RMUX_TRANSACTION_FILE" >/dev/null 2>&1 || return 1
-  for index in "${!destinations[@]}"; do
-    path="$(jq -er --argjson index "$index" \
-      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
-    stage="$(jq -er --argjson index "$index" \
-      '.entries[$index].stage_path' "$RMUX_TRANSACTION_FILE")" || return 1
-    [[ "$path" == "${destinations[$index]}" &&
-       "$stage" == "$(rmux_stage_path "$path")"* &&
-       "$(dirname "$stage")" == "$(dirname "$path")" ]] || return 1
-    previous_existed="$(jq -er --argjson index "$index" '
-      .entries[$index].previous.existed |
-      if type == "boolean" then tostring else error("invalid boolean") end
-    ' "$RMUX_TRANSACTION_FILE")" ||
-      return 1
-    if [[ "$previous_existed" == true ]]; then
-      backup="$(jq -er --argjson index "$index" \
-        '.entries[$index].previous.backup_path' \
-        "$RMUX_TRANSACTION_FILE")" || return 1
-      [[ "$backup" == "$(rmux_backup_path "$index")"* &&
-         "$(dirname "$backup")" == "$DEST" ]] || return 1
-    fi
-  done
-}
-
-clear_rmux_transaction() {
-  local index previous_existed artifact
-  local -a stages backups
-  validate_rmux_transaction || return 1
-  for index in 0 1 2; do
-    stages[$index]="$(jq -er --argjson index "$index" \
-      '.entries[$index].stage_path' "$RMUX_TRANSACTION_FILE")" || return 1
-    previous_existed="$(jq -er --argjson index "$index" '
-      .entries[$index].previous.existed |
-      if type == "boolean" then tostring else error("invalid boolean") end
-    ' "$RMUX_TRANSACTION_FILE")" ||
-      return 1
-    if [[ "$previous_existed" == true ]]; then
-      backups[$index]="$(jq -er --argjson index "$index" \
-        '.entries[$index].previous.backup_path' \
-        "$RMUX_TRANSACTION_FILE")" || return 1
-    else
-      backups[$index]=""
-    fi
-  done
-  # Once every destination is proven committed or rolled back, remove the
-  # recovery authority first. Leftover stages/backups are harmless orphans.
-  rm -f -- "$RMUX_TRANSACTION_FILE" || return 1
-  RMUX_TRANSACTION_ACTIVE=0
-  durable_sync_path "$DEST" || return 1
-  for artifact in "${stages[@]}" "${backups[@]}"; do
-    [[ -z "$artifact" ]] || rm -f -- "$artifact" 2>/dev/null || true
-  done
-}
-
-rollback_rmux_install() {
-  local index current_sha partial
-  local -a destinations candidate_shas previous_existed previous_shas
-  local -a backups current_shas
-  [ "$RMUX_TRANSACTION_ACTIVE" -eq 1 ] ||
-    [[ -e "$RMUX_TRANSACTION_FILE" || -L "$RMUX_TRANSACTION_FILE" ]] ||
-    return 0
-  validate_rmux_transaction || return 1
-  # Prove every rollback input before changing any installed executable.
-  for index in 0 1 2; do
-    destinations[$index]="$(jq -er --argjson index "$index" \
-      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
-    candidate_shas[$index]="$(jq -er --argjson index "$index" \
-      '.entries[$index].candidate_sha256' "$RMUX_TRANSACTION_FILE")" ||
-      return 1
-    previous_existed[$index]="$(jq -er --argjson index "$index" '
-      .entries[$index].previous.existed |
-      if type == "boolean" then tostring else error("invalid boolean") end
-    ' "$RMUX_TRANSACTION_FILE")" ||
-      return 1
-    current_sha=
-    if [[ -e "${destinations[$index]}" ||
-          -L "${destinations[$index]}" ]]; then
-      [[ -f "${destinations[$index]}" &&
-         ! -L "${destinations[$index]}" ]] || return 1
-      current_sha="$(
-        installer_sha256_file "${destinations[$index]}"
-      )" || return 1
-    fi
-    current_shas[$index]="$current_sha"
-    if [[ "${previous_existed[$index]}" == true ]]; then
-      previous_shas[$index]="$(jq -er --argjson index "$index" \
-        '.entries[$index].previous.sha256' "$RMUX_TRANSACTION_FILE")" ||
-        return 1
-      backups[$index]="$(jq -er --argjson index "$index" \
-        '.entries[$index].previous.backup_path' \
-        "$RMUX_TRANSACTION_FILE")" || return 1
-      [[ -f "${backups[$index]}" && ! -L "${backups[$index]}" &&
-         "$(installer_sha256_file "${backups[$index]}")" == \
-           "${previous_shas[$index]}" ]] || return 1
-      [[ -z "$current_sha" ||
-         "$current_sha" == "${candidate_shas[$index]}" ||
-         "$current_sha" == "${previous_shas[$index]}" ]] || return 1
-    else
-      previous_shas[$index]=""
-      backups[$index]=""
-      [[ -z "$current_sha" ||
-         "$current_sha" == "${candidate_shas[$index]}" ]] || return 1
-    fi
-  done
-
-  for index in 0 1 2; do
-    current_sha="${current_shas[$index]}"
-    if [[ "${previous_existed[$index]}" == true ]]; then
-      if [[ "$current_sha" != "${previous_shas[$index]}" ]]; then
-        partial="$(
-          mktemp "${destinations[$index]}.rollback.XXXXXX"
-        )" || return 1
-        if ! install -m 0755 "${backups[$index]}" "$partial" ||
-           ! durable_sync_path "$partial" ||
-           ! mv -f -- "$partial" "${destinations[$index]}" ||
-           ! durable_sync_path "${destinations[$index]}"; then
-          rm -f -- "$partial"
-          return 1
-        fi
-      fi
-    elif [[ -n "$current_sha" ]]; then
-      rm -f -- "${destinations[$index]}" || return 1
-      durable_sync_path "$(dirname "${destinations[$index]}")" || return 1
-    fi
-  done
-  for index in 0 1 2; do
-    if [[ "${previous_existed[$index]}" == true ]]; then
-      [[ -f "${destinations[$index]}" &&
-         ! -L "${destinations[$index]}" &&
-         "$(installer_sha256_file "${destinations[$index]}")" == \
-           "${previous_shas[$index]}" ]] || return 1
-    else
-      [[ ! -e "${destinations[$index]}" &&
-         ! -L "${destinations[$index]}" ]] || return 1
-    fi
-  done
-  clear_rmux_transaction
-}
-
-commit_rmux_install() {
-  local index destination candidate_sha
-  validate_rmux_transaction || return 1
-  for index in 0 1 2; do
-    destination="$(jq -er --argjson index "$index" \
-      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
-    candidate_sha="$(jq -er --argjson index "$index" \
-      '.entries[$index].candidate_sha256' "$RMUX_TRANSACTION_FILE")" ||
-      return 1
-    [[ -f "$destination" && ! -L "$destination" &&
-       "$(installer_sha256_file "$destination")" == "$candidate_sha" ]] ||
-      return 1
-  done
-  detect_rmux >/dev/null 2>&1 || return 1
-  clear_rmux_transaction
-}
-
-recover_pending_rmux_transaction() {
-  local index destination candidate_sha current_sha all_candidate=1
-  if [[ ! -e "$RMUX_TRANSACTION_FILE" &&
-        ! -L "$RMUX_TRANSACTION_FILE" ]]; then
-    return 0
-  fi
-  validate_rmux_transaction || {
-    err "Invalid pending RMUX transaction: $RMUX_TRANSACTION_FILE"
-    return 1
-  }
-  for index in 0 1 2; do
-    destination="$(jq -er --argjson index "$index" \
-      '.entries[$index].path' "$RMUX_TRANSACTION_FILE")" || return 1
-    candidate_sha="$(jq -er --argjson index "$index" \
-      '.entries[$index].candidate_sha256' "$RMUX_TRANSACTION_FILE")" ||
-      return 1
-    current_sha=
-    if [[ -e "$destination" || -L "$destination" ]]; then
-      [[ -f "$destination" && ! -L "$destination" ]] || {
-        err "Pending RMUX target is no longer a regular file: $destination"
-        return 1
-      }
-      current_sha="$(installer_sha256_file "$destination")" || return 1
-    fi
-    [[ "$current_sha" == "$candidate_sha" ]] || all_candidate=0
-  done
-  RMUX_TRANSACTION_ACTIVE=1
-  if [[ "$all_candidate" -eq 1 ]] && detect_rmux >/dev/null 2>&1; then
-    info "Recovering interrupted RMUX and Context Mode installation"
-    return 0
-  fi
-  if rollback_rmux_install; then
-    warn "Rolled back an interrupted RMUX activation"
-    return 0
-  fi
-  err "Interrupted RMUX installation could not be recovered safely"
-  return 1
-}
-
-detect_rmux() {
-  local version
-  rmux_install_layout
-  [ -x "$RMUX_CLIENT_PATH" ] &&
-    [ -x "$RMUX_DAEMON_PATH" ] &&
-    [ -x "$RMUX_HELPER_PATH" ] || {
-      err "AGS requires its complete RMUX installation at $RMUX_CLIENT_PATH"
-      return 1
-    }
-  version="$("$RMUX_CLIENT_PATH" -V 2>/dev/null || true)"
-  rmux_version_supported "$version" || {
-    err "AGS requires a compatible RMUX 0.9.x release (0.9.1 or newer); found ${version:-an unrecognized version}"
-    return 1
-  }
-  "$RMUX_CLIENT_PATH" list-commands >/dev/null 2>&1 || {
-    err "RMUX cannot find its private helper at $RMUX_HELPER_PATH"
-    return 1
-  }
-  AGS_TERMINAL_STATUS="available (${version#rmux })"
-}
-
-install_rmux() {
-  local os arch platform archive checksum url package_root version
-  local index entries_file journal_tmp previous_sha previous_json
-  local candidate_sha prepare_ok=1 activation_ok=1
-  local -a sources destinations stages backups existed candidate_shas previous_shas
-  rmux_install_layout
-  if detect_rmux >/dev/null 2>&1; then
-    return 0
-  fi
-  case "$(uname -s)" in
-    Linux) os=linux ;;
-    Darwin) os=macos ;;
-    *) err "RMUX does not support this operating system"; return 1 ;;
-  esac
-  case "$(uname -m)" in
-    x86_64|amd64) arch=x86_64 ;;
-    arm64|aarch64) arch=aarch64 ;;
-    *) err "RMUX does not support this CPU architecture"; return 1 ;;
-  esac
-  platform="$os-$arch"
-  archive="rmux-$RMUX_VERSION-$platform.tar.gz"
-  case "$platform" in
-    linux-x86_64)
-      checksum=f7e91baa912e942c1fd090b9bfb30142d51ac1da8b142e088e6b3a417321d54b
-      ;;
-    linux-aarch64)
-      checksum=dc5fdb1257154c19f53a6c6a78fb08573556b9c791d2411c013e819862316db3
-      ;;
-    macos-x86_64)
-      checksum=6ef9c27019593affc3bc487f85fed28571ba47ce57587ddfcf8f33b8c924522a
-      ;;
-    macos-aarch64)
-      checksum=608d932cb2ea40cad741b45c78d1fbd9065e503942499423a2fcc2ccd914979f
-      ;;
-  esac
-  command -v tar >/dev/null 2>&1 || {
-    err "RMUX installation requires tar"
-    return 1
-  }
-  if ! command -v sha256sum >/dev/null 2>&1 &&
-     ! command -v shasum >/dev/null 2>&1; then
-    err "RMUX installation requires sha256sum or shasum"
-    return 1
-  fi
-  if [ -n "$OFFLINE_TARBALL" ]; then
-    for package_root in \
-      "$TMP/rmux-$RMUX_VERSION-$platform" \
-      "$TMP/rmux" \
-      "$TMP"; do
-      if [ -x "$package_root/bin/rmux" ] &&
-         [ -x "$package_root/bin/rmux-daemon" ] &&
-         [ -x "$package_root/libexec/rmux/rmux" ]; then
-        break
-      fi
-    done
-    [ -x "$package_root/bin/rmux" ] || {
-      err "Offline bundle is missing mandatory RMUX $RMUX_VERSION"
-      return 1
-    }
-    info "Installing mandatory bundled RMUX $RMUX_VERSION"
-  else
-    url="$RMUX_RELEASE_BASE/$archive"
-    info "Installing mandatory RMUX $RMUX_VERSION"
-    curl -fsSL "${PROXY_ARGS[@]}" "$url" -o "$TMP/$archive" || {
-      err "Cannot download official RMUX release: $url"
-      return 1
-    }
-    verify_checksum "$TMP/$archive" "$checksum" || {
-      err "RMUX archive checksum verification failed"
-      return 1
-    }
-    tar -xzf "$TMP/$archive" -C "$TMP"
-    package_root="$TMP/rmux-$RMUX_VERSION-$platform"
-  fi
-  sources=(
-    "$package_root/bin/rmux"
-    "$package_root/bin/rmux-daemon"
-    "$package_root/libexec/rmux/rmux"
-  )
-  destinations=(
-    "$RMUX_CLIENT_PATH"
-    "$RMUX_DAEMON_PATH"
-    "$RMUX_HELPER_PATH"
-  )
-  for index in "${!sources[@]}"; do
-    [ -x "${sources[$index]}" ] || {
-      err "Official RMUX archive is missing its required executable layout"
-      return 1
-    }
-  done
-  version="$("${sources[0]}" -V 2>/dev/null || true)"
-  [ "$version" = "rmux $RMUX_VERSION" ] || {
-    err "Official RMUX archive reported an unexpected version: ${version:-unknown}"
-    return 1
-  }
-
-  [[ ! -e "$RMUX_TRANSACTION_FILE" &&
-     ! -L "$RMUX_TRANSACTION_FILE" ]] || {
-    err "A pending RMUX transaction must be recovered first"
-    return 1
-  }
-  entries_file="$TMP/rmux-transaction-entries.jsonl"
-  : > "$entries_file"
-  for index in "${!destinations[@]}"; do
-    mkdir -p "$(dirname "${destinations[$index]}")"
-    stages[$index]="$(
-      mktemp "$(rmux_stage_path "${destinations[$index]}")XXXXXX"
-    )" || { prepare_ok=0; break; }
-    if ! install -m 0755 "${sources[$index]}" "${stages[$index]}" ||
-       ! durable_sync_path "${stages[$index]}"; then
-      prepare_ok=0
-      break
-    fi
-    if [ "$os" = macos ] && command -v codesign >/dev/null 2>&1; then
-      if ! codesign --force --sign - "${stages[$index]}" >/dev/null ||
-         ! durable_sync_path "${stages[$index]}"; then
-        prepare_ok=0
-        break
-      fi
-    fi
-    candidate_sha="$(installer_sha256_file "${stages[$index]}")" || {
-      prepare_ok=0
-      break
-    }
-    candidate_shas[$index]="$candidate_sha"
-    if [[ -e "${destinations[$index]}" ||
-          -L "${destinations[$index]}" ]]; then
-      [[ -f "${destinations[$index]}" &&
-         ! -L "${destinations[$index]}" ]] || {
-        prepare_ok=0
-        break
-      }
-      existed[$index]=1
-      backups[$index]="$(
-        mktemp "$(rmux_backup_path "$index")XXXXXX"
-      )" || { prepare_ok=0; break; }
-      if ! cp -p -- "${destinations[$index]}" "${backups[$index]}" ||
-         ! durable_sync_path "${backups[$index]}"; then
-        prepare_ok=0
-        break
-      fi
-      previous_sha="$(installer_sha256_file "${backups[$index]}")" || {
-        prepare_ok=0
-        break
-      }
-      previous_shas[$index]="$previous_sha"
-    else
-      existed[$index]=0
-      backups[$index]=""
-      previous_shas[$index]=""
-    fi
-  done
-  if [[ "$prepare_ok" -ne 1 || "${#stages[@]}" -ne 3 ]]; then
-    rm -f -- "${stages[@]:-}" "${backups[@]:-}" 2>/dev/null || true
-    err "RMUX transaction could not be staged"
-    return 1
-  fi
-
-  for index in 0 1 2; do
-    if [[ "${existed[$index]}" -eq 1 ]]; then
-      previous_json=true
-    else
-      previous_json=false
-    fi
-    jq -n \
-      --arg path "${destinations[$index]}" \
-      --arg stage "${stages[$index]}" \
-      --arg candidate "${candidate_shas[$index]}" \
-      --argjson existed "$previous_json" \
-      --arg previous_sha "${previous_shas[$index]}" \
-      --arg backup "${backups[$index]}" '
-        {
-          path:$path,
-          stage_path:$stage,
-          candidate_sha256:$candidate,
-          previous:{
-            existed:$existed,
-            sha256:(if $existed then $previous_sha else null end),
-            backup_path:(if $existed then $backup else null end)
-          }
-        }
-      ' >> "$entries_file" || {
-        rm -f -- "${stages[@]}" "${backups[@]}" 2>/dev/null || true
-        return 1
-      }
-  done
-  journal_tmp="$(
-    mktemp "$DEST/.rmux-install-transaction.tmp.XXXXXX"
-  )" || return 1
-  if ! jq -s --arg version "$RMUX_VERSION" '{
-      schema:1,
-      managed_by:"ags-rmux-installer",
-      version:$version,
-      entries:.
-    }' "$entries_file" > "$journal_tmp" ||
-     ! chmod 600 "$journal_tmp" ||
-     ! mv -- "$journal_tmp" "$RMUX_TRANSACTION_FILE"; then
-    rm -f -- "$journal_tmp" "${stages[@]}" "${backups[@]}" \
-      2>/dev/null || true
-    err "Cannot persist the RMUX installer transaction"
-    return 1
-  fi
-  RMUX_TRANSACTION_ACTIVE=1
-  if ! durable_sync_path "$RMUX_TRANSACTION_FILE"; then
-    err "RMUX transaction journal was retained after a durability failure"
-    return 1
-  fi
-  for index in 0 1 2; do
-    if ! mv -f -- "${stages[$index]}" "${destinations[$index]}" ||
-       ! durable_sync_path "${destinations[$index]}"; then
-      activation_ok=0
-      break
-    fi
-  done
-  if [[ "$activation_ok" -ne 1 ]] || ! detect_rmux >/dev/null 2>&1; then
-    rollback_rmux_install ||
-      err "RMUX installation failed and automatic rollback was not proven safe"
-    return 1
-  fi
-  AGS_TERMINAL_STATUS="installed ($RMUX_VERSION)"
 }
 
 run_checkpoint_runtime() {
@@ -1332,7 +824,6 @@ configure_checkpoints() {
   fi
 
   install_checkpoint_wrapper
-  detect_rmux
   install_checkpoint_skill "$CODEX_CONFIG_ROOT/skills" AGS_CODEX_SKILL_STATUS
   install_checkpoint_skill "$CLAUDE_CONFIG_ROOT/skills" AGS_CLAUDE_SKILL_STATUS
   if write_checkpoint_hooks "$CODEX_CONFIG_ROOT/hooks.json" codex &&
@@ -1913,11 +1404,10 @@ recover_pending_install_transaction() {
   fi
 
   if [[ -n "$current_sha" && "$current_sha" == "$candidate_sha" ]]; then
-    # Keep the binary journal active and rejoin the ordinary post-install path.
-    # That path proves/installs RMUX first, initializes Context Mode, then
-    # commits RMUX before the casr binary.
+    # Keep the binary journal active and rejoin the ordinary post-install path,
+    # which initializes Context Mode and only then commits the casr binary.
     INSTALL_TRANSACTION_ACTIVE=1
-    info "Resuming the interrupted casr, RMUX, and Context Mode installation"
+    info "Resuming the interrupted casr and Context Mode installation"
     return 0
   fi
 
@@ -2406,7 +1896,6 @@ DEST="$(cd "$DEST" && pwd -P)" || {
   exit 1
 }
 INSTALL_TRANSACTION_FILE="$DEST/.${BINARY_NAME}.install-transaction.json"
-RMUX_TRANSACTION_FILE="$DEST/.rmux-install-transaction.json"
 preflight_context_mode recovery
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2446,21 +1935,11 @@ fi
 
 TMP=$(mktemp -d)
 cleanup() {
-  local status=$? binary_rollback_safe=1
+  local status=$?
   if [ "$status" -ne 0 ] && [ "$INSTALL_CORE_COMMITTED" -eq 0 ] &&
-     [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
-    if ! restore_install_transaction_if_safe; then
-      binary_rollback_safe=0
-      warn "Installer transaction was retained because automatic rollback was not proven safe"
-    fi
-  fi
-  if [ "$status" -ne 0 ] && [ "$RMUX_TRANSACTION_ACTIVE" -eq 1 ]; then
-    if [ "$binary_rollback_safe" -eq 1 ]; then
-      rollback_rmux_install ||
-        warn "RMUX rollback could not be completed automatically"
-    else
-      warn "RMUX transaction was retained with the binary transaction for joint recovery"
-    fi
+     [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ] &&
+     ! restore_install_transaction_if_safe; then
+    warn "Installer transaction was retained because automatic rollback was not proven safe"
   fi
   [ -z "$BINARY_STAGE" ] || rm -f -- "$BINARY_STAGE" 2>/dev/null || true
   rm -rf "$TMP" 2>/dev/null || true
@@ -2470,13 +1949,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-recover_pending_rmux_transaction || exit 1
 recover_pending_install_transaction || exit 1
-if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ] &&
-   detect_rmux >/dev/null 2>&1; then
-  # The installed casr and the complete RMUX layout are already the exact
-  # journaled candidates. Finish Context Mode and commit those transactions
-  # without requiring the original artifact or any network access.
+if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
+  # The installed casr is already the exact journaled candidate. Finish Context
+  # Mode and commit that transaction without requiring the original artifact or
+  # any network access.
   RESUME_CORE_ONLY=1
 fi
 
@@ -2511,7 +1988,7 @@ fi
 setup_proxy
 
 if [ "$RESUME_CORE_ONLY" -eq 1 ]; then
-  info "Finishing the recovered casr, RMUX, and Context Mode transaction"
+  info "Finishing the recovered casr and Context Mode transaction"
 else
   # Resolve version and platform only for new installation work. A recovered
   # candidate is already identified by its journaled SHA-256.
@@ -2705,14 +2182,7 @@ fi
 # Post-Install (shared across all install paths)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-install_rmux
 configure_context_mode_only
-if [ "$RMUX_TRANSACTION_ACTIVE" -eq 1 ]; then
-  commit_rmux_install || {
-    err "Context Mode succeeded, but the RMUX transaction could not be committed"
-    exit 1
-  }
-fi
 if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
   commit_install_transaction || {
     err "Context Mode succeeded, but the binary transaction could not be committed"
@@ -2769,7 +2239,6 @@ summary_lines=(
   "AGS Claude skill: $AGS_CLAUDE_SKILL_STATUS"
   "AGS hooks:        $AGS_HOOK_STATUS"
   "AGS vault:        $AGS_INIT_STATUS"
-  "AGS terminal:     $AGS_TERMINAL_STATUS"
   "Context Mode:     $CONTEXT_MODE_STATUS"
   "codext:           $CODEXT_STATUS"
   ""

@@ -352,13 +352,13 @@ impl OpenCode {
         serde_json::json!({
             "info": {
                 "id": session_id,
-                "slug": format!("agsx-{}", &id_seed[..id_seed.len().min(12)]),
+                "slug": format!("ags-{}", &id_seed[..id_seed.len().min(12)]),
                 "projectID": "global",
                 "directory": workspace.display().to_string(),
                 "title": title,
                 "version": env!("CARGO_PKG_VERSION"),
                 "metadata": {
-                    "importedBy": "agsx-convert",
+                    "importedBy": "ags",
                     "sourceProvider": session.provider_slug,
                 },
                 "time": {"created": created, "updated": updated},

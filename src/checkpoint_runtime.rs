@@ -53,7 +53,7 @@ fn runtime_command(args: &[OsString]) -> Result<(tempfile::NamedTempFile, Comman
     let (bash, homebrew_prefix) = runtime_bash()?;
     let current_exe = std::env::current_exe().context("cannot locate the casr executable")?;
     let mut script = tempfile::Builder::new()
-        .prefix("agsx-checkpoint-")
+        .prefix("ags-checkpoint-")
         .suffix(".sh")
         .tempfile()
         .context("cannot create the AGS checkpoint runtime file")?;
@@ -71,8 +71,8 @@ fn runtime_command(args: &[OsString]) -> Result<(tempfile::NamedTempFile, Comman
         .arg("ags")
         .arg(script.path())
         .args(args)
-        .env("AGSX_CONVERTER_BINARY", current_exe)
-        .env("AGSX_CONVERTER_VERSION", env!("CARGO_PKG_VERSION"));
+        .env("AGS_CONVERTER_BINARY", current_exe)
+        .env("AGS_CONVERTER_VERSION", env!("CARGO_PKG_VERSION"));
     if let Some(prefix) = homebrew_prefix {
         command.env("AGENT_SESSION_HOMEBREW_PREFIX", prefix);
     }

@@ -795,7 +795,7 @@ pub fn register_restored_thread(
         .unwrap_or_else(|| {
             let title = truncate_title(first_user, 100);
             if title.is_empty() {
-                "Restored checkpoint (via agsx)".to_string()
+                "Restored checkpoint (via ags)".to_string()
             } else {
                 title
             }
