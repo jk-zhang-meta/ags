@@ -1298,4 +1298,37 @@ if (( EUID == 0 )); then
     grep -Fq -- '--system cannot run as root' "$tmp/system-root.err"
 fi
 
+# A wrapper written before the agsx name was dropped must still be recognised as
+# the installer's own. `# ags-installer-` is not a substring of
+# `# agsx-installer-`, so a single-marker check reads those machines as
+# hand-written, preserves the file, and never updates it again — which would
+# strand every installation predating that rename.
+cat > "$bin_dir/ags" <<'EOF'
+#!/bin/sh
+# agsx-installer-checkpoint-wrapper
+script_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
+exec "$script_dir/casr" checkpoint "$@"
+EOF
+chmod 0755 "$bin_dir/ags"
+if ! run_installer > "$tmp/legacy-wrapper.out" 2> "$tmp/legacy-wrapper.err"; then
+    printf 'installer run over a pre-rename wrapper failed:\n' >&2
+    cat "$tmp/legacy-wrapper.err" >&2
+    exit 1
+fi
+if grep -Fq 'agsx-installer-checkpoint-wrapper' "$bin_dir/ags"; then
+    printf 'installer left a pre-rename wrapper in place instead of adopting it\n' >&2
+    exit 1
+fi
+grep -Fq '# ags-installer-checkpoint-wrapper' "$bin_dir/ags"
+
+# A wrapper the installer did not write is still left alone.
+printf '#!/bin/sh\n# mine\nexec true\n' > "$bin_dir/ags"
+chmod 0755 "$bin_dir/ags"
+if ! run_installer > "$tmp/unmanaged-wrapper.out" 2> "$tmp/unmanaged-wrapper.err"; then
+    printf 'installer run over an unmanaged wrapper failed:\n' >&2
+    cat "$tmp/unmanaged-wrapper.err" >&2
+    exit 1
+fi
+grep -Fqx '# mine' "$bin_dir/ags"
+
 printf 'ags install smoke passed (%s/%s)\n' "$platform" "$(uname -m)"

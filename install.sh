@@ -636,13 +636,21 @@ checkpoint_path_has_symlink() {
 install_checkpoint_wrapper() {
   local wrapper_path="$DEST/ags"
   local marker="# ags-installer-checkpoint-wrapper"
+  # Wrappers written before the agsx name was dropped carry the older marker,
+  # and `# ags-installer-` is not a substring of `# agsx-installer-`. Without
+  # recognising both, every machine installed before that rename looks
+  # hand-written: the branch below preserves it and the installer never touches
+  # that file again, so no future wrapper change can ever reach those machines.
+  local legacy_marker="# agsx-installer-checkpoint-wrapper"
   local temporary
 
   if [ "$NO_CONFIGURE" -eq 1 ]; then
     AGS_WRAPPER_STATUS="skipped (--no-configure)"
     return 0
   fi
-  if [ -e "$wrapper_path" ] && ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null; then
+  if [ -e "$wrapper_path" ] &&
+     ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null &&
+     ! grep -Fq "$legacy_marker" "$wrapper_path" 2>/dev/null; then
     AGS_WRAPPER_STATUS="preserved unmanaged ($(status_path "$wrapper_path"))"
     return 0
   fi

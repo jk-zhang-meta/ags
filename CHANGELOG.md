@@ -12,6 +12,17 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ### AGS Runtime
 
+- **The installer adopts wrappers written before the `agsx` rename**: ownership
+  of `bin/ags` is decided by a marker comment, and `# ags-installer-` is not a
+  substring of the older `# agsx-installer-`. Every machine installed before
+  that rename therefore read as hand-written, was preserved, and would never
+  have received a wrapper update again. Both markers are now recognised, and an
+  actually hand-written wrapper is still left alone.
+- **`ags update` says `ags`**: it reported `casr`, the upstream binary name,
+  beside lines naming `codext` and `Context Mode` — an implementation detail in
+  a line about a command nobody types `casr` to run. Only the messages changed:
+  the binary, the release asset names, and the cosign identity `install.sh`
+  pins are untouched.
 - **Resuming asks which directory to work in**: a checkpoint records where its
   session was working, and `ags resume` used to restore into that path or fail
   when it was gone — which made a synchronized checkpoint unresumable anywhere

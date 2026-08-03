@@ -8048,7 +8048,7 @@ resolve_ags_converter_binary() {
         binary="$(command -v casr 2>/dev/null || true)"
     fi
     valid_local_binary_path "$binary" ||
-        die "cannot find an executable casr binary; reinstall ags"
+        die "cannot find the ags program; reinstall ags"
     if [[ "$ags_converter_version" == unknown ]]; then
         version="$("$binary" --version 8>&- 9>&- </dev/null 2>/dev/null || true)"
         if [[ "$version" =~ ^casr[[:space:]]+([^[:space:]]+) ]]; then
@@ -14181,7 +14181,7 @@ update_ags() {
     destination="$(dirname "$binary")"
     current="$ags_converter_version"
     [[ "$current" != unknown ]] ||
-        die "cannot read the installed casr version from $binary; reinstall ags"
+        die "cannot read the installed ags version from $binary; reinstall ags"
 
     # Deliberately not `curl -f`: with it, "no such release", "this repository
     # is private and you are not authenticated", and "the network is down" all
@@ -14212,16 +14212,16 @@ update_ags() {
     # to understand `0.3.0-ags.1` is how install.sh grew its own version bug.
     # A move in either direction is printed, so a downgrade is never silent.
     if [[ "$tag" == "v$current" ]]; then
-        log "already current: casr $current is the latest release ($tag)"
+        log "already current: ags $current is the latest release ($tag)"
         return 0
     fi
 
     if (( check_only == 1 )); then
-        log "update available: casr $current -> $tag"
+        log "update available: ags $current -> $tag"
         return 0
     fi
 
-    log "updating casr $current -> $tag"
+    log "updating ags $current -> $tag"
 
     workspace="$(mktemp -d "${TMPDIR:-/tmp}/ags-update.XXXXXX")" ||
         die "cannot create a temporary directory for the installer"
