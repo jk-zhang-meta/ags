@@ -12,6 +12,15 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ### AGS Runtime
 
+- **Resuming asks which directory to work in**: a checkpoint records where its
+  session was working, and `ags resume` used to restore into that path or fail
+  when it was gone — which made a synchronized checkpoint unresumable anywhere
+  but the machine that wrote it, because the saved path rarely exists on the
+  next one. When the recorded directory and the directory you are resuming from
+  are different absolute paths, both are now shown and you choose. When they are
+  the same path nothing is printed. `--cwd PATH` answers in advance, and without
+  a terminal to ask on the recorded directory is still used, so scripts keep the
+  behaviour they were written against.
 - **Resuming is quiet on a terminal**: `ags resume` inherited `ags restore`'s
   fourteen-field `key=value` record and printed it directly above the Agent's
   own banner. The record is a real output contract — scripts and the test suite

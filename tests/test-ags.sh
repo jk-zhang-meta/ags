@@ -3823,8 +3823,10 @@ EOF
     grep -Fq "args  --yolo --model 'o3 mini'" <<< "$args_frame"
 
     # `a` replaces them for this launch, and Enter opens with what was typed.
-    # Ctrl-U first: the prompt opens prefilled with what is saved.
-    run_checkpoint_pty $'a\025--model o3\n\n' "$tmp/checkpoint-args-edit.out" \
+    # Ctrl-U first: the prompt opens prefilled with what is saved. The trailing
+    # newline answers the workspace question below, which fires here because the
+    # session was saved in "$tmp/work" and this runs somewhere else.
+    run_checkpoint_pty $'a\025--model o3\n\n\n' "$tmp/checkpoint-args-edit.out" \
         "$args_menu_root" CODEX_HOME="$tmp/args-menu-target/codex"
     args_edit_frame="$(strip_terminal_control < "$tmp/checkpoint-args-edit.out")"
     grep -Fq "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
@@ -3836,11 +3838,40 @@ EOF
         <<< "$args_edit_frame"
 
     # Clearing the line means no arguments, not "fall back to the saved ones".
-    run_checkpoint_pty $'a\025\n\n' "$tmp/checkpoint-args-cleared.out" \
+    run_checkpoint_pty $'a\025\n\n\n' "$tmp/checkpoint-args-cleared.out" \
         "$args_menu_root" CODEX_HOME="$tmp/args-menu-cleared/codex"
     args_cleared_frame="$(strip_terminal_control < "$tmp/checkpoint-args-cleared.out")"
     grep -Fq "FAKE_CODEX <resume> <$launch_args_session>" <<< "$args_cleared_frame"
     ! grep -Fq '<--yolo>' <<< "$args_cleared_frame"
+
+    # Resuming somewhere other than where a session was saved is a change of
+    # workspace, so it is asked rather than assumed. This checkpoint was saved
+    # in "$tmp/work" and the picker runs here, so the two paths differ and the
+    # question fires; both answers are honoured.
+    pty_cwd="$(pwd -P)"
+    [[ "$pty_cwd" != "$tmp/work" ]]
+    run_checkpoint_pty $'\n2\n' "$tmp/checkpoint-cwd-saved.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/cwd-saved-target/codex"
+    cwd_saved_frame="$(strip_terminal_control < "$tmp/checkpoint-cwd-saved.out")"
+    grep -Fq 'This session was saved in a different directory' \
+        <<< "$cwd_saved_frame"
+    grep -Fq "$tmp/work" <<< "$cwd_saved_frame"
+    grep -Fqx "FAKE_PWD=$tmp/work" <<< "$cwd_saved_frame"
+
+    run_checkpoint_pty $'\n1\n' "$tmp/checkpoint-cwd-here.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/cwd-here-target/codex"
+    cwd_here_frame="$(strip_terminal_control < "$tmp/checkpoint-cwd-here.out")"
+    grep -Fqx "FAKE_PWD=$pty_cwd" <<< "$cwd_here_frame"
+
+    # Same directory, nothing to choose between: the question must not appear.
+    cwd_same_out="$(
+        cd "$tmp/work"
+        env "${source_env[@]}" CODEX_HOME="$tmp/cwd-same-target/codex" \
+            AGENT_SESSION_LOCAL_DIR="$args_menu_root" \
+            "$tmp/stty-guard" "$tool" resume with-args
+    )"
+    ! grep -Fq 'saved in a different directory' <<< "$cwd_same_out"
+    grep -Fqx "FAKE_PWD=$tmp/work" <<< "$cwd_same_out"
 
     unsafe_selector_root="$tmp/unsafe-checkpoint-selector"
     unsafe_selector_id=$'0000\033]52;c;AGS_CHECKPOINT\a'

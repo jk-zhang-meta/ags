@@ -275,6 +275,10 @@ A checkpoint remembers the Agent arguments its session was started with, and
 `ags resume` replays them. Pass `--` to decide instead: with arguments after it
 they replace the saved ones, and with nothing after it the session starts with
 none. `ags show` prints what a checkpoint carries.
+A checkpoint also remembers the directory its session was working in. When that
+is not the directory you are resuming from, `ags resume` shows both and asks
+which to open in; `--cwd PATH` answers it in advance. Without a terminal to ask
+on, the recorded directory is used.
 Claude `--settings` may contain only provider authentication and model fields.
 EOF
 }
@@ -11590,6 +11594,79 @@ restore_checkpoint() {
     fi
 }
 
+# Which directory the resumed session works in, into `resolved_resume_cwd`.
+#
+# The checkpoint records where its session was working, and that is usually
+# still the right answer. It stops being one as soon as the record arrives from
+# somewhere else — these records synchronize between machines, where the saved
+# path may not exist at all, or may exist and hold something unrelated. Neither
+# directory is safe to assume when they differ, so this asks. When they are the
+# same absolute path there is nothing to ask about and nothing is printed.
+resolve_resume_cwd() {
+    local requested="$1" saved="$2" here choice pad
+    local saved_usable=0
+    resolved_resume_cwd=
+    here="$(pwd -P)"
+
+    # `--cwd` is already a decision.
+    if [[ -n "$requested" ]]; then
+        resolved_resume_cwd="$requested"
+        return 0
+    fi
+    if [[ "$saved" != unknown && "$saved" == /* &&
+          "$saved" != *$'\n'* && "$saved" != *$'\r'* && -d "$saved" ]]; then
+        saved="$(cd -- "$saved" && pwd -P)"
+        saved_usable=1
+    fi
+    if (( saved_usable == 1 )) && [[ "$saved" == "$here" ]]; then
+        resolved_resume_cwd="$saved"
+        return 0
+    fi
+    # Nobody to ask. A script keeps the behaviour it was written against, which
+    # includes failing the same way when the recorded directory is gone.
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        (( saved_usable == 1 )) ||
+            die "checkpoint needs an existing cwd; use --cwd PATH"
+        resolved_resume_cwd="$saved"
+        return 0
+    fi
+
+    init_terminal_style
+    if (( saved_usable == 0 )); then
+        # The cross-machine case. This used to be fatal, which made a
+        # synchronized checkpoint unresumable anywhere but the machine that
+        # wrote it — but proceeding elsewhere is a real change of workspace, so
+        # say which directory is missing rather than quietly substituting one.
+        printf '\n  %sThis session was saved in a directory that does not exist here:%s\n' \
+            "$style_bold" "$style_reset" >&2
+        printf '    %s%s%s\n\n' "$style_dim" "$2" "$style_reset" >&2
+        printf '  Open it in %s instead? [Y/n] ' "$here" >&2
+        IFS= read -r choice || choice=
+        printf '\n' >&2
+        case "${choice,,}" in
+            ''|y|yes) resolved_resume_cwd="$here" ;;
+            *) die "resume cancelled; use --cwd PATH to name a directory" ;;
+        esac
+        return 0
+    fi
+
+    pad=${#here}
+    (( pad >= ${#saved} )) || pad=${#saved}
+    printf '\n  %sThis session was saved in a different directory.%s\n\n' \
+        "$style_bold" "$style_reset" >&2
+    printf '    1) %-*s  %shere%s\n' "$pad" "$here" "$style_dim" "$style_reset" >&2
+    printf '    2) %-*s  %ssaved with the session%s\n\n' \
+        "$pad" "$saved" "$style_dim" "$style_reset" >&2
+    printf '  Open in [1]: ' >&2
+    IFS= read -r choice || choice=
+    printf '\n' >&2
+    case "${choice:-1}" in
+        1) resolved_resume_cwd="$here" ;;
+        2) resolved_resume_cwd="$saved" ;;
+        *) die "invalid directory selection" ;;
+    esac
+}
+
 resume_checkpoint() {
     local target="$1"
     shift
@@ -11731,7 +11808,8 @@ resume_checkpoint() {
         effective_profile="$profile"
         validate_claude_context_args "${client_args[@]}"
     fi
-    runtime_effective_cwd="${resume_cwd:-$runtime_saved_cwd}"
+    resolve_resume_cwd "$resume_cwd" "$runtime_saved_cwd"
+    runtime_effective_cwd="$resolved_resume_cwd"
     [[ "$runtime_effective_cwd" != unknown &&
        "$runtime_effective_cwd" == /* &&
        "$runtime_effective_cwd" != *$'\n'* &&
@@ -11761,8 +11839,12 @@ resume_checkpoint() {
     # fields, so the record survives wherever stdout is not a terminal. Warnings
     # go through `log` to stderr either way, and every value used below comes
     # from the variables restore sets, never from what it printed.
+    # The resolved directory, not `$resume_cwd`: restore places a Claude session
+    # under the project key of the directory it is given, so answering the
+    # question above has to reach this call or the transcript lands under the
+    # directory that was declined.
     local -a restore_call=(
-        "$target" "$checkpoint_id" "$resume_cwd"
+        "$target" "$checkpoint_id" "$runtime_effective_cwd"
         "$resume_target_agent" "$effective_profile"
     )
     if [[ -t 1 ]]; then

@@ -98,6 +98,26 @@ under.
 after it replace the saved ones, and `--` with nothing after it starts the
 session with none. `ags show ID` prints what a checkpoint carries.
 
+### Which directory it opens in
+
+A checkpoint also records the directory its session was working in. When that is
+a different absolute path from the one you are resuming from, `ags resume` shows
+both and asks; when they are the same path it says nothing:
+
+```
+  This session was saved in a different directory.
+
+    1) /home/you/work/api          here
+    2) /Users/you/work/api         saved with the session
+
+  Open in [1]:
+```
+
+This is what makes a synchronized checkpoint resumable on another machine at
+all: the recorded path usually does not exist there, and that used to be fatal.
+`--cwd PATH` answers the question in advance. Without a terminal to ask on — a
+script, a pipe — the recorded directory is used, unchanged.
+
 `ags list` opens a picker — Up/Down or `j`/`k` to move, Enter to open, `a` to
 edit the arguments for this launch, Del to delete, Esc to quit. The arguments
 for the highlighted session are always shown, because checkpoints synchronize
