@@ -3829,6 +3829,11 @@ EOF
     args_edit_frame="$(strip_terminal_control < "$tmp/checkpoint-args-edit.out")"
     grep -Fq "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
         <<< "$args_edit_frame"
+    # Opening a session is not a report. The restore record still goes to a
+    # caller capturing it — the non-terminal resumes above read those fields —
+    # but it must not land between the picker and the Agent's own banner.
+    ! grep -Eq '^(checkpoint_id|capture_fidelity|restore_pwd|conflicts)=' \
+        <<< "$args_edit_frame"
 
     # Clearing the line means no arguments, not "fall back to the saved ones".
     run_checkpoint_pty $'a\025\n\n' "$tmp/checkpoint-args-cleared.out" \

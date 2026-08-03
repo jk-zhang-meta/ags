@@ -11754,8 +11754,22 @@ resume_checkpoint() {
     context_mode_require_agent \
         "$runtime_effective_agent" "$launch_binary" \
         "$runtime_effective_cwd" "$effective_profile"
-    restore_checkpoint "$target" "$checkpoint_id" "$resume_cwd" \
+    # Resuming inherits `ags restore`'s machine-readable record, and on a
+    # terminal it lands as fourteen key=value lines directly above the Agent's
+    # own banner — for a person who just picked a session, that is noise. It is
+    # not noise to a caller capturing it: scripts and the test suite read these
+    # fields, so the record survives wherever stdout is not a terminal. Warnings
+    # go through `log` to stderr either way, and every value used below comes
+    # from the variables restore sets, never from what it printed.
+    local -a restore_call=(
+        "$target" "$checkpoint_id" "$resume_cwd"
         "$resume_target_agent" "$effective_profile"
+    )
+    if [[ -t 1 ]]; then
+        restore_checkpoint "${restore_call[@]}" > /dev/null
+    else
+        restore_checkpoint "${restore_call[@]}"
+    fi
     [[ "$restored_pwd" != unknown && -d "$restored_pwd" ]] ||
         die "checkpoint restored, but saved PWD is unavailable: $restored_pwd"
     cd -- "$restored_pwd"
@@ -11770,7 +11784,11 @@ resume_checkpoint() {
     # it at the first resume. The AGS-injected `resume`/`--settings` arguments
     # below stay out of it: they belong to this launch, not to the session.
     export_launch_args "${client_args[@]}"
-    (( ${#client_args[@]} == 0 )) ||
+    # Announced only when they were replayed. Arguments the caller typed need no
+    # echo, and the picker has already shown the ones it is opening with — this
+    # line exists for the case where a command line takes effect that nobody
+    # chose here, which is what a synchronized checkpoint can carry.
+    (( client_args_explicit == 1 || ${#client_args[@]} == 0 )) ||
         log "$restored_agent arguments: $(format_launch_args "$AGS_LAUNCH_ARGS")"
     case "$restored_agent" in
         codex)

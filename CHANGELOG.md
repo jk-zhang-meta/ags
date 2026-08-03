@@ -12,6 +12,13 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ### AGS Runtime
 
+- **Resuming is quiet on a terminal**: `ags resume` inherited `ags restore`'s
+  fourteen-field `key=value` record and printed it directly above the Agent's
+  own banner. The record is a real output contract — scripts and the test suite
+  read those fields — so it survives wherever stdout is not a terminal, and is
+  dropped for the person who just picked a session. Warnings still reach stderr
+  through `log` either way. Replayed Agent arguments are announced only when
+  they were replayed rather than chosen.
 - **Checkpoints remember their Agent arguments**: a session started as
   `ags codex --dangerously-bypass-approvals-and-sandbox` is saved with that
   flag and resumes under it, instead of silently coming back with different
