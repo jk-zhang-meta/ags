@@ -151,6 +151,8 @@ Usage:
   ags describe ID DESCRIPTION          Change a live terminal description
   ags context review-codex             Open Codex's official hook review UI
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
+  ags codex-init                       Configure the codext credential pool
+  ags codex-pool                       Show the credential pool this machine uses
   ags set ABSOLUTE_DIR                 Configure local checkpoint storage
   ags list                             List local checkpoints
   ags show ID|AGENT/RECORD_ID          Show complete local checkpoint details
@@ -5264,6 +5266,11 @@ initialize_ags() {
     printf 'status=initialized\nvault=%s\nidentity=%s\nrecipient=%s\n' \
         "$vault" "$selected_identity" "$recipient"
     log "Back up this identity separately; losing it makes encrypted records unrecoverable: $selected_identity"
+
+    # Last, and outside the lock: this one talks to the network and asks the
+    # user questions. Nothing above depends on it, so a declined or failed pool
+    # setup must not make `ags init` look like it failed.
+    offer_codex_pool
 }
 
 lock_checkpoint_root() {
@@ -7602,7 +7609,13 @@ valid_local_binary_path() {
 valid_agent_binary_path() {
     local agent="$1" path="$2"
     [[ "$agent" == codex || "$agent" == claude ]] &&
-        valid_binary_provenance_path "$path" && [[ "${path##*/}" == "$agent" ]]
+        valid_binary_provenance_path "$path" &&
+        { [[ "${path##*/}" == "$agent" ]] ||
+          # codext is Codex with the credential pool wired in. It is the same
+          # CLI, the same session format, the same everything AGS reads — the
+          # fork adds one auth provider. Refusing it here would mean AGS could
+          # never launch the build this machine is configured to use.
+          [[ "$agent" == codex && "${path##*/}" == codext ]]; }
 }
 
 find_agent_ancestor_binary() {
@@ -7656,6 +7669,22 @@ resolve_agent_binary() {
         printf '%s\n' "$binary"
         return
     fi
+    # Ahead of the registry below, which is only a cache of whichever binary
+    # AGS launched last, not a declared preference — it gets rewritten on the
+    # next launch anyway.
+    #
+    # Prefer codext when it is installed. It is a superset: with a pool
+    # configured it leases an account, and without one it falls back to the
+    # same local auth.json plain codex uses. Preferring it here is what makes
+    # `ags codex`, the launcher menu and every resume path go through the pool
+    # without any of them having to know the pool exists.
+    if [[ "$agent" == codex ]]; then
+        binary="$(command -v codext 2>/dev/null || true)"
+        if valid_agent_binary_path codex "$binary" && [[ -f "$binary" && -x "$binary" ]]; then
+            printf '%s\n' "$binary"
+            return
+        fi
+    fi
     registry="$trusted_binary_dir/$agent"
     if [[ "$mode" != save && -f "$registry" ]]; then
         IFS= read -r binary < "$registry" || true
@@ -7670,6 +7699,171 @@ resolve_agent_binary() {
         [[ -f "$binary" && -x "$binary" ]] ||
         die "cannot find an executable $agent binary"
     printf '%s\n' "$binary"
+}
+
+# --- codext credential pool -------------------------------------------------
+#
+# The pool lives in PersonalWeb; codext leases an account from it before every
+# request. AGS's part is small on purpose: ask for the address and this
+# terminal's key once, prove they work, and write them where codext looks.
+# Everything after that — which account, when to swap, reporting usage — is
+# decided server-side, so there is no state here to drift out of date.
+
+codex_pool_prefix='/x8Rk3Nq6Vd2'
+codex_pool_default_url='https://www.itachi.fans:844'
+
+codex_home_dir() {
+    printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"
+}
+
+codex_pool_config_path() {
+    printf '%s/pool.json\n' "$(codex_home_dir)"
+}
+
+# Prove the address resolves, the TLS chain is good, the port is served and the
+# key is live — every way this goes wrong in practice, in one call.
+#
+# Deliberately `/ping` and not `/lease`: leasing would occupy a scheduling slot
+# for a full lease period, so a connectivity check would leave a phantom holder
+# behind that skews which account the next real session gets.
+codex_pool_probe() {
+    local url="$1" key="$2" status
+    status="$(curl -sS --connect-timeout 8 --max-time 20 \
+        -o /dev/null -w '%{http_code}' \
+        -H "X-Codex-Pool-Token: $key" \
+        "$url$codex_pool_prefix/ping" 2>/dev/null)" || return 2
+    case "$status" in
+        200) return 0 ;;
+        403) return 3 ;;
+        404) return 4 ;;
+        '') return 2 ;;
+        *) return 5 ;;
+    esac
+}
+
+codex_pool_usable_accounts() {
+    local url="$1" key="$2"
+    curl -sS --connect-timeout 8 --max-time 20 \
+        -H "X-Codex-Pool-Token: $key" "$url$codex_pool_prefix/ping" 2>/dev/null |
+        jq -er '.data.accounts' 2>/dev/null || printf '?\n'
+}
+
+configure_codex_pool() {
+    local url key attempt reply
+    need curl; need jq
+    while :; do
+        printf 'PersonalWeb 地址 [%s]: ' "$codex_pool_default_url"
+        IFS= read -r url || return 1
+        url="${url:-$codex_pool_default_url}"
+        url="${url%/}"
+        [[ "$url" == https://* || "$url" == http://* ]] || {
+            log "地址要以 http:// 或 https:// 开头"
+            continue
+        }
+        # 端口必须写清楚：PersonalWeb 只服务 844，443 上没有东西，省掉端口的话
+        # 每个请求都会挂到超时，看起来像"网络不通"而不是"地址写错了"。
+        [[ "$url" =~ ^https?://[^/]+:[0-9]+$ ]] ||
+            log "提醒：地址没带端口，PersonalWeb 在 844 上（$codex_pool_default_url）"
+        IFS= read -r -s -p '终端密钥（在后台「密钥管理」签发）: ' key || return 1
+        printf '\n'
+        [[ -n "$key" ]] || { log "密钥不能为空"; continue; }
+
+        # `if`, not a bare call: this script runs under `set -e`, and the probe
+        # reports which way it failed through its exit status. Called bare, a
+        # failed probe would kill the script before the message explaining it.
+        if codex_pool_probe "$url" "$key"; then
+            attempt=0
+        else
+            attempt=$?
+        fi
+        case "$attempt" in
+            0) break ;;
+            2) log "连不上 $url —— 地址、端口或网络的问题" ;;
+            3) log "服务器拒绝了这把密钥（已停用、已过期，或抄错了）" ;;
+            4) log "$url 上没有这个接口 —— 地址对吗？" ;;
+            *) log "服务器返回了意外的状态，稍后再试" ;;
+        esac
+        printf '再试一次？[Y/n]: '
+        IFS= read -r reply || return 1
+        case "${reply:-y}" in
+            [Nn]*) return 1 ;;
+        esac
+    done
+
+    codex_pool_write "$url" "$key"
+    log "codext 已连上 $url"
+}
+
+codex_pool_write() {
+    local url="$1" key="$2" home target temporary
+    home="$(codex_home_dir)"
+    target="$(codex_pool_config_path)"
+    install -d -m700 "$home"
+    temporary="$target.tmp.$$"
+    rm -f -- "$temporary"
+    ( umask 077
+      jq -n --arg u "$url" --arg k "$key" '{base_url:$u, key:$k}' > "$temporary" ) ||
+        die "cannot write $target"
+    chmod 600 "$temporary"
+    mv -- "$temporary" "$target"
+}
+
+# Ask at init time whether this machine should use the pool at all.
+#
+# Asked rather than assumed: a machine that already has its own `codex login`
+# should be able to say no and keep using it. Declining leaves no config
+# behind, and codext then behaves exactly like stock codex.
+offer_codex_pool() {
+    local reply existing
+    existing="$(codex_pool_config_path)"
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        [[ -s "$existing" ]] ||
+            log "codext 凭据池未配置（非交互式运行）；需要时跑 ags codex-init"
+        return 0
+    fi
+    if [[ -s "$existing" ]]; then
+        printf '\ncodext 凭据池已配置（%s）。重新配置？[y/N]: ' "$existing"
+        IFS= read -r reply || return 0
+        case "${reply:-n}" in
+            [Yy]*) ;;
+            *) return 0 ;;
+        esac
+    else
+        printf '\n配置 codext 凭据池？（从 PersonalWeb 在线租借 Codex 账号）[y/N]: '
+        IFS= read -r reply || return 0
+        case "${reply:-n}" in
+            [Yy]*) ;;
+            *)
+                log "跳过。以后要配就跑 ags codex-init"
+                return 0
+                ;;
+        esac
+    fi
+    configure_codex_pool || log "没有配置 codext 凭据池"
+}
+
+codex_pool_status() {
+    local config url key
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || {
+        printf 'codext 凭据池：未配置\n跑 ags codex-init 配置它\n'
+        return 0
+    }
+    need jq
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" ||
+        die "配置文件读不出来：$config"
+    key="$(jq -er '.key' "$config" 2>/dev/null)" ||
+        die "配置文件里没有密钥：$config"
+    printf 'pool       %s\nCODEX_HOME %s\n' "$url" "$(codex_home_dir)"
+    if codex_pool_probe "$url" "$key"; then
+        # 账号是按**项目目录**派的，不是按机器：同一台电脑上不同项目各拿各的号。
+        # 所以这里报的是池子里现在有几个号可派，而不是"我占着哪个"。
+        printf 'status     可用（池子里 %s 个号可派）\n' \
+            "$(codex_pool_usable_accounts "$url" "$key")"
+    else
+        printf 'status     连不上或密钥无效\n'
+        return 1
+    fi
 }
 
 resolve_agsx_converter_binary() {
@@ -13533,6 +13727,216 @@ legacy_command() {
     esac
 }
 
+# Keep the installed codext current, as part of `ags update`.
+#
+# Separate from the casr update because they are separate release trains: the
+# fork tracks upstream Codex, casr tracks AGS. Folding them into one version
+# check would mean a Codex release could not reach a machine until AGS also
+# cut one.
+#
+# Unlike the casr path there is no installer to hand over to — codext ships a
+# single binary — so the download happens here. It is written beside the binary
+# it replaces and moved into place, so an interrupted download never leaves a
+# half-written executable on PATH.
+# Asset names this machine can use, best first.
+#
+# musl first because it runs on any glibc vintage; gnu is listed as a fallback
+# so a release cut from a workstation rather than from CI is still installable.
+# Both contain the same binary — only the libc it is linked against differs.
+# A token that can read the codext repository.
+#
+# The fork is private on purpose — it names the pool's endpoint prefix, and that
+# prefix is part of how the endpoint stays unfound. So unlike a public release,
+# reading it needs credentials. `gh` is the usual source; the env vars are for
+# machines without it.
+codext_update_token() {
+    local token="${CODEXT_UPDATE_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+    if [[ -z "$token" ]] && command -v gh >/dev/null 2>&1; then
+        token="$(gh auth token 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$token"
+}
+
+codext_asset_names() {
+    local machine
+    machine="$(uname -m)"
+    case "$platform:$machine" in
+        Linux:x86_64)
+            printf 'codext-x86_64-unknown-linux-musl.tar.gz\n'
+            printf 'codext-x86_64-unknown-linux-gnu.tar.gz\n'
+            ;;
+        Linux:aarch64)
+            printf 'codext-aarch64-unknown-linux-musl.tar.gz\n'
+            printf 'codext-aarch64-unknown-linux-gnu.tar.gz\n'
+            ;;
+        Darwin:arm64)   printf 'codext-aarch64-apple-darwin.tar.gz\n' ;;
+        Darwin:x86_64)  printf 'codext-x86_64-apple-darwin.tar.gz\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+update_codext() {
+    local check_only="${1:-0}"
+    local owner="${CODEXT_UPDATE_OWNER:-jk-zhang-meta}"
+    local repo="${CODEXT_UPDATE_REPO:-codext}"
+    local binary destination current tag response status asset url workspace stamp
+    local token asset_id
+    local -a candidates=() auth=()
+
+    binary="$(command -v codext 2>/dev/null || true)"
+    [[ -n "$binary" ]] || return 0
+    destination="$(dirname "$binary")"
+    [[ -w "$destination" ]] || {
+        log "codext 装在不可写的目录里，跳过：$destination"
+        return 0
+    }
+
+    # The tag we last installed, if we installed it. Preferred over the
+    # binary's own `--version`, which reports the upstream Codex version the
+    # fork is based on: two codext releases can share one upstream version, and
+    # comparing against `--version` would make the second one invisible.
+    stamp="$state/codext-release"
+    if [[ -s "$stamp" ]]; then
+        IFS= read -r current < "$stamp" || current=
+        current="${current#v}"
+    fi
+    if [[ -z "${current:-}" ]]; then
+        current="$("$binary" --version 2>/dev/null || true)"
+        current="${current##* }"
+    fi
+    [[ -n "$current" ]] || current=unknown
+
+    mapfile -t candidates < <(codext_asset_names) || true
+    (( ${#candidates[@]} > 0 )) || {
+        log "codext 没有为 $platform/$(uname -m) 发布的版本，跳过"
+        return 0
+    }
+
+    token="$(codext_update_token)"
+    auth=()
+    [[ -z "$token" ]] || auth=(-H "Authorization: Bearer $token")
+    response="$(curl -sSL --connect-timeout 5 --max-time 20 --max-filesize 1048576 \
+        -H 'Accept: application/vnd.github+json' "${auth[@]}" -w '\n%{http_code}' \
+        "https://api.github.com/repos/$owner/$repo/releases/latest" 2>/dev/null)" || {
+        log "连不上 api.github.com，跳过 codext 更新"
+        return 0
+    }
+    status="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    if [[ "$status" != 200 ]]; then
+        if [[ "$status" == 404 && -z "$token" ]]; then
+            log "读不到 $owner/$repo（私有仓库需要授权）：装个 gh 并 gh auth login，或设 CODEXT_UPDATE_TOKEN"
+        else
+            log "$owner/$repo 查不到发布（状态 $status），跳过 codext 更新"
+        fi
+        return 0
+    fi
+
+    tag="$(jq -er '.tag_name | select(type == "string" and test("^v[0-9]"))' \
+        <<< "$response" 2>/dev/null)" || {
+        log "$owner/$repo 最新发布没有可用的版本号，跳过"
+        return 0
+    }
+    if [[ "$tag" == "v$current" ]]; then
+        log "already current: codext $current is the latest release ($tag)"
+        return 0
+    fi
+    if (( check_only == 1 )); then
+        log "update available: codext $current -> $tag"
+        return 0
+    fi
+
+    # The API asset URL, not browser_download_url: the latter redirects to a
+    # signed CDN link that a private repository will not issue without the
+    # Authorization header, and curl drops that header across hosts.
+    asset_id=
+    for asset in "${candidates[@]}"; do
+        asset_id="$(jq -er --arg name "$asset" '
+            .assets[] | select(.name == $name) | .id
+        ' <<< "$response" 2>/dev/null)" && break
+        asset_id=
+    done
+    [[ -n "$asset_id" ]] || {
+        log "$tag 里没有 ${candidates[0]}（或其它本机可用的包），跳过 codext 更新"
+        return 0
+    }
+    url="https://api.github.com/repos/$owner/$repo/releases/assets/$asset_id"
+
+    log "updating codext $current -> $tag"
+    workspace="$(mktemp -d "${TMPDIR:-/tmp}/codext-update.XXXXXX")" ||
+        die "cannot create a temporary directory for the codext download"
+    curl -fsSL --connect-timeout 5 --max-time 900 \
+        -H 'Accept: application/octet-stream' "${auth[@]}" \
+        "$url" -o "$workspace/$asset" || {
+        rm -rf -- "$workspace"
+        log "codext $tag 下载失败，现有版本没有变动"
+        return 0
+    }
+    tar -xzf "$workspace/$asset" -C "$workspace" || {
+        rm -rf -- "$workspace"
+        log "codext $tag 解包失败，现有版本没有变动"
+        return 0
+    }
+    [[ -f "$workspace/codext" ]] || {
+        rm -rf -- "$workspace"
+        log "codext $tag 的包里没有 codext 可执行文件，现有版本没有变动"
+        return 0
+    }
+    chmod 755 "$workspace/codext"
+    # Same directory, so this is a rename and not a copy: the binary is never
+    # observed half-written, and a running codext keeps its own inode.
+    mv -- "$workspace/codext" "$binary.new.$$" &&
+        mv -- "$binary.new.$$" "$binary" || {
+        rm -f -- "$binary.new.$$"
+        rm -rf -- "$workspace"
+        die "cannot replace $binary"
+    }
+    rm -rf -- "$workspace"
+    install -d -m700 "$state"
+    printf '%s\n' "$tag" > "$stamp"
+    log "updated codext to $tag"
+}
+
+# Re-converge Context Mode, which ships on npm rather than in an AGS release.
+#
+# The installer re-converges it too, but the installer only runs when AGS
+# itself has a new release — and `update_ags` returns early when casr is
+# already current. So on the most common update of all ("codext published a
+# release, AGS did not") nothing would touch Context Mode, and nothing else
+# ever will: the per-launch check only *verifies* it and dies telling you to
+# run `ags init`. It would sit there getting older until something broke.
+#
+# This is not a second implementation of the update — `initialize_context_mode`
+# is the same entry point the installer reaches through `ags context-init`.
+#
+# In a subshell because that function reports failure with `die`, and a machine
+# that cannot reach npm should still get its codext and casr updates. Its own
+# guards make an unattended run safe: it refuses to move backwards, keeps the
+# verified bytes when npm republishes an integrity, retains the last-good
+# runtime when the registry is unreachable, and rolls the providers back when a
+# candidate fails validation.
+update_context_mode() {
+    local check_only="$1"
+    if (( check_only == 1 )); then
+        # `--check` only reports. Losing the comparison is not a failure worth
+        # stopping for: a plain `ags update` reconciles it either way.
+        (
+            context_mode_detect_host_target &&
+                load_context_mode_active &&
+                context_mode_resolve_latest ||
+                exit 1
+            if [[ "$context_mode_candidate_version" == "$context_mode_version" ]]; then
+                log "already current: Context Mode $context_mode_version is the latest npm release"
+            else
+                log "update available: Context Mode $context_mode_version -> $context_mode_candidate_version"
+            fi
+        ) || log "cannot compare Context Mode against npm; ags update reconciles it"
+        return 0
+    fi
+    ( initialize_context_mode ) ||
+        log "warning: Context Mode was left unchanged"
+}
+
 # `ags update` deliberately does not know how to update anything.
 #
 # install.sh already owns the hard parts — resolving the platform, verifying
@@ -13558,6 +13962,15 @@ update_ags() {
     done
 
     need curl; need jq
+
+    # codext first, and never fatally: it is a separate release train, and a
+    # machine that has not installed it at all is a normal machine. Running it
+    # before the casr update means a failure here still leaves casr updatable.
+    update_codext "$check_only" || true
+
+    # Before the casr block below, because that one returns early when casr is
+    # already current — and Context Mode's release train is npm's, not AGS's.
+    update_context_mode "$check_only"
 
     binary="$(resolve_agsx_converter_binary)"
     destination="$(dirname "$binary")"
@@ -13666,6 +14079,16 @@ case "${1:-}" in
         review_context_mode_codex
         ;;
     init) shift; initialize_ags "$@" ;;
+    codex-init)
+        shift
+        (( $# == 0 )) || die "usage: ags codex-init"
+        configure_codex_pool
+        ;;
+    codex-pool)
+        shift
+        (( $# == 0 )) || die "usage: ags codex-pool"
+        codex_pool_status
+        ;;
     context-init)
         shift
         (( $# == 0 )) || die "usage: ags context-init"
