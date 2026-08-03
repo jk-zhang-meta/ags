@@ -6298,4 +6298,108 @@ sftp_remove="$(env "${sftp_env[@]}" "$tool" remote remove sftp-backup)"
 grep -Fqx 'status=removed' <<< "$sftp_remove"
 ! env "${sftp_env[@]}" "$tool" remote list | grep -Fq sftp-backup
 
+# codext reports the upstream Codex version because it *is* that version, so a
+# second build on one upstream base publishes under the same tag and the tag
+# cannot say which of the two a host has. The asset digest is the discriminator,
+# and these four runs are the whole contract: install, recognise the same bytes,
+# notice new bytes under an unchanged tag, and refuse a download that does not
+# match the digest it is about to be recorded as.
+codext_root="$tmp/codext-update"
+mkdir -p "$codext_root/bin" "$codext_root/state" "$codext_root/serve"
+printf '%s\n' '#!/bin/sh' 'echo "codex-cli 0.146.0 installed"' \
+    > "$codext_root/bin/codext"
+chmod +x "$codext_root/bin/codext"
+
+# One release, one tag, whatever bytes the marker produces. Every platform's
+# asset name is listed so the test does not depend on the host it runs on.
+codext_publish() {
+    local marker="$1" stage digest
+    stage="$(mktemp -d "$tmp/codext-stage.XXXXXX")"
+    printf '%s\n' '#!/bin/sh' "echo \"codex-cli 0.146.0 $marker\"" \
+        > "$stage/codext"
+    chmod 755 "$stage/codext"
+    tar -czf "$codext_root/serve/asset.tar.gz" -C "$stage" codext
+    rm -rf -- "$stage"
+    digest="$(sha256sum "$codext_root/serve/asset.tar.gz" | cut -d' ' -f1)"
+    jq -n --arg digest "sha256:${2:-$digest}" '{
+      tag_name: "v0.146.0",
+      assets: ([
+        "codext-x86_64-unknown-linux-musl.tar.gz",
+        "codext-x86_64-unknown-linux-gnu.tar.gz",
+        "codext-aarch64-unknown-linux-musl.tar.gz",
+        "codext-aarch64-unknown-linux-gnu.tar.gz",
+        "codext-aarch64-apple-darwin.tar.gz",
+        "codext-x86_64-apple-darwin.tar.gz"
+      ] | to_entries | map({name: .value, id: (1000 + .key), digest: $digest}))
+    }' > "$codext_root/serve/release.json"
+}
+
+cat > "$codext_root/bin/curl" <<'CODEXTCURL'
+#!/usr/bin/env bash
+# Serves the canned codext release. The metadata call reads stdout and appends
+# the status code `-w` asked for; the asset call writes to the path after -o.
+out=
+url=
+prev=
+for arg in "$@"; do
+    [[ "$prev" != -o ]] || out="$arg"
+    [[ "$arg" != https://* ]] || url="$arg"
+    prev="$arg"
+done
+case "$url" in
+    */releases/latest)
+        cat "$CODEXT_FAKE_SERVE/release.json"
+        printf '\n200'
+        ;;
+    */releases/assets/*)
+        cp -- "$CODEXT_FAKE_SERVE/asset.tar.gz" "$out"
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+CODEXTCURL
+chmod +x "$codext_root/bin/curl"
+
+codext_env=(
+    HOME="$tmp/home"
+    PATH="$codext_root/bin:/usr/local/bin:/usr/bin:/bin"
+    AGENT_SESSION_STATE_DIR="$codext_root/state"
+    CODEXT_FAKE_SERVE="$codext_root/serve"
+    CODEXT_UPDATE_TOKEN=fake-token
+)
+codext_stamp="$codext_root/state/codext-release"
+
+codext_publish first
+env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-1.out" 2>&1
+grep -Fq 'updating codext to 0.146.0' "$tmp/codext-1.out"
+grep -Fq 'updated codext to 0.146.0' "$tmp/codext-1.out"
+grep -Fq '0.146.0 first' <<< "$("$codext_root/bin/codext")"
+grep -Fqx "sha256:$(sha256sum "$codext_root/serve/asset.tar.gz" | cut -d' ' -f1)" \
+    "$codext_stamp"
+
+# Same bytes, same tag: nothing to do. Before the digest replaced the tag
+# comparison this said "updating 0.146.0 -> v0.146.0-2" on every single run.
+env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-2.out" 2>&1
+grep -Fq 'already current: codext 0.146.0' "$tmp/codext-2.out"
+! grep -Fq 'updated codext' "$tmp/codext-2.out"
+
+# New bytes under the unchanged tag: the case a tag comparison cannot see.
+codext_publish second
+env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-3.out" 2>&1
+grep -Fq 'updated codext to 0.146.0' "$tmp/codext-3.out"
+! grep -Fq 'already current' "$tmp/codext-3.out"
+grep -Fq '0.146.0 second' <<< "$("$codext_root/bin/codext")"
+codext_installed_digest="$(cat "$codext_stamp")"
+
+# A download that does not hash to the published digest is not installed, and
+# the stamp keeps naming the build that is actually on disk rather than the one
+# that failed to arrive.
+codext_publish third \
+    0000000000000000000000000000000000000000000000000000000000000000
+env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-4.out" 2>&1
+grep -Fq '对不上' "$tmp/codext-4.out"
+grep -Fq '0.146.0 second' <<< "$("$codext_root/bin/codext")"
+grep -Fqx "$codext_installed_digest" "$codext_stamp"
+
 printf 'ags self-check passed\n'

@@ -2008,15 +2008,25 @@ function inspect(message) {
   if (hookReady && initReady) finish(0);
 }
 
+// What did not arrive, deliberately not the last line Claude wrote to stderr.
+// This probe sets ANTHROPIC_API_KEY itself, a few lines up, so that last line
+// is all but always Claude's warning that doing so disables claude.ai
+// connectors — noise this probe caused, printed where a diagnosis belongs.
+//
+// 45s because a warm run on the developer's own machine reaches both signals
+// in 3.0s and this fired at 12s, during an `ags update` that had just
+// reinstalled the very plugin being probed. Waiting longer costs nothing when
+// the probe passes: it settles the moment both signals land.
 const timeout = setTimeout(() => {
-  const detail = stderr.trim().split(/\r?\n/u).at(-1);
+  const missing = [
+    hookReady ? "" : "its SessionStart hook",
+    initReady ? "" : "its MCP session",
+  ].filter(Boolean);
   finish(
     1,
-    detail
-      ? `Claude effective Context Mode probe timed out: ${detail}`
-      : "Claude effective Context Mode probe timed out",
+    `Claude effective Context Mode probe timed out; Claude never reported ${missing.join(" or ")}`,
   );
-}, 12000);
+}, 45000);
 
 child.on("error", error => {
   finish(1, `Cannot start Claude effective Context Mode probe: ${error.message}`);
@@ -5077,15 +5087,31 @@ initialize_context_mode() {
         exec 8>&-
         die "Context Mode standalone initialization failed"
     fi
-    if ! validate_context_mode_runtime ||
-       { [[ "$context_mode_claude_present" == true ]] &&
-         ! { context_mode_claude_marketplace_ready "$claude_binary" &&
-             context_mode_claude_plugin_ready "$claude_binary" &&
-             context_mode_claude_effective_ready \
-                 "$claude_binary" "$(pwd -P)"; }; } ||
-       { [[ "$context_mode_codex_present" == true ]] &&
-         ! { context_mode_codex_marketplace_ready "$codex_binary" &&
-             context_mode_codex_plugin_ready "$codex_binary"; }; }; then
+    # Which of these five failed is the entire diagnosis, and collapsing them
+    # into one message is how a probe that had simply timed out got reported as
+    # a provider cache that changed underneath us. The elif chain reproduces
+    # the short-circuit of the `||`/`&&` expression it replaces exactly: no
+    # check runs here that the combined condition would not have run.
+    local verification_failure=
+    if ! validate_context_mode_runtime; then
+        verification_failure="the runtime did not verify"
+    elif [[ "$context_mode_claude_present" == true ]] &&
+         ! context_mode_claude_marketplace_ready "$claude_binary"; then
+        verification_failure="Claude's marketplace entry is not ready"
+    elif [[ "$context_mode_claude_present" == true ]] &&
+         ! context_mode_claude_plugin_ready "$claude_binary"; then
+        verification_failure="Claude's plugin entry is not ready"
+    elif [[ "$context_mode_claude_present" == true ]] &&
+         ! context_mode_claude_effective_ready "$claude_binary" "$(pwd -P)"; then
+        verification_failure="Context Mode is not in effect in Claude"
+    elif [[ "$context_mode_codex_present" == true ]] &&
+         ! context_mode_codex_marketplace_ready "$codex_binary"; then
+        verification_failure="Codex's marketplace entry is not ready"
+    elif [[ "$context_mode_codex_present" == true ]] &&
+         ! context_mode_codex_plugin_ready "$codex_binary"; then
+        verification_failure="Codex's plugin entry is not ready"
+    fi
+    if [[ -n "$verification_failure" ]]; then
         context_mode_rollback "$claude_binary" "$codex_binary"
         if (( transaction == 1 && upgrade == 0 )) &&
            ! restore_context_mode_pending_transaction \
@@ -5100,15 +5126,15 @@ initialize_context_mode() {
             flock -u 8
             exec 8>&-
             if (( active_compatible == 0 )); then
-                die "Context Mode $target_version changed during activation and the previous runtime cannot run on $context_mode_host_target"
+                die "Context Mode $target_version did not verify ($verification_failure) and the previous runtime cannot run on $context_mode_host_target"
             fi
             require_context_mode_upgrade_fallback_coverage
-            log "warning: Context Mode $target_version changed during activation; $previous_version remains active"
+            log "warning: Context Mode $target_version did not verify ($verification_failure); $previous_version remains active"
             return 0
         fi
         flock -u 8
         exec 8>&-
-        die "Context Mode runtime or provider cache changed during activation"
+        die "Context Mode activation stopped: $verification_failure"
     fi
     if ! write_context_mode_manifest; then
         context_mode_rollback "$claude_binary" "$codex_binary"
@@ -13427,7 +13453,7 @@ update_codext() {
     local owner="${CODEXT_UPDATE_OWNER:-jk-zhang-meta}"
     local repo="${CODEXT_UPDATE_REPO:-codext}"
     local binary destination current tag response status asset url workspace stamp
-    local token asset_id codex_binary fresh=0
+    local token asset_id digest entry actual codex_binary fresh=0
     local -a candidates=() auth=()
 
     binary="$(command -v codext 2>/dev/null || true)"
@@ -13462,27 +13488,25 @@ update_codext() {
         return 0
     }
 
-    # The tag we last installed, if we installed it. Preferred over the
-    # binary's own `--version`, which reports the upstream Codex version the
-    # fork is based on: two codext releases can share one upstream version, and
-    # comparing against `--version` would make the second one invisible.
+    # The build we last installed, identified by the release asset's content
+    # digest and deliberately not by the tag.
+    #
+    # codext's version is the upstream Codex version, exactly, and carries no
+    # fork-local suffix — `codext --version` has to be readable as `codex
+    # --version` by anything that reads either. So successive codext builds on
+    # one upstream base all publish under the same tag, and the tag cannot say
+    # whether this host has the current one. The digest is what moves when the
+    # binary does, and it says "no change" for a rebuild of identical bytes.
     #
     # A first install ignores the stamp entirely. It outlives an uninstalled
     # binary, and trusting it there would report "already current" about a
-    # codext that is not on the disk.
+    # codext that is not on the disk. So does a stamp from before this was a
+    # digest, which costs exactly one re-download to correct itself.
     stamp="$state/codext-release"
-    if (( fresh == 1 )); then
-        current=none
-    else
-        if [[ -s "$stamp" ]]; then
-            IFS= read -r current < "$stamp" || current=
-            current="${current#v}"
-        fi
-        if [[ -z "${current:-}" ]]; then
-            current="$("$binary" --version 2>/dev/null || true)"
-            current="${current##* }"
-        fi
-        [[ -n "$current" ]] || current=unknown
+    current=
+    if (( fresh == 0 )) && [[ -s "$stamp" ]]; then
+        IFS= read -r current < "$stamp" || current=
+        [[ "$current" == sha256:* ]] || current=
     fi
 
     mapfile -t candidates < <(codext_asset_names) || true
@@ -13516,39 +13540,48 @@ update_codext() {
         log "$owner/$repo 最新发布没有可用的版本号，跳过"
         return 0
     }
-    if [[ "$tag" == "v$current" ]]; then
-        log "already current: codext $current is the latest release ($tag)"
-        return 0
-    fi
-    if (( check_only == 1 )); then
-        if (( fresh == 1 )); then
-            log "codext 还没装；ags update 会把 $tag 装到 $destination"
-        else
-            log "update available: codext $current -> $tag"
-        fi
-        return 0
-    fi
-
     # The API asset URL, not browser_download_url: the latter redirects to a
     # signed CDN link that a private repository will not issue without the
     # Authorization header, and curl drops that header across hosts.
+    #
+    # Resolved before the up-to-date check and not after it, because the digest
+    # that answers that question belongs to this asset.
     asset_id=
+    digest=
     for asset in "${candidates[@]}"; do
-        asset_id="$(jq -er --arg name "$asset" '
-            .assets[] | select(.name == $name) | .id
-        ' <<< "$response" 2>/dev/null)" && break
-        asset_id=
+        if entry="$(jq -er --arg name "$asset" '
+            .assets[] | select(.name == $name) | "\(.id) \(.digest // "")"
+        ' <<< "$response" 2>/dev/null)"; then
+            asset_id="${entry%% *}"
+            digest="${entry#* }"
+            break
+        fi
     done
     [[ -n "$asset_id" ]] || {
-        log "$tag 里没有 ${candidates[0]}（或其它本机可用的包），跳过 codext 更新"
+        log "${tag#v} 里没有 ${candidates[0]}（或其它本机可用的包），跳过 codext 更新"
         return 0
     }
     url="https://api.github.com/repos/$owner/$repo/releases/assets/$asset_id"
 
+    # An asset GitHub has not published a digest for cannot prove it is
+    # unchanged, so it reinstalls rather than being assumed current.
+    if [[ -n "$digest" && "$digest" == "$current" ]]; then
+        log "already current: codext ${tag#v}"
+        return 0
+    fi
+    if (( check_only == 1 )); then
+        if (( fresh == 1 )); then
+            log "codext 还没装；ags update 会把 ${tag#v} 装到 $destination"
+        else
+            log "update available: codext ${tag#v} 有新构建"
+        fi
+        return 0
+    fi
+
     if (( fresh == 1 )); then
-        log "installing codext $tag into $destination"
+        log "installing codext ${tag#v} into $destination"
     else
-        log "updating codext $current -> $tag"
+        log "updating codext to ${tag#v}"
     fi
     workspace="$(mktemp -d "${TMPDIR:-/tmp}/codext-update.XXXXXX")" ||
         die "cannot create a temporary directory for the codext download"
@@ -13556,17 +13589,31 @@ update_codext() {
         -H 'Accept: application/octet-stream' "${auth[@]}" \
         "$url" -o "$workspace/$asset" || {
         rm -rf -- "$workspace"
-        log "codext $tag 下载失败，现有版本没有变动"
+        log "codext ${tag#v} 下载失败，现有版本没有变动"
         return 0
     }
+    # The digest is about to be written down as "the build this host has", and
+    # every later update check trusts that record. A truncated download would
+    # make it a lie that never corrects itself — the check would keep answering
+    # "already current" about bytes that are not there. Verifying here is what
+    # makes the stamp mean anything, and it is also the only integrity check
+    # standing between a mangled download and an executable on PATH.
+    if [[ -n "$digest" ]]; then
+        actual="$(context_mode_sha256_file "$workspace/$asset")" || actual=
+        if [[ "sha256:$actual" != "$digest" ]]; then
+            rm -rf -- "$workspace"
+            log "codext ${tag#v} 下载内容跟发布的 sha256 对不上，现有版本没有变动"
+            return 0
+        fi
+    fi
     tar -xzf "$workspace/$asset" -C "$workspace" || {
         rm -rf -- "$workspace"
-        log "codext $tag 解包失败，现有版本没有变动"
+        log "codext ${tag#v} 解包失败，现有版本没有变动"
         return 0
     }
     [[ -f "$workspace/codext" ]] || {
         rm -rf -- "$workspace"
-        log "codext $tag 的包里没有 codext 可执行文件，现有版本没有变动"
+        log "codext ${tag#v} 的包里没有 codext 可执行文件，现有版本没有变动"
         return 0
     }
     chmod 755 "$workspace/codext"
@@ -13580,7 +13627,7 @@ update_codext() {
     }
     rm -rf -- "$workspace"
     install -d -m700 "$state"
-    printf '%s\n' "$tag" > "$stamp"
+    printf '%s\n' "$digest" > "$stamp"
     if (( fresh == 1 )); then
         # Without a pool configured codext is exactly stock Codex, and it says
         # nothing about it. Someone who never runs codex-init would keep using
@@ -13591,10 +13638,10 @@ update_codext() {
         # once and a binary that appears afterwards stays invisible until
         # `rehash`. AGS launches codext by absolute path and does not care, but
         # someone typing `codext` in the shell they ran this from does.
-        log "installed codext $tag at $binary；跑 ags codex-init 配置凭据池"
+        log "installed codext ${tag#v} at $binary；跑 ags codex-init 配置凭据池"
         log "直接敲 codext 需要新开一个终端（zsh 里 rehash 也行）"
     else
-        log "updated codext to $tag"
+        log "updated codext to ${tag#v}"
     fi
 }
 
