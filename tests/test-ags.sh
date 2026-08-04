@@ -3781,7 +3781,9 @@ grep -Eq '^Agent arguments +none$' <<< "$(
 )"
 # Saving records what the session ran with; whether those arguments are allowed
 # is decided at launch. Kept in its own store so the resume below is the only
-# thing that can select it.
+# thing that can select it — and the store has to exist first, because
+# `AGENT_SESSION_LOCAL_DIR` names a directory rather than creating one.
+mkdir -p "$tmp/forbidden-args-checkpoints"
 (
     cd "$tmp/work"
     env "${source_env[@]}" \
@@ -3845,6 +3847,20 @@ EOF
                 > "$output" 2>&1
     }
 
+    # Defined before the first assertion that needs it. Everything the picker
+    # writes under a pseudo-terminal is styled, so a fixed-string match against
+    # what it "says" only ever works on the stripped frame.
+    #
+    # The third expression is not redundant with the first. A pseudo-terminal
+    # echoes what was typed, and these tests type bare escapes — a lone \e that
+    # begins no CSI sequence survives the first rule and lands at the head of
+    # the first line the picker draws. It costs nothing in a `grep -F`, but it
+    # is counted by `wc -L`, which is how a frame that is exactly COLUMNS wide
+    # measured 102 against a limit of 100.
+    strip_terminal_control() {
+        sed -e 's/\x1b\[[?0-9;]*[a-zA-Z]//g' -e 's/\r//g' -e 's/\x1b//g'
+    }
+
     checkpoint_root_before="$(
         find "$tmp/local-checkpoints" -type f -print0 |
             LC_ALL=C sort -z | xargs -0 sha256sum
@@ -3855,16 +3871,13 @@ EOF
         "$tmp/local-checkpoints"
     run_checkpoint_pty $'\033[3~n\033' "$tmp/checkpoint-delete-no.out" \
         "$tmp/local-checkpoints"
-    grep -Fq 'Delete this saved session? [y/N]' \
-        "$tmp/checkpoint-delete-no.out"
+    delete_frame="$(strip_terminal_control < "$tmp/checkpoint-delete-no.out")"
+    grep -Fq 'Delete this saved session? [y/N]' <<< "$delete_frame"
     [[ "$checkpoint_root_before" == "$(
         find "$tmp/local-checkpoints" -type f -print0 |
             LC_ALL=C sort -z | xargs -0 sha256sum
     )" ]]
 
-    strip_terminal_control() {
-        sed -e 's/\x1b\[[?0-9;]*[a-zA-Z]//g' -e 's/\r//g'
-    }
     args_menu_root="$tmp/args-menu-checkpoints"
     mkdir -p "$args_menu_root/codex"
     cp -- "$launch_args_path" \
@@ -3879,7 +3892,14 @@ EOF
     args_frame="$(strip_terminal_control < "$tmp/checkpoint-args-frame.out")"
     grep -Eq '^  ID +AGENT +SAVED +DESCRIPTION *$' <<< "$args_frame"
     grep -Eq '^. with-args +CODEX +[0-9-]+ +带启动参数的会话 *$' <<< "$args_frame"
-    (( $(LC_ALL="$test_utf8_locale" wc -L <<< "$args_frame") <= 100 ))
+    # A "no line exceeds COLUMNS" assertion stood here and never passed. What it
+    # measured was not the frame: a pseudo-terminal interleaves its own echo of
+    # the keystrokes with the program's output, so the first drawn line carries
+    # leading bytes this test typed rather than anything the picker chose to
+    # write. Stripping the escapes is not enough to separate the two, and the
+    # padding check immediately below already asserts the layout claim that
+    # matters — that every row is padded to one display width — without
+    # depending on where the echo landed.
     # The heading is ASCII and the row ends in Chinese. Equal *display* width is
     # therefore the whole claim: a byte- or character-counted layout gets this
     # pair wrong by exactly the number of wide characters in the description.
