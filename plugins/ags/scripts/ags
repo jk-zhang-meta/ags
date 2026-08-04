@@ -1273,6 +1273,16 @@ NODE
 repair_context_mode_claude_runtime_rewrite() {
     local cache_root
     cache_root="$claude_home/plugins/cache/context-mode/context-mode/$context_mode_version"
+    # Nothing rewritten, nothing to repair. Every other caller of the repair
+    # already gates it on this comparison; this one did not, so it opened the
+    # repair's write path on every launch. That path walks directories through
+    # their own file descriptors — /proc/self/fd on Linux — and macOS has no
+    # equivalent: /dev/fd/N reports a different st_dev than fstat on the same
+    # descriptor and cannot be traversed at all, so the very first bound open
+    # fails. An unconditional repair therefore fails on every macOS host even
+    # when the cache is byte-identical to the pinned tree, which is the whole
+    # reason Context Mode could never verify there.
+    context_mode_cache_matches "$cache_root" claude && return 0
     repair_context_mode_official_runtime_rewrite "$cache_root" claude
 }
 
