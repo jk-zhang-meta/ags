@@ -420,6 +420,7 @@ if [[ "$script" == - ]]; then
     exec "${FAKE_REAL_NODE_BINARY:?}" - "$@"
 fi
 if [[ "$script" == */context-mode/hooks/ensure-deps.mjs ]]; then
+    env > "${BASH_SOURCE[0]%/*}/../ensure-deps.env"
     exit 0
 fi
 [[ "$script" == */context-mode/cli.bundle.mjs ]] || {
@@ -2476,10 +2477,20 @@ context_init_env=(
     FAKE_CLAUDE_REWRITES_PACKAGE=1
     FAKE_CONTEXT_PACKAGE_ROOT="$context_package_root"
     FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
+    HTTPS_PROXY=http://proxy.test:8080
 )
 env "${context_init_env[@]}" "$tool" init \
     > "$tmp/context-init.out" 2> "$tmp/context-init.err"
 grep -Fqx 'status=initialized' "$tmp/context-init.out"
+# The native-dependency sandbox forwards the caller's network configuration,
+# and only the parts the caller actually set. Defining one of these as empty is
+# worse than omitting it: an empty SSL_CERT_FILE points OpenSSL at a trust
+# store with no roots, so every TLS handshake inside the sandbox fails and the
+# better-sqlite3 binding can never be fetched.
+context_deps_env="$tmp/home/.local/ensure-deps.env"
+grep -Fqx 'HTTPS_PROXY=http://proxy.test:8080' "$context_deps_env"
+! grep -qE '^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|npm_config_(proxy|https_proxy|noproxy|cafile|ca))=$' \
+    "$context_deps_env"
 [[ "$(grep -c '^NPM_CONTEXT=install ' \
     "$context_init_home/.context-mode-npm.log")" == 1 ]]
 grep -Fqx 'DOCTOR=claude-code' \
