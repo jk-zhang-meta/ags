@@ -1821,6 +1821,56 @@ fresh_claude_literal_option="$(
 grep -Fqx \
     'FAKE_CLAUDE <--> <--settings>' \
     <<< "$fresh_claude_literal_option"
+
+# A launch reports what the last finished update check found, and reports it out
+# of a file: nothing between typing `ags claude` and the Agent starting touches
+# the network. With no record there is nothing to say.
+rm -f -- "$tmp/state/update-check.lines" "$tmp/state/update-check.stamp"
+quiet_claude="$(
+    env "${managed_env[@]}" "$tool" claude --model sonnet \
+        2> "$tmp/quiet-claude.err"
+)"
+grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$quiet_claude"
+! grep -Fq 'update available:' "$tmp/quiet-claude.err"
+printf '%s\n' \
+    'update available: ags 0.3.0-test -> v0.4.0' \
+    'update available: codext 0.146.0 -> v0.147.0' \
+    'rm -rf /' \
+    > "$tmp/state/update-check.lines"
+date +%s > "$tmp/state/update-check.stamp"
+update_stamp_before="$(<"$tmp/state/update-check.stamp")"
+announced_claude="$(
+    env "${managed_env[@]}" "$tool" claude --model sonnet \
+        2> "$tmp/announced-claude.err"
+)"
+grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$announced_claude"
+grep -Fqx '[ags] update available: ags 0.3.0-test -> v0.4.0' \
+    "$tmp/announced-claude.err"
+grep -Fqx '[ags] update available: codext 0.146.0 -> v0.147.0' \
+    "$tmp/announced-claude.err"
+# Only the shape the refresh writes is printed, so a record that picked up
+# anything else cannot put arbitrary text behind the `[ags]` prefix.
+! grep -Fq 'rm -rf /' "$tmp/announced-claude.err"
+# Inside the interval nothing is re-checked and the record is left alone.
+[[ "$(<"$tmp/state/update-check.stamp")" == "$update_stamp_before" ]]
+env "${managed_env[@]}" AGS_UPDATE_CHECK=0 "$tool" claude --model sonnet \
+    > /dev/null 2> "$tmp/silenced-claude.err"
+! grep -Fq 'update available:' "$tmp/silenced-claude.err"
+[[ "$(<"$tmp/state/update-check.stamp")" == "$update_stamp_before" ]]
+# Past the interval the launch starts the next check and hands the terminal over
+# without waiting for it, so what it prints is still the previous answer. The
+# stamp moves before that check runs, which is what keeps several terminals
+# opened at once from each starting one.
+printf '0\n' > "$tmp/state/update-check.stamp"
+stale_claude="$(
+    env "${managed_env[@]}" "$tool" claude --model sonnet \
+        2> "$tmp/stale-claude.err"
+)"
+grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$stale_claude"
+grep -Fqx '[ags] update available: ags 0.3.0-test -> v0.4.0' \
+    "$tmp/stale-claude.err"
+[[ "$(<"$tmp/state/update-check.stamp")" != 0 ]]
+rm -f -- "$tmp/state/update-check.lines" "$tmp/state/update-check.stamp"
 safe_claude_settings="$tmp/safe-claude.settings.json"
 jq -n '{
   env:{

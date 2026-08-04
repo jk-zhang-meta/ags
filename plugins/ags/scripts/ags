@@ -16,6 +16,12 @@ storage_config="$state/storage.json"
 cloud_password_file="$state/cloud-password.age"
 remote_password_dir="$state/remote-passwords"
 trusted_binary_dir="$state/trusted-binaries"
+# What a launch prints about pending updates, and when the check behind it last
+# finished. Two plain files rather than one JSON object: the content is the
+# lines to print and the second they were found, so there is no schema to
+# validate and the launch path needs no `jq` it could fail on.
+update_check_lines="$state/update-check.lines"
+update_check_stamp="$state/update-check.stamp"
 managed_identity_file="$config_home/ags/identity.agekey"
 default_vault="$data_home/ags/checkpoints"
 remote_store_prefix="ags-v1"
@@ -229,6 +235,9 @@ Usage:
                                        Restore and launch a local checkpoint
   ags delete ID|AGENT/RECORD_ID        Move a local checkpoint to recoverable trash
   ags update [--check]                 Update to the latest release (--check only reports)
+                                       Launching an Agent reports a pending update once a
+                                       day, from a cached answer; AGS_UPDATE_CHECK=0 turns
+                                       that off, AGS_UPDATE_CHECK_INTERVAL sets the seconds
 
 Record synchronization:
   ags remote add NAME git URL [--branch BRANCH]
@@ -8357,6 +8366,12 @@ launch_managed_agent() {
         validate_claude_context_args "$@"
         validate_claude_settings_sources "$launch_cwd"
     fi
+    # After every check that can refuse this launch, so a pending update is
+    # never the last thing printed before a refusal — and never mistaken for
+    # part of one. `|| true` states the contract where it matters: an update
+    # notice is the least important thing this function does, and nothing about
+    # it may stand between a validated launch and the Agent.
+    announce_pending_updates || true
     exec "$launch_binary" "$@"
 }
 
@@ -14258,6 +14273,107 @@ update_ags() {
     log "updated to $tag"
 }
 
+# One line per pending update, immediately before the Agent takes the terminal.
+#
+# Reads a file and prints it. No network call, no version comparison, no `jq` —
+# a launch costs the same whether this host is online, offline, behind a proxy,
+# or rate-limited by api.github.com, and nothing here can fail a launch that the
+# Context Mode gate already passed.
+#
+# The corollary is that the first launch after a release is silent: what gets
+# printed is what the last *finished* check found. That is the trade, and it is
+# the right way round — a release is worth knowing about within a day, and no
+# release is worth making every `ags claude` wait on api.github.com.
+announce_pending_updates() {
+    local interval="${AGS_UPDATE_CHECK_INTERVAL:-86400}" now checked_at line
+    local recorded=
+    [[ "${AGS_UPDATE_CHECK:-1}" != 0 ]] || return 0
+    # Every read below is guarded rather than tested-then-read. Under `set -e` a
+    # redirect from a file that vanished between the test and the read is an
+    # error that ends this process — and this process is one `exec` away from
+    # being the Agent.
+    if [[ -f "$update_check_lines" && ! -L "$update_check_lines" ]]; then
+        recorded="$(cat -- "$update_check_lines" 2>/dev/null)" || recorded=
+    fi
+    while IFS= read -r line; do
+        # The refresh only ever writes lines of this shape, so re-checking it
+        # costs nothing and keeps a record that acquired anything else from
+        # printing whatever it likes behind the `[ags]` prefix.
+        [[ "$line" == "update available: "* ]] || continue
+        log "$line"
+    done <<< "$recorded"
+    [[ "$interval" =~ ^[0-9]+$ ]] || return 0
+    now="$(date +%s 2>/dev/null)" || return 0
+    checked_at=0
+    if [[ -f "$update_check_stamp" && ! -L "$update_check_stamp" ]]; then
+        checked_at="$(cat -- "$update_check_stamp" 2>/dev/null)" || checked_at=0
+    fi
+    [[ "$checked_at" =~ ^[0-9]+$ ]] || checked_at=0
+    (( now - checked_at >= interval )) || return 0
+    spawn_update_check_refresh "$now"
+}
+
+# Start the check that fills the file the next launch reads.
+#
+# A separate process, not a subshell: this runtime registers `rm -rf` EXIT traps
+# for its working directories, and a forked child would run them on its way out
+# and delete directories the launch it forked from is still using. `setsid` so
+# closing the terminal does not take the check with it.
+spawn_update_check_refresh() {
+    local now="$1" binary
+    # In a command substitution because `resolve_ags_converter_binary` reports a
+    # missing installation with `die`; the subshell absorbs that exit, and a
+    # host that cannot locate its own binary simply gets no update line.
+    binary="$( (resolve_ags_converter_binary) 2>/dev/null )" || return 0
+    [[ -n "$binary" ]] || return 0
+    # Stamped before the check runs rather than after. Several terminals opened
+    # at once would otherwise each start their own; the lines already recorded
+    # stay untouched, so launches keep reporting the last finished answer until
+    # this check replaces it.
+    mkdir -p "$state" 2>/dev/null || return 0
+    printf '%s\n' "$now" > "$update_check_stamp.tmp.$$" 2>/dev/null || return 0
+    mv -- "$update_check_stamp.tmp.$$" "$update_check_stamp" 2>/dev/null || {
+        rm -f -- "$update_check_stamp.tmp.$$" 2>/dev/null || true
+        return 0
+    }
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$binary" checkpoint update-check-refresh \
+            </dev/null >/dev/null 2>&1 &
+    else
+        "$binary" checkpoint update-check-refresh \
+            </dev/null >/dev/null 2>&1 &
+    fi
+    disown 2>/dev/null || true
+}
+
+# Record what `ags update --check` reports, for a later launch to print.
+#
+# Deliberately not a second version comparison. `update_ags --check` is the same
+# code path `ags update` uses to decide whether anything needs to happen, across
+# all three release trains; a thinner reimplementation here would be the one
+# that runs unattended every day, and therefore the one whose disagreement with
+# the real updater nobody would notice.
+refresh_update_check_record() {
+    local report status=0 lines
+    (( $# == 0 )) || die "usage: ags update-check-refresh"
+    need jq; need curl
+    mkdir -p "$state" || die "cannot create AGS state directory: $state"
+    # `--check` reports through `log`, so the answer arrives on stderr.
+    report="$(update_ags --check 2>&1 >/dev/null)" || status=$?
+    # A check that could not finish records nothing. Leaving the previous lines
+    # in place says "this is what the last completed check found", which is
+    # true; writing an empty list would claim every train is current, which on
+    # an unreachable network is a guess dressed as an answer.
+    (( status == 0 )) || die "the update check did not finish; the previous result is unchanged"
+    lines="$(sed -n 's/^\[ags\] \(update available: .*\)$/\1/p' <<< "$report")"
+    printf '%s' "${lines:+$lines$'\n'}" > "$update_check_lines.tmp.$$" ||
+        die "cannot write $update_check_lines"
+    mv -- "$update_check_lines.tmp.$$" "$update_check_lines" || {
+        rm -f -- "$update_check_lines.tmp.$$"
+        die "cannot replace $update_check_lines"
+    }
+}
+
 case "${1:-}" in
     '') enter_ags ;;
     claude) shift; start_managed_agent claude "$@" ;;
@@ -14325,6 +14441,7 @@ case "${1:-}" in
     legacy) shift; legacy_command "$@" ;;
     rehome-claude) rehome_claude "${2:-}" ;;
     update) shift; update_ags "$@" ;;
+    update-check-refresh) shift; refresh_update_check_record "$@" ;;
     -h|--help|help) usage ;;
     *) usage >&2; exit 2 ;;
 esac
