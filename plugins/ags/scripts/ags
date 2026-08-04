@@ -5236,7 +5236,11 @@ initialize_context_mode() {
                "$claude_binary" "$codex_binary"; then
             flock -u 8
             exec 8>&-
-            die "Context Mode bootstrap failed and its provider state could not be restored"
+            # Name the verification that failed even though the restore is what
+            # ended the run. The restore failure is downstream of it, and
+            # reporting only the restore sends the reader after provider state
+            # that was never the problem.
+            die "Context Mode bootstrap failed ($verification_failure) and its provider state could not be restored"
         fi
         if (( upgrade == 1 )) &&
            restore_context_mode_pending_transaction \
