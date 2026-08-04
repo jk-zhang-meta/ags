@@ -1965,7 +1965,17 @@ context_mode_claude_plugin_ready() {
     expected_cache="$claude_home/plugins/cache/context-mode/context-mode/$context_mode_version"
     [[ "$resolved_install" == "$(realpath -e -- "$expected_cache" 2>/dev/null)" ]] ||
         return 1
-    context_mode_cache_matches "$resolved_install" claude
+    # Repair here, not only at the tail of `context_mode_claude_effective_ready`.
+    # Context Mode rewrites `hooks/hooks.json` on every MCP boot — start.mjs
+    # expands `${CLAUDE_PLUGIN_ROOT}` and bare `node` into absolute paths so
+    # Windows shells can find them — so one ordinary session leaves this
+    # mismatched. The launch gate is `marketplace && plugin && effective`, and
+    # failing here short-circuits past the only place that knew how to undo that
+    # rewrite: every later launch then died with "run ags init", `init` cleaned
+    # it, and the next session dirtied it again. `context_mode_codex_plugin_ready`
+    # has always repaired inline, which is why Codex never had this loop.
+    context_mode_cache_matches "$resolved_install" claude ||
+        repair_context_mode_official_runtime_rewrite "$resolved_install" claude
 }
 
 context_mode_claude_plugin_installed() {

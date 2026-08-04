@@ -1101,6 +1101,14 @@ if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
         if [[ -n "$state" && -s "$state/claude-plugin-root" ]]; then
             plugin_root="$(<"$state/claude-plugin-root")"
         fi
+        # Stand in for the rewrite an ordinary session already performed:
+        # Context Mode's start.mjs normalizes the cached hooks.json and
+        # plugin.json on every MCP boot, so the readiness check that reads
+        # this listing is looking at a tree Claude changed after AGS wrote it.
+        if [[ "${FAKE_CLAUDE_REWRITES_CACHE:-}" == plugin-list &&
+              "$plugin_root" != "$default_package_root" ]]; then
+            fake_claude_rewrite_root "$plugin_root"
+        fi
         plugin_version="$(jq -r '.version' "$plugin_root/package.json")"
         jq -n --arg root "$plugin_root" --arg version "$plugin_version" \
             --argjson enabled "$enabled" '[{
@@ -2500,6 +2508,19 @@ claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
 [[ "$claude_probe_count_after" == "$claude_probe_count_before" ]]
 [[ ! -e "$context_check_helper_side_effect" ]]
 rm -f -- "$context_init_home/.claude/settings.json"
+claude_context_cache="$context_init_home/.claude/plugins/cache/context-mode/context-mode/1.0.169"
+if ! env "${context_init_env[@]}" \
+    FAKE_CLAUDE_REWRITES_CACHE=plugin-list \
+    "$tool" context-check claude "$tmp/home/.local/bin/claude" \
+    > "$tmp/context-claude-cache-rewrite.out" \
+    2> "$tmp/context-claude-cache-rewrite.err"; then
+    sed -n '1,160p' "$tmp/context-claude-cache-rewrite.err" >&2
+    exit 1
+fi
+cmp "$context_root_169/ags-pristine/claude-hooks.json" \
+    "$claude_context_cache/hooks/hooks.json"
+cmp "$context_root_169/ags-pristine/claude-plugin.json" \
+    "$claude_context_cache/.claude-plugin/plugin.json"
 codex_context_cache="$context_init_home/.codex/plugins/cache/context-mode/context-mode/1.0.169"
 if ! env "${context_init_env[@]}" \
     FAKE_CODEX_REWRITES_CACHE=plugin-list \
