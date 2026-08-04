@@ -4894,6 +4894,11 @@ initialize_context_mode() {
     else
         claude_binary=
     fi
+    # Deliberately `codex`, not codext: Context Mode's own doctor shells out to
+    # a binary of that name to verify the Codex hooks, so a host where only
+    # codext is on PATH cannot pass the Codex health check no matter what AGS
+    # detects here. Widening this to codext only converts a working
+    # Claude-only install into a failed one.
     codex_binary="$(command -v codex 2>/dev/null || true)"
     if valid_agent_binary_path codex "$codex_binary"; then
         context_mode_codex_present=true
