@@ -5450,7 +5450,10 @@ initialize_ags() {
 
     # 必须在 initialize_context_mode 之前：那一步是靠 `codex` 这个名字探测
     # Codex 的，名字定不下来它就配不出东西来。
-    reconcile_codex_binary_name
+    #
+    # maintain：`ags init` 可以被反复运行，所以这里只补一个空缺的名字，绝不
+    # 取代已经在的那个。取代是安装期的事，见 `ags codex-name`。
+    reconcile_codex_binary_name maintain
 
     initialize_context_mode
 
@@ -8081,7 +8084,17 @@ link_codext_as_codex() {
 #
 # Deciding here, before anything reads either name, is what makes
 # `codex --yolo` start in all three cases.
+#
+# `mode` 决定这一趟能走多远：
+#
+#   maintain（默认）  只在**没有任何** codex 时补上那个名字。不问，不动别人的
+#                     文件。`ags init` 走这一支——那个命令是可以反复跑的，而
+#                     「把某人的二进制挪走」不是能在一个随手重跑的命令里发生
+#                     的事，哪怕只发生一次。
+#   install           完整决定：发现外来 codex 就问，允许时把它挪开。只有安装
+#                     器调这一支。
 reconcile_codex_binary_name() {
+    local mode="${1:-maintain}"
     local codext_path codex_path resolved_codex resolved_codext
     local decision reply directory backup decision_file
     codext_path="$(command -v codext 2>/dev/null || true)"
@@ -8089,6 +8102,8 @@ reconcile_codex_binary_name() {
     codex_path="$(command -v codex 2>/dev/null || true)"
 
     if [[ -z "$codex_path" ]]; then
+        # 没有人占着这个名字，给它一个主人不会动到任何既有文件，所以两种模式
+        # 都做——这正是那个死循环的解。
         link_codext_as_codex "$codext_path" || true
         return 0
     fi
@@ -8097,6 +8112,9 @@ reconcile_codex_binary_name() {
     resolved_codext="$(realpath -e -- "$codext_path" 2>/dev/null || printf '%s' "$codext_path")"
     # 已经是同一个文件，没什么可决定的。
     [[ "$resolved_codex" != "$resolved_codext" ]] || return 0
+
+    # 到这里说明有一个外来的 codex。取代它是安装期的决定。
+    [[ "$mode" == install ]] || return 0
 
     decision_file="$(codex_name_decision_file)"
     decision=
@@ -14551,6 +14569,14 @@ case "${1:-}" in
         shift
         (( $# == 0 )) || die "usage: ags codext-update"
         update_codext 0
+        ;;
+    codex-name)
+        # 安装器专用。这是唯一会去问「要不要用 codext 取代现有 codex」并在
+        # 允许时挪走对方二进制的入口，因为那是装一次就定下来的事，不该在
+        # `ags init` 这种可以随手重跑的命令里发生。
+        shift
+        (( $# == 0 )) || die "usage: ags codex-name"
+        reconcile_codex_binary_name install
         ;;
     context-init)
         shift

@@ -809,6 +809,13 @@ configure_codext_only() {
     return 0
   fi
   run_checkpoint_runtime codext-update || true
+  # Decide who owns the name `codex`, now that codext is on disk.
+  #
+  # Here and nowhere else: this is the one step allowed to ask, and to move an
+  # existing codex aside if the answer is yes. `ags init` deliberately only
+  # fills an empty name — displacing someone's binary is not something a
+  # re-runnable command should ever do.
+  run_checkpoint_runtime codex-name || true
   # The stamp, not `codext --version`: that reports the upstream Codex version
   # the fork is built on, so two codext releases can read as the same thing.
   if [ -s "$CODEXT_RELEASE_STAMP" ]; then
