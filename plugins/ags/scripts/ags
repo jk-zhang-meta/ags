@@ -22,6 +22,7 @@ trusted_binary_dir="$state/trusted-binaries"
 # validate and the launch path needs no `jq` it could fail on.
 update_check_lines="$state/update-check.lines"
 update_check_stamp="$state/update-check.stamp"
+update_decline_file="$state/update-declined.lines"
 managed_identity_file="$config_home/ags/identity.agekey"
 default_vault="$data_home/ags/checkpoints"
 remote_store_prefix="ags-v1"
@@ -14450,6 +14451,57 @@ update_ags() {
 # printed is what the last *finished* check found. That is the trade, and it is
 # the right way round — a release is worth knowing about within a day, and no
 # release is worth making every `ags claude` wait on api.github.com.
+# Offer a pending update before running whatever was asked for.
+#
+# Reads the record a background check already filled (see
+# `announce_pending_updates`), so this touches no network and no command waits
+# on it. A version that has to phone home before every invocation is a version
+# people turn off.
+#
+# Asked once per pending release, not once per command. A prompt that returns on
+# every invocation stops being a question and becomes a toll — declining writes
+# the pending lines down and stays quiet until they change. That is also why the
+# answer is remembered as *what* was declined rather than as a timestamp: a
+# newer release is a different question and deserves to be asked again.
+#
+# Never asked when stdin or stdout is not a terminal. Several of these
+# subcommands are driven by install.sh, which parses their stdout; a prompt
+# there would corrupt the thing reading it.
+offer_pending_update() {
+    local recorded= pending= declined= line reply
+    [[ "${AGS_UPDATE_CHECK:-1}" != 0 ]] || return 0
+    [[ -t 0 && -t 1 ]] || return 0
+    [[ -f "$update_check_lines" && ! -L "$update_check_lines" ]] || return 0
+    recorded="$(cat -- "$update_check_lines" 2>/dev/null)" || return 0
+    while IFS= read -r line; do
+        [[ "$line" == "update available: "* ]] || continue
+        pending+="${pending:+$'\n'}$line"
+    done <<< "$recorded"
+    [[ -n "$pending" ]] || return 0
+    if [[ -f "$update_decline_file" && ! -L "$update_decline_file" ]]; then
+        declined="$(cat -- "$update_decline_file" 2>/dev/null)" || declined=
+    fi
+    [[ "$declined" != "$pending" ]] || return 0
+
+    while IFS= read -r line; do log "$line"; done <<< "$pending"
+    printf '现在更新？[Y/n]: '
+    IFS= read -r reply || reply=n
+    case "${reply:-y}" in
+        [Nn]*)
+            install -d -m700 "$state" 2>/dev/null || true
+            printf '%s\n' "$pending" > "$update_decline_file" 2>/dev/null || true
+            log "跳过。想更新随时跑 ags update"
+            return 0
+            ;;
+    esac
+    rm -f -- "$update_decline_file"
+    # 装完不重新 exec 自己：这一趟已经把旧的运行时读进内存了，中途换掉它需要
+    # 把参数原样重建再交接，而那是一条只有更新路径会走、平时无人测试的分支。
+    # 让它跑完，下一条命令就是新的。
+    update_ags || log "更新失败；这次仍用当前版本继续"
+    log "新版本从下一条 ags 命令起生效"
+}
+
 announce_pending_updates() {
     local interval="${AGS_UPDATE_CHECK_INTERVAL:-86400}" now checked_at line
     local recorded=
@@ -14539,6 +14591,14 @@ refresh_update_check_record() {
         die "cannot replace $update_check_lines"
     }
 }
+
+# 任何 ags 命令之前都问一次，除了这几个：`update` 系列自己就是答案，其余四个
+# 由 install.sh 驱动并且它要解析它们的 stdout。（`-t` 那道闸已经挡住非交互式
+# 调用，这里是第二道——install.sh 也可能在终端里跑。）
+case "${1:-}" in
+    update|update-check-refresh|codext-update|context-init|context-check|codex-name) ;;
+    *) offer_pending_update || true ;;
+esac
 
 case "${1:-}" in
     '') enter_ags ;;
