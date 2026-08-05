@@ -5448,6 +5448,10 @@ initialize_ags() {
         fi
     fi
 
+    # 必须在 initialize_context_mode 之前：那一步是靠 `codex` 这个名字探测
+    # Codex 的，名字定不下来它就配不出东西来。
+    reconcile_codex_binary_name
+
     initialize_context_mode
 
     if [[ ! -e "$vault" ]]; then
@@ -8045,6 +8049,106 @@ codex_pool_write() {
     mv -- "$temporary" "$target"
 }
 
+codex_name_decision_file() { printf '%s/codex-name\n' "$state"; }
+codex_pool_disabled_file() { printf '%s/codex-pool-disabled\n' "$state"; }
+
+# Give codext the name `codex`, in the directory codext already lives in.
+#
+# Same directory on purpose: that directory is by definition on PATH — it is
+# where `command -v codext` just found it — so the new name takes effect with
+# no PATH change and no second place to keep in sync.
+link_codext_as_codex() {
+    local codext_path="$1" directory
+    directory="$(dirname -- "$codext_path")"
+    [[ -w "$directory" ]] || {
+        log "警告：$directory 不可写，codext 无法取得 codex 这个名字；ags codex 将不可用"
+        return 1
+    }
+    ln -sfn -- "$codext_path" "$directory/codex" || return 1
+    log "codext 已取得 codex 这个名字：$directory/codex -> $codext_path"
+}
+
+# Decide, once, which binary owns the name `codex` on this machine.
+#
+# Two places disagree about what "Codex" means, and that disagreement is what
+# made a codext-only host unusable. `initialize_context_mode` detects Codex
+# strictly by the name `codex`, because Context Mode's own doctor shells out to
+# a binary of that name. `resolve_agent_binary` prefers `codext`. So on a host
+# carrying only codext: init sees no Codex and configures nothing, launch finds
+# codext regardless, and the refusal reads "run ags init" — advice that could
+# never work there, because the next init makes the same non-decision. The user
+# is told to do the one thing that cannot help, forever.
+#
+# Deciding here, before anything reads either name, is what makes
+# `codex --yolo` start in all three cases.
+reconcile_codex_binary_name() {
+    local codext_path codex_path resolved_codex resolved_codext
+    local decision reply directory backup decision_file
+    codext_path="$(command -v codext 2>/dev/null || true)"
+    [[ -n "$codext_path" ]] || return 0
+    codex_path="$(command -v codex 2>/dev/null || true)"
+
+    if [[ -z "$codex_path" ]]; then
+        link_codext_as_codex "$codext_path" || true
+        return 0
+    fi
+
+    resolved_codex="$(realpath -e -- "$codex_path" 2>/dev/null || printf '%s' "$codex_path")"
+    resolved_codext="$(realpath -e -- "$codext_path" 2>/dev/null || printf '%s' "$codext_path")"
+    # 已经是同一个文件，没什么可决定的。
+    [[ "$resolved_codex" != "$resolved_codext" ]] || return 0
+
+    decision_file="$(codex_name_decision_file)"
+    decision=
+    [[ ! -s "$decision_file" ]] || IFS= read -r decision < "$decision_file" || decision=
+    [[ "$decision" == replace || "$decision" == keep ]] || decision=
+
+    if [[ -z "$decision" ]]; then
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            # 非交互式选不破坏的那一边。移动别人的二进制不是能替人默认的事。
+            decision=keep
+            log "检测到另一个 codex（$resolved_codex）；非交互式运行按保留处理"
+        else
+            printf '\n检测到已安装的 codex：%s\n' "$resolved_codex"
+            printf 'codext 是它的超集：配了凭据池就在线租号，没配就退回同一份本地 auth.json。\n'
+            printf '用 codext 接管 codex 这个名字？\n'
+            printf '  y = 把现有的挪到一边（保留备份，可还原），codex 指向 codext\n'
+            printf '  N = 保留现有的；本机不配置凭据池，原生 codex 读不到它\n[y/N]: '
+            IFS= read -r reply || reply=n
+            case "${reply:-n}" in
+                [Yy]*) decision=replace ;;
+                *) decision=keep ;;
+            esac
+        fi
+    fi
+
+    if [[ "$decision" == replace ]]; then
+        directory="$(dirname -- "$codex_path")"
+        if [[ ! -w "$directory" ]]; then
+            log "警告：$directory 不可写，改为保留现有 codex"
+            decision=keep
+        else
+            backup="$codex_path.stock.$(date -u +%Y%m%dT%H%M%SZ)"
+            mv -- "$codex_path" "$backup" || return 1
+            # 挪开而不是删除：这是可还原的，而删除不是。包管理器装的那种
+            # （npm、brew）仍然认为自己装着，下次升级可能把它放回来——真要
+            # 永久移除，得用装它的那个包管理器卸载。
+            log "原 codex 已挪到 $backup（若由包管理器安装，升级时可能被放回）"
+            link_codext_as_codex "$codext_path" || return 1
+            rm -f -- "$(codex_pool_disabled_file)"
+        fi
+    fi
+
+    if [[ "$decision" == keep ]]; then
+        # 原生 codex 读不到池配置，问了也用不上，所以这里直接记为禁用而不是
+        # 每次 init 再问一遍。
+        : > "$(codex_pool_disabled_file)"
+        log "保留现有 codex；本机不配置凭据池（原生 codex 用不到）"
+    fi
+    printf '%s\n' "$decision" > "$decision_file"
+    log "要改这个决定：删掉 $decision_file 再跑 ags init"
+}
+
 # Ask at init time whether this machine should use the pool at all.
 #
 # Asked rather than assumed: a machine that already has its own `codex login`
@@ -8053,6 +8157,8 @@ codex_pool_write() {
 offer_codex_pool() {
     local reply existing
     existing="$(codex_pool_config_path)"
+    # 选了保留原生 codex 的机器不必再被问一遍——那份配置它读不到。
+    [[ ! -e "$(codex_pool_disabled_file)" ]] || return 0
     if [[ ! -t 0 || ! -t 1 ]]; then
         [[ -s "$existing" ]] ||
             log "codext 凭据池未配置（非交互式运行）；需要时跑 ags codex-init"
