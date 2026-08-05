@@ -806,19 +806,42 @@ const directoryFlags =
   fs.constants.O_RDONLY |
   fs.constants.O_DIRECTORY |
   fs.constants.O_NOFOLLOW;
+// Only Linux has a per-descriptor path that behaves like the directory it
+// refers to. macOS advertises /dev/fd, but that is a devfs node, not a second
+// name for the same directory: measured on macOS 26, `stat("/dev/fd/N")`
+// reports dev=688260186 where `fstat(fd)` reports dev=16777231 (the inode
+// number does match), `readdirSync` on it is ENOTDIR, and "/dev/fd/N/child" is
+// ENOENT. So the identity check below could never pass there, and relaxing it
+// would not help — the path is unusable for the traversal that follows.
+//
+// An unknown platform is still refused. macOS falls back to the verified
+// lexical path.
+if (!["linux", "darwin"].includes(process.platform)) process.exit(1);
 const descriptorRoot =
-  process.platform === "linux"
-    ? "/proc/self/fd"
-    : process.platform === "darwin"
-      ? "/dev/fd"
-      : null;
-if (!descriptorRoot) process.exit(1);
+  process.platform === "linux" ? "/proc/self/fd" : null;
 
 function sameIdentity(left, right) {
   return left.dev === right.dev && left.ino === right.ino;
 }
 
-function descriptorPath(fd) {
+/// The path later operations should go through for an already-opened,
+/// already-verified directory.
+///
+/// On Linux this is the descriptor's own path, which pins every later operation
+/// to the inode this function was handed: a component swapped after the check
+/// cannot be reached through it.
+///
+/// macOS has no such path (see above), so it gets `verifiedPath` — the caller's
+/// lexical path, which by then has passed absolute-path, realpath-equality,
+/// lstat-is-a-real-directory and O_NOFOLLOW-open-identity checks. Every one of
+/// those still holds; what is lost is only that later operations re-resolve the
+/// path instead of riding the descriptor, so a swap racing *between* the check
+/// and the use is no longer impossible — merely unwinnable without write access
+/// to the cache directory being repaired, which is already enough to corrupt it
+/// outright. Failing the install instead was not a safer trade: it left macOS
+/// unable to run AGS at all whenever Claude was on PATH.
+function descriptorPath(fd, verifiedPath) {
+  if (descriptorRoot === null) return verifiedPath;
   const candidate = path.join(descriptorRoot, String(fd));
   const stat = fs.statSync(candidate);
   const opened = fs.fstatSync(fd);
@@ -844,7 +867,7 @@ function openBoundDirectory(requestedRoot) {
   }
   return {
     fd,
-    descriptor: descriptorPath(fd),
+    descriptor: descriptorPath(fd, requestedRoot),
     root: requestedRoot,
   };
 }
@@ -876,7 +899,7 @@ function openBoundParent(root, relative) {
   }
   return {
     fd,
-    descriptor: descriptorPath(fd),
+    descriptor: descriptorPath(fd, lexical),
     root: lexical,
   };
 }
@@ -1275,13 +1298,8 @@ repair_context_mode_claude_runtime_rewrite() {
     cache_root="$claude_home/plugins/cache/context-mode/context-mode/$context_mode_version"
     # Nothing rewritten, nothing to repair. Every other caller of the repair
     # already gates it on this comparison; this one did not, so it opened the
-    # repair's write path on every launch. That path walks directories through
-    # their own file descriptors — /proc/self/fd on Linux — and macOS has no
-    # equivalent: /dev/fd/N reports a different st_dev than fstat on the same
-    # descriptor and cannot be traversed at all, so the very first bound open
-    # fails. An unconditional repair therefore fails on every macOS host even
-    # when the cache is byte-identical to the pinned tree, which is the whole
-    # reason Context Mode could never verify there.
+    # repair's write path on every launch even when the cache was byte-identical
+    # to the pinned tree.
     context_mode_cache_matches "$cache_root" claude && return 0
     repair_context_mode_official_runtime_rewrite "$cache_root" claude
 }
