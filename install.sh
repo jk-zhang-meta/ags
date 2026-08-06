@@ -19,7 +19,7 @@
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #   --no-verify        Skip checksum + signature verification (not recommended)
-#   --no-configure     Skip optional agent setup; Context Mode remains mandatory
+#   --no-configure     Skip optional agent setup
 #   --no-skill         Skip skill installation for Claude/Codex
 #   --offline TARBALL  Install from local tarball (airgap mode)
 #   --force            Reinstall even if same version exists
@@ -67,11 +67,6 @@ NO_SKILL=0
 FORCE_INSTALL=0
 OFFLINE_TARBALL=""
 CHECKPOINT_IDENTITY=""
-CONTEXT_MODE_RUNTIME_BASE="${XDG_DATA_HOME:-$HOME/.local/share}/ags/context-mode"
-CONTEXT_MODE_RUNTIME_ROOT="$CONTEXT_MODE_RUNTIME_BASE"
-CONTEXT_MODE_ACTIVE_MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ags/context-mode.json"
-CONTEXT_MODE_PENDING_MANIFEST="${XDG_STATE_HOME:-$HOME/.local/state}/ags/context-mode.pending.json"
-CONTEXT_MODE_STATUS="not-attempted"
 CODEXT_STATUS="not-attempted"
 CODEXT_RELEASE_STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/ags/codext-release"
 INSTALL_TRANSACTION_FILE=""
@@ -761,32 +756,9 @@ checkpoint_dependencies_ready() {
 }
 
 run_checkpoint_runtime() {
-  if [ -n "$OFFLINE_TARBALL" ]; then
-    AGS_CONTEXT_MODE_OFFLINE=1 "$DEST/$BINARY_NAME" checkpoint "$@"
-  else
-    "$DEST/$BINARY_NAME" checkpoint "$@"
-  fi
+  "$DEST/$BINARY_NAME" checkpoint "$@"
 }
 
-configure_context_mode_only() {
-  local init_output version root runtime_base="$CONTEXT_MODE_RUNTIME_BASE"
-  local runtime_target
-  init_output="$(run_checkpoint_runtime context-init)"
-  version="$(sed -n 's/^context-mode-version=//p' <<< "$init_output" | tail -n 1)"
-  root="$(sed -n 's/^context-mode-root=//p' <<< "$init_output" | tail -n 1)"
-  runtime_target="${root#"$runtime_base/runtimes/"}"
-  runtime_target="${runtime_target%"/$version"}"
-  if ! grep -Fqx 'status=context-mode-initialized' <<< "$init_output" ||
-     [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
-     [[ ! "$runtime_target" =~ ^(linux|darwin)-[a-z0-9_]+-node[1-9][0-9]*$ ]] ||
-     [ "$root" != "$runtime_base/runtimes/$runtime_target/$version" ]; then
-    CONTEXT_MODE_STATUS="failed"
-    err "Context Mode initialization returned an unexpected result"
-    return 1
-  fi
-  CONTEXT_MODE_RUNTIME_ROOT="$root"
-  CONTEXT_MODE_STATUS="initialized ($version)"
-}
 
 # Bring codext to the current release, installing it if this host has none.
 #
@@ -1051,42 +1023,24 @@ check_network() {
   fi
 }
 
-context_mode_node_supported() {
-  local version="${1:-}" major minor patch
-  [[ "$version" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
-  major="${BASH_REMATCH[1]}"
-  minor="${BASH_REMATCH[2]}"
-  patch="${BASH_REMATCH[3]}"
-  (( major > 22 || (major == 22 && minor >= 5) ))
-}
-
-preflight_context_mode() {
-  local mode="${1:-install}" node_version command
-  for command in cmp flock jq realpath; do
-    command -v "$command" >/dev/null 2>&1 || {
-      err "Context Mode integration requires $command"
-      exit 1
-    }
-  done
+preflight_installer_tools() {
+  # 这三样是安装事务自己的依赖，不是谁的附带要求：
+  #   jq            读写和校验 install-transaction 日志
+  #   node          durable_sync_path 靠它把改动刷到盘上
+  #   sha256sum/shasum  比对候选二进制和回滚副本
+  # 少一样，失败会发生在写了一半的地方，而不是发生在动手之前。
+  command -v jq >/dev/null 2>&1 || {
+    err "The installer requires jq"
+    exit 1
+  }
+  command -v node >/dev/null 2>&1 || {
+    err "The installer requires Node.js"
+    exit 1
+  }
   if ! command -v sha256sum >/dev/null 2>&1 &&
      ! command -v shasum >/dev/null 2>&1; then
-    err "Context Mode integration requires sha256sum or shasum"
+    err "The installer requires sha256sum or shasum"
     exit 1
-  fi
-  command -v node >/dev/null 2>&1 || {
-    err "Context Mode requires Node.js 22.5.0 or newer"
-    exit 1
-  }
-  node_version="$(node --version 2>/dev/null || true)"
-  context_mode_node_supported "$node_version" || {
-    err "Context Mode requires Node.js 22.5.0 or newer; found ${node_version:-unknown}"
-    exit 1
-  }
-  if [[ "$mode" != recovery && -z "$OFFLINE_TARBALL" ]]; then
-    command -v npm >/dev/null 2>&1 || {
-      err "Installing or refreshing mandatory Context Mode requires npm"
-      exit 1
-    }
   fi
 }
 
@@ -1143,29 +1097,14 @@ install_transaction_child_path() {
      "$name" != *$'\r'* ]]
 }
 
-context_manifest_fingerprint() {
-  if [[ -e "$CONTEXT_MODE_ACTIVE_MANIFEST" ||
-        -L "$CONTEXT_MODE_ACTIVE_MANIFEST" ]]; then
-    [[ -f "$CONTEXT_MODE_ACTIVE_MANIFEST" &&
-       ! -L "$CONTEXT_MODE_ACTIVE_MANIFEST" ]] ||
-      return 1
-    installer_sha256_file "$CONTEXT_MODE_ACTIVE_MANIFEST"
-  else
-    printf 'absent\n'
-  fi
-}
-
 validate_install_transaction() {
   [[ -f "$INSTALL_TRANSACTION_FILE" &&
      ! -L "$INSTALL_TRANSACTION_FILE" ]] ||
     return 1
-  jq -e --arg binary "$DEST/$BINARY_NAME" \
-    --arg active "$CONTEXT_MODE_ACTIVE_MANIFEST" \
-    --arg pending "$CONTEXT_MODE_PENDING_MANIFEST" '
+  jq -e --arg binary "$DEST/$BINARY_NAME" '
       (keys | sort) ==
-        ["binary_path", "candidate", "context", "managed_by",
-         "previous", "schema"] and
-      .schema == 1 and
+        ["binary_path", "candidate", "managed_by", "previous", "schema"] and
+      .schema == 2 and
       .managed_by == "ags-installer" and
       .binary_path == $binary and
       (.candidate | keys | sort) == ["sha256", "stage_path"] and
@@ -1183,15 +1122,6 @@ validate_install_transaction() {
           .previous.sha256 == null and
           .previous.backup_path == null
         end
-      ) and
-      (.context | keys | sort) ==
-        ["active_before", "active_manifest_path",
-         "pending_manifest_path"] and
-      .context.active_manifest_path == $active and
-      .context.pending_manifest_path == $pending and
-      (
-        .context.active_before == "absent" or
-        (.context.active_before | test("^[0-9a-f]{64}$"))
       )
     ' "$INSTALL_TRANSACTION_FILE" >/dev/null 2>&1 ||
     return 1
@@ -1214,11 +1144,10 @@ validate_install_transaction() {
 
 write_install_transaction() {
   local stage="$1" candidate_sha="$2"
-  local previous_sha= backup_json=null active_before temporary
+  local previous_sha= backup_json=null temporary
   [[ ! -e "$INSTALL_TRANSACTION_FILE" &&
      ! -L "$INSTALL_TRANSACTION_FILE" ]] ||
     return 1
-  active_before="$(context_manifest_fingerprint)" || return 1
   if [[ "$BINARY_PREEXISTED" -eq 1 ]]; then
     previous_sha="$(installer_sha256_file "$DEST/$BINARY_NAME")" ||
       return 1
@@ -1239,12 +1168,9 @@ write_install_transaction() {
       --argjson previous_existed \
         "$([[ "$BINARY_PREEXISTED" -eq 1 ]] && printf true || printf false)" \
       --arg previous_sha "$previous_sha" \
-      --argjson backup "$backup_json" \
-      --arg active "$CONTEXT_MODE_ACTIVE_MANIFEST" \
-      --arg pending "$CONTEXT_MODE_PENDING_MANIFEST" \
-      --arg active_before "$active_before" '
+      --argjson backup "$backup_json" '
         {
-          schema:1,
+          schema:2,
           managed_by:"ags-installer",
           binary_path:$binary,
           candidate:{
@@ -1257,11 +1183,6 @@ write_install_transaction() {
               if $previous_existed then $previous_sha else null end
             ),
             backup_path:$backup
-          },
-          context:{
-            active_manifest_path:$active,
-            pending_manifest_path:$pending,
-            active_before:$active_before
           }
         }
       ' > "$temporary"; then
@@ -1278,14 +1199,6 @@ write_install_transaction() {
   }
   INSTALL_TRANSACTION_ACTIVE=1
   durable_sync_path "$INSTALL_TRANSACTION_FILE"
-}
-
-install_transaction_context_changed() {
-  local before current
-  before="$(jq -er '.context.active_before' \
-    "$INSTALL_TRANSACTION_FILE")" || return 0
-  current="$(context_manifest_fingerprint 2>/dev/null)" || return 0
-  [[ "$current" != "$before" ]]
 }
 
 clear_install_transaction_artifacts() {
@@ -1323,11 +1236,6 @@ commit_install_transaction() {
   current_sha="$(installer_sha256_file "$DEST/$BINARY_NAME")" ||
     return 1
   [[ "$current_sha" == "$candidate_sha" ]] || return 1
-  [[ ! -e "$CONTEXT_MODE_PENDING_MANIFEST" &&
-     ! -L "$CONTEXT_MODE_PENDING_MANIFEST" &&
-     -f "$CONTEXT_MODE_ACTIVE_MANIFEST" &&
-     ! -L "$CONTEXT_MODE_ACTIVE_MANIFEST" ]] ||
-    return 1
   clear_install_transaction_artifacts
 }
 
@@ -1335,10 +1243,6 @@ restore_install_transaction_if_safe() {
   local candidate_sha previous_existed previous_sha backup current_sha=
   local restore_stage
   validate_install_transaction || return 1
-  [[ ! -e "$CONTEXT_MODE_PENDING_MANIFEST" &&
-     ! -L "$CONTEXT_MODE_PENDING_MANIFEST" ]] ||
-    return 1
-  install_transaction_context_changed && return 1
   candidate_sha="$(jq -er '.candidate.sha256' \
     "$INSTALL_TRANSACTION_FILE")" || return 1
   previous_existed="$(jq -er '
@@ -1420,9 +1324,9 @@ recover_pending_install_transaction() {
 
   if [[ -n "$current_sha" && "$current_sha" == "$candidate_sha" ]]; then
     # Keep the binary journal active and rejoin the ordinary post-install path,
-    # which initializes Context Mode and only then commits the casr binary.
+    # which commits the casr binary.
     INSTALL_TRANSACTION_ACTIVE=1
-    info "Resuming the interrupted casr and Context Mode installation"
+    info "Resuming the interrupted casr installation"
     return 0
   fi
 
@@ -1812,10 +1716,10 @@ Options:
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
   --no-verify        Skip checksum + signature verification (not recommended)
-  --no-configure     Skip optional AGS setup; Context Mode remains mandatory
+  --no-configure     Skip optional AGS setup
   --no-skill         Skip skill installation for Claude/Codex
   --identity FILE     Import an existing AGS age identity during initialization
-  --offline TARBALL  Install from local tarball; Context Mode must exist locally
+  --offline TARBALL  Install from local tarball
   --force            Force reinstall even if same version is installed
 
 Environment:
@@ -1841,7 +1745,7 @@ Examples:
   # Build from source (requires Rust nightly)
   bash install.sh --from-source
 
-  # Skip optional setup (mandatory Context Mode is still configured)
+  # Skip optional setup
   bash install.sh --no-configure --no-skill
 EOFU
 }
@@ -1882,7 +1786,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$SYSTEM_INSTALL" -eq 1 ] && [ "$EUID" -eq 0 ]; then
-  err "--system cannot run as root because mandatory Context Mode belongs to the target user's Claude/Codex configuration"
+  err "--system cannot run as root because AGS configuration belongs to the target user"
   err "Run the installer as that user with a writable --dest (the default is recommended)"
   exit 1
 fi
@@ -1900,8 +1804,8 @@ fi
 # Main Installation Flow
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Recover an interrupted binary/Context transaction before network resolution
-# or any new installation work.
+# Recover an interrupted binary transaction before network resolution or any
+# new installation work.
 mkdir -p "$DEST" || {
   err "Cannot create destination directory: $DEST"
   exit 1
@@ -1911,7 +1815,7 @@ DEST="$(cd "$DEST" && pwd -P)" || {
   exit 1
 }
 INSTALL_TRANSACTION_FILE="$DEST/.${BINARY_NAME}.install-transaction.json"
-preflight_context_mode recovery
+preflight_installer_tools
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Atomic Locking (mkdir-based, cross-platform)
@@ -2003,7 +1907,7 @@ fi
 setup_proxy
 
 if [ "$RESUME_CORE_ONLY" -eq 1 ]; then
-  info "Finishing the recovered casr and Context Mode transaction"
+  info "Finishing the recovered casr transaction"
 else
   # Resolve version and platform only for new installation work. A recovered
   # candidate is already identified by its journaled SHA-256.
@@ -2011,9 +1915,6 @@ else
   detect_platform
   set_artifact_url
 fi
-
-# Mandatory Context Mode must be viable before AGS writes its binary.
-preflight_context_mode
 
 # Preflight
 preflight_checks
@@ -2197,10 +2098,9 @@ fi
 # Post-Install (shared across all install paths)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-configure_context_mode_only
 if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
   commit_install_transaction || {
-    err "Context Mode succeeded, but the binary transaction could not be committed"
+    err "The binary transaction could not be committed"
     exit 1
   }
 fi
@@ -2254,7 +2154,6 @@ summary_lines=(
   "AGS Claude skill: $AGS_CLAUDE_SKILL_STATUS"
   "AGS hooks:        $AGS_HOOK_STATUS"
   "AGS vault:        $AGS_INIT_STATUS"
-  "Context Mode:     $CONTEXT_MODE_STATUS"
   "codext:           $CODEXT_STATUS"
   ""
   "Get started:"
@@ -2270,7 +2169,6 @@ summary_lines=(
   "  binary:   $(status_path "$DEST/$BINARY_NAME")"
   "  wrappers: $(status_path "$DEST")/{cc,cod,gmi,ags}"
   "  skills:   ~/.claude/skills/{casr,ags} and ~/.codex/skills/{casr,ags}"
-  "  context:  $(status_path "$CONTEXT_MODE_RUNTIME_ROOT")"
 )
 
 echo ""

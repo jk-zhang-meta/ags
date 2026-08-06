@@ -917,31 +917,7 @@ fn launch_blocker(
                 .to_string(),
         );
     }
-    if !launch.dry_run
-        && let Some(agent) = context_mode_agent(provider.slug())
-        && let Some(binary) = spec.program_path()
-        && let Err(error) = casr::checkpoint_runtime::check_context_mode(
-            agent,
-            &binary,
-            spec.cwd.as_deref().unwrap_or_else(|| Path::new(".")),
-        )
-    {
-        return Some(format!(
-            "mandatory Context Mode verification failed for {}: {error}. The session was \
-             converted and written; no agent was started",
-            provider.name()
-        ));
-    }
-
     None
-}
-
-fn context_mode_agent(provider_slug: &str) -> Option<&'static str> {
-    match provider_slug {
-        "claude-code" => Some("claude"),
-        "codex" => Some("codex"),
-        _ => None,
-    }
 }
 
 /// Start the target agent on the session the conversion just wrote.

@@ -247,8 +247,6 @@ The accepted implementation direction is:
 - the official checksummed RMUX 0.9.1 release, or an already complete compatible
   stable 0.9.x installation at or above 0.9.1, as AGS's mandatory
   live-terminal runtime for interactive Claude Code and Codex commands;
-- Context Mode's latest AGS-compatible stable npm release as a mandatory
-  context runtime for both Agents;
 - a local-first vault with optional named Git and SFTP remotes;
 - one Agent seam with concrete Codex and Claude adapters;
 - one Storage seam operating on opaque immutable records;
@@ -279,22 +277,20 @@ argument—including tokens named `--to`, `--cwd`, or `--profile`—belongs to
 that native Agent. For checkpoint resume, AGS parses only
 the known options before an independent `--`; every argument after it belongs
 to the restored Agent. Unknown pre-separator arguments fail instead of
-silently changing which side owns the remaining command line. Mandatory
-Context Mode still validates Agent arguments without renaming or reordering
-them.
+silently changing which side owns the remaining command line. AGS still
+validates Agent arguments without renaming or reordering them.
 
 Claude `--settings FILE` and `--settings=JSON` remain native Claude arguments,
 but AGS validates their contents before launch. They may contain only provider
 authentication (`ANTHROPIC_BASE_URL`, API key/token, or `apiKeyHelper`) plus
 `model` and `effortLevel`. Settings that can change hooks, MCP servers,
-plugins, permissions, or tool availability fail closed so mandatory Context
-Mode cannot be bypassed. `apiKeyHelper` is limited to
+plugins, permissions, or tool availability fail closed so the AGS plugin
+cannot be disabled from under the launch. `apiKeyHelper` is limited to
 `/usr/bin/printenv ENV_NAME`; arbitrary helper commands are rejected.
 AGS applies that helper restriction to Claude's active managed, user, project,
 local, legacy-local, and main-worktree-local settings files too. Other fields
-in those native settings sources remain available. The helper check runs before
-`init`/`context-init`, `context-check claude`, the effective Context Mode probe,
-and again at the managed-launch boundary.
+in those native settings sources remain available. The helper check runs at the
+managed-launch boundary.
 
 An optional description belongs to AGS only in the prefix form
 `ags --description TEXT claude|codex ...`. A token named `--description` after
@@ -378,154 +374,6 @@ RMUX is initially integrated through its stable CLI because that code owns raw
 TTY mode, resizing, rendering, and detach behavior. The Rust SDK remains a
 future option for pane events or checkpoint triggers, not a replacement for the
 CLI attach path.
-
-## Mandatory Context Mode Runtime
-
-AGS resolves npm's stable `latest` channel and installs the exact release into
-a versioned, AGS-owned user-data prefix:
-
-```text
-${XDG_DATA_HOME:-~/.local/share}/ags/context-mode/runtimes/<platform>-<arch>-node<abi>/<version>
-```
-
-The package requires Node.js 22.5.0 or newer. Online installation and every
-online `ags init` query the official registry once for version, tarball, and SHA-512
-integrity. AGS rejects prereleases, registry redirects, and downgrades. It
-installs the exact candidate with lifecycle scripts disabled into a hidden
-sibling directory. AGS first validates the package name, package lock,
-integrity, CLI, MCP entrypoint, upstream native provisioner, and Claude/Codex
-plugin and hook contracts. It then runs only that reviewed native provisioner
-in an isolated environment until the package tree reaches a fixed point before
-the candidate can be renamed into place.
-
-The runtime target is part of the last-good identity. A Node ABI change stages
-and validates a separate target even when npm's package version is unchanged.
-An online `ags init` can build that target from the exact verified package; an
-offline init with only a different target fails closed and names the required
-online recovery.
-
-During that verified npm transaction, AGS records SHA-256 values for the full
-runtime package tree: every regular file and every safe in-package symbolic link,
-including nested dependencies and the active native ABI binding. Every later
-initialization and managed launch recomputes that tree. Agent-managed plugin
-caches are also compared exactly with the verified package, so a stale,
-modified, missing, or extra file fails closed. The active ownership manifest is
-the single last-good pointer. Network failure, an incompatible upstream
-release, or a failed health check leaves that pointer and the previous runtime
-intact. Normal launches never query npm.
-
-An offline AGS install performs no Context Mode download and accepts only a
-previously committed, revalidated last-good runtime. A fresh machine must
-complete one online `ags init` against the official npm registry. A copied
-version prefix and its self-carried package lock or AGS hashes are deliberately
-not accepted as a first-use trust anchor.
-
-During offline revalidation, AGS does not run `doctor`, because upstream
-`doctor` performs a best-effort npm version lookup. Instead, it uses the public
-`index` and `search` commands to persist a unique health record and prove a
-real SQLite/FTS round trip without a network request. Online installation and
-a normal `ags init` run the full `doctor` lifecycle. Setting
-`AGS_CONTEXT_MODE_OFFLINE=1` explicitly selects the same offline health path
-for an airgapped `ags init`. Both health paths use a disposable
-`CONTEXT_MODE_DIR`, so validating a runtime cannot migrate or seed the user's
-existing Claude/Codex Context Mode databases before activation.
-
-`ags init` is the convergence operation. For every installed Agent it:
-
-1. validates existing AGS storage, vault, and identity state before changing
-   either Agent;
-2. resolves and stages the newest compatible stable package without modifying
-   the active last-good manifest;
-3. adds the selected local package as an official plugin marketplace when
-   absent, rejecting a same-named marketplace from any other source;
-4. installs and verifies `context-mode@context-mode` through the Agent's own
-   plugin manager;
-5. enables Codex's stable `hooks` feature only when it is currently disabled,
-   while ignoring the removed `plugin_hooks` compatibility flag;
-6. runs the selected upstream health path, checking storage, server execution,
-   and SQLite/FTS; and
-7. only after health passes, atomically writes a mode-0600 ownership manifest
-   so later repair/removal can distinguish AGS-created entries from
-   pre-existing user configuration.
-
-When replacing an active version, AGS keeps the prior passed manifest unchanged
-and writes a separate pending journal before rebinding either Agent. A failed
-candidate restores the previous AGS-owned marketplace and plugin bindings. A
-later `ags init` also detects and recovers an interrupted switch. The candidate
-manifest becomes active only after provider convergence and health checks pass.
-AGS automatically rebinds only entries that the prior ownership manifest marks
-as AGS-created. A user-managed same-name binding is retained rather than
-silently removed, and the last-good version stays active.
-
-The outer installer applies the same recovery rule to the AGS binary. Before
-replacing `casr`, it durably records the exact target, candidate, previous
-backup, and pre-install Context Mode state. If the process stops after the
-rename, the next installer run either completes the matching transaction or
-restores the verified previous binary; it does not infer success from a missing
-candidate.
-
-Context Mode currently exposes no public `init` command. AGS therefore uses the
-upstream plugin installation plus its public health lifecycle instead of
-inventing or calling a private API. Its `upgrade` command is not used: AGS must
-control staging, compatibility checks, provider rollback, and the last-good
-commit as one transaction.
-
-Claude plugin activation is non-interactive. Codex plugin activation is
-automatic, but Codex itself requires the user to review and trust lifecycle
-hooks before entering the first model session. Run:
-
-```bash
-ags context review-codex
-```
-
-Choose **Review hooks**, inspect `Plugin - context-mode@context-mode`, trust
-only its six hooks, and then exit Codex. Do not choose the page-level
-**Trust all** action, because it can approve unrelated workspace hooks. AGS
-preserves this trust boundary: it never passes
-`--dangerously-bypass-hook-trust` and never writes Codex's internal
-`trusted_hash` state.
-
-Every new or restored `ags claude`/`ags codex` launch re-verifies the active
-runtime bytes, plugin version, enabled state, Agent cache bytes, and Codex hooks
-feature before creating an RMUX session. For Codex, AGS performs a read-only
-audit against the real effective Codex home, workspace, and selected profile
-through the official app-server `hooks/list` API. The launch proceeds only when
-all six exact Context hooks report `trusted` or `managed`; warnings, modified
-hooks, missing hooks, and untrusted hooks all fail closed. Existing live RMUX
-sessions can still be attached without restarting or mutating the Agent.
-
-For Claude, the preflight launches a sacrificial real Claude process with its
-model API endpoint redirected to loopback and no session persistence. It accepts the
-effective configuration only after observing the Context Mode SessionStart
-protection marker, connected MCP server, both core `ctx_*` tools, and the exact
-plugin version, then terminates before a model request. This catches effective
-user, project, local, and managed-policy overrides that static file inspection
-cannot see. AGS accepts `--settings` only after validating the authentication
-and model-only schema described above. It also rejects shell-capable
-`apiKeyHelper` values in every local settings scope before the probe and checks
-those sources again immediately before RMUX launch. It rejects `--agent`, `--agents`,
-`--setting-sources`, `--mcp-config`, `--plugin-dir`, `--plugin-url`,
-`--disallowedTools`, `--safe-mode`, `--bare`, and `--strict-mcp-config` forms
-because they can alter the already-audited runtime or replace its tool set.
-
-The current user's configuration and Context Mode cache are one trust domain.
-AGS does not claim to defend either from a hostile same-UID process that
-rewrites bytes between validation and Agent startup; such a process could also
-rewrite the verified plugin cache directly. The second settings check closes
-the normal preflight window and catches accidental edits before launch.
-
-Context Mode data is intentionally not part of AGS record synchronization:
-
-```text
-${CLAUDE_CONFIG_DIR:-~/.claude}/context-mode
-${CODEX_HOME:-~/.codex}/context-mode
-```
-
-Those databases may contain indexed source and conversation-derived state.
-Local, Neburst/SFTP, and GitHub checkpoint consolidation moves encrypted AGS
-records; it does not silently publish Context Mode databases. A future data
-sync feature would need its own privacy, merge, retention, and deletion
-contract.
 
 ## Storage Selection and Consolidation
 

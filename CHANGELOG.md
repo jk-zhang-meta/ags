@@ -12,6 +12,24 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ### AGS Runtime
 
+- **Context Mode is no longer bundled**: installing AGS no longer installs,
+  provisions, verifies, or updates `context-mode`, and launching Claude or Codex
+  no longer requires it. The mandatory integration is gone in full — the
+  installer's preflight and initialization step, the ~4,700-line provisioning
+  runtime (npm resolution, staged activation, manifest verification, plugin and
+  marketplace registration, hook trust, rollback), the `context-init` /
+  `context-check` / `context review-codex` subcommands, and the launch-time gate
+  in the Rust entry point. The install transaction journal drops its `context`
+  block and moves to `schema: 2`; a journal written by an older installer is
+  therefore not resumed. Anyone who wants Context Mode installs it themselves.
+
+  The Agent argument restrictions stay, because they never really were about
+  Context Mode: `--safe-mode`, `--agent`, `--mcp-config`, `--plugin-dir` and the
+  rest can disable the AGS plugin the launch itself depends on. Only their
+  wording changed. `preflight_installer_tools` now checks `jq`, Node, and
+  sha256 on the installer's own behalf — that check used to ride along on
+  Context Mode's preflight and would have disappeared with it.
+
 - **The installer adopts wrappers written before the `agsx` rename**: ownership
   of `bin/ags` is decided by a marker comment, and `# ags-installer-` is not a
   substring of the older `# agsx-installer-`. Every machine installed before

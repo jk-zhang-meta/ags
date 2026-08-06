@@ -6,7 +6,7 @@
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
 use anyhow::{Context, Result, bail};
@@ -21,32 +21,6 @@ pub fn run(args: &[OsString]) -> Result<ExitStatus> {
     command
         .status()
         .context("failed to start the AGS checkpoint runtime")
-}
-
-/// Verify the mandatory Context Mode boundary through the same embedded
-/// runtime used by the `ags` shell entry point.
-pub fn check_context_mode(agent: &str, binary: &Path, cwd: &Path) -> Result<()> {
-    let args = [
-        OsString::from("context-check"),
-        OsString::from(agent),
-        binary.as_os_str().to_owned(),
-    ];
-    let (_script, mut command) = runtime_command(&args)?;
-    command.current_dir(cwd);
-    let output = command
-        .output()
-        .context("failed to verify the Context Mode launch boundary")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let reason = String::from_utf8_lossy(&output.stderr);
-    let reason = reason
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("Context Mode verification failed");
-    bail!("{reason}");
 }
 
 fn runtime_command(args: &[OsString]) -> Result<(tempfile::NamedTempFile, Command)> {

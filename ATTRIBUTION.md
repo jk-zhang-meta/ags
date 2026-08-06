@@ -49,20 +49,6 @@ also governed by this repository's root `LICENSE`, including the upstream
 OpenAI/Anthropic rider. The AGS source's original MIT grant remains recorded,
 but embedding it here does not remove the rider from the combined artifact.
 
-## Mandatory Context Mode dependency
-
-AGS installs **Context Mode** by Mert Koseoglu from
-<https://github.com/mksglu/context-mode>. AGS resolves the package's stable npm
-`latest` channel and activates only an exact release that passes AGS integrity,
-plugin-contract, and health checks. AGS invokes the published package and
-official Claude Code/Codex plugin manifests without copying or rewriting
-Context Mode source into this repository.
-
-Context Mode is licensed under the Elastic License 2.0, not MIT and not an
-OSI-approved open-source license. A copy of its terms is retained at
-`licenses/Context-Mode-ELv2.txt`. Users installing or using AGS also install and
-use Context Mode subject to those separate terms.
-
 ## What this fork changes
 
 Upstream casr normalizes every provider's session into a flat text model

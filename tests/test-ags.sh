@@ -25,16 +25,6 @@ export FAKE_REAL_MV_BINARY="$(command -v mv)"
 [[ -x "$FAKE_REAL_NODE_BINARY" ]]
 [[ -x "$FAKE_REAL_RM_BINARY" ]]
 [[ -x "$FAKE_REAL_MV_BINARY" ]]
-export FAKE_CONTEXT_RUNTIME_PLATFORM="$(
-    "$FAKE_REAL_NODE_BINARY" -p 'process.platform'
-)"
-export FAKE_CONTEXT_RUNTIME_ARCH="$(
-    "$FAKE_REAL_NODE_BINARY" -p 'process.arch'
-)"
-export FAKE_CONTEXT_RUNTIME_NODE_ABI="$(
-    "$FAKE_REAL_NODE_BINARY" -p 'process.versions.modules'
-)"
-export FAKE_CONTEXT_RUNTIME_TARGET="$FAKE_CONTEXT_RUNTIME_PLATFORM-$FAKE_CONTEXT_RUNTIME_ARCH-node$FAKE_CONTEXT_RUNTIME_NODE_ABI"
 
 if [[ "$test_platform" == Darwin ]]; then
     brew_prefix="${HOMEBREW_PREFIX:-$(brew --prefix)}"
@@ -181,9 +171,6 @@ write_codex_profile() {
     mkdir -p "$native_home"
     printf 'model_provider = "%s"\n' "$provider" \
         > "$native_home/$profile.config.toml"
-    if [[ -n "${context_mode_test_package_root:-}" ]]; then
-        seed_context_mode_agent_cache "$native_home" codex
-    fi
 }
 
 trap cleanup EXIT
@@ -194,211 +181,6 @@ test_sha256_file() {
     else
         shasum -a 256 -- "$1" | awk '{print $1}'
     fi
-}
-
-context_mode_test_runtime_root() {
-    local runtime_home="$1" version="$2"
-    printf '%s/.local/share/ags/context-mode/runtimes/%s/%s\n' \
-        "$runtime_home" "$FAKE_CONTEXT_RUNTIME_TARGET" "$version"
-}
-
-write_context_mode_test_manifest() {
-    local runtime_root="$1"
-    local package_root="$runtime_root/node_modules/context-mode"
-    local file
-    {
-        printf 'ags-context-tree-v1\n'
-        while IFS= read -r -d '' file; do
-            printf 'f\t%s\t%s\n' \
-                "$(test_sha256_file "$file")" "${file#"$package_root/"}"
-        done < <(
-            find "$package_root" -type f -print0 | LC_ALL=C sort -z
-        )
-    } > "$runtime_root/ags-files.sha256"
-    chmod 600 "$runtime_root/ags-files.sha256"
-    mkdir -p "$runtime_root/ags-pristine"
-    cp -p -- "$package_root/.claude-plugin/plugin.json" \
-        "$runtime_root/ags-pristine/claude-plugin.json"
-    cp -p -- "$package_root/hooks/hooks.json" \
-        "$runtime_root/ags-pristine/claude-hooks.json"
-    chmod 600 "$runtime_root/ags-pristine/claude-plugin.json" \
-        "$runtime_root/ags-pristine/claude-hooks.json"
-}
-
-prepare_context_mode_runtime() {
-    local runtime_home="$1"
-    local version="${2:-1.0.169}"
-    local integrity="${3:-sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ==}"
-    local runtime_root
-    runtime_root="$(context_mode_test_runtime_root "$runtime_home" "$version")"
-    local package_root="$runtime_root/node_modules/context-mode"
-    local hook node_abi
-    node_abi="$("$FAKE_REAL_NODE_BINARY" -p 'process.versions.modules')"
-    mkdir -p "$package_root/.claude-plugin" "$package_root/.codex-plugin" \
-        "$package_root/hooks/codex" "$package_root/scripts" \
-        "$package_root/node_modules/better-sqlite3/build/Release" \
-        "$package_root/node_modules/@modelcontextprotocol/sdk"
-    jq -n --arg version "$version" --arg integrity "$integrity" '{
-      lockfileVersion:3,
-      packages:{
-        "node_modules/context-mode":{
-          version:$version,
-          resolved:("https://registry.npmjs.org/context-mode/-/context-mode-" + $version + ".tgz"),
-          integrity:$integrity
-        }
-      }
-    }' > "$runtime_root/package-lock.json"
-    jq -n --arg version "$version" \
-        '{
-          name:"context-mode",version:$version,license:"Elastic-2.0",
-          dependencies:{
-            "better-sqlite3":"test",
-            "@modelcontextprotocol/sdk":"test"
-          }
-        }' \
-        > "$package_root/package.json"
-    jq -n --arg version "$version" '{
-      name:"context-mode",
-      metadata:{version:$version},
-      plugins:[{name:"context-mode",source:"./",version:$version}]
-    }' > "$package_root/.claude-plugin/marketplace.json"
-    jq -n --arg version "$version" '{
-      name:"context-mode",version:$version,skills:"./skills/",
-      mcpServers:{"context-mode":{
-        command:"node",args:["${CLAUDE_PLUGIN_ROOT}/start.mjs"]
-      }}
-    }' > "$package_root/.claude-plugin/plugin.json"
-    jq -n --arg version "$version" '{
-      name:"context-mode",version:$version,skills:"./skills/",
-      mcpServers:"./.codex-plugin/mcp.json",
-      hooks:"./.codex-plugin/hooks.json"
-    }' > "$package_root/.codex-plugin/plugin.json"
-    jq -n '{
-      mcpServers:{"context-mode":{
-        command:"node",args:["./start.mjs"],cwd:".",
-        env:{CONTEXT_MODE_PLATFORM:"codex"}
-      }}
-    }' > "$package_root/.codex-plugin/mcp.json"
-    jq -n '{
-      hooks:{
-        PreToolUse:[{
-          matcher:"local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__",
-          hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/pretooluse.mjs\""}]
-        }],
-        PostToolUse:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/posttooluse.mjs\""}]}],
-        SessionStart:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/sessionstart.mjs\""}]}],
-        PreCompact:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/precompact.mjs\""}]}],
-        UserPromptSubmit:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/userpromptsubmit.mjs\""}]}],
-        Stop:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/stop.mjs\""}]}]
-      }
-    }' > "$package_root/.codex-plugin/hooks.json"
-    jq -n '{
-      description:"Context Mode test hooks",
-      hooks:{
-        PreToolUse:(
-          ["Bash","WebFetch","Read","Grep","Agent","mcp__"] |
-          map(. as $matcher | {
-            matcher:$matcher,
-            hooks:[{
-              type:"command",
-              command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs\""
-            }]
-          })
-        ),
-        PostToolUse:[{
-          matcher:"",
-          hooks:[{
-            type:"command",
-            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/posttooluse.mjs\""
-          }]
-        }],
-        SessionStart:[{
-          matcher:"",
-          hooks:[{
-            type:"command",
-            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs\""
-          }]
-        }],
-        PreCompact:[{
-          matcher:"",
-          hooks:[{
-            type:"command",
-            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.mjs\""
-          }]
-        }],
-        UserPromptSubmit:[{
-          matcher:"",
-          hooks:[{
-            type:"command",
-            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/userpromptsubmit.mjs\""
-          }]
-        }],
-        Stop:[{
-          matcher:"",
-          hooks:[{
-            type:"command",
-            command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.mjs\""
-          }]
-        }]
-      }
-    }' > "$package_root/hooks/hooks.json"
-    printf '// context-mode test entrypoint\n' > "$package_root/cli.bundle.mjs"
-    printf '// context-mode test MCP entrypoint\n' > "$package_root/start.mjs"
-    printf '// context-mode test server\n' > "$package_root/server.bundle.mjs"
-    for hook in pretooluse posttooluse sessionstart precompact userpromptsubmit stop; do
-        printf '// context-mode claude %s hook\n' "$hook" \
-            > "$package_root/hooks/$hook.mjs"
-        printf '// context-mode codex %s hook\n' "$hook" \
-            > "$package_root/hooks/codex/$hook.mjs"
-    done
-    printf '// context-mode codex platform bridge\n' \
-        > "$package_root/hooks/codex/platform.mjs"
-    printf '// context-mode dependency provision test\n' \
-        > "$package_root/hooks/ensure-deps.mjs"
-    printf '// context-mode native healing test\n' \
-        > "$package_root/scripts/heal-better-sqlite3.mjs"
-    cat > "$package_root/node_modules/better-sqlite3/package.json" <<'EOF'
-{"name":"better-sqlite3","version":"0.0.0-test","main":"index.js","dependencies":{}}
-EOF
-    cat > "$package_root/node_modules/better-sqlite3/index.js" <<'EOF'
-class TestDatabase {
-  constructor() {}
-  exec(statement) {
-    if (!statement.includes("fts5")) throw new Error("expected FTS5 probe");
-  }
-  close() {}
-}
-module.exports = TestDatabase;
-EOF
-    cat > "$package_root/node_modules/@modelcontextprotocol/sdk/package.json" <<'EOF'
-{"name":"@modelcontextprotocol/sdk","version":"0.0.0-test","exports":{".":{"import":"./dist/esm/index.js","require":"./dist/cjs/index.js"}},"dependencies":{}}
-EOF
-    printf 'test native binding\n' \
-        > "$package_root/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-    printf 'test ABI binding\n' \
-        > "$package_root/node_modules/better-sqlite3/build/Release/better_sqlite3.abi${node_abi}.node"
-    write_context_mode_test_manifest "$runtime_root"
-}
-
-seed_context_mode_provider_caches() {
-    local package_root="$1" codex_home="$2" claude_home="$3"
-    local version codex_cache claude_cache
-    version="$(jq -r '.version' "$package_root/package.json")"
-    codex_cache="$codex_home/plugins/cache/context-mode/context-mode/$version"
-    claude_cache="$claude_home/plugins/cache/context-mode/context-mode/$version"
-    mkdir -p "$codex_cache" "$claude_cache"
-    cp -a -- "$package_root/." "$codex_cache/"
-    cp -a -- "$package_root/." "$claude_cache/"
-    context_mode_test_package_root="$package_root"
-}
-
-seed_context_mode_agent_cache() {
-    local native_home="$1" agent="$2" version destination
-    [[ "$agent" == codex || "$agent" == claude ]]
-    version="$(jq -r '.version' "$context_mode_test_package_root/package.json")"
-    destination="$native_home/plugins/cache/context-mode/context-mode/$version"
-    mkdir -p "$destination"
-    cp -a -- "$context_mode_test_package_root/." "$destination/"
 }
 
 ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
@@ -663,11 +445,6 @@ if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
       -n "${RCLONE_SFTP_PASS:-}" ]]; then
     printf 'CODEX_TRANSPORT_SECRET_LEAK\n' >&2
     exit 98
-fi
-default_package_root="${FAKE_CONTEXT_PACKAGE_ROOT:-$HOME/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/1.0.169/node_modules/context-mode}"
-package_root="$default_package_root"
-if [[ -n "$state" && -s "$state/codex-plugin-root" ]]; then
-    package_root="$(<"$state/codex-plugin-root")"
 fi
 fake_codex_rewrite_root() {
     local root="$1" node_binary temporary
@@ -983,11 +760,6 @@ if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
     printf 'CLAUDE_TRANSPORT_SECRET_LEAK\n' >&2
     exit 98
 fi
-default_package_root="${FAKE_CONTEXT_PACKAGE_ROOT:-$HOME/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/1.0.169/node_modules/context-mode}"
-package_root="$default_package_root"
-if [[ -n "$state" && -s "$state/claude-plugin-root" ]]; then
-    package_root="$(<"$state/claude-plugin-root")"
-fi
 fake_claude_rewrite_root() {
     local root="$1" node_binary temporary
     node_binary="${FAKE_REAL_NODE_BINARY:?}"
@@ -1167,13 +939,6 @@ for argument in "$@"; do printf ' <%s>' "$argument"; done
 printf '\nFAKE_PWD=%s\n' "$PWD"
 EOF
 chmod +x "$tmp/home/.local/bin/claude"
-prepare_context_mode_runtime "$tmp/home"
-seed_context_mode_provider_caches \
-    "$tmp/home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode" \
-    "$tmp/source/codex" "$tmp/source/claude"
-seed_context_mode_provider_caches \
-    "$tmp/home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode" \
-    "$tmp/target/codex" "$tmp/target/claude"
 cat > "$tmp/home/.local/bin/casr" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1655,70 +1420,10 @@ managed_env=(
     "${source_env[@]}"
     AGENT_SESSION_LOCAL_DIR="$tmp/managed-local-checkpoints"
 )
-context_runtime_base_root="$(
-    context_mode_test_runtime_root "$tmp/home" 1.0.169
-)"
-context_runtime_root="$context_runtime_base_root/node_modules/context-mode"
-context_files_sha256="$(
-    test_sha256_file "$context_runtime_base_root/ags-files.sha256"
-)"
 mkdir -p "$tmp/state"
-jq -n --arg root "$context_runtime_root" \
-    --arg files_sha256 "$context_files_sha256" \
-    --arg platform "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
-    --arg arch "$FAKE_CONTEXT_RUNTIME_ARCH" \
-    --argjson node_abi "$FAKE_CONTEXT_RUNTIME_NODE_ABI" \
-    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" '
-  {
-    schema:2,
-    managed_by:"ags",
-    activation_id:"ags-test-active",
-    version:"1.0.169",
-    runtime:{
-      platform:$platform,arch:$arch,node_abi:$node_abi,target:$target
-    },
-    source:{
-      type:"npm",
-      package:"context-mode",
-      integrity:"sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ==",
-      files_sha256:$files_sha256
-    },
-    package_root:$root,
-    health:{mode:"doctor",status:"passed"},
-    providers:{
-      claude:{
-        configured:true,
-        plugin_owned:true,
-        marketplace_owned:true
-      },
-      codex:{
-        configured:true,
-        plugin_owned:true,
-        marketplace_owned:true,
-        hooks_enabled_by_ags:true,
-        trust:"official-review-required"
-      }
-    }
-  }
-' > "$tmp/state/context-mode.json"
 converted_claude_id=bbbbbbbb-cccc-4ddd-8eee-ffffffffffff
 converted_codex_id=01999999-aaaa-7bbb-8ccc-dddddddddddd
 
-launch_count_before="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
-if env "${managed_env[@]}" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$tmp/missing-context-plugin" \
-    "$tool" codex > "$tmp/missing-context-plugin.out" \
-    2> "$tmp/missing-context-plugin.err"; then
-    echo 'managed Codex launch ignored a missing mandatory Context Mode plugin' >&2
-    exit 1
-fi
-if ! grep -Fq 'Context Mode is not enabled for Codex; run ags init' \
-    "$tmp/missing-context-plugin.err"; then
-    sed -n '1,120p' "$tmp/missing-context-plugin.err" >&2
-    exit 1
-fi
-launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
-[[ "$launch_count_after" == "$launch_count_before" ]]
 
 fresh_codex="$(
     env "${managed_env[@]}" "$tool" codex --model o3 \
@@ -1766,21 +1471,6 @@ if grep -Eq '^CODEX_APP_SERVER=.*(^|[[:space:]])(-p|--profile)' \
     echo 'managed Codex leaked a runtime profile into app-server' >&2
     exit 1
 fi
-printf '%s\n' '[features]' 'hooks = false' \
-    > "$tmp/source/codex/hooks-off.config.toml"
-launch_count_before="$(grep -c '^LAUNCH=' \
-    "$tmp/home/.local/ags.log" || true)"
-if env "${managed_env[@]}" "$tool" codex --profile hooks-off \
-    > "$tmp/codex-profile-hooks-off.out" \
-    2> "$tmp/codex-profile-hooks-off.err"; then
-    echo 'managed Codex accepted a profile that disables hooks' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode hook source or shape does not match' \
-    "$tmp/codex-profile-hooks-off.err"
-launch_count_after="$(grep -c '^LAUNCH=' \
-    "$tmp/home/.local/ags.log" || true)"
-[[ "$launch_count_after" == "$launch_count_before" ]]
 scrubbed_codex="$(
     env "${managed_env[@]}" \
         AGENT_SESSION_REMOTE_PASSWORD=remote-secret \
@@ -1917,7 +1607,7 @@ if env "${managed_env[@]}" "$tool" claude \
     --settings "$unsafe_claude_settings" \
     >"$tmp/unsafe-claude-settings.out" \
     2>"$tmp/unsafe-claude-settings.err"; then
-    echo 'managed Claude accepted settings that disable Context Mode' >&2
+    echo 'managed Claude accepted settings that disable the AGS plugin' >&2
     exit 1
 fi
 grep -Fq 'Claude --settings may contain only' \
@@ -2128,32 +1818,6 @@ grep -Fqx 'FAKE_CLAUDE <--model> <safe-source-settings>' \
     <<< "$safe_source_settings_output"
 rm -f -- "$tmp/source/claude/settings.json"
 
-replacement_claude_settings="$tmp/replacement-claude.settings.json"
-replacement_helper_side_effect="$tmp/replacement-helper-side-effect"
-jq -n --arg command "touch $replacement_helper_side_effect" \
-    '{apiKeyHelper:$command}' > "$replacement_claude_settings"
-launch_count_before="$(grep -c '^LAUNCH=' \
-    "$tmp/home/.local/ags.log" || true)"
-claude_probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/ags.log" || true)"
-if env "${managed_env[@]}" \
-    FAKE_CLAUDE_REPLACE_SETTINGS_WITH="$replacement_claude_settings" \
-    "$tool" claude --model replacement-race \
-    > "$tmp/claude-replacement-race.out" \
-    2> "$tmp/claude-replacement-race.err"; then
-    echo 'managed Claude accepted settings replaced during its probe' >&2
-    exit 1
-fi
-grep -Fq 'Claude user settings must be one JSON object and apiKeyHelper' \
-    "$tmp/claude-replacement-race.err"
-launch_count_after="$(grep -c '^LAUNCH=' \
-    "$tmp/home/.local/ags.log" || true)"
-claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/ags.log" || true)"
-[[ "$launch_count_after" == "$launch_count_before" ]]
-[[ "$claude_probe_count_after" == $((claude_probe_count_before + 1)) ]]
-[[ ! -e "$replacement_helper_side_effect" ]]
-rm -f -- "$tmp/source/claude/settings.json"
 
 assert_managed_claude_arg_rejected() {
     local label="$1" expected="$2"
@@ -2164,7 +1828,7 @@ assert_managed_claude_arg_rejected() {
     if env "${managed_env[@]}" "$tool" claude "$@" \
         >"$tmp/claude-arg-$label.out" \
         2>"$tmp/claude-arg-$label.err"; then
-        echo "managed Claude accepted Context Mode bypass: $label" >&2
+        echo "managed Claude accepted a forbidden argument: $label" >&2
         exit 1
     fi
     grep -Fq "Claude $expected cannot be forwarded" \
@@ -2204,61 +1868,6 @@ assert_managed_claude_arg_rejected \
     no-session-persistence-equals --no-session-persistence \
     --no-session-persistence=true
 
-for effective_failure in hooks mcp; do
-    launch_count_before="$(
-        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
-    )"
-    if env "${managed_env[@]}" \
-        FAKE_CONTEXT_EFFECTIVE_FAIL="$effective_failure" \
-        "$tool" claude >"$tmp/claude-effective-$effective_failure.out" \
-        2>"$tmp/claude-effective-$effective_failure.err"; then
-        echo "managed Claude ignored ineffective Context Mode $effective_failure" >&2
-        exit 1
-    fi
-    grep -Fq 'Context Mode is not enabled for Claude; run ags init' \
-        "$tmp/claude-effective-$effective_failure.err"
-    launch_count_after="$(
-        grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
-    )"
-    [[ "$launch_count_after" == "$launch_count_before" ]]
-done
-
-launch_count_before="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
-if env "${managed_env[@]}" FAKE_CONTEXT_TRUST_STATUS=untrusted "$tool" codex \
-    > "$tmp/untrusted-context.out" 2> "$tmp/untrusted-context.err"; then
-    echo 'managed Codex launch ignored untrusted Context Mode hooks' >&2
-    exit 1
-fi
-grep -Fq "Context Mode hooks are not trusted for this workspace" \
-    "$tmp/untrusted-context.err"
-launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
-[[ "$launch_count_after" == "$launch_count_before" ]]
-
-if env "${managed_env[@]}" FAKE_CONTEXT_CORRUPT_CACHE=1 "$tool" codex \
-    > "$tmp/corrupt-context.out" 2> "$tmp/corrupt-context.err"; then
-    echo 'managed Codex launch accepted a changed Context Mode cache manifest' >&2
-    exit 1
-fi
-grep -Fq "Context Mode hook verification failed for this workspace" \
-    "$tmp/corrupt-context.err"
-launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
-[[ "$launch_count_after" == "$launch_count_before" ]]
-cp -- "$context_runtime_root/.codex-plugin/hooks.json" \
-    "$tmp/source/codex/plugins/cache/context-mode/context-mode/1.0.169/.codex-plugin/hooks.json"
-
-if env "${managed_env[@]}" \
-    FAKE_CONTEXT_CORRUPT_CACHE_FILE=server.bundle.mjs "$tool" codex \
-    > "$tmp/corrupt-context-server.out" \
-    2> "$tmp/corrupt-context-server.err"; then
-    echo 'managed Codex launch accepted changed Context Mode executable bytes' >&2
-    exit 1
-fi
-grep -Fq "Context Mode hook verification failed for this workspace" \
-    "$tmp/corrupt-context-server.err"
-launch_count_after="$(grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true)"
-[[ "$launch_count_after" == "$launch_count_before" ]]
-cp -- "$context_runtime_root/server.bundle.mjs" \
-    "$tmp/source/codex/plugins/cache/context-mode/context-mode/1.0.169/server.bundle.mjs"
 
 extract_checkpoint() {
     local archive="$1" destination="$2"
@@ -2341,7 +1950,6 @@ reference_ascii_claude_project_key() {
 run_clean_init() {
     local init_home="$1"
     shift
-    prepare_context_mode_runtime "$init_home"
     env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
         -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
         -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
@@ -2349,69 +1957,10 @@ run_clean_init() {
         CODEX_HOME="$init_home/.codex" \
         CLAUDE_CONFIG_DIR="$init_home/.claude" \
         PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-        FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-        FAKE_CONTEXT_PLUGIN_STATE_DIR="$init_home/.context-mode-provider-state" \
         "$tool" init "$@"
 }
 
-context_fixture_home="$tmp/context-fixtures"
-prepare_context_mode_runtime "$context_fixture_home"
 
-assert_context_command_rejects_unsafe_claude_settings() {
-    local label="$1" command_name="$2" unsafe_home side_effect
-    local probe_count_before probe_count_after
-    unsafe_home="$tmp/context-unsafe-$label"
-    side_effect="$tmp/context-unsafe-$label-side-effect"
-    prepare_context_mode_runtime "$unsafe_home"
-    mkdir -p "$unsafe_home/.claude"
-    jq -n --arg command \
-        "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then touch $side_effect; fi; /usr/bin/printenv TEST_CLAUDE_API_KEY" \
-        '{apiKeyHelper:$command}' > "$unsafe_home/.claude/settings.json"
-    probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-        "$tmp/home/.local/ags.log" || true)"
-    if env HOME="$unsafe_home" \
-        PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-        CODEX_HOME="$unsafe_home/.codex" \
-        CLAUDE_CONFIG_DIR="$unsafe_home/.claude" \
-        FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-        FAKE_CONTEXT_PLUGIN_STATE_DIR="$unsafe_home/.context-mode-provider-state" \
-        "$tool" "$command_name" \
-        > "$tmp/context-unsafe-$label.out" \
-        2> "$tmp/context-unsafe-$label.err"; then
-        echo "$command_name accepted an unsafe Claude helper" >&2
-        exit 1
-    fi
-    grep -Fq \
-        'Claude user settings must be one JSON object and apiKeyHelper' \
-        "$tmp/context-unsafe-$label.err"
-    probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-        "$tmp/home/.local/ags.log" || true)"
-    [[ "$probe_count_after" == "$probe_count_before" ]]
-    [[ ! -e "$side_effect" ]]
-    [[ ! -e "$unsafe_home/.local/state/ags/context-mode.json" ]]
-}
-
-assert_context_command_rejects_unsafe_claude_settings init init
-assert_context_command_rejects_unsafe_claude_settings \
-    context-init context-init
-
-standalone_context_home="$tmp/context-standalone-home"
-standalone_context_bin="$tmp/context-standalone-bin"
-mkdir -p "$standalone_context_home" "$standalone_context_bin"
-ln -s "$tmp/home/.local/bin/node" "$standalone_context_bin/node"
-ln -s "$tmp/home/.local/bin/npm" "$standalone_context_bin/npm"
-env HOME="$standalone_context_home" \
-    PATH="$standalone_context_bin:/usr/bin:/bin" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_STANDALONE_PROVIDER_FAIL=1 \
-    "$tool" context-init > "$tmp/context-standalone.out" \
-    2> "$tmp/context-standalone.err"
-grep -Fqx 'status=context-mode-initialized' "$tmp/context-standalone.out"
-jq -e '
-  .schema == 2 and
-  .health == {mode:"doctor",status:"passed"} and
-  .providers == {}
-' "$standalone_context_home/.local/state/ags/context-mode.json" >/dev/null
 init_home="$tmp/init-home"
 init_vault="$init_home/.local/share/ags/checkpoints"
 init_identity="$init_home/.config/ags/identity.agekey"
@@ -2426,10 +1975,6 @@ grep -Fqx "vault=$init_vault" "$tmp/init.out"
 grep -Fqx "identity=$init_identity" "$tmp/init.out"
 grep -Fqx "recipient=$(age-keygen -y "$init_identity")" "$tmp/init.out"
 grep -Fq 'Back up this identity separately' "$tmp/init.err"
-grep -Fqx 'DOCTOR=claude-code' \
-    "$init_home/.local/state/ags/context-mode-test.log"
-grep -Fqx 'DOCTOR=codex' \
-    "$init_home/.local/state/ags/context-mode-test.log"
 if grep -Fq 'AGE-SECRET-KEY-' "$tmp/init.out" "$tmp/init.err"; then
     echo 'init printed the secret identity' >&2
     exit 1
@@ -2448,1023 +1993,6 @@ init_identity_sha="$(sha256sum "$init_identity" | cut -d' ' -f1)"
 run_clean_init "$init_home" > "$tmp/init-again.out" 2> "$tmp/init-again.err"
 [[ "$init_identity_sha" == "$(sha256sum "$init_identity" | cut -d' ' -f1)" ]]
 grep -Fqx 'status=initialized' "$tmp/init-again.out"
-
-context_init_home="$tmp/context-init-home"
-context_plugin_state="$tmp/context-plugin-state"
-context_root_169="$(
-    context_mode_test_runtime_root "$context_init_home" 1.0.169
-)"
-context_package_root="$context_root_169/node_modules/context-mode"
-claude_market_before="$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/ags.log" || true)"
-claude_plugin_before="$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
-    "$tmp/home/.local/ags.log" || true)"
-codex_market_before="$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/ags.log" || true)"
-codex_plugin_before="$(grep -c '^CODEX_CONTEXT=plugin add ' \
-    "$tmp/home/.local/ags.log" || true)"
-codex_hooks_before="$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/ags.log" || true)"
-prepare_context_mode_runtime "$context_init_home"
-context_init_env=(
-    HOME="$context_init_home"
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
-    CODEX_HOME="$context_init_home/.codex"
-    CLAUDE_CONFIG_DIR="$context_init_home/.claude"
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_plugin_state"
-    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1
-    FAKE_CLAUDE_REWRITES_PACKAGE=1
-    FAKE_CONTEXT_PACKAGE_ROOT="$context_package_root"
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
-    HTTPS_PROXY=http://proxy.test:8080
-)
-env "${context_init_env[@]}" "$tool" init \
-    > "$tmp/context-init.out" 2> "$tmp/context-init.err"
-grep -Fqx 'status=initialized' "$tmp/context-init.out"
-# The native-dependency sandbox forwards the caller's network configuration,
-# and only the parts the caller actually set. Defining one of these as empty is
-# worse than omitting it: an empty SSL_CERT_FILE points OpenSSL at a trust
-# store with no roots, so every TLS handshake inside the sandbox fails and the
-# better-sqlite3 binding can never be fetched.
-context_deps_env="$tmp/home/.local/ensure-deps.env"
-grep -Fqx 'HTTPS_PROXY=http://proxy.test:8080' "$context_deps_env"
-! grep -qE '^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|https?_proxy|all_proxy|no_proxy|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|SSL_CERT_DIR|npm_config_(proxy|https_proxy|noproxy|cafile|ca))=$' \
-    "$context_deps_env"
-[[ "$(grep -c '^NPM_CONTEXT=install ' \
-    "$context_init_home/.context-mode-npm.log")" == 1 ]]
-grep -Fqx 'DOCTOR=claude-code' \
-    "$context_init_home/.local/state/ags/context-mode-test.log"
-grep -Fqx 'DOCTOR=codex' \
-    "$context_init_home/.local/state/ags/context-mode-test.log"
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin \
-    codex-hooks; do
-    [[ -f "$context_plugin_state/$marker" ]]
-done
-grep -Fqx 'hooks = true' "$context_init_home/.codex/config.toml"
-grep -Fqx '[marketplaces.context-mode]' \
-    "$context_init_home/.codex/config.toml"
-grep -Fqx '[plugins."context-mode@context-mode"]' \
-    "$context_init_home/.codex/config.toml"
-cmp "$context_fixture_home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode/.claude-plugin/plugin.json" \
-    "$context_package_root/.claude-plugin/plugin.json"
-cmp "$context_fixture_home/.local/share/ags/context-mode/runtimes/$FAKE_CONTEXT_RUNTIME_TARGET/1.0.169/node_modules/context-mode/hooks/hooks.json" \
-    "$context_package_root/hooks/hooks.json"
-context_manifest="$context_init_home/.local/state/ags/context-mode.json"
-jq -e --arg root "$context_package_root" \
-    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
-    --arg files_sha256 "$(
-        test_sha256_file "$context_root_169/ags-files.sha256"
-    )" '
-    .schema == 2 and .version == "1.0.169" and
-    .runtime.target == $target and
-    .package_root == $root and
-    .source.files_sha256 == $files_sha256 and
-    .health == {mode:"doctor",status:"passed"} and
-    .providers.claude == {
-      configured:true, plugin_owned:true, marketplace_owned:true
-    } and
-    .providers.codex == {
-      configured:true, plugin_owned:true, marketplace_owned:true,
-      hooks_enabled_by_ags:true, trust:"official-review-required"
-    }
-' "$context_manifest" >/dev/null
-env "${context_init_env[@]}" "$tool" init \
-    > "$tmp/context-init-again.out" 2> "$tmp/context-init-again.err"
-[[ "$(grep -c '^NPM_CONTEXT=install ' \
-    "$context_init_home/.context-mode-npm.log")" == 1 ]]
-[[ "$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/ags.log")" == $((claude_market_before + 1)) ]]
-[[ "$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
-    "$tmp/home/.local/ags.log")" == $((claude_plugin_before + 1)) ]]
-[[ "$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
-    "$tmp/home/.local/ags.log")" == $((codex_market_before + 1)) ]]
-[[ "$(grep -c '^CODEX_CONTEXT=plugin add ' \
-    "$tmp/home/.local/ags.log")" == $((codex_plugin_before + 1)) ]]
-[[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/ags.log")" == $((codex_hooks_before + 1)) ]]
-if grep -Fq -- '--dangerously-bypass-hook-trust' \
-    "$tmp/home/.local/ags.log" "$tmp/context-init.out" "$tmp/context-init.err"; then
-    echo 'Context Mode integration bypassed Codex hook trust' >&2
-    exit 1
-fi
-context_check_helper_side_effect="$tmp/context-check-helper-side-effect"
-jq -n --arg command \
-    "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then touch $context_check_helper_side_effect; fi; /usr/bin/printenv TEST_CLAUDE_API_KEY" \
-    '{apiKeyHelper:$command}' \
-    > "$context_init_home/.claude/settings.json"
-claude_probe_count_before="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/ags.log" || true)"
-if env "${context_init_env[@]}" \
-    "$tool" context-check claude "$tmp/home/.local/bin/claude" \
-    > "$tmp/context-claude-unsafe-helper.out" \
-    2> "$tmp/context-claude-unsafe-helper.err"; then
-    echo 'Claude context-check accepted an unsafe helper' >&2
-    exit 1
-fi
-grep -Fq 'Claude user settings must be one JSON object and apiKeyHelper' \
-    "$tmp/context-claude-unsafe-helper.err"
-claude_probe_count_after="$(grep -c '^CLAUDE_EFFECTIVE_PROBE$' \
-    "$tmp/home/.local/ags.log" || true)"
-[[ "$claude_probe_count_after" == "$claude_probe_count_before" ]]
-[[ ! -e "$context_check_helper_side_effect" ]]
-rm -f -- "$context_init_home/.claude/settings.json"
-claude_context_cache="$context_init_home/.claude/plugins/cache/context-mode/context-mode/1.0.169"
-if ! env "${context_init_env[@]}" \
-    FAKE_CLAUDE_REWRITES_CACHE=plugin-list \
-    "$tool" context-check claude "$tmp/home/.local/bin/claude" \
-    > "$tmp/context-claude-cache-rewrite.out" \
-    2> "$tmp/context-claude-cache-rewrite.err"; then
-    sed -n '1,160p' "$tmp/context-claude-cache-rewrite.err" >&2
-    exit 1
-fi
-cmp "$context_root_169/ags-pristine/claude-hooks.json" \
-    "$claude_context_cache/hooks/hooks.json"
-cmp "$context_root_169/ags-pristine/claude-plugin.json" \
-    "$claude_context_cache/.claude-plugin/plugin.json"
-codex_context_cache="$context_init_home/.codex/plugins/cache/context-mode/context-mode/1.0.169"
-if ! env "${context_init_env[@]}" \
-    FAKE_CODEX_REWRITES_CACHE=plugin-list \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-codex-cache-rewrite.out" \
-    2> "$tmp/context-codex-cache-rewrite.err"; then
-    sed -n '1,160p' "$tmp/context-codex-cache-rewrite.err" >&2
-    exit 1
-fi
-for relative in .claude-plugin/plugin.json hooks/hooks.json; do
-    cmp "$context_package_root/$relative" "$codex_context_cache/$relative"
-done
-if ! env "${context_init_env[@]}" \
-    FAKE_CODEX_REWRITES_CACHE=app-server \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-codex-app-server-rewrite.out" \
-    2> "$tmp/context-codex-app-server-rewrite.err"; then
-    sed -n '1,160p' "$tmp/context-codex-app-server-rewrite.err" >&2
-    exit 1
-fi
-for relative in .claude-plugin/plugin.json hooks/hooks.json; do
-    cmp "$context_package_root/$relative" "$codex_context_cache/$relative"
-done
-if env "${context_init_env[@]}" \
-    FAKE_CODEX_REWRITES_CACHE=plugin-list \
-    FAKE_CODEX_REWRITE_NODE=/tmp/not-the-active-node \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-codex-wrong-node.out" \
-    2> "$tmp/context-codex-wrong-node.err"; then
-    echo 'Codex cache repair accepted an unrelated absolute Node path' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode is not enabled for Codex' \
-    "$tmp/context-codex-wrong-node.err"
-! cmp -s "$context_package_root/.claude-plugin/plugin.json" \
-    "$codex_context_cache/.claude-plugin/plugin.json"
-for relative in .claude-plugin/plugin.json hooks/hooks.json; do
-    cp -p -- "$context_package_root/$relative" "$codex_context_cache/$relative"
-done
-if env "${context_init_env[@]}" \
-    FAKE_CODEX_REWRITES_CACHE=plugin-list \
-    FAKE_CODEX_REWRITE_PARTIAL=plugin \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-codex-partial-rewrite.out" \
-    2> "$tmp/context-codex-partial-rewrite.err"; then
-    echo 'Codex cache repair accepted a one-file partial rewrite' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode is not enabled for Codex' \
-    "$tmp/context-codex-partial-rewrite.err"
-! cmp -s "$context_package_root/.claude-plugin/plugin.json" \
-    "$codex_context_cache/.claude-plugin/plugin.json"
-for relative in .claude-plugin/plugin.json hooks/hooks.json; do
-    cp -p -- "$context_package_root/$relative" "$codex_context_cache/$relative"
-done
-if env "${context_init_env[@]}" \
-    FAKE_CODEX_REWRITES_PACKAGE=1 \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-codex-package-rewrite.out" \
-    2> "$tmp/context-codex-package-rewrite.err"; then
-    echo 'Codex cache repair accepted a canonical package rewrite' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode is not enabled for Codex' \
-    "$tmp/context-codex-package-rewrite.err"
-! cmp -s "$context_root_169/ags-pristine/claude-plugin.json" \
-    "$context_package_root/.claude-plugin/plugin.json"
-cp -p -- "$context_root_169/ags-pristine/claude-plugin.json" \
-    "$context_package_root/.claude-plugin/plugin.json"
-cp -p -- "$context_root_169/ags-pristine/claude-hooks.json" \
-    "$context_package_root/hooks/hooks.json"
-if env "${context_init_env[@]}" \
-    FAKE_CODEX_TOUCH_ALLOWED_FILE=.claude-plugin/plugin.json \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-codex-allowed-file-tamper.out" \
-    2> "$tmp/context-codex-allowed-file-tamper.err"; then
-    echo 'Codex cache repair accepted a non-official allowed-file edit' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode is not enabled for Codex' \
-    "$tmp/context-codex-allowed-file-tamper.err"
-! cmp -s "$context_package_root/.claude-plugin/plugin.json" \
-    "$codex_context_cache/.claude-plugin/plugin.json"
-cp -p -- "$context_package_root/.claude-plugin/plugin.json" \
-    "$codex_context_cache/.claude-plugin/plugin.json"
-
-context_crash_home="$tmp/context-crash-home"
-context_crash_state="$tmp/context-crash-provider-state"
-context_crash_package_root="$(
-    context_mode_test_runtime_root "$context_crash_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$context_crash_home"
-context_crash_env=(
-    HOME="$context_crash_home"
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
-    CODEX_HOME="$context_crash_home/.codex"
-    CLAUDE_CONFIG_DIR="$context_crash_home/.claude"
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_crash_state"
-    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1
-    FAKE_CONTEXT_PACKAGE_ROOT="$context_crash_package_root"
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
-)
-if env "${context_crash_env[@]}" \
-    FAKE_CONTEXT_CRASH_AFTER_HOOK_ENABLE=1 \
-    "$tool" init > "$tmp/context-crash.out" \
-    2> "$tmp/context-crash.err"; then
-    echo 'Context Mode hook configuration crash fixture unexpectedly passed' >&2
-    exit 1
-fi
-context_crash_pending="$context_crash_home/.local/state/ags/context-mode.pending.json"
-context_crash_config="$context_crash_home/.codex/config.toml"
-[[ -f "$context_crash_pending" && -f "$context_crash_config" ]]
-jq -e '
-  .schema == 4 and
-  .kind == "bootstrap" and
-  .codex_hooks_config.before_state == "implicit-true" and
-  .codex_hooks_config.before_present == false and
-  .codex_hooks_config.before_sha256 == null and
-  (.codex_hooks_config.enabled_sha256 | test("^[0-9a-f]{64}$"))
-' "$context_crash_pending" >/dev/null
-[[ -f "$context_crash_home/.local/state/ags/context-mode.codex-config.enabled" ]]
-context_crash_quarantine="$(jq -er \
-    '.codex_hooks_config.quarantine_path' "$context_crash_pending")"
-context_crash_restore="$(jq -er \
-    '.codex_hooks_config.restore_path' "$context_crash_pending")"
-mv -- "$context_crash_config" "$context_crash_quarantine"
-printf 'interrupted restore candidate\n' > "$context_crash_restore"
-if env "${context_crash_env[@]}" \
-    FAKE_CONTEXT_DOCTOR_FAIL=codex \
-    "$tool" init > "$tmp/context-crash-recovery.out" \
-    2> "$tmp/context-crash-recovery.err"; then
-    echo 'Context Mode recovery ignored the forced Codex doctor failure' >&2
-    exit 1
-fi
-[[ ! -e "$context_crash_config" && ! -e "$context_crash_pending" ]]
-[[ ! -e "$context_crash_quarantine" && ! -e "$context_crash_restore" ]]
-for snapshot in context-mode.codex-config.before \
-    context-mode.codex-config.enabled .context-mode-codex-config-probe; do
-    [[ ! -e "$context_crash_home/.local/state/ags/$snapshot" ]]
-done
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    [[ ! -e "$context_crash_state/$marker" ]]
-done
-
-context_race_home="$tmp/context-race-home"
-context_race_state="$tmp/context-race-provider-state"
-context_race_bin="$tmp/context-race-bin"
-context_race_root="$(
-    context_mode_test_runtime_root "$context_race_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$context_race_home"
-mkdir -p "$context_race_bin"
-cat > "$context_race_bin/mv" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-source_path="${@: -2:1}"
-destination_path="${@: -1}"
-"${FAKE_REAL_MV_BINARY:?}" "$@"
-if [[ "${FAKE_CONTEXT_CONCURRENT_CONFIG_WRITE:-0}" == 1 &&
-      "$destination_path" == *.ags-context-mode-quarantine &&
-      ! -e "$source_path" ]]; then
-    printf 'model = "concurrent-user-write"\n' > "$source_path"
-fi
-EOF
-chmod +x "$context_race_bin/mv"
-context_race_env=(
-    HOME="$context_race_home"
-    PATH="$context_race_bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
-    CODEX_HOME="$context_race_home/.codex"
-    CLAUDE_CONFIG_DIR="$context_race_home/.claude"
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_race_state"
-    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1
-    FAKE_CONTEXT_PACKAGE_ROOT="$context_race_root"
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home"
-    FAKE_REAL_MV_BINARY="$(command -v mv)"
-    FAKE_CONTEXT_CONCURRENT_CONFIG_WRITE=1
-    FAKE_CONTEXT_DOCTOR_FAIL=codex
-)
-if env "${context_race_env[@]}" "$tool" init \
-    > "$tmp/context-race.out" 2> "$tmp/context-race.err"; then
-    echo 'Context Mode concurrent config fixture unexpectedly passed' >&2
-    exit 1
-fi
-grep -Fq 'provider state could not be restored' "$tmp/context-race.err"
-grep -Fqx 'model = "concurrent-user-write"' \
-    "$context_race_home/.codex/config.toml"
-context_race_pending="$context_race_home/.local/state/ags/context-mode.pending.json"
-[[ -f "$context_race_pending" ]]
-context_race_quarantine="$(jq -er \
-    '.codex_hooks_config.quarantine_path' "$context_race_pending")"
-context_race_restore="$(jq -er \
-    '.codex_hooks_config.restore_path' "$context_race_pending")"
-[[ ! -e "$context_race_quarantine" && ! -e "$context_race_restore" ]]
-
-claude_context_cache="$context_init_home/.claude/plugins/cache/context-mode/context-mode/1.0.169"
-printf '\n// damaged AGS-owned cache\n' \
-    >> "$claude_context_cache/server.bundle.mjs"
-if ! env "${context_init_env[@]}" "$tool" init \
-    > "$tmp/context-cache-repair.out" 2> "$tmp/context-cache-repair.err"; then
-    sed -n '1,160p' "$tmp/context-cache-repair.err" >&2
-    exit 1
-fi
-cmp "$context_package_root/server.bundle.mjs" \
-    "$claude_context_cache/server.bundle.mjs"
-if env "${context_init_env[@]}" FAKE_CONTEXT_DOCTOR_FAIL=codex "$tool" init \
-    > "$tmp/context-reinit-fail.out" 2> "$tmp/context-reinit-fail.err"; then
-    echo 'repeat init ignored a mandatory Context Mode diagnostic failure' >&2
-    exit 1
-fi
-jq -e '.health == {mode:"doctor",status:"passed"}' \
-    "$context_manifest" >/dev/null
-env "${context_init_env[@]}" "$tool" init \
-    > "$tmp/context-reinit-recover.out" 2> "$tmp/context-reinit-recover.err"
-jq -e '.health == {mode:"doctor",status:"passed"}' \
-    "$context_manifest" >/dev/null
-
-context_integrity_170="sha512-$(printf 'A%.0s' {1..86})=="
-context_integrity_171="sha512-$(printf 'B%.0s' {1..86})=="
-prepare_context_mode_runtime \
-    "$context_fixture_home" 1.0.170 "$context_integrity_170"
-prepare_context_mode_runtime \
-    "$context_fixture_home" 1.0.171 "$context_integrity_171"
-
-standalone_upgrade_state="$tmp/context-standalone-upgrade-state"
-standalone_upgrade_root_169="$(
-    context_mode_test_runtime_root "$standalone_context_home" 1.0.169
-)/node_modules/context-mode"
-if env HOME="$standalone_context_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$standalone_context_home/.codex" \
-    CLAUDE_CONFIG_DIR="$standalone_context_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$standalone_upgrade_state" \
-    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1 \
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
-    FAKE_CONTEXT_PACKAGE_ROOT="$standalone_upgrade_root_169" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    FAKE_CONTEXT_DOCTOR_FAIL=codex \
-    "$tool" context-init > "$tmp/context-first-binding-upgrade.out" \
-    2> "$tmp/context-first-binding-upgrade.err"; then
-    echo 'Context Mode accepted a failed upgrade with an unconfigured Codex provider' >&2
-    exit 1
-fi
-grep -Fq 'no configured previous integration exists' \
-    "$tmp/context-first-binding-upgrade.err"
-jq -e '
-  .version == "1.0.169" and
-  .health.status == "passed" and
-  .providers == {}
-' "$standalone_context_home/.local/state/ags/context-mode.json" >/dev/null
-[[ ! -e "$standalone_context_home/.codex/config.toml" ]]
-[[ ! -e "$standalone_context_home/.local/state/ags/context-mode.pending.json" ]]
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    [[ ! -e "$standalone_upgrade_state/$marker" ]]
-done
-
-standalone_candidate_root_170="$(
-    context_mode_test_runtime_root "$standalone_context_home" 1.0.170
-)/node_modules/context-mode"
-standalone_candidate_claude_cache_170="$standalone_context_home/.claude/plugins/cache/context-mode/context-mode/1.0.170"
-standalone_saved_test_package_root="$context_mode_test_package_root"
-seed_context_mode_provider_caches \
-    "$standalone_candidate_root_170" \
-    "$standalone_context_home/.codex" \
-    "$standalone_context_home/.claude"
-context_mode_test_package_root="$standalone_saved_test_package_root"
-mkdir -p "$standalone_upgrade_state"
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    : > "$standalone_upgrade_state/$marker"
-done
-printf '%s\n' "$standalone_candidate_root_170" \
-    > "$standalone_upgrade_state/claude-marketplace-root"
-printf '%s\n' "$standalone_candidate_claude_cache_170" \
-    > "$standalone_upgrade_state/claude-plugin-root"
-printf '%s\n' "$standalone_candidate_root_170" \
-    > "$standalone_upgrade_state/codex-marketplace-root"
-printf '%s\n' "$standalone_candidate_root_170" \
-    > "$standalone_upgrade_state/codex-plugin-root"
-cp -a -- "$standalone_upgrade_state" \
-    "$tmp/context-standalone-upgrade-state.before"
-if env HOME="$standalone_context_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$standalone_context_home/.codex" \
-    CLAUDE_CONFIG_DIR="$standalone_context_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$standalone_upgrade_state" \
-    FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1 \
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
-    FAKE_CONTEXT_PACKAGE_ROOT="$standalone_upgrade_root_169" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    FAKE_CONTEXT_DOCTOR_FAIL=codex \
-    "$tool" context-init > "$tmp/context-prebound-upgrade.out" \
-    2> "$tmp/context-prebound-upgrade.err"; then
-    echo 'Context Mode accepted a failed upgrade with preexisting candidate bindings' >&2
-    exit 1
-fi
-grep -Fq 'no configured previous integration exists' \
-    "$tmp/context-prebound-upgrade.err"
-diff -ru "$tmp/context-standalone-upgrade-state.before" \
-    "$standalone_upgrade_state"
-jq -e '
-  .version == "1.0.169" and
-  .health.status == "passed" and
-  .providers == {}
-' "$standalone_context_home/.local/state/ags/context-mode.json" >/dev/null
-[[ ! -e "$standalone_context_home/.codex/config.toml" ]]
-[[ ! -e "$standalone_context_home/.local/state/ags/context-mode.pending.json" ]]
-
-context_codex_config="$context_init_home/.codex/config.toml"
-awk '
-  $0 == "[features]" { saw_features = 1; next }
-  saw_features && $0 == "hooks = true" { saw_features = 0; next }
-  { saw_features = 0; print }
-' "$context_codex_config" > "$context_codex_config.implicit"
-chmod --reference="$context_codex_config" \
-    "$context_codex_config.implicit"
-mv -- "$context_codex_config.implicit" "$context_codex_config"
-! grep -Eq '^hooks = (true|false)$' "$context_codex_config"
-context_prejournal_bin="$tmp/context-prejournal-bin"
-context_prejournal_marker="$tmp/context-prejournal-flipped"
-mkdir -p "$context_prejournal_bin"
-cat > "$context_prejournal_bin/rm" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-"${FAKE_REAL_RM_BINARY:?}" "$@"
-for argument in "$@"; do
-    if [[ "${FAKE_CONTEXT_FLIP_AFTER_CONVERGENCE:-0}" == 1 &&
-          "$argument" == "${FAKE_CONTEXT_ENABLED_SNAPSHOT:?}" &&
-          ! -e "${FAKE_CONTEXT_FLIP_MARKER:?}" ]]; then
-        config_file="${FAKE_CONTEXT_LIVE_CONFIG:?}"
-        temporary="$config_file.concurrent-false"
-        awk '
-          $0 == "hooks = true" { print "hooks = false"; next }
-          { print }
-        ' "$config_file" > "$temporary"
-        chmod --reference="$config_file" "$temporary"
-        mv -- "$temporary" "$config_file"
-        : > "$FAKE_CONTEXT_FLIP_MARKER"
-    fi
-done
-EOF
-chmod +x "$context_prejournal_bin/rm"
-env "${context_init_env[@]}" \
-    PATH="$context_prejournal_bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    FAKE_REAL_RM_BINARY="$(command -v rm)" \
-    FAKE_CONTEXT_FLIP_AFTER_CONVERGENCE=1 \
-    FAKE_CONTEXT_ENABLED_SNAPSHOT="$context_init_home/.local/state/ags/context-mode.codex-config.enabled" \
-    FAKE_CONTEXT_FLIP_MARKER="$context_prejournal_marker" \
-    FAKE_CONTEXT_LIVE_CONFIG="$context_codex_config" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    "$tool" init > "$tmp/context-prejournal-race.out" \
-    2> "$tmp/context-prejournal-race.err"
-[[ -e "$context_prejournal_marker" ]]
-grep -Fq 'last-good version remains active' \
-    "$tmp/context-prejournal-race.err"
-grep -Fqx 'hooks = false' "$context_codex_config"
-jq -e '.version == "1.0.169" and .health.status == "passed"' \
-    "$context_manifest" >/dev/null
-[[ "$(<"$context_plugin_state/claude-marketplace-root")" == \
-    "$context_package_root" ]]
-[[ "$(<"$context_plugin_state/codex-marketplace-root")" == \
-    "$context_package_root" ]]
-for transaction_file in context-mode.pending.json \
-    context-mode.codex-hooks-convergence.json \
-    context-mode.codex-config.before \
-    context-mode.codex-config.enabled; do
-    [[ ! -e "$context_init_home/.local/state/ags/$transaction_file" ]]
-done
-awk '
-  $0 == "[features]" { saw_features = 1; next }
-  saw_features && $0 == "hooks = false" { saw_features = 0; next }
-  { saw_features = 0; print }
-' "$context_codex_config" > "$context_codex_config.implicit"
-chmod --reference="$context_codex_config" \
-    "$context_codex_config.implicit"
-mv -- "$context_codex_config.implicit" "$context_codex_config"
-context_hooks_before_implicit_upgrade="$(
-    grep -c '^CODEX_CONTEXT=features enable hooks$' \
-        "$tmp/home/.local/ags.log"
-)"
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    "$tool" init > "$tmp/context-upgrade.out" \
-    2> "$tmp/context-upgrade.err"
-context_root_170="$(
-    context_mode_test_runtime_root "$context_init_home" 1.0.170
-)"
-context_package_root_170="$context_root_170/node_modules/context-mode"
-context_claude_cache_root_170="$context_init_home/.claude/plugins/cache/context-mode/context-mode/1.0.170"
-jq -e --arg root "$context_package_root_170" \
-    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
-    --arg integrity "$context_integrity_170" '
-    .schema == 2 and
-    .version == "1.0.170" and
-    .runtime.target == $target and
-    .source.integrity == $integrity and
-    .package_root == $root and
-    .health == {mode:"doctor",status:"passed"}
-' "$context_manifest" >/dev/null
-[[ -d "$context_root_169" ]]
-[[ -d "$context_root_170" ]]
-[[ ! -e "$context_init_home/.local/state/ags/context-mode.pending.json" ]]
-[[ "$(<"$context_plugin_state/claude-marketplace-root")" == \
-    "$context_package_root_170" ]]
-[[ "$(<"$context_plugin_state/codex-marketplace-root")" == \
-    "$context_package_root_170" ]]
-grep -Fqx 'hooks = true' "$context_codex_config"
-[[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/ags.log")" == \
-    $((context_hooks_before_implicit_upgrade + 1)) ]]
-grep -Fq -- '--registry=https://registry.npmjs.org' \
-    "$context_init_home/.context-mode-npm.log"
-grep -Fq -- '--ignore-scripts' \
-    "$context_init_home/.context-mode-npm.log"
-context_install_count="$(
-    grep -c '^NPM_CONTEXT=install ' \
-        "$context_init_home/.context-mode-npm.log"
-)"
-context_republished_integrity="sha512-$(printf 'R%.0s' {1..86})=="
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_republished_integrity" \
-    "$tool" init > "$tmp/context-integrity-drift.out" \
-    2> "$tmp/context-integrity-drift.err"
-grep -Fq 'npm changed the integrity of published Context Mode 1.0.170' \
-    "$tmp/context-integrity-drift.err"
-jq -e --arg integrity "$context_integrity_170" '
-  .version == "1.0.170" and
-  .source.integrity == $integrity and
-  .health.status == "passed"
-' "$context_manifest" >/dev/null
-[[ "$context_install_count" == "$(
-    grep -c '^NPM_CONTEXT=install ' \
-        "$context_init_home/.context-mode-npm.log"
-)" ]]
-context_old_target="$FAKE_CONTEXT_RUNTIME_PLATFORM-$FAKE_CONTEXT_RUNTIME_ARCH-node999"
-context_old_root="$context_init_home/.local/share/ags/context-mode/runtimes/$context_old_target/1.0.170"
-context_old_package_root="$context_old_root/node_modules/context-mode"
-mkdir -p "${context_old_root%/1.0.170}"
-mv -- "$context_root_170" "$context_old_root"
-jq --arg target "$context_old_target" \
-    --arg root "$context_old_package_root" '
-      .runtime.node_abi = 999 |
-      .runtime.target = $target |
-      .package_root = $root
-    ' "$context_manifest" > "$context_manifest.abi-old"
-mv -- "$context_manifest.abi-old" "$context_manifest"
-chmod 600 "$context_manifest"
-for provider in claude codex; do
-    printf '%s\n' "$context_old_package_root" \
-        > "$context_plugin_state/$provider-marketplace-root"
-    printf '%s\n' "$context_old_package_root" \
-        > "$context_plugin_state/$provider-plugin-root"
-done
-context_install_count="$(
-    grep -c '^NPM_CONTEXT=install ' \
-        "$context_init_home/.context-mode-npm.log"
-)"
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    "$tool" init > "$tmp/context-abi-upgrade.out" \
-    2> "$tmp/context-abi-upgrade.err"
-[[ -d "$context_root_170" && -d "$context_old_root" ]]
-jq -e --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
-    --arg root "$context_package_root_170" '
-      .schema == 2 and
-      .runtime.target == $target and
-      .package_root == $root
-    ' "$context_manifest" >/dev/null
-[[ "$((context_install_count + 1))" == "$(
-    grep -c '^NPM_CONTEXT=install ' \
-        "$context_init_home/.context-mode-npm.log"
-)" ]]
-if env "${context_init_env[@]}" \
-    FAKE_CONTEXT_TRUST_STATUS=untrusted \
-    "$tool" context-check codex "$tmp/home/.local/bin/codex" \
-    > "$tmp/context-upgrade-trust.out" \
-    2> "$tmp/context-upgrade-trust.err"; then
-    echo 'upgraded Context Mode inherited old Codex hook trust' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode hooks are not trusted' \
-    "$tmp/context-upgrade-trust.err"
-
-awk '
-  $0 == "hooks = true" { print "hooks = false"; next }
-  { print }
-' "$context_codex_config" > "$context_codex_config.crash-disabled"
-chmod --reference="$context_codex_config" \
-    "$context_codex_config.crash-disabled"
-mv -- "$context_codex_config.crash-disabled" "$context_codex_config"
-context_convergence_journal="$context_init_home/.local/state/ags/context-mode.codex-hooks-convergence.json"
-if env "${context_init_env[@]}" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    FAKE_CONTEXT_CRASH_AFTER_HOOK_ENABLE=1 \
-    "$tool" init > "$tmp/context-convergence-crash.out" \
-    2> "$tmp/context-convergence-crash.err"; then
-    echo 'active Codex hooks convergence crash fixture unexpectedly passed' >&2
-    exit 1
-fi
-[[ -f "$context_convergence_journal" ]]
-[[ -f "$context_init_home/.local/state/ags/context-mode.codex-config.before" ]]
-[[ -f "$context_init_home/.local/state/ags/context-mode.codex-config.enabled" ]]
-[[ ! -e "$context_init_home/.local/state/ags/context-mode.pending.json" ]]
-grep -Fqx 'hooks = true' "$context_codex_config"
-jq -e '
-  .schema == 1 and
-  .managed_by == "ags" and
-  .kind == "codex-hooks-convergence" and
-  .before_state == "disabled" and
-  .before_present == true and
-  (.before_sha256 | test("^[0-9a-f]{64}$")) and
-  (.enabled_sha256 | test("^[0-9a-f]{64}$"))
-' "$context_convergence_journal" >/dev/null
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    "$tool" init > "$tmp/context-convergence-recovery.out" \
-    2> "$tmp/context-convergence-recovery.err"
-for transaction_file in context-mode.codex-hooks-convergence.json \
-    context-mode.codex-config.before \
-    context-mode.codex-config.enabled; do
-    [[ ! -e "$context_init_home/.local/state/ags/$transaction_file" ]]
-done
-grep -Fqx 'hooks = true' "$context_codex_config"
-jq -e '.version == "1.0.170" and .health.status == "passed"' \
-    "$context_manifest" >/dev/null
-
-awk '
-  $0 == "hooks = true" { print "hooks = false"; next }
-  { print }
-' "$context_codex_config" > "$context_codex_config.disabled"
-chmod --reference="$context_codex_config" \
-    "$context_codex_config.disabled"
-mv -- "$context_codex_config.disabled" "$context_codex_config"
-grep -Fqx 'hooks = false' "$context_codex_config"
-context_hooks_before_disabled_upgrade="$(
-    grep -c '^CODEX_CONTEXT=features enable hooks$' \
-        "$tmp/home/.local/ags.log"
-)"
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.171 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_171" \
-    FAKE_CONTEXT_DOCTOR_FAIL=codex \
-    "$tool" init > "$tmp/context-upgrade-health-fail.out" \
-    2> "$tmp/context-upgrade-health-fail.err"
-jq -e '.version == "1.0.170" and .health.status == "passed"' \
-    "$context_manifest" >/dev/null
-[[ "$(<"$context_plugin_state/claude-marketplace-root")" == \
-    "$context_package_root_170" ]]
-[[ "$(<"$context_plugin_state/codex-marketplace-root")" == \
-    "$context_package_root_170" ]]
-[[ ! -e "$context_init_home/.local/state/ags/context-mode.pending.json" ]]
-grep -Fq '1.0.170 remains active' "$tmp/context-upgrade-health-fail.err"
-grep -Fqx 'hooks = true' "$context_codex_config"
-! grep -Fqx 'hooks = false' "$context_codex_config"
-[[ "$(grep -c '^CODEX_CONTEXT=features enable hooks$' \
-    "$tmp/home/.local/ags.log")" == \
-    $((context_hooks_before_disabled_upgrade + 1)) ]]
-
-context_concurrent_hooks_pending="$context_init_home/.local/state/ags/context-mode.pending.json"
-if env "${context_init_env[@]}" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.171 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_171" \
-    FAKE_CONTEXT_FLIP_HOOKS_FALSE_AFTER_PLUGIN_ADD=1 \
-    "$tool" init > "$tmp/context-concurrent-hooks.out" \
-    2> "$tmp/context-concurrent-hooks.err"; then
-    echo 'Context Mode ignored a concurrent Codex hooks disable' >&2
-    exit 1
-fi
-grep -Fq 'mandatory Context Mode configuration failed for Codex' \
-    "$tmp/context-concurrent-hooks.err"
-grep -Fqx 'hooks = false' "$context_codex_config"
-jq -e '
-  .schema == 4 and
-  .kind == "upgrade" and
-  .codex_hooks_config.before_state == "explicit-true"
-' "$context_concurrent_hooks_pending" >/dev/null
-jq -e '.version == "1.0.170" and .health.status == "passed"' \
-    "$context_manifest" >/dev/null
-awk '
-  $0 == "hooks = false" { print "hooks = true"; next }
-  { print }
-' "$context_codex_config" > "$context_codex_config.reenabled"
-chmod --reference="$context_codex_config" \
-    "$context_codex_config.reenabled"
-mv -- "$context_codex_config.reenabled" "$context_codex_config"
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    "$tool" init > "$tmp/context-concurrent-hooks-recovery.out" \
-    2> "$tmp/context-concurrent-hooks-recovery.err"
-[[ ! -e "$context_concurrent_hooks_pending" ]]
-grep -Fqx 'hooks = true' "$context_codex_config"
-jq -e '.version == "1.0.170" and .health.status == "passed"' \
-    "$context_manifest" >/dev/null
-
-context_pending="$context_init_home/.local/state/ags/context-mode.pending.json"
-context_package_root_171="$(
-    context_mode_test_runtime_root "$context_init_home" 1.0.171
-)/node_modules/context-mode"
-jq --arg candidate_root "$context_package_root_171" \
-    --arg candidate_integrity "$context_integrity_171" \
-    --arg platform "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
-    --arg arch "$FAKE_CONTEXT_RUNTIME_ARCH" \
-    --argjson node_abi "$FAKE_CONTEXT_RUNTIME_NODE_ABI" \
-    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" '{
-      schema:3,
-      managed_by:"ags",
-      activation_id:"ags-test-pending-upgrade",
-      kind:"upgrade",
-      previous:{
-        version:.version,
-        runtime:.runtime,
-        source:.source,
-        package_root:.package_root,
-        providers:.providers
-      },
-      candidate:{
-        version:"1.0.171",
-        runtime:{
-          platform:$platform,arch:$arch,node_abi:$node_abi,target:$target
-        },
-        source:{
-          type:"npm",
-          package:"context-mode",
-          integrity:$candidate_integrity
-        },
-        package_root:$candidate_root
-      },
-      attempted_providers:{claude:true,codex:true},
-      provider_before:{
-        claude:{
-          marketplace_present:false,
-          plugin_present:false,
-          plugin_enabled:false
-        },
-        codex:{
-          marketplace_present:false,
-          plugin_present:false
-        }
-      },
-      codex_hooks_was_enabled:true
-    }' "$context_manifest" > "$context_pending"
-chmod 600 "$context_pending"
-for provider in claude codex; do
-    printf '%s\n' "$context_package_root_171" \
-        > "$context_plugin_state/$provider-marketplace-root"
-    printf '%s\n' "$context_package_root_171" \
-        > "$context_plugin_state/$provider-plugin-root"
-done
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_LATEST_VERSION=1.0.170 \
-    FAKE_CONTEXT_LATEST_INTEGRITY="$context_integrity_170" \
-    "$tool" init > "$tmp/context-upgrade-recovery.out" \
-    2> "$tmp/context-upgrade-recovery.err"
-[[ ! -e "$context_pending" ]]
-[[ "$(<"$context_plugin_state/claude-plugin-root")" == \
-    "$context_claude_cache_root_170" ]]
-[[ "$(<"$context_plugin_state/codex-plugin-root")" == \
-    "$context_package_root_170" ]]
-
-env "${context_init_env[@]}" \
-    FAKE_CONTEXT_NPM_VIEW_FAIL=1 \
-    "$tool" init > "$tmp/context-registry-fallback.out" \
-    2> "$tmp/context-registry-fallback.err"
-jq -e '
-    .version == "1.0.170" and
-    .health == {mode:"offline-index-search",status:"passed"}
-' "$context_manifest" >/dev/null
-grep -Fq 'retaining validated Context Mode 1.0.170' \
-    "$tmp/context-registry-fallback.err"
-env "${context_init_env[@]}" \
-    AGS_CONTEXT_MODE_OFFLINE=1 \
-    FAKE_CONTEXT_NPM_FORBID=1 \
-    "$tool" init > "$tmp/context-offline-last-good.out" \
-    2> "$tmp/context-offline-last-good.err"
-jq -e '.version == "1.0.170" and .health.status == "passed"' \
-    "$context_manifest" >/dev/null
-
-context_fail_home="$tmp/context-fail-home"
-context_fail_state="$tmp/context-fail-state"
-context_fail_root="$(
-    context_mode_test_runtime_root "$context_fail_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$context_fail_home"
-if env HOME="$context_fail_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$context_fail_home/.codex" \
-    CLAUDE_CONFIG_DIR="$context_fail_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$context_fail_state" \
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
-    FAKE_CONTEXT_PACKAGE_ROOT="$context_fail_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_DOCTOR_FAIL=codex \
-    "$tool" init > "$tmp/context-fail.out" 2> "$tmp/context-fail.err"; then
-    echo 'init ignored a mandatory Context Mode diagnostic failure' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode initialization failed for codex' \
-    "$tmp/context-fail.err"
-[[ ! -e "$context_fail_home/.config/ags/identity.agekey" ]]
-[[ ! -e "$context_fail_home/.local/state/ags/storage.json" ]]
-[[ ! -e "$context_fail_home/.local/state/ags/context-mode.json" ]]
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    [[ ! -e "$context_fail_state/$marker" ]]
-done
-[[ ! -e "$context_fail_home/.codex/config.toml" ]]
-[[ ! -e "$context_fail_home/.local/state/ags/context-mode.pending.json" ]]
-
-disabled_home="$tmp/context-disabled-home"
-disabled_state="$tmp/context-disabled-state"
-disabled_root="$(
-    context_mode_test_runtime_root "$disabled_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$disabled_home"
-mkdir -p "$disabled_state"
-: > "$disabled_state/claude-marketplace"
-: > "$disabled_state/claude-plugin"
-: > "$disabled_state/claude-plugin-disabled"
-if env HOME="$disabled_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$disabled_home/.codex" \
-    CLAUDE_CONFIG_DIR="$disabled_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$disabled_state" \
-    FAKE_CODEX_PLUGIN_WRITES_CONFIG=1 \
-    FAKE_CONTEXT_PACKAGE_ROOT="$disabled_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CONTEXT_DOCTOR_FAIL=codex \
-    "$tool" init > "$tmp/context-disabled.out" \
-    2> "$tmp/context-disabled.err"; then
-    echo 'init ignored a health failure after enabling a disabled Claude plugin' >&2
-    exit 1
-fi
-[[ -e "$disabled_state/claude-marketplace" ]]
-[[ -e "$disabled_state/claude-plugin" ]]
-[[ -e "$disabled_state/claude-plugin-disabled" ]]
-for marker in codex-marketplace codex-plugin; do
-    [[ ! -e "$disabled_state/$marker" ]]
-done
-[[ ! -e "$disabled_home/.codex/config.toml" ]]
-[[ ! -e "$disabled_home/.local/state/ags/context-mode.pending.json" ]]
-grep -Fq 'CLAUDE_CONTEXT=plugin enable context-mode@context-mode --scope user' \
-    "$tmp/home/.local/ags.log"
-grep -Fq 'CLAUDE_CONTEXT=plugin disable context-mode@context-mode --scope user' \
-    "$tmp/home/.local/ags.log"
-[[ ! -e "$disabled_home/.config/ags/identity.agekey" ]]
-[[ ! -e "$disabled_home/.local/state/ags/storage.json" ]]
-[[ ! -e "$disabled_home/.local/state/ags/context-mode.json" ]]
-
-malformed_home="$tmp/context-malformed-home"
-malformed_state="$tmp/context-malformed-state"
-malformed_root="$(
-    context_mode_test_runtime_root "$malformed_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$malformed_home"
-mkdir -p "$malformed_home/.local/state/ags"
-printf '{"local_path":42}\n' \
-    > "$malformed_home/.local/state/ags/storage.json"
-if env HOME="$malformed_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$malformed_home/.codex" \
-    CLAUDE_CONFIG_DIR="$malformed_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$malformed_state" \
-    FAKE_CONTEXT_PACKAGE_ROOT="$malformed_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    "$tool" init > "$tmp/context-malformed.out" \
-    2> "$tmp/context-malformed.err"; then
-    echo 'init changed Context Mode before rejecting malformed AGS storage' >&2
-    exit 1
-fi
-grep -Fq 'local storage path is invalid' "$tmp/context-malformed.err"
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin \
-    codex-hooks; do
-    [[ ! -e "$malformed_state/$marker" ]]
-done
-[[ ! -e "$malformed_home/.local/state/ags/context-mode.json" ]]
-[[ ! -e "$malformed_home/.config/ags/identity.agekey" ]]
-
-claude_conflict_home="$tmp/context-claude-conflict-home"
-claude_conflict_state="$tmp/context-claude-conflict-state"
-claude_conflict_root="$(
-    context_mode_test_runtime_root "$claude_conflict_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$claude_conflict_home"
-mkdir -p "$claude_conflict_state"
-: > "$claude_conflict_state/claude-marketplace"
-: > "$claude_conflict_state/claude-plugin"
-if env HOME="$claude_conflict_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$claude_conflict_home/.codex" \
-    CLAUDE_CONFIG_DIR="$claude_conflict_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$claude_conflict_state" \
-    FAKE_CONTEXT_PACKAGE_ROOT="$claude_conflict_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CLAUDE_CONTEXT_MARKETPLACE_ROOT="$tmp/different-claude-context-mode" \
-    "$tool" init > "$tmp/context-claude-conflict.out" \
-    2> "$tmp/context-claude-conflict.err"; then
-    echo 'init accepted a conflicting Claude Context Mode marketplace' >&2
-    exit 1
-fi
-grep -Fq 'Claude already has a different marketplace named context-mode' \
-    "$tmp/context-claude-conflict.err"
-[[ -e "$claude_conflict_state/claude-marketplace" ]]
-[[ -e "$claude_conflict_state/claude-plugin" ]]
-[[ ! -e "$claude_conflict_home/.local/state/ags/storage.json" ]]
-[[ ! -e "$claude_conflict_home/.local/state/ags/context-mode.json" ]]
-
-codex_conflict_home="$tmp/context-codex-conflict-home"
-codex_conflict_state="$tmp/context-codex-conflict-state"
-codex_conflict_root="$(
-    context_mode_test_runtime_root "$codex_conflict_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$codex_conflict_home"
-mkdir -p "$codex_conflict_state"
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    : > "$codex_conflict_state/$marker"
-done
-if env HOME="$codex_conflict_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$codex_conflict_home/.codex" \
-    CLAUDE_CONFIG_DIR="$codex_conflict_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$codex_conflict_state" \
-    FAKE_CONTEXT_PACKAGE_ROOT="$codex_conflict_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    FAKE_CODEX_CONTEXT_MARKETPLACE_ROOT="$tmp/different-codex-context-mode" \
-    "$tool" init > "$tmp/context-codex-conflict.out" \
-    2> "$tmp/context-codex-conflict.err"; then
-    echo 'init accepted a conflicting Codex Context Mode marketplace' >&2
-    exit 1
-fi
-grep -Fq 'Codex already has a different marketplace named context-mode' \
-    "$tmp/context-codex-conflict.err"
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    [[ -e "$codex_conflict_state/$marker" ]]
-done
-[[ ! -e "$codex_conflict_state/codex-hooks" ]]
-[[ ! -e "$codex_conflict_home/.local/state/ags/storage.json" ]]
-[[ ! -e "$codex_conflict_home/.local/state/ags/context-mode.json" ]]
-
-tampered_home="$tmp/context-tampered-home"
-tampered_state="$tmp/context-tampered-state"
-tampered_root="$(
-    context_mode_test_runtime_root "$tampered_home" 1.0.169
-)/node_modules/context-mode"
-prepare_context_mode_runtime "$tampered_home"
-env HOME="$tampered_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$tampered_home/.codex" \
-    CLAUDE_CONFIG_DIR="$tampered_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$tampered_state" \
-    FAKE_CONTEXT_PACKAGE_ROOT="$tampered_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    "$tool" init > "$tmp/context-tampered-init.out" \
-    2> "$tmp/context-tampered-init.err"
-printf '\n// post-install mutation\n' >> "$tampered_root/server.bundle.mjs"
-if env HOME="$tampered_home" \
-    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
-    CODEX_HOME="$tampered_home/.codex" \
-    CLAUDE_CONFIG_DIR="$tampered_home/.claude" \
-    FAKE_CONTEXT_PLUGIN_STATE_DIR="$tampered_state" \
-    FAKE_CONTEXT_PACKAGE_ROOT="$tampered_root" \
-    FAKE_CONTEXT_FIXTURE_HOME="$context_fixture_home" \
-    "$tool" init > "$tmp/context-tampered-reinit.out" \
-    2> "$tmp/context-tampered-reinit.err"; then
-    echo 'init accepted modified Context Mode executable bytes' >&2
-    exit 1
-fi
-grep -Fq 'invalid Context Mode last-good manifest' \
-    "$tmp/context-tampered-reinit.err"
 
 symlink_init_home="$tmp/symlink-init-home"
 symlink_init_outside="$tmp/symlink-init-outside"
@@ -3572,7 +2100,6 @@ age_session_id=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
 age_session_rel="sessions/2026/01/01/rollout-age-$age_session_id.jsonl"
 age_codex_home="$tmp/age-source/codex"
 mkdir -p "$age_codex_home/$(dirname "$age_session_rel")" "$tmp/age-work"
-seed_context_mode_agent_cache "$age_codex_home" codex
 printf '%s\n' '{"type":"session_meta"}' '{"type":"event_msg"}' \
     > "$age_codex_home/$age_session_rel"
 age_env=(
@@ -4071,7 +2598,7 @@ resume_override_args="$(
 grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
     <<< "$resume_override_args"
 
-# Replayed arguments face the same Context Mode gate a typed one does. A
+# Replayed arguments face the same argument checks a typed one does. A
 # synchronized record must not be a way around it.
 env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-forbidden/codex" \
     AGENT_SESSION_LOCAL_DIR="$tmp/forbidden-args-checkpoints" \
@@ -4150,7 +2677,6 @@ zst_path="$(sed -n 's/^path=//p' <<< "$zst_output")"
 assert_format4_archive "$zst_path" "$tmp/extracted/zst"
 grep -Fqx "relative_path=$zst_rel" "$tmp/extracted/zst/manifest"
 cmp "$tmp/source/codex/$zst_rel" "$tmp/extracted/zst/artifacts/$zst_rel"
-seed_context_mode_agent_cache "$tmp/zst-target/codex" codex
 zst_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/zst-target/codex" \
     "$tool" resume compressed -- --model compressed-model)"
 grep -Fqx \
@@ -4159,7 +2685,6 @@ grep -Fqx \
 [[ "$zst_resume" != *'<-->'* ]]
 cmp "$tmp/source/codex/$zst_rel" "$tmp/zst-target/codex/$zst_rel"
 zst_cross_home="$tmp/zst-cross-target/claude"
-seed_context_mode_agent_cache "$zst_cross_home" claude
 zst_cross_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$tmp/work")"
 zst_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$zst_cross_home" \
     OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
@@ -4678,7 +3203,6 @@ grep -Fq 'expected one cloud checkpoint named cloud-race; found 2' \
 for record_id in "${cloud_race_records[@]}"; do
     grep -Fq "$record_id" "$tmp/cloud-race-ambiguous.err"
 done
-seed_context_mode_agent_cache "$tmp/cloud-race-target/codex" codex
 cloud_race_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/cloud-race-target/codex" \
     "$tool" cloud resume "${cloud_race_records[0]}" -- --model race-model)"
 grep -Fqx "FAKE_CODEX <resume> <$session_id> <--model> <race-model>" <<< "$cloud_race_resume"
@@ -4738,7 +3262,6 @@ printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
 
 codex_active_home="$tmp/codex-active-target/codex"
 mkdir -p "$codex_active_home/${session_rel%/*}"
-seed_context_mode_agent_cache "$codex_active_home" codex
 cp -- "$tmp/source/codex/$session_rel" "$codex_active_home/$session_rel"
 start_codex_session_process "$codex_active_home" "$session_id" "$session_rel"
 codex_active_pid="$active_test_pid"
@@ -4756,7 +3279,6 @@ cmp "$tmp/source/codex/$session_rel" "$codex_active_home/$session_rel"
 stop_test_process "$codex_active_pid"
 
 codex_deleted_home="$tmp/codex-deleted-target/codex"
-seed_context_mode_agent_cache "$codex_deleted_home" codex
 start_codex_session_process "$codex_deleted_home" "$session_id"
 codex_deleted_pid="$active_test_pid"
 codex_deleted_path="$active_codex_path"
@@ -4801,7 +3323,6 @@ else
     printf '%s\n' '#!/usr/bin/env sh' 'exit 1' > "$tmp/other-home/.local/bin/pgrep"
 fi
 chmod +x "$tmp/other-home/.local/bin/codex" "$tmp/other-home/.local/bin/pgrep"
-seed_context_mode_agent_cache "$tmp/resume-target/codex" codex
 resume_output="$(env "${source_env[@]}" \
     PATH="$tmp/other-home/.local/bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     CODEX_HOME="$tmp/resume-target/codex" \
@@ -4837,7 +3358,6 @@ codex_to_claude_work="$tmp/codex-to-claude-work"
 codex_to_claude_home="$tmp/codex-to-claude-target/claude"
 codex_to_claude_settings="$codex_to_claude_home/sub2api.settings.json"
 mkdir -p "$codex_to_claude_work" "$codex_to_claude_home"
-seed_context_mode_agent_cache "$codex_to_claude_home" claude
 printf '%s\n' \
     '{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example","ANTHROPIC_API_KEY":"","ANTHROPIC_AUTH_TOKEN":""},"apiKeyHelper":"/usr/bin/printenv SUB2API_API_KEY"}' \
     > "$codex_to_claude_settings"
@@ -4913,7 +3433,6 @@ grep -Fq 'do not combine --profile with Claude --settings' \
 unicode_cross_work="$tmp/项目😀"
 unicode_cross_home="$tmp/unicode-cross-target/claude"
 mkdir -p "$unicode_cross_work"
-seed_context_mode_agent_cache "$unicode_cross_home" claude
 unicode_parent_key="$(reference_ascii_claude_project_key "$tmp")"
 unicode_cross_key="${unicode_parent_key}-----"
 unicode_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$unicode_cross_home" \
@@ -4940,7 +3459,6 @@ long_cross_component="$(printf 'a%.0s' {1..210})"
 long_cross_work="$tmp/$long_cross_component"
 long_cross_home="$tmp/long-cross-target/claude"
 mkdir -p "$long_cross_work"
-seed_context_mode_agent_cache "$long_cross_home" claude
 long_cross_key="$(reference_ascii_claude_project_key "$long_cross_work")"
 long_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$long_cross_home" \
     "$tool" resume "$queued_id" --to claude \
@@ -5043,7 +3561,6 @@ done
 
 claude_active_home="$tmp/claude-active-target/claude"
 mkdir -p "$claude_active_home/${claude_session_rel%/*}"
-seed_context_mode_agent_cache "$claude_active_home" claude
 cp -- "$tmp/source/claude/$claude_session_rel" \
     "$claude_active_home/$claude_session_rel"
 start_claude_session_process "$claude_active_home" "$claude_session_id"
@@ -5064,7 +3581,6 @@ stop_test_process "$claude_active_pid"
 
 claude_unrelated_id=cccccccc-dddd-4eee-8fff-111111111111
 claude_unrelated_home="$tmp/claude-unrelated-target/claude"
-seed_context_mode_agent_cache "$claude_unrelated_home" claude
 start_claude_session_process "$claude_unrelated_home" "$claude_unrelated_id"
 claude_unrelated_pid="$active_test_pid"
 claude_unrelated_resume="$(
@@ -5078,7 +3594,6 @@ kill -0 "$claude_unrelated_pid"
 stop_test_process "$claude_unrelated_pid"
 
 claude_stale_home="$tmp/claude-stale-target/claude"
-seed_context_mode_agent_cache "$claude_stale_home" claude
 start_claude_session_process "$claude_stale_home" "$claude_session_id" 1
 claude_stale_pid="$active_test_pid"
 claude_stale_resume="$(
@@ -5132,7 +3647,6 @@ mkdir -p "$claude_resume_work"
 claude_resume_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$claude_resume_work")"
 claude_resume_rel="projects/$claude_resume_key/$claude_session_id.jsonl"
 claude_resume_tree="projects/$claude_resume_key/$claude_session_id"
-seed_context_mode_agent_cache "$tmp/claude-resume-target/claude" claude
 claude_resume="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/claude-resume-target/claude" \
     "$tool" resume claude-window --cwd "$claude_resume_work" -- \
         --model sonnet 'continue here')"
@@ -5169,7 +3683,6 @@ done
 claude_profile_home="$tmp/claude-profile-target/claude"
 claude_profile_settings="$claude_profile_home/sub2api.settings.json"
 mkdir -p "$claude_profile_home"
-seed_context_mode_agent_cache "$claude_profile_home" claude
 printf '%s\n' \
     '{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example","ANTHROPIC_API_KEY":"","ANTHROPIC_AUTH_TOKEN":""},"apiKeyHelper":"/usr/bin/printenv SUB2API_API_KEY"}' \
     > "$claude_profile_settings"
@@ -5185,12 +3698,10 @@ grep -Fqx \
 
 claude_to_codex_home="$tmp/claude-to-codex-target/codex"
 mkdir -p "$claude_to_codex_home"
-seed_context_mode_agent_cache "$claude_to_codex_home" codex
 printf '%s\n' 'model_provider = "sub2api"' \
     > "$claude_to_codex_home/sub2api.config.toml"
 profile_after_separator_home="$tmp/profile-after-separator/codex"
 mkdir -p "$profile_after_separator_home"
-seed_context_mode_agent_cache "$profile_after_separator_home" codex
 printf '%s\n' 'model_provider = "sub2api"' \
     > "$profile_after_separator_home/sub2api.config.toml"
 profile_after_separator="$(
@@ -5271,7 +3782,7 @@ assert_cross_codex_provider_override_rejected() {
     fi
     case "$label" in
         config|provider-config)
-            grep -Fq 'cannot be forwarded because it changes the workspace or configuration after Context Mode audit' \
+            grep -Fq 'cannot be forwarded because it changes the workspace or configuration after AGS validated it' \
                 "$tmp/codex-provider-override-$label.err"
             ;;
         *)
@@ -5331,7 +3842,6 @@ rm -f -- "$cross_unrelated_codex_path"
 [[ "$(find "$claude_to_codex_home/sessions" -type f | wc -l)" == 1 ]]
 
 register_failure_home="$tmp/register-failure-target/codex"
-seed_context_mode_agent_cache "$register_failure_home" codex
 register_failure_file="$register_failure_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
 if env "${source_env[@]}" CODEX_HOME="$register_failure_home" \
     AGS_REGISTER_FAIL=1 \
@@ -5351,7 +3861,6 @@ grep -Fqx \
 [[ ! -d "$register_failure_home/sessions" ]]
 
 claude_to_default_codex_home="$tmp/claude-to-default-codex-target/codex"
-seed_context_mode_agent_cache "$claude_to_default_codex_home" codex
 claude_to_default_codex="$(env "${source_env[@]}" \
     CODEX_HOME="$claude_to_default_codex_home" \
     "$tool" resume claude-window --to codex)"
@@ -5368,7 +3877,6 @@ jq -e '
 
 claude_to_base_codex_home="$tmp/claude-to-base-codex-target/codex"
 mkdir -p "$claude_to_base_codex_home"
-seed_context_mode_agent_cache "$claude_to_base_codex_home" codex
 printf '%s\n' "model_provider = 'basegateway'" \
     > "$claude_to_base_codex_home/config.toml"
 claude_to_base_codex="$(env "${source_env[@]}" \
@@ -5406,7 +3914,6 @@ printf '{"message":"synthetic conversion failure"}\n' >&2
 exit 42
 EOF
 chmod +x "$tmp/home/.local/bin/casr-fail"
-seed_context_mode_agent_cache "$tmp/conversion-failure-target/codex" codex
 if env "${source_env[@]}" CODEX_HOME="$tmp/conversion-failure-target/codex" \
     AGS_CONVERTER_BINARY="$tmp/home/.local/bin/casr-fail" \
     "$tool" resume claude-window --to codex \
@@ -5442,7 +3949,6 @@ grep -Fq "$legacy_id" <<< "$legacy_list"
 grep -Fq '旧版检查点' <<< "$legacy_list"
 grep -Eq '^sat-index +CODEX +' <<< "$legacy_list"
 grep -Eq '^claude-window +CLAUDE +' <<< "$legacy_list"
-seed_context_mode_agent_cache "$tmp/legacy-resume-target/codex" codex
 legacy_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/legacy-resume-target/codex" \
     "$tool" resume "$legacy_id" -- --sandbox read-only)"
 grep -Fqx "FAKE_CODEX <resume> <$legacy_session_id> <--sandbox> <read-only>" <<< "$legacy_resume"

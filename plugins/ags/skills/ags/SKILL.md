@@ -156,8 +156,8 @@ argument after `--` exactly. AGS owns `--to`, `--cwd`, and long `--profile`
 only before `--`. After `--`, both short and long options belong to the target
 Agent. Codex interprets `-p` and `--profile` as its native profile, while
 Claude interprets `-p` as `--print`. AGS inspects a Codex native profile only
-to enforce mandatory Context Mode and, for cross-Agent resume, to select the
-same conversion provider; it forwards the option unchanged. Do not specify a
+for cross-Agent resume, to select the same conversion provider; it forwards the
+option unchanged. Do not specify a
 Codex profile both before and after `--`.
 
 AGS resolves a profile selected before `--` for the target Agent:
@@ -178,8 +178,8 @@ Claude client `--settings` arguments may contain only the same authentication
 and model fields accepted for profiles. Claude client arguments cannot forward
 `--agent`, `--agents`, `--setting-sources`, `--mcp-config`, `--plugin-dir`,
 `--plugin-url`, `--disallowedTools`, `--disallowed-tools`, `--safe-mode`, `--bare`, or
-`--strict-mcp-config`, because they can replace or disable the mandatory
-Context Mode configuration or tool set after AGS validates it.
+`--strict-mcp-config`, because they can replace or disable the AGS plugin
+configuration or tool set after AGS validates it.
 `--no-session-persistence` is rejected because it disables session recovery.
 `CLAUDE_CODE_SAFE_MODE` and `CLAUDE_CODE_SIMPLE` must also be unset or false.
 Any `apiKeyHelper` in Claude's active managed, user, project, local,

@@ -122,7 +122,7 @@ script, a pipe — the recorded directory is used, unchanged.
 edit the arguments for this launch, Del to delete, Esc to quit. The arguments
 for the highlighted session are always shown, because checkpoints synchronize
 between machines and a replayed command line is another machine's decision
-taking effect here. Replayed arguments pass the same Context Mode checks a typed
+taking effect here. Replayed arguments pass the same argument checks a typed
 one does; a synchronized record is not a way around them.
 
 Every managed launch selects one checkpoint storage mode:
@@ -193,67 +193,16 @@ available without those tools. Use
 `--identity /absolute/path/to/identity.agekey` during installation to import an
 existing encryption identity.
 
-Context Mode is a required AGS runtime, not an optional integration. The online
-installer and every online `ags init` resolve npm's current stable `latest`
-release from the official registry. AGS records its exact version, tarball, and SHA-512
-integrity; installs the exact version with npm lifecycle scripts disabled into
-a sibling staging directory; validates the reviewed upstream native
-provisioner; runs that provisioner in an isolated environment until the
-package tree stops changing; and only then activates the versioned runtime under
-`${XDG_DATA_HOME:-~/.local/share}/ags/context-mode/runtimes/<platform>-<arch>-node<abi>/<version>`.
-A Node ABI change gets its own runtime and requires one online `ags init`;
-offline initialization fails closed when its last-good target does not match.
-A candidate that
-cannot be fetched, validated, configured, or health-checked never replaces the
-last-good release. Normal Agent launches use that last-good release without a
-network lookup.
-
-npm integrity is supplemented by an AGS SHA-256 manifest over the complete
-runtime package tree: every regular file and every safe in-package symbolic link,
-including nested dependencies and the active native ABI binding.
-Initialization and launch verify that tree and the Agent-managed plugin cache.
-This requires Node.js 22.5.0 or newer and `jq`; online refresh also requires
-`npm`. `ags init` repairs the registrations and runs Context Mode's
-initialization lifecycle for every installed Claude/Codex Agent. Online
-initialization runs the official `doctor`; an offline reinstall with a
-previously committed last-good runtime performs an `index`/`search` round trip
-against Context Mode's persistent SQLite/FTS store without making a network
-request.
-Context Mode currently has no public `init` subcommand, so AGS defines
-initialization as official plugin convergence plus one of those upstream health
-paths.
-
-For Claude, AGS also starts a short-lived real Claude process whose model API
-endpoint is redirected to loopback before every managed launch and requires the effective SessionStart protection
-marker, connected Context MCP server, both core `ctx_*` tools, and exact plugin
-version. Claude `--settings` accepts only provider authentication plus model
-fields; `apiKeyHelper` is limited to `/usr/bin/printenv ENV_NAME`. Hooks, MCP,
-plugin, permission, and tool settings fail closed. The same helper restriction
-is enforced for active managed, user, project, and local settings files while
-their other native Claude fields remain available. AGS performs this check
-before Context Mode initialization and verification can start Claude, and
-again at the managed-launch boundary. Other
-managed Claude arguments that can replace the selected Agent, settings, MCP,
-plugins, or Context tools are rejected, including `--agent`, `--agents`,
+For Claude, AGS rejects managed arguments that can replace the selected Agent,
+settings, MCP, plugins, or tools, including `--agent`, `--agents`,
 `--setting-sources`, `--mcp-config`, `--plugin-dir`, `--plugin-url`,
-`--disallowedTools`, `--safe-mode`, `--bare`, and `--strict-mcp-config`.
-
-The integration has no opt-out: `--no-configure` and `--no-skill` only skip
-the optional AGS aliases, skills, hooks, and checkpoint bootstrap covered by
-those flags. They do not skip Context Mode.
-Claude is ready after installation. Codex launches fail closed until its six
-Context Mode lifecycle hooks have been reviewed in Codex's official UI. Run
-`ags context review-codex`, choose **Review hooks**, trust only
-`Plugin - context-mode@context-mode`, exit Codex, and retry the original AGS
-command. AGS never uses `--dangerously-bypass-hook-trust` or writes Codex's
-private trust hashes.
-
-Context Mode's databases remain in the Agent-native locations
-(`${CLAUDE_CONFIG_DIR:-~/.claude}/context-mode` and
-`${CODEX_HOME:-~/.codex}/context-mode`). They are not included in AGS
-checkpoint synchronization, because they can contain indexed project and
-conversation data. AGS checkpoints still restore the native Agent session;
-Context Mode then supplies its own continuity data on that machine.
+`--disallowedTools`, `--safe-mode`, `--bare`, and `--strict-mcp-config`: they
+would disable the AGS plugin the launch depends on. Claude `--settings` accepts
+only provider authentication plus model fields; `apiKeyHelper` is limited to
+`/usr/bin/printenv ENV_NAME`. Hooks, MCP, plugin, permission, and tool settings
+fail closed. The same helper restriction is enforced for active managed, user,
+project, and local settings files while their other native Claude fields remain
+available.
 
 Named SFTP storage requires a verified `known_hosts` entry and an SSH server
 shell with `flock` plus standard file utilities. Password mode additionally
@@ -374,10 +323,10 @@ What this installer does for you:
 | Platform targeting | Detects Linux/macOS + x86_64/aarch64 and picks the right artifact |
 | Supply-chain checks | Verifies SHA256 and Sigstore/cosign when available |
 | Download fallback chain | Versioned release -> latest release naming variants -> source build |
-| Airgap install | `--offline <tarball>` uses a local AGS artifact and requires a previously committed, revalidated Context Mode last-good runtime |
+| Airgap install | `--offline <tarball>` installs from a local AGS artifact without network access |
 | Proxy-aware networking | Uses `HTTPS_PROXY` / `HTTP_PROXY` automatically |
 | Shell UX | Installs completions for bash/zsh/fish |
-| Agent setup | Installs mandatory Context Mode, conversion/checkpoint skills, checkpoint hooks, `ags`, and optional `cc`/`cod`/`gmi` wrappers |
+| Agent setup | Installs conversion/checkpoint skills, checkpoint hooks, `ags`, and optional `cc`/`cod`/`gmi` wrappers |
 
 High-value installer flags:
 
@@ -385,30 +334,23 @@ High-value installer flags:
 |---|---|
 | `--verify` | Runs post-install self-test |
 | `--force` | Reinstall even if same version is already present |
-| `--offline <tarball>` | Reinstall AGS without network access after Context Mode has completed one trusted online initialization |
+| `--offline <tarball>` | Reinstall AGS from a local artifact without network access |
 | `--from-source` | Build from source directly |
 | `--system` | Put the binary in `/usr/local/bin`; run as the target non-root user and only when that directory is already writable |
 | `--easy-mode` | Auto-update PATH in shell rc files |
 | `--yes` | Non-interactive prompt acceptance |
-| `--no-configure` | Skip optional agent skill/wrapper setup; Context Mode remains mandatory |
+| `--no-configure` | Skip optional agent skill/wrapper setup |
 | `--no-skill` | Skip Claude/Codex skill installation |
 | `--identity <file>` | Import an existing AGS age identity |
 
 ```bash
 # Examples
 bash install.sh --verify
-# Mandatory Context Mode is per-user, so do not run this example with sudo.
+# AGS configuration is per-user, so do not run this example with sudo.
 bash install.sh --system --easy-mode --yes
 bash install.sh --offline ./casr-x86_64-unknown-linux-musl.tar.xz
 bash install.sh --no-configure --no-skill
 ```
-
-A fresh machine must complete one online `ags init` against the official npm
-registry before it can use `--offline`. AGS deliberately does not trust a
-copied Context Mode runtime cache or its self-carried hashes as a first-use
-trust anchor. After a successful activation, later offline reinstalls and
-initializations revalidate the committed last-good manifest, full runtime tree,
-native binding, and Agent plugin caches before use.
 
 Run `bash install.sh --help` for the full option set.
 

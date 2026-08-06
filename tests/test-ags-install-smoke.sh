@@ -99,34 +99,6 @@ write_rmux_recovery_journal() {
     chmod 600 "$journal"
 }
 
-context_mode_test_runtime_root() {
-    local runtime_home="$1" version="$2"
-    printf '%s/.local/share/ags/context-mode/runtimes/%s/%s\n' \
-        "$runtime_home" "$FAKE_CONTEXT_RUNTIME_TARGET" "$version"
-}
-
-write_context_mode_test_manifest() {
-    local runtime_root="$1" package_root="$runtime_root/node_modules/context-mode"
-    local file
-    {
-        printf 'ags-context-tree-v1\n'
-        while IFS= read -r -d '' file; do
-            printf 'f\t%s\t%s\n' \
-                "$(test_sha256_file "$file")" "${file#"$package_root/"}"
-        done < <(
-            find "$package_root" -type f -print0 | LC_ALL=C sort -z
-        )
-    } > "$runtime_root/ags-files.sha256"
-    chmod 600 "$runtime_root/ags-files.sha256"
-    mkdir -p "$runtime_root/ags-pristine"
-    cp -p -- "$package_root/.claude-plugin/plugin.json" \
-        "$runtime_root/ags-pristine/claude-plugin.json"
-    cp -p -- "$package_root/hooks/hooks.json" \
-        "$runtime_root/ags-pristine/claude-hooks.json"
-    chmod 600 "$runtime_root/ags-pristine/claude-plugin.json" \
-        "$runtime_root/ags-pristine/claude-hooks.json"
-}
-
 artifact_root="$tmp/artifact"
 artifact="$tmp/casr.tar.xz"
 home="$tmp/home"
@@ -152,176 +124,6 @@ chmod 0755 "$artifact_root/bin/rmux" "$artifact_root/bin/rmux-daemon" \
 tar -cJf "$artifact" -C "$artifact_root" \
     casr bin/rmux bin/rmux-daemon libexec/rmux/rmux
 
-prepare_context_mode_runtime() {
-    local runtime_home="$1"
-    local runtime_root
-    runtime_root="$(context_mode_test_runtime_root "$runtime_home" 1.0.169)"
-    local package_root="$runtime_root/node_modules/context-mode"
-    local hook node_abi
-    node_abi="$("$FAKE_REAL_NODE_BINARY" -p 'process.versions.modules')"
-    mkdir -p "$package_root/.claude-plugin" "$package_root/.codex-plugin" \
-        "$package_root/hooks/codex" "$package_root/scripts" \
-        "$package_root/node_modules/better-sqlite3/build/Release" \
-        "$package_root/node_modules/@modelcontextprotocol/sdk"
-    jq -n '{
-      lockfileVersion:3,
-      packages:{
-        "node_modules/context-mode":{
-          version:"1.0.169",
-          resolved:"https://registry.npmjs.org/context-mode/-/context-mode-1.0.169.tgz",
-          integrity:"sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ=="
-        }
-      }
-    }' > "$runtime_root/package-lock.json"
-    printf '%s\n' \
-        '{"name":"context-mode","version":"1.0.169","license":"Elastic-2.0","dependencies":{"better-sqlite3":"test","@modelcontextprotocol/sdk":"test"}}' \
-        > "$package_root/package.json"
-    jq -n '{
-      name:"context-mode",
-      metadata:{version:"1.0.169"},
-      plugins:[{name:"context-mode",source:"./",version:"1.0.169"}]
-    }' > "$package_root/.claude-plugin/marketplace.json"
-    jq -n '{
-      name:"context-mode",version:"1.0.169",skills:"./skills/",
-      mcpServers:{"context-mode":{
-        command:"node",args:["${CLAUDE_PLUGIN_ROOT}/start.mjs"]
-      }}
-    }' > "$package_root/.claude-plugin/plugin.json"
-    jq -n '{
-      name:"context-mode",version:"1.0.169",skills:"./skills/",
-      mcpServers:"./.codex-plugin/mcp.json",
-      hooks:"./.codex-plugin/hooks.json"
-    }' > "$package_root/.codex-plugin/plugin.json"
-    jq -n '{
-      mcpServers:{"context-mode":{
-        command:"node",args:["./start.mjs"],cwd:".",
-        env:{CONTEXT_MODE_PLATFORM:"codex"}
-      }}
-    }' > "$package_root/.codex-plugin/mcp.json"
-    jq -n '{
-      hooks:{
-        PreToolUse:[{
-          matcher:"local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__",
-          hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/pretooluse.mjs\""}]
-        }],
-        PostToolUse:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/posttooluse.mjs\""}]}],
-        SessionStart:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/sessionstart.mjs\""}]}],
-        PreCompact:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/precompact.mjs\""}]}],
-        UserPromptSubmit:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/userpromptsubmit.mjs\""}]}],
-        Stop:[{hooks:[{type:"command",command:"node \"${PLUGIN_ROOT}/hooks/codex/stop.mjs\""}]}]
-      }
-    }' > "$package_root/.codex-plugin/hooks.json"
-    jq -n '{
-      description:"Context Mode test hooks",
-      hooks:{
-        PreToolUse:(
-          ["Bash","WebFetch","Read","Grep","Agent","mcp__"] |
-          map(. as $matcher | {
-            matcher:$matcher,
-            hooks:[{
-              type:"command",
-              command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs\""
-            }]
-          })
-        ),
-        PostToolUse:[{matcher:"",hooks:[{
-          type:"command",
-          command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/posttooluse.mjs\""
-        }]}],
-        SessionStart:[{matcher:"",hooks:[{
-          type:"command",
-          command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs\""
-        }]}],
-        PreCompact:[{matcher:"",hooks:[{
-          type:"command",
-          command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/precompact.mjs\""
-        }]}],
-        UserPromptSubmit:[{matcher:"",hooks:[{
-          type:"command",
-          command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/userpromptsubmit.mjs\""
-        }]}],
-        Stop:[{matcher:"",hooks:[{
-          type:"command",
-          command:"node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.mjs\""
-        }]}]
-      }
-    }' > "$package_root/hooks/hooks.json"
-    printf '// context-mode offline test entrypoint\n' > "$package_root/cli.bundle.mjs"
-    printf '// context-mode offline test MCP entrypoint\n' > "$package_root/start.mjs"
-    printf '// context-mode offline test server\n' > "$package_root/server.bundle.mjs"
-    for hook in pretooluse posttooluse sessionstart precompact userpromptsubmit stop; do
-        printf '// context-mode claude %s hook\n' "$hook" \
-            > "$package_root/hooks/$hook.mjs"
-        printf '// context-mode codex %s hook\n' "$hook" \
-            > "$package_root/hooks/codex/$hook.mjs"
-    done
-    printf '// context-mode codex platform bridge\n' \
-        > "$package_root/hooks/codex/platform.mjs"
-    printf '// context-mode dependency provision test\n' \
-        > "$package_root/hooks/ensure-deps.mjs"
-    printf '// context-mode native healing test\n' \
-        > "$package_root/scripts/heal-better-sqlite3.mjs"
-    cat > "$package_root/node_modules/better-sqlite3/package.json" <<'EOF'
-{"name":"better-sqlite3","version":"0.0.0-test","main":"index.js","dependencies":{}}
-EOF
-    cat > "$package_root/node_modules/better-sqlite3/index.js" <<'EOF'
-class TestDatabase {
-  constructor() {}
-  exec(statement) {
-    if (!statement.includes("fts5")) throw new Error("expected FTS5 probe");
-  }
-  close() {}
-}
-module.exports = TestDatabase;
-EOF
-    cat > "$package_root/node_modules/@modelcontextprotocol/sdk/package.json" <<'EOF'
-{"name":"@modelcontextprotocol/sdk","version":"0.0.0-test","exports":{".":{"import":"./dist/esm/index.js","require":"./dist/cjs/index.js"}},"dependencies":{}}
-EOF
-    printf 'test native binding\n' \
-        > "$package_root/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-    printf 'test ABI binding\n' \
-        > "$package_root/node_modules/better-sqlite3/build/Release/better_sqlite3.abi${node_abi}.node"
-    write_context_mode_test_manifest "$runtime_root"
-}
-
-prepare_context_mode_last_good() {
-    local runtime_home="$1"
-    local runtime_root
-    runtime_root="$(context_mode_test_runtime_root "$runtime_home" 1.0.169)"
-    local package_root="$runtime_root/node_modules/context-mode"
-    local files_sha256
-    prepare_context_mode_runtime "$runtime_home"
-    files_sha256="$(test_sha256_file "$runtime_root/ags-files.sha256")"
-    mkdir -p "$runtime_home/.local/state/ags"
-    jq -n --arg root "$package_root" --arg files_sha256 "$files_sha256" \
-      --arg platform "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
-      --arg arch "$FAKE_CONTEXT_RUNTIME_ARCH" \
-      --argjson node_abi "$FAKE_CONTEXT_RUNTIME_NODE_ABI" \
-      --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" '{
-      schema:2,
-      managed_by:"ags",
-      activation_id:"ags-test-last-good",
-      version:"1.0.169",
-      source:{
-        type:"npm",
-        package:"context-mode",
-        integrity:"sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ==",
-        files_sha256:$files_sha256
-      },
-      runtime:{
-        platform:$platform,
-        arch:$arch,
-        node_abi:$node_abi,
-        target:$target
-      },
-      package_root:$root,
-      health:{mode:"offline-index-search",status:"passed"},
-      providers:{}
-    }' > "$runtime_home/.local/state/ags/context-mode.json"
-    chmod 600 "$runtime_home/.local/state/ags/context-mode.json"
-}
-
-prepare_context_mode_last_good "$home"
 cat > "$offline_guard_bin/curl" <<'EOF'
 #!/bin/sh
 : > "${OFFLINE_NETWORK_MARKER:?}"
@@ -572,26 +374,6 @@ if grep -Fq 'AGE-SECRET-KEY-' "$tmp/first.out" "$tmp/first.err"; then
     exit 1
 fi
 [[ ! -e "$offline_network_marker" ]]
-context_runtime="$(context_mode_test_runtime_root "$home" 1.0.169)"
-context_root="$context_runtime/node_modules/context-mode"
-jq -e '.name == "context-mode" and .version == "1.0.169"' \
-    "$context_root/package.json" >/dev/null
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin \
-    codex-hooks; do
-    [[ -f "$home/.local/state/context-mode-fake/$marker" ]]
-done
-grep -Fq 'CLAUDE_CONTEXT=plugin marketplace add ' "$home/.context-mode-test.log"
-grep -Fq 'CLAUDE_CONTEXT=plugin install context-mode@context-mode --scope user' \
-    "$home/.context-mode-test.log"
-grep -Fq 'CODEX_CONTEXT=plugin marketplace add ' "$home/.context-mode-test.log"
-grep -Fq 'CODEX_CONTEXT=plugin add context-mode@context-mode --json' \
-    "$home/.context-mode-test.log"
-grep -Fqx 'CODEX_CONTEXT=features enable hooks' "$home/.context-mode-test.log"
-if grep -Fq -- '--dangerously-bypass-hook-trust' \
-    "$home/.context-mode-test.log" "$tmp/first.out" "$tmp/first.err"; then
-    printf 'installer bypassed Codex hook trust\n' >&2
-    exit 1
-fi
 
 identity="$home/.config/ags/identity.agekey"
 config="$home/.local/state/ags/storage.json"
@@ -703,7 +485,6 @@ rollback_home="$tmp/rollback-home"
 rollback_bin="$tmp/rollback-bin"
 rollback_state="$rollback_home/.local/state/context-mode-fake"
 mkdir -p "$rollback_home" "$rollback_bin"
-prepare_context_mode_last_good "$rollback_home"
 rollback_context_sha="$(
     test_sha256_file "$rollback_home/.local/state/ags/context-mode.json"
 )"
@@ -724,22 +505,13 @@ if env HOME="$rollback_home" \
     printf 'installer ignored a mandatory Context Mode health failure\n' >&2
     exit 1
 fi
-grep -Fq 'Context Mode initialization failed for codex' "$tmp/rollback.err"
 [[ "$rollback_binary_sha" == "$(sha256sum "$rollback_bin/casr" | cut -d' ' -f1)" ]]
 [[ "$("$rollback_bin/casr")" == preexisting-casr ]]
 [[ ! -e "$rollback_bin/rmux" && ! -e "$rollback_bin/rmux-daemon" ]]
 [[ ! -e "$rollback_bin/libexec/rmux/rmux" ]]
-[[ -d "$(context_mode_test_runtime_root "$rollback_home" 1.0.169)" ]]
-for marker in claude-marketplace claude-plugin codex-marketplace codex-plugin; do
-    [[ ! -e "$rollback_state/$marker" ]]
-done
 [[ ! -e "$rollback_home/.codex/config.toml" ]]
-[[ ! -e "$rollback_home/.local/state/ags/context-mode.pending.json" ]]
 [[ ! -e "$rollback_home/.config/ags/identity.agekey" ]]
 [[ ! -e "$rollback_home/.local/state/ags/storage.json" ]]
-[[ "$rollback_context_sha" == "$(
-    test_sha256_file "$rollback_home/.local/state/ags/context-mode.json"
-)" ]]
 [[ ! -e "$rollback_bin/.casr.install-transaction.json" ]]
 [[ ! -e "$rollback_bin/.rmux-install-transaction.json" ]]
 [[ -z "$(find "$rollback_bin" -type f \
@@ -753,7 +525,6 @@ interrupted_stage="$interrupted_bin/.casr.install.recovery"
 interrupted_journal="$interrupted_bin/.casr.install-transaction.json"
 interrupted_missing_artifact="$tmp/interrupted-missing.tar.xz"
 mkdir -p "$interrupted_home" "$interrupted_bin"
-prepare_context_mode_last_good "$interrupted_home"
 printf '%s\n' '#!/bin/sh' 'printf "recovered-casr\n"' \
     > "$interrupted_backup"
 chmod 755 "$interrupted_backup"
@@ -821,7 +592,6 @@ rmux_partial_helper="$rmux_partial_bin/libexec/rmux/rmux"
 rmux_partial_journal="$rmux_partial_bin/.rmux-install-transaction.json"
 rmux_partial_missing="$tmp/rmux-partial-missing.tar.xz"
 mkdir -p "$rmux_partial_home" "$(dirname "$rmux_partial_helper")"
-prepare_context_mode_last_good "$rmux_partial_home"
 rmux_partial_destinations=(
     "$rmux_partial_bin/rmux"
     "$rmux_partial_bin/rmux-daemon"
@@ -892,7 +662,6 @@ rmux_resume_binary_backup="$rmux_resume_bin/.casr.rollback.recovery"
 rmux_resume_binary_stage="$rmux_resume_bin/.casr.install.recovery"
 rmux_resume_missing="$tmp/rmux-resume-missing.tar.xz"
 mkdir -p "$rmux_resume_home" "$(dirname "$rmux_resume_helper")"
-prepare_context_mode_last_good "$rmux_resume_home"
 rmux_resume_destinations=(
     "$rmux_resume_bin/rmux"
     "$rmux_resume_bin/rmux-daemon"
@@ -972,11 +741,11 @@ env HOME="$rmux_resume_home" \
     "$project_root/install.sh" --offline "$rmux_resume_missing" \
     --dest "$rmux_resume_bin" --no-verify \
     > "$tmp/rmux-resume.out" 2> "$tmp/rmux-resume.err"
-grep -Fq 'Recovering interrupted RMUX and Context Mode installation' \
+grep -Fq 'Recovering interrupted RMUX installation' \
     "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-grep -Fq 'Resuming the interrupted casr, RMUX, and Context Mode installation' \
+grep -Fq 'Resuming the interrupted casr installation' \
     "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-grep -Fq 'Finishing the recovered casr, RMUX, and Context Mode transaction' \
+grep -Fq 'Finishing the recovered casr transaction' \
     "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
 [[ ! -e "$rmux_resume_missing" && ! -e "$offline_network_marker" ]]
 [[ "$(test_sha256_file "$rmux_resume_bin/casr")" == \
@@ -1000,7 +769,6 @@ jq -e '
 new_failure_home="$tmp/new-failure-home"
 new_failure_bin="$tmp/new-failure-bin"
 mkdir -p "$new_failure_home" "$new_failure_bin"
-prepare_context_mode_last_good "$new_failure_home"
 new_failure_context_sha="$(
     test_sha256_file "$new_failure_home/.local/state/ags/context-mode.json"
 )"
@@ -1033,7 +801,6 @@ fi
 unmanaged_home="$tmp/unmanaged-home"
 unmanaged_bin="$tmp/unmanaged-bin"
 mkdir -p "$unmanaged_home" "$unmanaged_bin"
-prepare_context_mode_last_good "$unmanaged_home"
 printf 'unmanaged\n' > "$unmanaged_bin/ags"
 env HOME="$unmanaged_home" \
     XDG_CONFIG_HOME="$unmanaged_home/.config" \
@@ -1054,7 +821,6 @@ hook_outside="$tmp/hook-outside.json"
 mkdir -p "$symlink_home/.codex/skills" "$symlink_home/.claude" \
     "$skill_outside" "$symlink_tools"
 ln -s "$offline_guard_bin/node" "$symlink_tools/node"
-prepare_context_mode_last_good "$symlink_home"
 printf '{"outside":true}\n' > "$hook_outside"
 ln -s "$skill_outside" "$symlink_home/.codex/skills/ags"
 ln -s "$hook_outside" "$symlink_home/.claude/settings.json"
@@ -1072,50 +838,6 @@ grep -Fqx '{"outside":true}' "$hook_outside"
 grep -Fq 'Checkpoint skill path contains a symbolic link' "$tmp/symlink.out"
 grep -Fq 'Checkpoint hook path contains a symbolic link' "$tmp/symlink.out"
 
-missing_context_home="$tmp/missing-context-home"
-missing_context_bin="$tmp/missing-context-bin"
-mkdir -p "$missing_context_home" "$missing_context_bin"
-if env HOME="$missing_context_home" \
-    XDG_CONFIG_HOME="$missing_context_home/.config" \
-    XDG_DATA_HOME="$missing_context_home/.local/share" \
-    XDG_STATE_HOME="$missing_context_home/.local/state" \
-    PATH="$offline_guard_bin:$missing_context_bin:$PATH" \
-    OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-ags.1 \
-    "$project_root/install.sh" --offline "$artifact" --dest "$missing_context_bin" \
-    --no-verify --quiet > "$tmp/missing-context.out" \
-    2> "$tmp/missing-context.err"; then
-    printf 'offline installer accepted a missing mandatory Context Mode runtime\n' >&2
-    exit 1
-fi
-grep -Fq 'offline Context Mode initialization requires a validated last-good runtime; a fresh install must contact the official npm registry once' \
-    "$tmp/missing-context.err"
-[[ ! -e "$missing_context_bin/casr" ]]
-[[ ! -e "$missing_context_bin/.casr.install-transaction.json" ]]
-[[ -z "$(find "$missing_context_bin" -maxdepth 1 -type f \
-    -name '.casr.rollback.*' -print -quit)" ]]
-
-old_node_home="$tmp/old-node-home"
-old_node_bin="$tmp/old-node-bin"
-mkdir -p "$old_node_home" "$old_node_bin"
-prepare_context_mode_last_good "$old_node_home"
-if env HOME="$old_node_home" \
-    XDG_CONFIG_HOME="$old_node_home/.config" \
-    XDG_DATA_HOME="$old_node_home/.local/share" \
-    XDG_STATE_HOME="$old_node_home/.local/state" \
-    PATH="$offline_guard_bin:$old_node_bin:$PATH" \
-    OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    FAKE_NODE_VERSION=v22.4.0 \
-    VERSION=v0.3.0-ags.1 \
-    "$project_root/install.sh" --offline "$artifact" --dest "$old_node_bin" \
-    --no-verify --quiet > "$tmp/old-node.out" 2> "$tmp/old-node.err"; then
-    printf 'installer accepted Node older than Context Mode requires\n' >&2
-    exit 1
-fi
-grep -Fq 'Context Mode requires Node.js 22.5.0 or newer' \
-    "$tmp/old-node.err"
-[[ ! -e "$old_node_bin/casr" ]]
-
 online_home="$tmp/online-home"
 online_bin="$tmp/online-bin"
 online_tools="$tmp/online-tools"
@@ -1127,162 +849,6 @@ install -m 0755 "$artifact_root/bin/rmux" "$online_bin/rmux"
 install -m 0755 "$artifact_root/bin/rmux-daemon" "$online_bin/rmux-daemon"
 install -m 0755 "$artifact_root/libexec/rmux/rmux" \
     "$online_bin/libexec/rmux/rmux"
-ln -s "$FAKE_REAL_NODE_BINARY" "$online_tools/node-real"
-prepare_context_mode_runtime "$online_fixture_home"
-cat > "$online_tools/npm" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$*" >> "${FAKE_NPM_LOG:?}"
-case "${1:-}" in
-    view)
-        jq -n '{
-          version:"1.0.169",
-          "dist.tarball":"https://registry.npmjs.org/context-mode/-/context-mode-1.0.169.tgz",
-          "dist.integrity":"sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ==",
-          license:"Elastic-2.0"
-        }'
-        ;;
-    install)
-        shift
-        prefix=
-        package=
-        ignore_scripts=0
-        while (( $# > 0 )); do
-            case "$1" in
-                --prefix)
-                    prefix="$2"
-                    shift 2
-                    ;;
-                --ignore-scripts)
-                    ignore_scripts=1
-                    shift
-                    ;;
-                --registry=*|--no-audit|--no-fund|--save-exact)
-                    shift
-                    ;;
-                *)
-                    package="$1"
-                    shift
-                    ;;
-            esac
-        done
-        [[ "$prefix" == /* &&
-           "$package" == context-mode@1.0.169 &&
-           "$ignore_scripts" == 1 ]]
-        mkdir -p "$prefix"
-        cp -a "${FAKE_NPM_RUNTIME_SOURCE:?}/." "$prefix/"
-        cp -a \
-            "$prefix/node_modules/context-mode/node_modules/." \
-            "$prefix/node_modules/"
-        mkdir -p "$prefix/node_modules/.bin"
-        ln -s ../context-mode/cli.bundle.mjs \
-            "$prefix/node_modules/.bin/context-mode"
-        printf '{"lockfileVersion":3}\n' \
-            > "$prefix/node_modules/.package-lock.json"
-        ;;
-    *) exit 64 ;;
-esac
-EOF
-chmod +x "$online_tools/npm"
-cat > "$online_tools/curl" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-destination=
-while (( $# > 0 )); do
-    case "$1" in
-        -o)
-            destination="$2"
-            shift 2
-            ;;
-        *)
-            shift
-            ;;
-    esac
-done
-[[ -n "$destination" ]]
-cp -- "${FAKE_ONLINE_ARTIFACT:?}" "$destination"
-EOF
-chmod +x "$online_tools/curl"
-cat > "$online_tools/node" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-if [[ "${1:-}" == --version ]]; then
-    printf 'v22.5.0\n'
-    exit
-fi
-script="${1:-}"
-shift || true
-if [[ "$script" == - ]]; then
-    real_node="${FAKE_REAL_NODE_BINARY:-${BASH_SOURCE[0]%/*}/node-real}"
-    exec "$real_node" - "$@"
-fi
-if [[ "$script" == */context-mode/hooks/ensure-deps.mjs ]]; then
-    real_node="${FAKE_REAL_NODE_BINARY:-${BASH_SOURCE[0]%/*}/node-real}"
-    exec "$real_node" "$script" "$@"
-fi
-[[ "$script" == */context-mode/cli.bundle.mjs ]]
-case "${1:-}" in
-    --help)
-        printf 'context-mode online install fixture\n'
-        ;;
-    doctor)
-        printf '%s\n' \
-            'Storage session: PASS' \
-            'Storage content: PASS' \
-            'Storage stats: PASS' \
-            'Server test: PASS' \
-            'FTS5 / SQLite: PASS' \
-            'Plugin enabled: PASS' \
-            'PreToolUse hook: PASS' \
-            'PostToolUse hook: PASS' \
-            'SessionStart hook: PASS' \
-            'PreCompact hook: PASS' \
-            'UserPromptSubmit hook: PASS' \
-            'Stop hook: PASS' \
-            'Codex hooks feature flag: PASS' \
-            'Codex plugin root: PASS'
-        ;;
-    *)
-        exit 64
-        ;;
-esac
-EOF
-chmod +x "$online_tools/node"
-cp -- "$offline_guard_bin/claude" "$online_tools/claude"
-cp -- "$offline_guard_bin/codex" "$online_tools/codex"
-chmod +x "$online_tools/claude" "$online_tools/codex"
-env HOME="$online_home" \
-    XDG_CONFIG_HOME="$online_home/.config" \
-    XDG_DATA_HOME="$online_home/.local/share" \
-    XDG_STATE_HOME="$online_home/.local/state" \
-    PATH="$online_tools:$online_bin:$PATH" \
-    FAKE_NPM_LOG="$online_npm_log" \
-    FAKE_NPM_RUNTIME_SOURCE="$(
-        context_mode_test_runtime_root "$online_fixture_home" 1.0.169
-    )" \
-    FAKE_ONLINE_ARTIFACT="$artifact" \
-    ARTIFACT_URL=https://example.invalid/casr.tar.xz \
-    VERSION=v0.3.0-ags.1 \
-    "$project_root/install.sh" --dest "$online_bin" --no-verify \
-    --no-configure --no-skill --quiet \
-    > "$tmp/online.out" 2> "$tmp/online.err"
-grep -Fqx \
-    'view --registry=https://registry.npmjs.org context-mode@latest version dist.tarball dist.integrity license --json' \
-    "$online_npm_log"
-grep -Eq \
-    '^install --registry=https://registry\.npmjs\.org --prefix .*/\.context-mode-1\.0\.169\.install\.[^ ]+ --no-audit --no-fund --ignore-scripts --save-exact context-mode@1\.0\.169$' \
-    "$online_npm_log"
-online_context_runtime="$(
-    context_mode_test_runtime_root "$online_home" 1.0.169
-)"
-[[ -x "$online_bin/casr" ]]
-[[ -f "$online_context_runtime/ags-files.sha256" ]]
-[[ -f "$online_context_runtime/node_modules/context-mode/server.bundle.mjs" ]]
-jq -e '
-    .health == {mode:"doctor",status:"passed"} and
-    .source.package == "context-mode" and
-    (.source.files_sha256 | type) == "string"
-' "$online_home/.local/state/ags/context-mode.json" >/dev/null
 
 if (( EUID == 0 )); then
     if env HOME="$tmp/system-root-home" \
