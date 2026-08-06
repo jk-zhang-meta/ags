@@ -67,8 +67,6 @@ NO_SKILL=0
 FORCE_INSTALL=0
 OFFLINE_TARBALL=""
 CHECKPOINT_IDENTITY=""
-CODEXT_STATUS="not-attempted"
-CODEXT_RELEASE_STAMP="${XDG_STATE_HOME:-$HOME/.local/state}/ags/codext-release"
 INSTALL_TRANSACTION_FILE=""
 INSTALL_TRANSACTION_ACTIVE=0
 INSTALL_CORE_COMMITTED=0
@@ -303,7 +301,8 @@ detect_providers() {
   fi
 
   # Codex CLI (cod)
-  if [[ -d "$CODEX_CONFIG_ROOT" ]] || command -v codex &>/dev/null; then
+  if [[ -d "$CODEX_CONFIG_ROOT" ]] || command -v codex &>/dev/null ||
+     command -v codext &>/dev/null; then
     DETECTED_PROVIDERS+=("codex")
     CODEX_VERSION=$(try_version codex)
   fi
@@ -545,7 +544,8 @@ configure_agent_skills() {
     CLAUDE_SKILL_STATUS="not-detected"
   fi
 
-  if has_provider "codex" || [ -d "$CODEX_CONFIG_ROOT" ] || command -v codex >/dev/null 2>&1; then
+  if has_provider "codex" || [ -d "$CODEX_CONFIG_ROOT" ] ||
+   command -v codex >/dev/null 2>&1 || command -v codext >/dev/null 2>&1; then
     install_skill_for_agent "Codex" "$CODEX_CONFIG_ROOT/skills" CODEX_SKILL_STATUS
   else
     CODEX_SKILL_STATUS="not-detected"
@@ -760,44 +760,6 @@ run_checkpoint_runtime() {
 }
 
 
-# Bring codext to the current release, installing it if this host has none.
-#
-# codext is Codex with the credential pool wired in, and AGS launches it in
-# preference to stock Codex whenever it is on PATH — so an install that skips it
-# leaves every session quietly running on the machine's own account.
-#
-# It rides its own release train, which is why this runs after the core install
-# transaction has been committed and can only report, never fail the install.
-# `ags codext-update` is the same function `ags update` calls; reaching for
-# `ags update` here instead would also self-update casr and undo an explicit
-# `--version` seconds after it landed.
-configure_codext_only() {
-  if [ "$NO_CONFIGURE" -eq 1 ]; then
-    CODEXT_STATUS="skipped (--no-configure)"
-    return 0
-  fi
-  if [ -n "$OFFLINE_TARBALL" ]; then
-    CODEXT_STATUS="skipped (--offline)"
-    return 0
-  fi
-  run_checkpoint_runtime codext-update || true
-  # Decide who owns the name `codex`, now that codext is on disk.
-  #
-  # Here and nowhere else: this is the one step allowed to ask, and to move an
-  # existing codex aside if the answer is yes. `ags init` deliberately only
-  # fills an empty name — displacing someone's binary is not something a
-  # re-runnable command should ever do.
-  run_checkpoint_runtime codex-name || true
-  # The stamp, not `codext --version`: that reports the upstream Codex version
-  # the fork is built on, so two codext releases can read as the same thing.
-  if [ -s "$CODEXT_RELEASE_STAMP" ]; then
-    CODEXT_STATUS="$(head -n 1 "$CODEXT_RELEASE_STAMP")"
-  elif command -v codext >/dev/null 2>&1; then
-    CODEXT_STATUS="installed (release unknown)"
-  else
-    CODEXT_STATUS="not installed"
-  fi
-}
 
 configure_checkpoints() {
   local init_output
@@ -2105,7 +2067,6 @@ if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
   }
 fi
 INSTALL_CORE_COMMITTED=1
-configure_codext_only
 maybe_add_path
 maybe_install_completions
 configure_agents
@@ -2154,7 +2115,6 @@ summary_lines=(
   "AGS Claude skill: $AGS_CLAUDE_SKILL_STATUS"
   "AGS hooks:        $AGS_HOOK_STATUS"
   "AGS vault:        $AGS_INIT_STATUS"
-  "codext:           $CODEXT_STATUS"
   ""
   "Get started:"
   "  casr providers"

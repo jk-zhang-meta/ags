@@ -10,21 +10,6 @@ test_tmp_root=/tmp
 tmp="$(mktemp -d "$test_tmp_root/ags-install-smoke.XXXXXX")"
 export FAKE_REAL_NODE_BINARY="$(command -v node)"
 [[ -x "$FAKE_REAL_NODE_BINARY" ]]
-export FAKE_CONTEXT_RUNTIME_PLATFORM="$(
-    "$FAKE_REAL_NODE_BINARY" -p 'process.platform'
-)"
-export FAKE_CONTEXT_RUNTIME_ARCH="$(
-    "$FAKE_REAL_NODE_BINARY" -p 'process.arch'
-)"
-export FAKE_CONTEXT_RUNTIME_NODE_ABI="$(
-    "$FAKE_REAL_NODE_BINARY" -p 'process.versions.modules'
-)"
-export FAKE_CONTEXT_RUNTIME_TARGET="$(
-    printf '%s-%s-node%s' \
-        "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
-        "$FAKE_CONTEXT_RUNTIME_ARCH" \
-        "$FAKE_CONTEXT_RUNTIME_NODE_ABI"
-)"
 
 cleanup() {
     case "$tmp" in
@@ -143,208 +128,20 @@ if [[ "$script" == - ]]; then
     real_node="${FAKE_REAL_NODE_BINARY:-${BASH_SOURCE[0]%/*}/node-real}"
     exec "$real_node" - "$@"
 fi
-if [[ "$script" == */context-mode/hooks/ensure-deps.mjs ]]; then
-    real_node="${FAKE_REAL_NODE_BINARY:-${BASH_SOURCE[0]%/*}/node-real}"
-    exec "$real_node" "$script" "$@"
-fi
-[[ "$script" == */context-mode/cli.bundle.mjs ]] || exit 64
-printf 'CONTEXT_MODE=%s:%s\n' "${CONTEXT_MODE_PLATFORM:-unknown}" "${1:-}" \
-    >> "$HOME/.context-mode-test.log"
-case "${1:-}" in
-    index)
-        if [[ "${FAKE_CONTEXT_HEALTH_FAIL:-}" == "${CONTEXT_MODE_PLATFORM:-}" ]]; then
-            exit 65
-        fi
-        source_file="${2:?}"
-        shift 2
-        source_label=
-        project=
-        while (( $# > 0 )); do
-            case "$1" in
-                --source) source_label="${2:?}"; shift 2 ;;
-                --project) project="${2:?}"; shift 2 ;;
-                *) exit 64 ;;
-            esac
-        done
-        index_state="${CONTEXT_MODE_DIR:?}/fake-index.json"
-        title="$(sed -n 's/^# //p' "$source_file" | head -n 1)"
-        content="$(sed -n '3p' "$source_file")"
-        jq -n --arg title "$title" --arg content "$content" \
-            --arg source "$source_label" --arg project "$project" \
-            '{title:$title,content:$content,source:$source,project:$project}' \
-            > "$index_state"
-        printf 'Indexed 1 sections from %s\nSource: %s\nProject: %s\n' \
-            "$source_file" "$source_label" "$project"
-        ;;
-    search)
-        query="${2:?}"
-        shift 2
-        source_label=
-        project=
-        while (( $# > 0 )); do
-            case "$1" in
-                --source) source_label="${2:?}"; shift 2 ;;
-                --project) project="${2:?}"; shift 2 ;;
-                --limit) [[ "${2:?}" == 1 ]]; shift 2 ;;
-                *) exit 64 ;;
-            esac
-        done
-        index_state="${CONTEXT_MODE_DIR:?}/fake-index.json"
-        jq -e --arg query "$query" --arg source "$source_label" \
-            --arg project "$project" '
-              .source == $source and .project == $project and
-              (.content | contains($query))
-            ' "$index_state" >/dev/null
-        jq -r '"## 1. " + .title, "Source: " + .source, .content' \
-            "$index_state"
-        ;;
-    *) exit 64 ;;
-esac
+real_node="${FAKE_REAL_NODE_BINARY:-${BASH_SOURCE[0]%/*}/node-real}"
+exec "$real_node" "$script" "$@"
 EOF
 chmod +x "$offline_guard_bin/node"
 cat > "$offline_guard_bin/claude" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-state="$HOME/.local/state/context-mode-fake"
-root="$HOME/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/1.0.169/node_modules/context-mode"
-if [[ "${1:-}" == --version ]]; then printf 'claude-test 1.0\n'; exit; fi
-if [[ " $* " == *" --include-hook-events "* ]]; then
-    printf '%s\n' \
-        '{"type":"system","subtype":"hook_response","hook_event":"SessionStart","outcome":"success","exit_code":0,"output":"<context_window_protection>ready</context_window_protection>"}' \
-        '{"type":"system","subtype":"init","mcp_servers":[{"name":"plugin:context-mode:context-mode","status":"connected"}],"tools":["mcp__plugin_context-mode_context-mode__ctx_execute","mcp__plugin_context-mode_context-mode__ctx_search"],"plugins":[{"source":"context-mode@context-mode","version":"1.0.169"}]}'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == list ]]; then
-    [[ -e "$state/claude-marketplace" ]] &&
-        jq -n --arg root "${FAKE_CLAUDE_CONTEXT_MARKETPLACE_ROOT:-$root}" \
-            '[{name:"context-mode",source:"directory",path:$root,installLocation:$root}]' ||
-        printf '[]\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == add ]]; then
-    mkdir -p "$state"; : > "$state/claude-marketplace"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == remove ]]; then
-    rm -f -- "$state/claude-marketplace"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
-    cache_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/context-mode/context-mode/1.0.169"
-    [[ -e "$state/claude-plugin" ]] &&
-        jq -n --arg root "$cache_root" \
-            '[{id:"context-mode@context-mode",version:"1.0.169",scope:"user",enabled:true,installPath:$root}]' ||
-        printf '[]\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && ( "${2:-}" == install || "${2:-}" == enable ) ]]; then
-    mkdir -p "$state"; : > "$state/claude-plugin"
-    cache_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/cache/context-mode/context-mode/1.0.169"
-    mkdir -p "$cache_root"
-    cp -a -- "$root/." "$cache_root/"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == uninstall ]]; then
-    rm -f -- "$state/claude-plugin"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == disable ]]; then
-    rm -f -- "$state/claude-plugin"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-exit 64
+printf 'FAKE_CLAUDE %s\n' "$*"
 EOF
 chmod +x "$offline_guard_bin/claude"
 cat > "$offline_guard_bin/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-state="$HOME/.local/state/context-mode-fake"
-root="$HOME/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/1.0.169/node_modules/context-mode"
-if [[ "${1:-}" == --version ]]; then printf 'codex-test 1.0\n'; exit; fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == list ]]; then
-    [[ -e "$state/codex-marketplace" ]] &&
-        jq -n --arg root "${FAKE_CODEX_CONTEXT_MARKETPLACE_ROOT:-$root}" '{
-          marketplaces:[{name:"context-mode",root:$root,
-            marketplaceSource:{sourceType:"local",source:$root}}]
-        }' ||
-        printf '{"marketplaces":[]}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == add ]]; then
-    mkdir -p "$state"; : > "$state/codex-marketplace"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == remove ]]; then
-    rm -f -- "$state/codex-marketplace"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
-    [[ -e "$state/codex-plugin" ]] &&
-        jq -n --arg root "$root" '{
-          installed:[{pluginId:"context-mode@context-mode",version:"1.0.169",
-            installed:true,enabled:true,source:{source:"local",path:$root},
-            marketplaceSource:{sourceType:"local",source:$root}}],
-          available:[]
-        }' ||
-        printf '{"installed":[],"available":[]}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == add ]]; then
-    mkdir -p "$state"; : > "$state/codex-plugin"
-    cache_root="${CODEX_HOME:-$HOME/.codex}/plugins/cache/context-mode/context-mode/1.0.169"
-    mkdir -p "$cache_root"
-    cp -a -- "$root/." "$cache_root/"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == remove ]]; then
-    rm -f -- "$state/codex-plugin"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == features && "${2:-}" == list ]]; then
-    [[ -e "$state/codex-hooks" ||
-       "${FAKE_CONTEXT_HOOKS_DEFAULT_TRUE:-0}" == 1 ]] &&
-        printf 'hooks stable true\n' ||
-        printf 'hooks stable false\n'
-    printf 'plugin_hooks removed false\n'
-    exit
-fi
-if [[ "${1:-}" == features && "${2:-}" == enable && "${3:-}" == hooks ]]; then
-    config_home="${CODEX_HOME:-$HOME/.codex}"
-    config_file="$config_home/config.toml"
-    mkdir -p "$config_home"
-    if [[ ! -f "$config_file" ]] ||
-       ! grep -Fqx 'hooks = true' "$config_file"; then
-        if [[ -s "$config_file" ]]; then
-            printf '\n' >> "$config_file"
-        fi
-        printf '[features]\nhooks = true\n' >> "$config_file"
-    fi
-    if [[ "${AGS_CONTEXT_MODE_CONFIG_PROBE:-0}" == 1 ]]; then
-        exit
-    fi
-    mkdir -p "$state"; : > "$state/codex-hooks"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-if [[ "${1:-}" == features && "${2:-}" == disable && "${3:-}" == hooks ]]; then
-    rm -f -- "$state/codex-hooks"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$HOME/.context-mode-test.log"
-    exit
-fi
-exit 64
+printf 'FAKE_CODEX %s\n' "$*"
 EOF
 chmod +x "$offline_guard_bin/codex"
 printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}\n' \
@@ -357,7 +154,6 @@ run_installer() {
         XDG_DATA_HOME="$home/.local/share" \
         XDG_STATE_HOME="$home/.local/state" \
         PATH="$offline_guard_bin:$bin_dir:$PATH" \
-        FAKE_CONTEXT_HOOKS_DEFAULT_TRUE=1 \
         OFFLINE_NETWORK_MARKER="$offline_network_marker" \
         VERSION=v0.3.0-ags.1 \
         "$project_root/install.sh" --offline "$artifact" --dest "$bin_dir" \
@@ -393,24 +189,6 @@ jq -e --arg vault "$vault" --arg identity "$identity" '
     .version == 4 and .local_path == $vault and
     .encryption == {type:"age-x25519", identity_file:$identity}
 ' "$config" >/dev/null
-jq -e --arg root "$context_root" \
-    --arg platform "$FAKE_CONTEXT_RUNTIME_PLATFORM" \
-    --arg arch "$FAKE_CONTEXT_RUNTIME_ARCH" \
-    --argjson node_abi "$FAKE_CONTEXT_RUNTIME_NODE_ABI" \
-    --arg target "$FAKE_CONTEXT_RUNTIME_TARGET" \
-    --arg files_sha256 "$(
-        test_sha256_file "$context_runtime/ags-files.sha256"
-    )" '
-    .schema == 2 and .version == "1.0.169" and .package_root == $root and
-    .runtime == {
-      platform:$platform,arch:$arch,node_abi:$node_abi,target:$target
-    } and
-    .source.files_sha256 == $files_sha256 and
-    .health == {mode:"offline-index-search",status:"passed"} and
-    .providers.claude.configured == true and
-    .providers.codex.configured == true and
-    .providers.codex.trust == "official-review-required"
-' "$home/.local/state/ags/context-mode.json" >/dev/null
 
 for root in "$home/.codex/skills" "$home/.claude/skills"; do
     cmp "$project_root/plugins/ags/skills/ags/SKILL.md" "$root/ags/SKILL.md"
@@ -472,52 +250,6 @@ if ! run_installer > "$tmp/second.out" 2> "$tmp/second.err"; then
 fi
 [[ "$identity_sha" == "$(sha256sum "$identity" | cut -d' ' -f1)" ]]
 jq -e --arg vault "$custom_vault" '.local_path == $vault' "$config" >/dev/null
-[[ "$(grep -c '^CLAUDE_CONTEXT=plugin marketplace add ' \
-    "$home/.context-mode-test.log")" == 1 ]]
-[[ "$(grep -c '^CLAUDE_CONTEXT=plugin install ' \
-    "$home/.context-mode-test.log")" == 1 ]]
-[[ "$(grep -c '^CODEX_CONTEXT=plugin marketplace add ' \
-    "$home/.context-mode-test.log")" == 1 ]]
-[[ "$(grep -c '^CODEX_CONTEXT=plugin add ' \
-    "$home/.context-mode-test.log")" == 1 ]]
-
-rollback_home="$tmp/rollback-home"
-rollback_bin="$tmp/rollback-bin"
-rollback_state="$rollback_home/.local/state/context-mode-fake"
-mkdir -p "$rollback_home" "$rollback_bin"
-rollback_context_sha="$(
-    test_sha256_file "$rollback_home/.local/state/ags/context-mode.json"
-)"
-printf '%s\n' '#!/bin/sh' 'printf "preexisting-casr\n"' \
-    > "$rollback_bin/casr"
-chmod +x "$rollback_bin/casr"
-rollback_binary_sha="$(sha256sum "$rollback_bin/casr" | cut -d' ' -f1)"
-if env HOME="$rollback_home" \
-    XDG_CONFIG_HOME="$rollback_home/.config" \
-    XDG_DATA_HOME="$rollback_home/.local/share" \
-    XDG_STATE_HOME="$rollback_home/.local/state" \
-    PATH="$offline_guard_bin:$rollback_bin:$PATH" \
-    OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    FAKE_CONTEXT_HEALTH_FAIL=codex \
-    VERSION=v0.3.0-ags.1 \
-    "$project_root/install.sh" --offline "$artifact" --dest "$rollback_bin" \
-    --no-verify --quiet > "$tmp/rollback.out" 2> "$tmp/rollback.err"; then
-    printf 'installer ignored a mandatory Context Mode health failure\n' >&2
-    exit 1
-fi
-[[ "$rollback_binary_sha" == "$(sha256sum "$rollback_bin/casr" | cut -d' ' -f1)" ]]
-[[ "$("$rollback_bin/casr")" == preexisting-casr ]]
-[[ ! -e "$rollback_bin/rmux" && ! -e "$rollback_bin/rmux-daemon" ]]
-[[ ! -e "$rollback_bin/libexec/rmux/rmux" ]]
-[[ ! -e "$rollback_home/.codex/config.toml" ]]
-[[ ! -e "$rollback_home/.config/ags/identity.agekey" ]]
-[[ ! -e "$rollback_home/.local/state/ags/storage.json" ]]
-[[ ! -e "$rollback_bin/.casr.install-transaction.json" ]]
-[[ ! -e "$rollback_bin/.rmux-install-transaction.json" ]]
-[[ -z "$(find "$rollback_bin" -type f \
-    \( -name '.rmux.rollback.*' -o -name '*.install-transaction.*' \) \
-    -print -quit)" ]]
-
 interrupted_home="$tmp/interrupted-home"
 interrupted_bin="$tmp/interrupted-bin"
 interrupted_backup="$interrupted_bin/.casr.rollback.recovery"
@@ -530,20 +262,13 @@ printf '%s\n' '#!/bin/sh' 'printf "recovered-casr\n"' \
 chmod 755 "$interrupted_backup"
 interrupted_previous_sha="$(test_sha256_file "$interrupted_backup")"
 interrupted_candidate_sha="$(test_sha256_file "$binary")"
-interrupted_context_sha="$(
-    test_sha256_file \
-        "$interrupted_home/.local/state/ags/context-mode.json"
-)"
 jq -n \
     --arg binary "$interrupted_bin/casr" \
     --arg candidate_sha "$interrupted_candidate_sha" \
     --arg stage "$interrupted_stage" \
     --arg previous_sha "$interrupted_previous_sha" \
     --arg backup "$interrupted_backup" \
-    --arg active "$interrupted_home/.local/state/ags/context-mode.json" \
-    --arg pending "$interrupted_home/.local/state/ags/context-mode.pending.json" \
-    --arg active_before "$interrupted_context_sha" '{
-      schema:1,
+      schema:2,
       managed_by:"ags-installer",
       binary_path:$binary,
       candidate:{sha256:$candidate_sha,stage_path:$stage},
@@ -552,11 +277,6 @@ jq -n \
         sha256:$previous_sha,
         backup_path:$backup
       },
-      context:{
-        active_manifest_path:$active,
-        pending_manifest_path:$pending,
-        active_before:$active_before
-      }
     }' > "$interrupted_journal"
 chmod 600 "$interrupted_journal"
 if env HOME="$interrupted_home" \
@@ -711,11 +431,8 @@ jq -n \
     --arg stage "$rmux_resume_binary_stage" \
     --arg previous_sha "$rmux_resume_binary_previous_sha" \
     --arg backup "$rmux_resume_binary_backup" \
-    --arg active "$rmux_resume_home/.local/state/ags/context-mode.json" \
-    --arg pending "$rmux_resume_home/.local/state/ags/context-mode.pending.json" \
-    --arg active_before \
         0000000000000000000000000000000000000000000000000000000000000000 '{
-      schema:1,
+      schema:2,
       managed_by:"ags-installer",
       binary_path:$binary,
       candidate:{sha256:$candidate_sha,stage_path:$stage},
@@ -724,11 +441,6 @@ jq -n \
         sha256:$previous_sha,
         backup_path:$backup
       },
-      context:{
-        active_manifest_path:$active,
-        pending_manifest_path:$pending,
-        active_before:$active_before
-      }
     }' > "$rmux_resume_binary_journal"
 chmod 600 "$rmux_resume_binary_journal"
 env HOME="$rmux_resume_home" \
@@ -760,44 +472,6 @@ done
 [[ ! -e "$rmux_resume_journal" ]]
 [[ ! -e "$rmux_resume_binary_journal" ]]
 [[ ! -e "$rmux_resume_binary_backup" && ! -e "$rmux_resume_binary_stage" ]]
-jq -e '
-    .health == {mode:"offline-index-search",status:"passed"} and
-    .providers.claude.configured == true and
-    .providers.codex.configured == true
-' "$rmux_resume_home/.local/state/ags/context-mode.json" >/dev/null
-
-new_failure_home="$tmp/new-failure-home"
-new_failure_bin="$tmp/new-failure-bin"
-mkdir -p "$new_failure_home" "$new_failure_bin"
-new_failure_context_sha="$(
-    test_sha256_file "$new_failure_home/.local/state/ags/context-mode.json"
-)"
-if env HOME="$new_failure_home" \
-    XDG_CONFIG_HOME="$new_failure_home/.config" \
-    XDG_DATA_HOME="$new_failure_home/.local/share" \
-    XDG_STATE_HOME="$new_failure_home/.local/state" \
-    PATH="$offline_guard_bin:$new_failure_bin:$PATH" \
-    OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    FAKE_CONTEXT_HEALTH_FAIL=codex \
-    VERSION=v0.3.0-ags.1 \
-    "$project_root/install.sh" --offline "$artifact" --dest "$new_failure_bin" \
-    --no-verify --quiet > "$tmp/new-failure.out" \
-    2> "$tmp/new-failure.err"; then
-    printf 'new install ignored a mandatory Context Mode health failure\n' >&2
-    exit 1
-fi
-[[ ! -e "$new_failure_bin/casr" ]]
-[[ ! -e "$new_failure_bin/rmux" && ! -e "$new_failure_bin/rmux-daemon" ]]
-[[ ! -e "$new_failure_bin/libexec/rmux/rmux" ]]
-[[ "$new_failure_context_sha" == "$(
-    test_sha256_file "$new_failure_home/.local/state/ags/context-mode.json"
-)" ]]
-[[ ! -e "$new_failure_bin/.casr.install-transaction.json" ]]
-[[ ! -e "$new_failure_bin/.rmux-install-transaction.json" ]]
-[[ -z "$(find "$new_failure_bin" -type f \
-    \( -name '.rmux.rollback.*' -o -name '*.install-transaction.*' \) \
-    -print -quit)" ]]
-
 unmanaged_home="$tmp/unmanaged-home"
 unmanaged_bin="$tmp/unmanaged-bin"
 mkdir -p "$unmanaged_home" "$unmanaged_bin"
@@ -858,7 +532,7 @@ if (( EUID == 0 )); then
         "$project_root/install.sh" --system --offline "$artifact" \
         --no-verify --quiet > "$tmp/system-root.out" \
         2> "$tmp/system-root.err"; then
-        printf 'installer accepted root --system for a per-user Context Mode setup\n' >&2
+        printf 'installer accepted root --system for a per-user setup\n' >&2
         exit 1
     fi
     grep -Fq -- '--system cannot run as root' "$tmp/system-root.err"

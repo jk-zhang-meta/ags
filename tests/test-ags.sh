@@ -201,280 +201,13 @@ shift || true
 if [[ "$script" == - ]]; then
     exec "${FAKE_REAL_NODE_BINARY:?}" - "$@"
 fi
-if [[ "$script" == */context-mode/hooks/ensure-deps.mjs ]]; then
-    env > "${BASH_SOURCE[0]%/*}/../ensure-deps.env"
-    exit 0
-fi
-[[ "$script" == */context-mode/cli.bundle.mjs ]] || {
-    printf 'unexpected fake node invocation: %s\n' "$script" >&2
-    exit 64
-}
-case "${1:-}" in
-    --help)
-        printf 'context-mode test runtime\n'
-        ;;
-    doctor)
-        log="${FAKE_CONTEXT_LOG:-$HOME/.local/state/ags/context-mode-test.log}"
-        mkdir -p "${log%/*}"
-        printf 'DOCTOR=%s\n' "${CONTEXT_MODE_PLATFORM:-unknown}" >> "$log"
-        if [[ "${FAKE_CONTEXT_DOCTOR_FAIL:-}" == "${CONTEXT_MODE_PLATFORM:-}" ]]; then
-            exit 1
-        fi
-        printf '%s\n' \
-            'Storage session: PASS' \
-            'Storage content: PASS' \
-            'Storage stats: PASS' \
-            'Server test: PASS' \
-            'FTS5 / SQLite: PASS'
-        if [[ "${FAKE_CONTEXT_STANDALONE_PROVIDER_FAIL:-0}" == 1 ]]; then
-            printf '%s\n' \
-                'Plugin enabled: WARN' \
-                'PreToolUse hook: FAIL' \
-                'SessionStart hook: FAIL'
-        elif [[ "${CONTEXT_MODE_PLATFORM:-}" == codex ]]; then
-            printf '%s\n' \
-                'Codex hooks feature flag: PASS' \
-                'Codex plugin root: PASS' \
-                'Plugin enabled: PASS' \
-                'PreToolUse hook: PASS' \
-                'PostToolUse hook: PASS' \
-                'SessionStart hook: PASS' \
-                'PreCompact hook: PASS' \
-                'UserPromptSubmit hook: PASS' \
-                'Stop hook: PASS'
-        else
-            printf '%s\n' \
-                'Plugin enabled: PASS' \
-                'PreToolUse hook: PASS' \
-                'SessionStart hook: PASS'
-        fi
-        ;;
-    index)
-        source_file="${2:?}"
-        shift 2
-        source_label=
-        project=
-        while (( $# > 0 )); do
-            case "$1" in
-                --source) source_label="${2:?}"; shift 2 ;;
-                --project) project="${2:?}"; shift 2 ;;
-                *) exit 64 ;;
-            esac
-        done
-        index_state="${CONTEXT_MODE_DIR:?}/fake-index.json"
-        title="$(sed -n 's/^# //p' "$source_file" | head -n 1)"
-        content="$(sed -n '3p' "$source_file")"
-        jq -n --arg title "$title" --arg content "$content" \
-            --arg source "$source_label" --arg project "$project" \
-            '{title:$title,content:$content,source:$source,project:$project}' \
-            > "$index_state"
-        printf 'Indexed 1 sections from %s\nSource: %s\nProject: %s\n' \
-            "$source_file" "$source_label" "$project"
-        ;;
-    search)
-        query="${2:?}"
-        shift 2
-        source_label=
-        project=
-        while (( $# > 0 )); do
-            case "$1" in
-                --source) source_label="${2:?}"; shift 2 ;;
-                --project) project="${2:?}"; shift 2 ;;
-                --limit) [[ "${2:?}" == 1 ]]; shift 2 ;;
-                *) exit 64 ;;
-            esac
-        done
-        index_state="${CONTEXT_MODE_DIR:?}/fake-index.json"
-        jq -e --arg query "$query" --arg source "$source_label" \
-            --arg project "$project" '
-              .source == $source and .project == $project and
-              (.content | contains($query))
-            ' "$index_state" >/dev/null
-        jq -r '"## 1. " + .title, "Source: " + .source, .content' \
-            "$index_state"
-        ;;
-    *)
-        printf 'unexpected fake context-mode command: %s\n' "${1:-}" >&2
-        exit 64
-        ;;
-esac
+exec "${FAKE_REAL_NODE_BINARY:?}" "$script" "$@"
 EOF
 chmod +x "$tmp/home/.local/bin/node"
-cat > "$tmp/home/.local/bin/npm" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-default_integrity='sha512-94JIaFuLjF9SO2BsGTrbGtyT44K95+9OC8BdbaL/UT76xOkanJLfUR5CzmNw+GELXZQqH4nBrKg9wjBnSFkVnQ=='
-printf 'NPM_CONTEXT=%s\n' "$*" >> "${FAKE_CONTEXT_NPM_LOG:-$HOME/.context-mode-npm.log}"
-[[ "${FAKE_CONTEXT_NPM_FORBID:-0}" == 0 ]] || exit 97
-case "${1:-}" in
-    view)
-        [[ "${FAKE_CONTEXT_NPM_VIEW_FAIL:-0}" == 0 ]] || exit 98
-        version="${FAKE_CONTEXT_LATEST_VERSION:-1.0.169}"
-        integrity="${FAKE_CONTEXT_LATEST_INTEGRITY:-$default_integrity}"
-        jq -n --arg version "$version" --arg integrity "$integrity" '{
-          version:$version,
-          "dist.tarball":("https://registry.npmjs.org/context-mode/-/context-mode-" + $version + ".tgz"),
-          "dist.integrity":$integrity,
-          license:"Elastic-2.0"
-        }'
-        ;;
-    install)
-        [[ " $* " == *" --registry=https://registry.npmjs.org "* ]]
-        [[ " $* " == *" --ignore-scripts "* ]]
-        prefix=
-        version=
-        while (( $# > 0 )); do
-            case "$1" in
-                --prefix)
-                    prefix="${2:-}"
-                    shift 2
-                    ;;
-                context-mode@*)
-                    version="${1#context-mode@}"
-                    shift
-                    ;;
-                *) shift ;;
-            esac
-        done
-        [[ -n "$prefix" && -n "$version" ]]
-        source_root="${FAKE_CONTEXT_FIXTURE_HOME:?}/.local/share/ags/context-mode/runtimes/${FAKE_CONTEXT_RUNTIME_TARGET:?}/$version"
-        [[ -d "$source_root" ]]
-        mkdir -p "$prefix"
-        cp -a -- "$source_root/." "$prefix/"
-        cp -a -- \
-            "$prefix/node_modules/context-mode/node_modules/." \
-            "$prefix/node_modules/"
-        mkdir -p "$prefix/node_modules/.bin"
-        ln -s ../context-mode/cli.bundle.mjs \
-            "$prefix/node_modules/.bin/context-mode"
-        printf '{"lockfileVersion":3}\n' \
-            > "$prefix/node_modules/.package-lock.json"
-        ;;
-    *)
-        printf 'unexpected fake npm invocation\n' >&2
-        exit 64
-        ;;
-esac
-EOF
-chmod +x "$tmp/home/.local/bin/npm"
 cat > "$tmp/home/.local/bin/codex" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 log="${BASH_SOURCE[0]%/*}/../ags.log"
-state="${FAKE_CONTEXT_PLUGIN_STATE_DIR:-}"
-fake_codex_config_append() {
-    local block="$1" config_home config_file
-    [[ "${FAKE_CODEX_PLUGIN_WRITES_CONFIG:-0}" == 1 ]] || return 0
-    config_home="${CODEX_HOME:-$HOME/.codex}"
-    config_file="$config_home/config.toml"
-    mkdir -p "$config_home"
-    {
-        printf '# fake-codex-%s-begin\n' "$block"
-        case "$block" in
-            marketplace)
-                printf '[marketplaces.context-mode]\n'
-                printf 'source_type = "local"\n'
-                printf 'source = "%s"\n' "$package_root"
-                ;;
-            plugin)
-                printf '[plugins."context-mode@context-mode"]\n'
-                printf 'enabled = true\n'
-                ;;
-            *) exit 64 ;;
-        esac
-        printf '# fake-codex-%s-end\n' "$block"
-    } >> "$config_file"
-    chmod 600 "$config_file"
-}
-fake_codex_config_remove() {
-    local block="$1" config_home config_file temporary
-    [[ "${FAKE_CODEX_PLUGIN_WRITES_CONFIG:-0}" == 1 ]] || return 0
-    config_home="${CODEX_HOME:-$HOME/.codex}"
-    config_file="$config_home/config.toml"
-    [[ -f "$config_file" ]] || return 0
-    temporary="$config_file.fake-codex"
-    awk -v begin="# fake-codex-$block-begin" \
-        -v end="# fake-codex-$block-end" '
-      $0 == begin { skipping = 1; next }
-      $0 == end { skipping = 0; next }
-      !skipping { print }
-    ' "$config_file" > "$temporary"
-    chmod --reference="$config_file" "$temporary"
-    mv -- "$temporary" "$config_file"
-}
-fake_codex_config_set_hooks() {
-    local value="$1" config_home config_file temporary
-    config_home="${CODEX_HOME:-$HOME/.codex}"
-    config_file="$config_home/config.toml"
-    temporary="$config_file.fake-features"
-    mkdir -p "$config_home"
-    if [[ -f "$config_file" ]] &&
-       grep -Eq '^hooks = (true|false)$' "$config_file"; then
-        awk -v value="$value" '
-          /^hooks = (true|false)$/ { print "hooks = " value; next }
-          { print }
-        ' "$config_file" > "$temporary"
-    elif [[ -f "$config_file" ]] &&
-         grep -Fqx '[features]' "$config_file"; then
-        awk -v value="$value" '
-          $0 == "[features]" {
-            print
-            print "hooks = " value
-            next
-          }
-          { print }
-        ' "$config_file" > "$temporary"
-    else
-        if [[ -s "$config_file" ]]; then
-            cp -- "$config_file" "$temporary"
-            printf '\n' >> "$temporary"
-        else
-            : > "$temporary"
-        fi
-        printf '[features]\nhooks = %s\n' "$value" >> "$temporary"
-    fi
-    if [[ -f "$config_file" ]]; then
-        chmod --reference="$config_file" "$temporary"
-    else
-        chmod 600 "$temporary"
-    fi
-    mv -- "$temporary" "$config_file"
-}
-if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
-      -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
-      -n "${RCLONE_SFTP_PASS:-}" ]]; then
-    printf 'CODEX_TRANSPORT_SECRET_LEAK\n' >&2
-    exit 98
-fi
-fake_codex_rewrite_root() {
-    local root="$1" node_binary temporary
-    local partial="${FAKE_CODEX_REWRITE_PARTIAL:-both}"
-    node_binary="${FAKE_CODEX_REWRITE_NODE:-${FAKE_REAL_NODE_BINARY:?}}"
-    if [[ "$partial" == both || "$partial" == plugin ]]; then
-        temporary="$root/.claude-plugin/plugin.json.fake-codex"
-        jq --arg node "$node_binary" --arg root "$root" '
-          .mcpServers["context-mode"].command = $node |
-          .mcpServers["context-mode"].args = [$root + "/start.mjs"]
-        ' "$root/.claude-plugin/plugin.json" > "$temporary"
-        mv -- "$temporary" "$root/.claude-plugin/plugin.json"
-    fi
-    if [[ "$partial" == both || "$partial" == hooks ]]; then
-        temporary="$root/hooks/hooks.json.fake-codex"
-        jq --arg node "$node_binary" --arg root "$root" '
-          .hooks |= with_entries(
-            .value |= map(
-              .hooks |= map(
-                .command |= sub(
-                  "^node \"\\$\\{CLAUDE_PLUGIN_ROOT\\}/";
-                  "\"" + $node + "\" \"" + $root + "/"
-                )
-              )
-            )
-          )
-        ' "$root/hooks/hooks.json" > "$temporary"
-        mv -- "$temporary" "$root/hooks/hooks.json"
-    fi
-}
 if [[ "${1:-}" == --version ]]; then
     printf 'codex-test 1.0\n'
     exit
@@ -496,249 +229,6 @@ if (( profile_before_subcommand == 1 )) && [[ "${1:-}" == app-server ]]; then
         'Error: --profile only applies to runtime commands and `codex mcp`.' >&2
     exit 2
 fi
-if [[ "${1:-}" == app-server ]]; then
-    printf 'CODEX_APP_SERVER=%s\n' "$*" >> "$log"
-    package_version="$(jq -r '.version' "$package_root/package.json")"
-    cache_root="$CODEX_HOME/plugins/cache/context-mode/context-mode/$package_version"
-    source_path="$cache_root/.codex-plugin/hooks.json"
-    while IFS= read -r request; do
-        case "$(jq -r '.method // empty' <<< "$request")" in
-            initialize)
-                printf '{"id":0,"result":{"userAgent":"codex-test","codexHome":"%s","platformFamily":"unix","platformOs":"linux"}}\n' \
-                    "$CODEX_HOME"
-                ;;
-            initialized) ;;
-            config/read)
-                config_file="$CODEX_HOME/config.toml"
-                hooks_enabled=true
-                if [[ -f "$config_file" ]] &&
-                   grep -Eq '^"?hooks"?[[:space:]]*=[[:space:]]*false$' \
-                       "$config_file"; then
-                    hooks_enabled=false
-                fi
-                jq -nc --arg file "$config_file" \
-                    --argjson hooks_enabled "$hooks_enabled" '
-                  {
-                    id:1,
-                    result:{
-                      config:{},
-                      origins:{},
-                      layers:[{
-                        name:{type:"user",file:$file,profile:null},
-                        version:"fake",
-                        config:{features:{hooks:$hooks_enabled}}
-                      }]
-                    }
-                  }'
-                printf '\n'
-                ;;
-            hooks/list)
-                [[ -d "$cache_root" ]]
-                if [[ "${FAKE_CODEX_REWRITES_CACHE:-}" == app-server ]]; then
-                    fake_codex_rewrite_root "$cache_root"
-                fi
-                if [[ "${FAKE_CONTEXT_CORRUPT_CACHE:-0}" == 1 ]]; then
-                    printf '\n ' >> "$source_path"
-                fi
-                if [[ -n "${FAKE_CONTEXT_CORRUPT_CACHE_FILE:-}" ]]; then
-                    printf '\n// changed after plugin caching\n' \
-                        >> "$cache_root/$FAKE_CONTEXT_CORRUPT_CACHE_FILE"
-                fi
-                cwd="$(jq -r '.params.cwds[0]' <<< "$request")"
-                hooks_enabled=true
-                if [[ -f "$CODEX_HOME/config.toml" ]] &&
-                   grep -Eq '^"?hooks"?[[:space:]]*=[[:space:]]*false$' \
-                       "$CODEX_HOME/config.toml"; then
-                    hooks_enabled=false
-                fi
-                jq -nc --arg cwd "$cwd" \
-                    --arg cache_root "$cache_root" \
-                    --arg source_path "$source_path" \
-                    --arg trust "${FAKE_CONTEXT_TRUST_STATUS:-trusted}" \
-                    --argjson hooks_enabled "$hooks_enabled" '
-                  {
-                    id:1,
-                    result:{
-                      data:[{
-                        cwd:$cwd,
-                        warnings:[],
-                        errors:[],
-                        hooks:(if $hooks_enabled then
-                          [
-                            ["preToolUse", "pre_tool_use", "pretooluse.mjs",
-                             "local_shell|shell|shell_command|exec_command|Bash|Shell|apply_patch|Edit|Write|grep_files|ctx_execute|ctx_execute_file|ctx_batch_execute|ctx_fetch_and_index|ctx_search|ctx_index|mcp__"],
-                            ["postToolUse", "post_tool_use", "posttooluse.mjs", null],
-                            ["sessionStart", "session_start", "sessionstart.mjs", null],
-                            ["preCompact", "pre_compact", "precompact.mjs", null],
-                            ["userPromptSubmit", "user_prompt_submit", "userpromptsubmit.mjs", null],
-                            ["stop", "stop", "stop.mjs", null]
-                          ] |
-                          map({
-                            key:("context-mode@context-mode:.codex-plugin/hooks.json:" + .[1] + ":0:0"),
-                            eventName: .[0],
-                            handlerType:"command",
-                            matcher:.[3],
-                            command:("node \"" + $cache_root +
-                              "/hooks/codex/" + .[2] + "\""),
-                            timeoutSec:30,
-                            statusMessage:null,
-                            additionalContextLimit:null,
-                            sourcePath:$source_path,
-                            source:"plugin",
-                            pluginId:"context-mode@context-mode",
-                            displayOrder:0,
-                            enabled:true,
-                            isManaged:false,
-                            currentHash:"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                            trustStatus:$trust
-                          })
-                        else [] end)
-                      }]
-                    }
-                  }'
-                printf '\n'
-                ;;
-        esac
-    done
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == list ]]; then
-    if [[ -z "$state" || -e "$state/codex-marketplace" ]]; then
-        marketplace_root="${FAKE_CODEX_CONTEXT_MARKETPLACE_ROOT:-}"
-        if [[ -z "$marketplace_root" && -n "$state" &&
-              -s "$state/codex-marketplace-root" ]]; then
-            marketplace_root="$(<"$state/codex-marketplace-root")"
-        fi
-        [[ -n "$marketplace_root" ]] || marketplace_root="$default_package_root"
-        jq -n --arg root "$marketplace_root" '{
-          marketplaces:[{
-            name:"context-mode", root:$root,
-            marketplaceSource:{sourceType:"local", source:$root}
-          }]
-        }'
-    else
-        printf '{"marketplaces":[]}\n'
-    fi
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == add ]]; then
-    mkdir -p "$state"
-    : > "$state/codex-marketplace"
-    printf '%s\n' "${4:?}" > "$state/codex-marketplace-root"
-    package_root="${4:?}"
-    fake_codex_config_append marketplace
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == remove ]]; then
-    [[ -z "$state" ]] ||
-        rm -f -- "$state/codex-marketplace" "$state/codex-marketplace-root"
-    fake_codex_config_remove marketplace
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
-    if [[ -z "$state" || -e "$state/codex-plugin" ]]; then
-        plugin_root="$default_package_root"
-        if [[ -n "$state" && -s "$state/codex-plugin-root" ]]; then
-            plugin_root="$(<"$state/codex-plugin-root")"
-        fi
-        plugin_version="$(jq -r '.version' "$plugin_root/package.json")"
-        if [[ "${FAKE_CODEX_REWRITES_CACHE:-}" == plugin-list ]]; then
-            cache_root="$CODEX_HOME/plugins/cache/context-mode/context-mode/$plugin_version"
-            [[ -d "$cache_root" ]]
-            fake_codex_rewrite_root "$cache_root"
-        fi
-        if [[ "${FAKE_CODEX_REWRITES_PACKAGE:-0}" == 1 ]]; then
-            fake_codex_rewrite_root "$plugin_root"
-        fi
-        if [[ -n "${FAKE_CODEX_TOUCH_ALLOWED_FILE:-}" ]]; then
-            printf ' \n' >> "$CODEX_HOME/plugins/cache/context-mode/context-mode/$plugin_version/$FAKE_CODEX_TOUCH_ALLOWED_FILE"
-        fi
-        jq -n --arg root "$plugin_root" --arg version "$plugin_version" '{
-          installed:[{
-            pluginId:"context-mode@context-mode",
-            name:"context-mode",
-            marketplaceName:"context-mode",
-            version:$version,
-            installed:true,
-            enabled:true,
-            source:{source:"local", path:$root},
-            marketplaceSource:{sourceType:"local",source:$root}
-          }],
-          available:[]
-        }'
-    else
-        printf '{"installed":[],"available":[]}\n'
-    fi
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == add ]]; then
-    mkdir -p "$state"
-    : > "$state/codex-plugin"
-    cp -- "$state/codex-marketplace-root" "$state/codex-plugin-root"
-    package_root="$(<"$state/codex-plugin-root")"
-    package_version="$(jq -r '.version' "$package_root/package.json")"
-    cache_root="$CODEX_HOME/plugins/cache/context-mode/context-mode/$package_version"
-    mkdir -p "$cache_root"
-    cp -a -- "$package_root/." "$cache_root/"
-    fake_codex_config_append plugin
-    if [[ "${FAKE_CONTEXT_FLIP_HOOKS_FALSE_AFTER_PLUGIN_ADD:-0}" == 1 ]]; then
-        fake_codex_config_set_hooks false
-    fi
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == remove ]]; then
-    [[ -z "$state" ]] ||
-        rm -f -- "$state/codex-plugin" "$state/codex-plugin-root"
-    fake_codex_config_remove plugin
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
-    printf '{"ok":true}\n'
-    exit
-fi
-if [[ "${1:-}" == features && "${2:-}" == list ]]; then
-    config_home="${CODEX_HOME:-$HOME/.codex}"
-    config_file="$config_home/config.toml"
-    if [[ -f "$config_file" ]] &&
-       grep -Fqx 'hooks = false' "$config_file"; then
-        printf 'hooks stable false\n'
-    elif [[ -f "$config_file" ]] &&
-         grep -Fqx 'hooks = true' "$config_file"; then
-        printf 'hooks stable true\n'
-    elif [[ -z "$state" || -e "$state/codex-hooks" ||
-            "${FAKE_CONTEXT_HOOKS_DEFAULT_TRUE:-0}" == 1 ]]; then
-        printf 'hooks stable true\n'
-    else
-        printf 'hooks stable false\n'
-    fi
-    printf 'plugin_hooks removed false\n'
-    exit
-fi
-if [[ "${1:-}" == features && "${2:-}" == enable && "${3:-}" == hooks ]]; then
-    fake_codex_config_set_hooks true
-    if [[ "${AGS_CONTEXT_MODE_CONFIG_PROBE:-0}" == 1 ]]; then
-        exit
-    fi
-    if [[ -n "$state" ]]; then
-        mkdir -p "$state"
-        : > "$state/codex-hooks"
-    fi
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
-    if [[ "${FAKE_CONTEXT_CRASH_AFTER_HOOK_ENABLE:-0}" == 1 ]]; then
-        kill -KILL "$PPID"
-        exit 137
-    fi
-    exit
-fi
-if [[ "${1:-}" == features && "${2:-}" == disable && "${3:-}" == hooks ]]; then
-    [[ -z "$state" ]] || rm -f -- "$state/codex-hooks"
-    printf 'CODEX_CONTEXT=%s\n' "$*" >> "$log"
-    exit
-fi
 case "${1:-}" in
     resume) [[ ! -e "/dev/fd/9" ]] || { printf 'FD9_OPEN\n'; exit 99; } ;;
 esac
@@ -753,181 +243,14 @@ cat > "$tmp/home/.local/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 log="${BASH_SOURCE[0]%/*}/../ags.log"
-state="${FAKE_CONTEXT_PLUGIN_STATE_DIR:-}"
 if [[ -n "${AGENT_SESSION_REMOTE_PASSWORD:-}" ||
       -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ||
       -n "${RCLONE_SFTP_PASS:-}" ]]; then
     printf 'CLAUDE_TRANSPORT_SECRET_LEAK\n' >&2
     exit 98
 fi
-fake_claude_rewrite_root() {
-    local root="$1" node_binary temporary
-    node_binary="${FAKE_REAL_NODE_BINARY:?}"
-    temporary="$root/.claude-plugin/plugin.json.fake-claude"
-    jq --arg node "$node_binary" --arg root "$root" '
-      .mcpServers["context-mode"].command = $node |
-      .mcpServers["context-mode"].args = [$root + "/start.mjs"]
-    ' "$root/.claude-plugin/plugin.json" > "$temporary"
-    mv -- "$temporary" "$root/.claude-plugin/plugin.json"
-    temporary="$root/hooks/hooks.json.fake-claude"
-    jq --arg node "$node_binary" --arg root "$root" '
-      .hooks |= with_entries(
-        .value |= map(
-          .hooks |= map(
-            .command |= sub(
-              "^node \"\\$\\{CLAUDE_PLUGIN_ROOT\\}/";
-              "\"" + $node + "\" \"" + $root + "/"
-            )
-          )
-        )
-      )
-    ' "$root/hooks/hooks.json" > "$temporary"
-    mv -- "$temporary" "$root/hooks/hooks.json"
-}
 if [[ "${1:-}" == --version ]]; then
     printf 'claude-test 1.0\n'
-    exit
-fi
-if [[ " $* " == *" --include-hook-events "* ]]; then
-    printf 'CLAUDE_EFFECTIVE_PROBE\n' >> "$log"
-    if [[ -n "${FAKE_CLAUDE_REPLACE_SETTINGS_WITH:-}" ]]; then
-        cp -- "$FAKE_CLAUDE_REPLACE_SETTINGS_WITH" \
-            "$CLAUDE_CONFIG_DIR/settings.json"
-    fi
-    if [[ "${FAKE_CLAUDE_REWRITES_PACKAGE:-0}" == 1 ]]; then
-        fake_claude_rewrite_root "$package_root"
-        if [[ -n "$state" && -s "$state/claude-marketplace-root" ]]; then
-            marketplace_root="$(<"$state/claude-marketplace-root")"
-            if [[ "$marketplace_root" != "$package_root" ]]; then
-                fake_claude_rewrite_root "$marketplace_root"
-            fi
-        fi
-    fi
-    package_version="$(jq -r '.version' "$package_root/package.json")"
-    if [[ "${FAKE_CONTEXT_EFFECTIVE_FAIL:-}" != hooks ]]; then
-        jq -nc '{
-          type:"system",subtype:"hook_response",
-          hook_event:"SessionStart",outcome:"success",exit_code:0,
-          output:"<context_window_protection>test</context_window_protection>"
-        }'
-    fi
-    if [[ "${FAKE_CONTEXT_EFFECTIVE_FAIL:-}" == mcp ]]; then
-        jq -nc --arg version "$package_version" '{
-          type:"system",subtype:"init",tools:[],mcp_servers:[],
-          plugins:[{
-            source:"context-mode@context-mode",version:$version
-          }]
-        }'
-    else
-        jq -nc --arg version "$package_version" '{
-          type:"system",subtype:"init",
-          tools:[
-            "mcp__plugin_context-mode_context-mode__ctx_execute",
-            "mcp__plugin_context-mode_context-mode__ctx_search"
-          ],
-          mcp_servers:[{
-            name:"plugin:context-mode:context-mode",status:"connected"
-          }],
-          plugins:[{
-            source:"context-mode@context-mode",version:$version
-          }]
-        }'
-    fi
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == list ]]; then
-    if [[ -z "$state" || -e "$state/claude-marketplace" ]]; then
-        marketplace_root="${FAKE_CLAUDE_CONTEXT_MARKETPLACE_ROOT:-}"
-        if [[ -z "$marketplace_root" && -n "$state" &&
-              -s "$state/claude-marketplace-root" ]]; then
-            marketplace_root="$(<"$state/claude-marketplace-root")"
-        fi
-        [[ -n "$marketplace_root" ]] || marketplace_root="$default_package_root"
-        jq -n --arg root "$marketplace_root" \
-            '[{name:"context-mode", source:"directory", path:$root, installLocation:$root}]'
-    else
-        printf '[]\n'
-    fi
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == add ]]; then
-    mkdir -p "$state"
-    : > "$state/claude-marketplace"
-    printf '%s\n' "${4:?}" > "$state/claude-marketplace-root"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == marketplace && "${3:-}" == remove ]]; then
-    [[ -z "$state" ]] ||
-        rm -f -- "$state/claude-marketplace" "$state/claude-marketplace-root"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == list ]]; then
-    if [[ -z "$state" || -e "$state/claude-plugin" ]]; then
-        enabled=true
-        [[ -z "$state" || ! -e "$state/claude-plugin-disabled" ]] || enabled=false
-        package_version="$(jq -r '.version' "$package_root/package.json")"
-        default_cache_root="$CLAUDE_CONFIG_DIR/plugins/cache/context-mode/context-mode/$package_version"
-        plugin_root="$default_cache_root"
-        [[ -d "$plugin_root" ]] || plugin_root="$default_package_root"
-        if [[ -n "$state" && -s "$state/claude-plugin-root" ]]; then
-            plugin_root="$(<"$state/claude-plugin-root")"
-        fi
-        # Stand in for the rewrite an ordinary session already performed:
-        # Context Mode's start.mjs normalizes the cached hooks.json and
-        # plugin.json on every MCP boot, so the readiness check that reads
-        # this listing is looking at a tree Claude changed after AGS wrote it.
-        if [[ "${FAKE_CLAUDE_REWRITES_CACHE:-}" == plugin-list &&
-              "$plugin_root" != "$default_package_root" ]]; then
-            fake_claude_rewrite_root "$plugin_root"
-        fi
-        plugin_version="$(jq -r '.version' "$plugin_root/package.json")"
-        jq -n --arg root "$plugin_root" --arg version "$plugin_version" \
-            --argjson enabled "$enabled" '[{
-          id:"context-mode@context-mode",
-          version:$version,
-          scope:"user",
-          enabled:$enabled,
-          installPath:$root
-        }]'
-    else
-        printf '[]\n'
-    fi
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == install ]]; then
-    mkdir -p "$state"
-    : > "$state/claude-plugin"
-    package_root="$(<"$state/claude-marketplace-root")"
-    package_version="$(jq -r '.version' "$package_root/package.json")"
-    cache_root="$CLAUDE_CONFIG_DIR/plugins/cache/context-mode/context-mode/$package_version"
-    mkdir -p "$cache_root"
-    cp -a -- "$package_root/." "$cache_root/"
-    printf '%s\n' "$cache_root" > "$state/claude-plugin-root"
-    rm -f -- "$state/claude-plugin-disabled"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == enable ]]; then
-    mkdir -p "$state"
-    : > "$state/claude-plugin"
-    rm -f -- "$state/claude-plugin-disabled"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == disable ]]; then
-    mkdir -p "$state"
-    : > "$state/claude-plugin"
-    : > "$state/claude-plugin-disabled"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
-    exit
-fi
-if [[ "${1:-}" == plugin && "${2:-}" == uninstall ]]; then
-    [[ -z "$state" ]] ||
-        rm -f -- "$state/claude-plugin" "$state/claude-plugin-disabled" \
-            "$state/claude-plugin-root"
-    printf 'CLAUDE_CONTEXT=%s\n' "$*" >> "$log"
     exit
 fi
 case "${1:-}" in
@@ -1525,7 +848,6 @@ grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$quiet_claude"
 ! grep -Fq 'update available:' "$tmp/quiet-claude.err"
 printf '%s\n' \
     'update available: ags 0.3.0-test -> v0.4.0' \
-    'update available: codext 0.146.0 -> v0.147.0' \
     'rm -rf /' \
     > "$tmp/state/update-check.lines"
 date +%s > "$tmp/state/update-check.stamp"
@@ -1536,8 +858,6 @@ announced_claude="$(
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$announced_claude"
 grep -Fqx '[ags] update available: ags 0.3.0-test -> v0.4.0' \
-    "$tmp/announced-claude.err"
-grep -Fqx '[ags] update available: codext 0.146.0 -> v0.147.0' \
     "$tmp/announced-claude.err"
 # Only the shape the refresh writes is printed, so a record that picked up
 # anything else cannot put arbitrary text behind the `[ags]` prefix.
@@ -1599,7 +919,7 @@ grep -Fqx \
     "FAKE_CLAUDE <--settings=$inline_claude_settings> <--model> <haiku>" \
     <<< "$inline_claude_settings_output"
 unsafe_claude_settings="$tmp/unsafe-claude.settings.json"
-jq -n '{enabledPlugins:{"context-mode@context-mode":false}}' \
+jq -n '{enabledPlugins:{"some-plugin@example":false}}' \
     > "$unsafe_claude_settings"
 launch_count_before="$(grep -c '^LAUNCH=' \
     "$tmp/home/.local/ags.log" || true)"
@@ -1641,7 +961,7 @@ assert_managed_claude_settings_rejected() {
 
 multi_document_claude_settings="$tmp/multi-document-claude.settings.json"
 printf '%s\n%s\n' \
-    '{"enabledPlugins":{"context-mode@context-mode":false}}' \
+    '{"enabledPlugins":{"some-plugin@example":false}}' \
     '{"env":{}}' > "$multi_document_claude_settings"
 assert_managed_claude_settings_rejected \
     multiple-json-documents "$multi_document_claude_settings" \
@@ -1715,7 +1035,7 @@ git -C "$claude_settings_repo" -c user.name=AGS \
 base_helper_side_effect="$tmp/base-helper-side-effect"
 base_helper_secret='AGS_BASE_HELPER_SECRET_4EF2'
 jq -n --arg command \
-    "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-context-mode-probe ]; then :; else touch $base_helper_side_effect; fi; printf '%s' $base_helper_secret" \
+    "if [ \"\${ANTHROPIC_API_KEY:-}\" = ags-settings-probe ]; then :; else touch $base_helper_side_effect; fi; printf '%s' $base_helper_secret" \
     '{apiKeyHelper:$command}' > "$tmp/source/claude/settings.json"
 assert_managed_claude_source_settings_rejected \
     conditional-user-helper "$claude_settings_repo/subdir" \
@@ -1850,10 +1170,10 @@ assert_managed_claude_arg_rejected \
     --plugin-url=https://example.invalid/plugin.zip
 assert_managed_claude_arg_rejected \
     disallowed-tools --disallowedTools \
-    --disallowedTools mcp__plugin_context-mode_context-mode__ctx_execute
+    --disallowedTools mcp__some_plugin__do_thing
 assert_managed_claude_arg_rejected \
     disallowed-tools-kebab-equals --disallowed-tools \
-    --disallowed-tools=mcp__plugin_context-mode_context-mode__ctx_search
+    --disallowed-tools=mcp__some_plugin__find_thing
 assert_managed_claude_arg_rejected \
     agent --agent --agent restricted
 assert_managed_claude_arg_rejected \
@@ -4262,7 +3582,6 @@ quiet_launch_state="$tmp/quiet-launch-state"
 quiet_launch_local="$tmp/quiet-launch-local"
 quiet_launch_remote="$tmp/git/quiet-launch.git"
 mkdir -p "$quiet_launch_state" "$quiet_launch_local/codex"
-cp -- "$tmp/state/context-mode.json" "$quiet_launch_state/context-mode.json"
 cp -- "$queued_path" \
     "$quiet_launch_local/codex/$sync_record_id.checkpoint.tar.gz.age"
 git init -q --bare "$quiet_launch_remote"
@@ -5084,108 +4403,5 @@ sftp_remove="$(env "${sftp_env[@]}" "$tool" remote remove sftp-backup)"
 grep -Fqx 'status=removed' <<< "$sftp_remove"
 ! env "${sftp_env[@]}" "$tool" remote list | grep -Fq sftp-backup
 
-# codext reports the upstream Codex version because it *is* that version, so a
-# second build on one upstream base publishes under the same tag and the tag
-# cannot say which of the two a host has. The asset digest is the discriminator,
-# and these four runs are the whole contract: install, recognise the same bytes,
-# notice new bytes under an unchanged tag, and refuse a download that does not
-# match the digest it is about to be recorded as.
-codext_root="$tmp/codext-update"
-mkdir -p "$codext_root/bin" "$codext_root/state" "$codext_root/serve"
-printf '%s\n' '#!/bin/sh' 'echo "codex-cli 0.146.0 installed"' \
-    > "$codext_root/bin/codext"
-chmod +x "$codext_root/bin/codext"
-
-# One release, one tag, whatever bytes the marker produces. Every platform's
-# asset name is listed so the test does not depend on the host it runs on.
-codext_publish() {
-    local marker="$1" stage digest
-    stage="$(mktemp -d "$tmp/codext-stage.XXXXXX")"
-    printf '%s\n' '#!/bin/sh' "echo \"codex-cli 0.146.0 $marker\"" \
-        > "$stage/codext"
-    chmod 755 "$stage/codext"
-    tar -czf "$codext_root/serve/asset.tar.gz" -C "$stage" codext
-    rm -rf -- "$stage"
-    digest="$(sha256sum "$codext_root/serve/asset.tar.gz" | cut -d' ' -f1)"
-    jq -n --arg digest "sha256:${2:-$digest}" '{
-      tag_name: "v0.146.0",
-      assets: ([
-        "codext-x86_64-unknown-linux-musl.tar.gz",
-        "codext-x86_64-unknown-linux-gnu.tar.gz",
-        "codext-aarch64-unknown-linux-musl.tar.gz",
-        "codext-aarch64-unknown-linux-gnu.tar.gz",
-        "codext-aarch64-apple-darwin.tar.gz",
-        "codext-x86_64-apple-darwin.tar.gz"
-      ] | to_entries | map({name: .value, id: (1000 + .key), digest: $digest}))
-    }' > "$codext_root/serve/release.json"
-}
-
-cat > "$codext_root/bin/curl" <<'CODEXTCURL'
-#!/usr/bin/env bash
-# Serves the canned codext release. The metadata call reads stdout and appends
-# the status code `-w` asked for; the asset call writes to the path after -o.
-out=
-url=
-prev=
-for arg in "$@"; do
-    [[ "$prev" != -o ]] || out="$arg"
-    [[ "$arg" != https://* ]] || url="$arg"
-    prev="$arg"
-done
-case "$url" in
-    */releases/latest)
-        cat "$CODEXT_FAKE_SERVE/release.json"
-        printf '\n200'
-        ;;
-    */releases/assets/*)
-        cp -- "$CODEXT_FAKE_SERVE/asset.tar.gz" "$out"
-        ;;
-    *)
-        exit 1
-        ;;
-esac
-CODEXTCURL
-chmod +x "$codext_root/bin/curl"
-
-codext_env=(
-    HOME="$tmp/home"
-    PATH="$codext_root/bin:/usr/local/bin:/usr/bin:/bin"
-    AGENT_SESSION_STATE_DIR="$codext_root/state"
-    CODEXT_FAKE_SERVE="$codext_root/serve"
-    CODEXT_UPDATE_TOKEN=fake-token
-)
-codext_stamp="$codext_root/state/codext-release"
-
-codext_publish first
-env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-1.out" 2>&1
-grep -Fq 'updating codext to 0.146.0' "$tmp/codext-1.out"
-grep -Fq 'updated codext to 0.146.0' "$tmp/codext-1.out"
-grep -Fq '0.146.0 first' <<< "$("$codext_root/bin/codext")"
-grep -Fqx "sha256:$(sha256sum "$codext_root/serve/asset.tar.gz" | cut -d' ' -f1)" \
-    "$codext_stamp"
-
-# Same bytes, same tag: nothing to do. Before the digest replaced the tag
-# comparison this said "updating 0.146.0 -> v0.146.0-2" on every single run.
-env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-2.out" 2>&1
-grep -Fq 'already current: codext 0.146.0' "$tmp/codext-2.out"
-! grep -Fq 'updated codext' "$tmp/codext-2.out"
-
-# New bytes under the unchanged tag: the case a tag comparison cannot see.
-codext_publish second
-env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-3.out" 2>&1
-grep -Fq 'updated codext to 0.146.0' "$tmp/codext-3.out"
-! grep -Fq 'already current' "$tmp/codext-3.out"
-grep -Fq '0.146.0 second' <<< "$("$codext_root/bin/codext")"
-codext_installed_digest="$(cat "$codext_stamp")"
-
-# A download that does not hash to the published digest is not installed, and
-# the stamp keeps naming the build that is actually on disk rather than the one
-# that failed to arrive.
-codext_publish third \
-    0000000000000000000000000000000000000000000000000000000000000000
-env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-4.out" 2>&1
-grep -Fq '对不上' "$tmp/codext-4.out"
-grep -Fq '0.146.0 second' <<< "$("$codext_root/bin/codext")"
-grep -Fqx "$codext_installed_digest" "$codext_stamp"
 
 printf 'ags self-check passed\n'

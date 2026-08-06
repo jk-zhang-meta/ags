@@ -12,6 +12,22 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
 
 ### AGS Runtime
 
+- **codext is no longer bundled either**: installing AGS no longer installs or
+  updates codext, `ags update` no longer carries it, and `ags init` no longer
+  claims the name `codex` for it. `ags codext-update` and `ags codex-name` are
+  gone with the machinery behind them.
+
+  The rename existed to paper over a detection bug, not to solve one: the
+  launcher menu asked `command -v codex` while `resolve_agent_binary` accepts
+  codext, so a codext-only host could run `ags codex` yet be told no Codex was
+  installed. Detection now goes through the same resolution the launch uses
+  (`agent_available`), and the installer's provider scan accepts codext too — so
+  nothing has to be renamed for a codext-only machine to be seen correctly.
+
+  What stays is everything that is not an installation: AGS still prefers codext
+  over stock Codex when it is on PATH, and `ags codex-init` / `ags codex-pool`
+  still configure and report the credential pool. Bring your own codext.
+
 - **Context Mode is no longer bundled**: installing AGS no longer installs,
   provisions, verifies, or updates `context-mode`, and launching Claude or Codex
   no longer requires it. The mandatory integration is gone in full — the
