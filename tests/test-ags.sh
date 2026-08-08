@@ -4480,6 +4480,12 @@ case "$url" in
     */releases/assets/*)
         cp -- "$CODEXT_FAKE_SERVE/asset.tar.gz" "$out"
         ;;
+    *codex-package-*)
+        # 只有备好了整包才供应它。没备的时候走 404，正是"上游包拿不到"那条
+        # 退路——上面那几轮断言的就是它。
+        [ -f "$CODEXT_FAKE_SERVE/package.tar.gz" ] || exit 22
+        cp -- "$CODEXT_FAKE_SERVE/package.tar.gz" "$out"
+        ;;
     *)
         exit 1
         ;;
@@ -4527,5 +4533,50 @@ env "${codext_env[@]}" "$tool" codext-update > "$tmp/codext-4.out" 2>&1
 grep -Fq '对不上' "$tmp/codext-4.out"
 grep -Fq '0.146.0 second' <<< "$("$codext_root/bin/codext")"
 grep -Fqx "$codext_installed_digest" "$codext_stamp"
+
+# codext = 上游整包 + 换掉一个 entrypoint。
+#
+# 上面四轮走的是"上游包拿不到"那条退路（假 curl 对 codex-package 返回 22），装出来
+# 的是光杆二进制。这一轮备好整包，断言的是应有的形态：树整个来自上游，只有清单
+# 指的那个 entrypoint 是我们的构建，而 PATH 上的 `codext` 是指进树里的软链接。
+#
+# 这条测试真正盯住的是"以后上游往包里加东西，我们自动带上"：sidecar 不是我们枚举
+# 出来的，是包里有什么就装什么。所以这里放一个我们代码里从没提过名字的文件
+# （`bin/codex-some-future-sidecar`），它必须也被装进去。
+codext_pkg_stage="$(mktemp -d "$tmp/codext-pkg.XXXXXX")"
+mkdir -p "$codext_pkg_stage/bin" "$codext_pkg_stage/codex-resources"
+printf '%s\n' '#!/bin/sh' 'echo upstream-entrypoint' > "$codext_pkg_stage/bin/codex"
+printf '%s\n' '#!/bin/sh' 'echo upstream-host' \
+    > "$codext_pkg_stage/bin/codex-code-mode-host"
+printf '%s\n' '#!/bin/sh' 'echo future' \
+    > "$codext_pkg_stage/bin/codex-some-future-sidecar"
+printf 'upstream-resource\n' > "$codext_pkg_stage/codex-resources/marker"
+chmod 755 "$codext_pkg_stage/bin/"*
+jq -n '{
+  layoutVersion: 1,
+  version: "0.146.0",
+  target: "test",
+  variant: "codex",
+  entrypoint: "bin/codex",
+  resourcesDir: "codex-resources",
+  pathDir: "codex-path"
+}' > "$codext_pkg_stage/codex-package.json"
+tar -czf "$codext_root/serve/package.tar.gz" -C "$codext_pkg_stage" .
+rm -rf -- "$codext_pkg_stage"
+
+codext_publish fifth
+codext_pkg_root="$codext_root/pkgroot"
+env "${codext_env[@]}" AGS_CODEXT_PACKAGE_ROOT="$codext_pkg_root" \
+    "$tool" codext-update > "$tmp/codext-5.out" 2>&1
+grep -Fq '按上游整包布局装在' "$tmp/codext-5.out"
+# entrypoint 是我们的构建，不是包里那个占位的。
+grep -Fq '0.146.0 fifth' <<< "$("$codext_pkg_root/0.146.0/bin/codex")"
+# 其余全部是上游的，包括我们代码里从没写过名字的那个。
+grep -Fqx upstream-host <<< "$("$codext_pkg_root/0.146.0/bin/codex-code-mode-host")"
+grep -Fqx future <<< "$("$codext_pkg_root/0.146.0/bin/codex-some-future-sidecar")"
+grep -Fqx upstream-resource < "$codext_pkg_root/0.146.0/codex-resources/marker"
+# PATH 上那个名字变成指进树里的软链接，跑起来仍然是我们的构建。
+[[ -L "$codext_root/bin/codext" ]]
+grep -Fq '0.146.0 fifth' <<< "$("$codext_root/bin/codext")"
 
 printf 'ags self-check passed\n'

@@ -9290,6 +9290,114 @@ codext_asset_names() {
     esac
 }
 
+# 上游那个「整包」的 target 名。
+#
+# codext 只是 codex 换掉了一个可执行文件，剩下的东西——`codex-code-mode-host`、
+# `rg`、`bwrap`、自带的 zsh——我们一行都没改，所以不该由我们构建，也不该由我们
+# 分发：直接用上游发布的整包，把里面的 entrypoint 换成我们的二进制就是 codext。
+#
+# 这样「ags 能不能 hold 住 codext 的下一次更新」就不再取决于我们维护的清单：包里
+# 有什么由上游的 `codex-package.json` 说了算。上游哪天再拆出一个 sidecar、换掉
+# `rg`、加一个新的 resources 目录，下一次更新自动带上，这里一个字都不用改。
+#
+# Linux 上游整包只发 musl，我们的 `codext` 目前是 gnu。混用没有问题：sidecar 是
+# **独立进程**（`codex-code-mode-host` 走 WebSocket），resources 是数据和自带的
+# 静态二进制，两边不共享 ABI。
+codext_package_target() {
+    local machine
+    machine="$(uname -m)"
+    case "$platform:$machine" in
+        Linux:x86_64)   printf 'x86_64-unknown-linux-musl\n' ;;
+        Linux:aarch64)  printf 'aarch64-unknown-linux-musl\n' ;;
+        Darwin:arm64)   printf 'aarch64-apple-darwin\n' ;;
+        Darwin:x86_64)  printf 'x86_64-apple-darwin\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+# 把上游整包装成 codext：树整个是上游的，只有 entrypoint 换成我们的二进制。
+#
+# 这是 codext 应该长成的样子——上游分发的是一棵树（`bin/codex`、
+# `bin/codex-code-mode-host`、`codex-path/rg`、`codex-resources/{bwrap,zsh}`，外加
+# 一份自描述的 `codex-package.json`），而我们只改了其中一个文件。以前只发那一个
+# 文件，等于把上游的其余部分整个丢掉：0.147.0 之后 code mode 只走独立 host，缺了
+# 它就 fail closed，而 `rg`/`bwrap`/`zsh` 也一直在退回系统版本。
+#
+# 装成这个布局还有一层作用：`codex-package.json` 一旦在树里，`InstallContext` 就
+# 认出这是一个包，从而去 `codex-resources` / `codex-path` 找东西——和官方安装的
+# codex 走同一条路径解析。
+#
+# 版本对齐是天然的：codext 的版本号**就是**上游版本号，`v0.147.0` 直接对应上游
+# `rust-v0.147.0`，不需要任何映射表。
+#
+# 失败一律返回非零，不 die：调用方会退回只装我们那一个二进制。
+install_codext_package() {
+    local workspace="$1" version="$2" binary="$3"
+    local target url pkg entrypoint root dest staged
+    need jq
+
+    target="$(codext_package_target)" || return 1
+    pkg="$workspace/pkg"
+    mkdir -p -- "$pkg" || return 1
+
+    # 上游仓库是公开的，这里**不带** token：把我们的凭据发给别人的仓库既无必要
+    # 也不该做。
+    url="https://github.com/openai/codex/releases/download/rust-v$version/codex-package-$target.tar.gz"
+    curl -fsSL --connect-timeout 5 --max-time 900 "$url" -o "$workspace/pkg.tar.gz" || {
+        log "取不到上游整包（rust-v$version / $target），这次只装 codext 本身"
+        return 1
+    }
+    tar -xzf "$workspace/pkg.tar.gz" -C "$pkg" || {
+        log "上游整包解包失败，这次只装 codext 本身"
+        return 1
+    }
+
+    # entrypoint 从清单里读，不写死 `bin/codex`：上游换了位置我们跟着换。
+    entrypoint="$(jq -er '.entrypoint | select(type == "string" and . != "")' \
+        < "$pkg/codex-package.json" 2>/dev/null)" || {
+        log "上游整包没有可用的 codex-package.json，这次只装 codext 本身"
+        return 1
+    }
+    case "$entrypoint" in
+        /*|*..*) log "上游整包的 entrypoint 不是包内相对路径，拒绝：$entrypoint"; return 1 ;;
+    esac
+    [[ -f "$pkg/$entrypoint" ]] || {
+        log "上游整包里没有 $entrypoint，这次只装 codext 本身"
+        return 1
+    }
+
+    # 换掉那一个文件。这就是 codext 与上游的全部差异。
+    cat -- "$workspace/codext" > "$pkg/$entrypoint" || return 1
+    chmod 755 "$pkg/$entrypoint" || return 1
+
+    root="${AGS_CODEXT_PACKAGE_ROOT:-$HOME/.local/share/codext}"
+    install -d -m755 "$root" 2>/dev/null || return 1
+    dest="$root/$version"
+    staged="$root/.staging.$$"
+    rm -rf -- "$staged"
+    mv -- "$pkg" "$staged" || return 1
+    # 先把旧版挪开再落位：跨目录 rename 不是原子的，而一个跑到一半被覆盖的树比
+    # 没有树更难查。旧版留着，回退只是改一个软链接。
+    rm -rf -- "$dest.prev"
+    [[ ! -e "$dest" ]] || mv -- "$dest" "$dest.prev" || { rm -rf -- "$staged"; return 1; }
+    mv -- "$staged" "$dest" || {
+        [[ ! -e "$dest.prev" ]] || mv -- "$dest.prev" "$dest"
+        rm -rf -- "$staged"
+        return 1
+    }
+
+    # `$binary` 变成指向包内 entrypoint 的软链接。先建后换，PATH 上那个名字不会有
+    # 一瞬间是坏的。
+    ln -sfn -- "$dest/$entrypoint" "$binary.new.$$" &&
+        mv -- "$binary.new.$$" "$binary" || {
+        rm -f -- "$binary.new.$$"
+        return 1
+    }
+    rm -rf -- "$dest.prev"
+    log "codext $version 按上游整包布局装在 $dest（entrypoint 已换成我们的构建）"
+    return 0
+}
+
 update_codext() {
     local check_only="${1:-0}"
     local owner="${CODEXT_UPDATE_OWNER:-jk-zhang-meta}"
@@ -9459,14 +9567,21 @@ update_codext() {
         return 0
     }
     chmod 755 "$workspace/codext"
-    # Same directory, so this is a rename and not a copy: the binary is never
-    # observed half-written, and a running codext keeps its own inode.
-    mv -- "$workspace/codext" "$binary.new.$$" &&
-        mv -- "$binary.new.$$" "$binary" || {
+    # 先按上游的整包装。装成了，`$binary` 已经是指向包内 entrypoint 的软链接。
+    if ! install_codext_package "$workspace" "${tag#v}" "$binary"; then
+        # 退回只装我们这一个二进制——codext 一直以来的形态。宁可暂时少 code mode，
+        # 也不要让上游侧的一次抖动把这台机器上能跑的 codext 弄没。
+        #
+        # Same directory, so this is a rename and not a copy: the binary is never
+        # observed half-written, and a running codext keeps its own inode.
         rm -f -- "$binary.new.$$"
-        rm -rf -- "$workspace"
-        die "cannot replace $binary"
-    }
+        mv -- "$workspace/codext" "$binary.new.$$" &&
+            mv -- "$binary.new.$$" "$binary" || {
+            rm -f -- "$binary.new.$$"
+            rm -rf -- "$workspace"
+            die "cannot replace $binary"
+        }
+    fi
     rm -rf -- "$workspace"
     install -d -m700 "$state"
     printf '%s\n' "$digest" > "$stamp"
