@@ -3198,7 +3198,7 @@ configure_codex_pool() {
         # 端口必须写清楚：PersonalWeb 只服务 844，443 上没有东西，省掉端口的话
         # 每个请求都会挂到超时，看起来像"网络不通"而不是"地址写错了"。
         [[ "$url" =~ ^https?://[^/]+:[0-9]+$ ]] ||
-            log "提醒：地址没带端口，PersonalWeb 在 844 上（$codex_pool_default_url）"
+            log "提醒：地址没带端口，PersonalWeb 在 844 上（${codex_pool_default_url}）"
         IFS= read -r -s -p '终端密钥（在后台「密钥管理」签发）: ' key || return 1
         printf '\n'
         [[ -n "$key" ]] || { log "密钥不能为空"; continue; }
@@ -3314,7 +3314,7 @@ reconcile_codex_binary_name() {
         if [[ ! -t 0 || ! -t 1 ]]; then
             # 非交互式选不破坏的那一边。移动别人的二进制不是能替人默认的事。
             decision=keep
-            log "检测到另一个 codex（$resolved_codex）；非交互式运行按保留处理"
+            log "检测到另一个 codex（${resolved_codex}）；非交互式运行按保留处理"
         else
             printf '\n检测到已安装的 codex：%s\n' "$resolved_codex"
             printf 'codext 是它的超集：配了凭据池就在线租号，没配就退回同一份本地 auth.json。\n'
@@ -3340,7 +3340,7 @@ reconcile_codex_binary_name() {
             # 挪开而不是删除：这是可还原的，而删除不是。包管理器装的那种
             # （npm、brew）仍然认为自己装着，下次升级可能把它放回来——真要
             # 永久移除，得用装它的那个包管理器卸载。
-            log "原 codex 已挪到 $backup（若由包管理器安装，升级时可能被放回）"
+            log "原 codex 已挪到 ${backup}（若由包管理器安装，升级时可能被放回）"
             link_codext_as_codex "$codext_path" || return 1
             rm -f -- "$(codex_pool_disabled_file)"
         fi
@@ -9344,7 +9344,7 @@ install_codext_package() {
     # 也不该做。
     url="https://github.com/openai/codex/releases/download/rust-v$version/codex-package-$target.tar.gz"
     curl -fsSL --connect-timeout 5 --max-time 900 "$url" -o "$workspace/pkg.tar.gz" || {
-        log "取不到上游整包（rust-v$version / $target），这次只装 codext 本身"
+        log "取不到上游整包（rust-v$version / ${target}），这次只装 codext 本身"
         return 1
     }
     tar -xzf "$workspace/pkg.tar.gz" -C "$pkg" || {
@@ -9362,7 +9362,7 @@ install_codext_package() {
         /*|*..*) log "上游整包的 entrypoint 不是包内相对路径，拒绝：$entrypoint"; return 1 ;;
     esac
     [[ -f "$pkg/$entrypoint" ]] || {
-        log "上游整包里没有 $entrypoint，这次只装 codext 本身"
+        log "上游整包里没有 ${entrypoint}，这次只装 codext 本身"
         return 1
     }
 
@@ -9394,7 +9394,7 @@ install_codext_package() {
         return 1
     }
     rm -rf -- "$dest.prev"
-    log "codext $version 按上游整包布局装在 $dest（entrypoint 已换成我们的构建）"
+    log "codext $version 按上游整包布局装在 ${dest}（entrypoint 已换成我们的构建）"
     return 0
 }
 
@@ -9478,9 +9478,9 @@ update_codext() {
     response="${response%$'\n'*}"
     if [[ "$status" != 200 ]]; then
         if [[ "$status" == 404 && -z "$token" ]]; then
-            log "读不到 $owner/$repo（私有仓库需要授权）：装个 gh 并 gh auth login，或设 CODEXT_UPDATE_TOKEN"
+            log "读不到 $owner/${repo}（私有仓库需要授权）：装个 gh 并 gh auth login，或设 CODEXT_UPDATE_TOKEN"
         else
-            log "$owner/$repo 查不到发布（状态 $status），跳过 codext 更新"
+            log "$owner/$repo 查不到发布（状态 ${status}），跳过 codext 更新"
         fi
         return 0
     fi
@@ -9595,7 +9595,7 @@ update_codext() {
         # once and a binary that appears afterwards stays invisible until
         # `rehash`. AGS launches codext by absolute path and does not care, but
         # someone typing `codext` in the shell they ran this from does.
-        log "installed codext ${tag#v} at $binary；跑 ags codex-init 配置凭据池"
+        log "installed codext ${tag#v} at ${binary}；跑 ags codex-init 配置凭据池"
         log "直接敲 codext 需要新开一个终端（zsh 里 rehash 也行）"
     else
         log "updated codext to ${tag#v}"

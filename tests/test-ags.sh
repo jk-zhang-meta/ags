@@ -17,6 +17,22 @@ done
     echo 'tests require an installed UTF-8 locale' >&2
     exit 1
 }
+# macOS 的 /bin/bash 是 3.2.57，`"$dest（…"` 这种「变量紧跟全角字符」会被它把多字节
+# 字符的首字节当成变量名的一部分，于是在 `set -u` 下报 `dest?: unbound variable` 而
+# 整个脚本中止。Linux 上的 bash 5 完全正常，所以这个雷只在 Mac 上炸，而且只在真的
+# 走到那一行时才炸——2026-08-08 就是这样在 `ags codext-update` 的最后一句 log 上炸的，
+# 那时安装其实已经成功了，只是 stamp 没写成。
+#
+# 这条 lint 放在最前面，因为它必须在任何环境下都真的被执行到。修法永远是加花括号。
+mapfile -t bare_var_before_multibyte < <(
+    grep -nP '\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]' "$tool" || true
+)
+(( ${#bare_var_before_multibyte[@]} == 0 )) || {
+    printf 'bash 3.2 会把多字节字符的首字节吃进变量名，这些地方要写成 ${var}：\n' >&2
+    printf '%s\n' "${bare_var_before_multibyte[@]}" >&2
+    exit 1
+}
+
 tmp="$(mktemp -d "$test_tmp_root/agent-session-test.XXXXXX")"
 declare -A test_child_pids=()
 export FAKE_REAL_NODE_BINARY="$(command -v node)"
