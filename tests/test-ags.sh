@@ -884,6 +884,24 @@ grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$stale_claude"
 grep -Fqx '[ags] update available: ags 0.3.0-test -> v0.4.0' \
     "$tmp/stale-claude.err"
 [[ "$(<"$tmp/state/update-check.stamp")" != 0 ]]
+
+# 不启动 Agent 的命令同样要去拿答案。
+#
+# 报告（offer_pending_update）本来就在每条命令上跑，刷新却只挂在启动 Agent 那条
+# 路上。两边不对称的后果不是"晚一点提醒"，是**永远不提醒**：一台只用 `ags list` /
+# `ags resume` / `ags sync` 的机器，那个缓存文件从头到尾没人写过。stamp 被写动就是
+# 刷新被排上了——它走后台，所以这条命令自己不等它。
+rm -f -- "$tmp/state/update-check.stamp"
+env "${managed_env[@]}" "$tool" storage list > /dev/null 2>&1 || true
+[[ -s "$tmp/state/update-check.stamp" ]]
+[[ "$(<"$tmp/state/update-check.stamp")" != 0 ]]
+
+# `update` 系列自己就要联网，不该再排一次后台检查。
+rm -f -- "$tmp/state/update-check.stamp"
+env "${managed_env[@]}" AGS_UPDATE_CHECK_INTERVAL=0 "$tool" codext-update \
+    > /dev/null 2>&1 || true
+[[ ! -e "$tmp/state/update-check.stamp" ]]
+
 rm -f -- "$tmp/state/update-check.lines" "$tmp/state/update-check.stamp"
 safe_claude_settings="$tmp/safe-claude.settings.json"
 jq -n '{

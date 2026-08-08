@@ -9653,7 +9653,7 @@ offer_pending_update() {
 }
 
 announce_pending_updates() {
-    local interval="${AGS_UPDATE_CHECK_INTERVAL:-86400}" now checked_at line
+    local line
     local recorded=
     [[ "${AGS_UPDATE_CHECK:-1}" != 0 ]] || return 0
     # Every read below is guarded rather than tested-then-read. Under `set -e` a
@@ -9670,6 +9670,23 @@ announce_pending_updates() {
         [[ "$line" == "update available: "* ]] || continue
         log "$line"
     done <<< "$recorded"
+    maybe_refresh_update_check
+}
+
+# 到点了就在后台补一次检查。
+#
+# 从 `announce_pending_updates` 里拆出来，因为**每一条命令**都该让它有机会跑。
+# 原来只有启动 Agent 那条路会刷新，而报告那一半（`offer_pending_update`）是每条
+# 命令都跑的——两边不对称的后果是：一台平时只用 `ags list` / `ags resume` /
+# `ags sync` 的机器从来不去问有没有新版本，那个缓存文件从头到尾是空的，于是提醒
+# 永远不出现。看起来像"提醒坏了"，其实是从来没人去拿答案。
+#
+# **仍然是后台异步的。** 同步查一次 GitHub 要几百毫秒，把它加到每一条 ags 命令上
+# 是笔糟糕的买卖：代价是每条命令都变慢、离线时还要处理超时，换来的只是提醒早一条
+# 命令出现。所以这条命令报的是上一次检查的结果，同时把下一次的答案准备好。
+maybe_refresh_update_check() {
+    local interval="${AGS_UPDATE_CHECK_INTERVAL:-86400}" now checked_at
+    [[ "${AGS_UPDATE_CHECK:-1}" != 0 ]] || return 0
     [[ "$interval" =~ ^[0-9]+$ ]] || return 0
     now="$(date +%s 2>/dev/null)" || return 0
     checked_at=0
@@ -9745,9 +9762,19 @@ refresh_update_check_record() {
 # 任何 ags 命令之前都问一次，除了这几个：`update` 系列自己就是答案，其余四个
 # 由 install.sh 驱动并且它要解析它们的 stdout。（`-t` 那道闸已经挡住非交互式
 # 调用，这里是第二道——install.sh 也可能在终端里跑。）
+#
+# 刷新和报告在这里成对出现。只报告不刷新，等于一直读一个没人写过的文件：一台只跑
+# `ags list` / `ags resume` / `ags sync` 的机器永远不会知道有新版本。刷新走后台，
+# 所以这一对不给命令增加任何等待——报的是上一次的答案，同时备好下一次的。
+#
+# 排除的那四个也不刷新：`update` 自己就要联网查一遍，`update-check-refresh` 就是
+# 那个后台检查本身，另外两个由 install.sh 驱动。
 case "${1:-}" in
     update|update-check-refresh|codext-update|codex-name) ;;
-    *) offer_pending_update || true ;;
+    *)
+        offer_pending_update || true
+        maybe_refresh_update_check || true
+        ;;
 esac
 
 case "${1:-}" in
