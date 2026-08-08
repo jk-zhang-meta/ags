@@ -452,6 +452,17 @@ storage_path_has_safe_components() {
 
 
 
+sha256_file() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$file" | awk '{print $1}'
+    else
+        return 1
+    fi
+}
+
 
 
 
@@ -632,6 +643,10 @@ initialize_ags() {
             chmod 600 "$managed_identity_file"
         fi
     fi
+
+    # maintain：`ags init` 可以被反复运行，所以这里只补一个空缺的名字，绝不
+    # 取代已经在的那个。取代是安装期的事，见 `ags codex-name`。
+    reconcile_codex_binary_name maintain
 
     if [[ ! -e "$vault" ]]; then
         install -d -m700 "$vault"
@@ -3228,7 +3243,118 @@ codex_pool_write() {
     mv -- "$temporary" "$target"
 }
 
+codex_name_decision_file() { printf '%s/codex-name\n' "$state"; }
 codex_pool_disabled_file() { printf '%s/codex-pool-disabled\n' "$state"; }
+
+# Give codext the name `codex`, in the directory codext already lives in.
+#
+# Same directory on purpose: that directory is by definition on PATH — it is
+# where `command -v codext` just found it — so the new name takes effect with
+# no PATH change and no second place to keep in sync.
+link_codext_as_codex() {
+    local codext_path="$1" directory
+    directory="$(dirname -- "$codext_path")"
+    [[ -w "$directory" ]] || {
+        log "警告：$directory 不可写，codext 无法取得 codex 这个名字；ags codex 将不可用"
+        return 1
+    }
+    ln -sfn -- "$codext_path" "$directory/codex" || return 1
+    log "codext 已取得 codex 这个名字：$directory/codex -> $codext_path"
+}
+
+# Decide, once, which binary owns the name `codex` on this machine.
+#
+# Two places disagree about what "Codex" means, and that disagreement is what
+# made a codext-only host unusable. Anything that detects Codex strictly by the
+# name `codex` sees nothing on a codext-only host, while `resolve_agent_binary`
+# prefers `codext` and finds it regardless — so init configures nothing, launch
+# works anyway, and any refusal in between reads "run ags init": advice that
+# could never work there, because the next init makes the same non-decision.
+#
+# Deciding here, before anything reads either name, is what makes
+# `codex --yolo` start in all three cases.
+#
+# `mode` 决定这一趟能走多远：
+#
+#   maintain（默认）  只在**没有任何** codex 时补上那个名字。不问，不动别人的
+#                     文件。`ags init` 走这一支——那个命令是可以反复跑的，而
+#                     「把某人的二进制挪走」不是能在一个随手重跑的命令里发生
+#                     的事，哪怕只发生一次。
+#   install           完整决定：发现外来 codex 就问，允许时把它挪开。只有安装
+#                     器调这一支。
+reconcile_codex_binary_name() {
+    local mode="${1:-maintain}"
+    local codext_path codex_path resolved_codex resolved_codext
+    local decision reply directory backup decision_file
+    codext_path="$(command -v codext 2>/dev/null || true)"
+    [[ -n "$codext_path" ]] || return 0
+    codex_path="$(command -v codex 2>/dev/null || true)"
+
+    if [[ -z "$codex_path" ]]; then
+        # 没有人占着这个名字，给它一个主人不会动到任何既有文件，所以两种模式
+        # 都做——这正是那个死循环的解。
+        link_codext_as_codex "$codext_path" || true
+        return 0
+    fi
+
+    resolved_codex="$(realpath -e -- "$codex_path" 2>/dev/null || printf '%s' "$codex_path")"
+    resolved_codext="$(realpath -e -- "$codext_path" 2>/dev/null || printf '%s' "$codext_path")"
+    # 已经是同一个文件，没什么可决定的。
+    [[ "$resolved_codex" != "$resolved_codext" ]] || return 0
+
+    # 到这里说明有一个外来的 codex。取代它是安装期的决定。
+    [[ "$mode" == install ]] || return 0
+
+    decision_file="$(codex_name_decision_file)"
+    decision=
+    [[ ! -s "$decision_file" ]] || IFS= read -r decision < "$decision_file" || decision=
+    [[ "$decision" == replace || "$decision" == keep ]] || decision=
+
+    if [[ -z "$decision" ]]; then
+        if [[ ! -t 0 || ! -t 1 ]]; then
+            # 非交互式选不破坏的那一边。移动别人的二进制不是能替人默认的事。
+            decision=keep
+            log "检测到另一个 codex（$resolved_codex）；非交互式运行按保留处理"
+        else
+            printf '\n检测到已安装的 codex：%s\n' "$resolved_codex"
+            printf 'codext 是它的超集：配了凭据池就在线租号，没配就退回同一份本地 auth.json。\n'
+            printf '用 codext 接管 codex 这个名字？\n'
+            printf '  y = 把现有的挪到一边（保留备份，可还原），codex 指向 codext\n'
+            printf '  N = 保留现有的；本机不配置凭据池，原生 codex 读不到它\n[y/N]: '
+            IFS= read -r reply || reply=n
+            case "${reply:-n}" in
+                [Yy]*) decision=replace ;;
+                *) decision=keep ;;
+            esac
+        fi
+    fi
+
+    if [[ "$decision" == replace ]]; then
+        directory="$(dirname -- "$codex_path")"
+        if [[ ! -w "$directory" ]]; then
+            log "警告：$directory 不可写，改为保留现有 codex"
+            decision=keep
+        else
+            backup="$codex_path.stock.$(date -u +%Y%m%dT%H%M%SZ)"
+            mv -- "$codex_path" "$backup" || return 1
+            # 挪开而不是删除：这是可还原的，而删除不是。包管理器装的那种
+            # （npm、brew）仍然认为自己装着，下次升级可能把它放回来——真要
+            # 永久移除，得用装它的那个包管理器卸载。
+            log "原 codex 已挪到 $backup（若由包管理器安装，升级时可能被放回）"
+            link_codext_as_codex "$codext_path" || return 1
+            rm -f -- "$(codex_pool_disabled_file)"
+        fi
+    fi
+
+    if [[ "$decision" == keep ]]; then
+        # 原生 codex 读不到池配置，问了也用不上，所以这里直接记为禁用而不是
+        # 每次 init 再问一遍。
+        : > "$(codex_pool_disabled_file)"
+        log "保留现有 codex；本机不配置凭据池（原生 codex 用不到）"
+    fi
+    printf '%s\n' "$decision" > "$decision_file"
+    log "要改这个决定：删掉 $decision_file 再跑 ags init"
+}
 
 # Ask at init time whether this machine should use the pool at all.
 #
@@ -3656,8 +3782,9 @@ start_managed_agent() {
 #
 # 必须和 resolve_agent_binary 用同一套判断：它认 codext 当 codex，而菜单从前
 # 只认 `codex` 这个名字。两边口径不一致的后果具体而恼人——一台只装了 codext
-# 的机器，`ags codex` 跑得好好的，菜单却说找不到 Codex。以前是靠给 codext 加
-# 一个叫 codex 的软链接来抹平，那是拿改名去补一个判断错误。
+# 的机器，`ags codex` 跑得好好的，菜单却说找不到 Codex。给 codext 加一个叫
+# codex 的软链接（`ags codex-name`）能让名字对上，但那是安装期的取舍，判断本身
+# 不该指望它：没做那一步的机器，菜单照样要看得见。
 agent_available() {
     resolve_agent_binary "$1" >/dev/null 2>&1
 }
@@ -9115,6 +9242,252 @@ legacy_command() {
     esac
 }
 
+# Keep the installed codext current, as part of `ags update`.
+#
+# Separate from the casr update because they are separate release trains: the
+# fork tracks upstream Codex, casr tracks AGS. Folding them into one version
+# check would mean a Codex release could not reach a machine until AGS also
+# cut one.
+#
+# Unlike the casr path there is no installer to hand over to — codext ships a
+# single binary — so the download happens here. It is written beside the binary
+# it replaces and moved into place, so an interrupted download never leaves a
+# half-written executable on PATH.
+# Asset names this machine can use, best first.
+#
+# musl first because it runs on any glibc vintage; gnu is listed as a fallback
+# so a release cut from a workstation rather than from CI is still installable.
+# Both contain the same binary — only the libc it is linked against differs.
+# A token that can read the codext repository.
+#
+# The fork is private on purpose — it names the pool's endpoint prefix, and that
+# prefix is part of how the endpoint stays unfound. So unlike a public release,
+# reading it needs credentials. `gh` is the usual source; the env vars are for
+# machines without it.
+codext_update_token() {
+    local token="${CODEXT_UPDATE_TOKEN:-${GH_TOKEN:-${GITHUB_TOKEN:-}}}"
+    if [[ -z "$token" ]] && command -v gh >/dev/null 2>&1; then
+        token="$(gh auth token 2>/dev/null || true)"
+    fi
+    printf '%s\n' "$token"
+}
+
+codext_asset_names() {
+    local machine
+    machine="$(uname -m)"
+    case "$platform:$machine" in
+        Linux:x86_64)
+            printf 'codext-x86_64-unknown-linux-musl.tar.gz\n'
+            printf 'codext-x86_64-unknown-linux-gnu.tar.gz\n'
+            ;;
+        Linux:aarch64)
+            printf 'codext-aarch64-unknown-linux-musl.tar.gz\n'
+            printf 'codext-aarch64-unknown-linux-gnu.tar.gz\n'
+            ;;
+        Darwin:arm64)   printf 'codext-aarch64-apple-darwin.tar.gz\n' ;;
+        Darwin:x86_64)  printf 'codext-x86_64-apple-darwin.tar.gz\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+update_codext() {
+    local check_only="${1:-0}"
+    local owner="${CODEXT_UPDATE_OWNER:-jk-zhang-meta}"
+    local repo="${CODEXT_UPDATE_REPO:-codext}"
+    local binary destination current tag response status asset url workspace stamp
+    local token asset_id digest entry actual codex_binary fresh=0
+    local -a candidates=() auth=()
+
+    binary="$(command -v codext 2>/dev/null || true)"
+    if [[ -z "$binary" ]]; then
+        # Not installed yet: put it exactly where the native Codex lives.
+        # `resolve_agent_binary` decides by nothing more than whether `codext`
+        # is on PATH, so landing in that same directory is what makes every
+        # launch path start going through the pool.
+        #
+        # The directory of the path `command -v` reported, deliberately not the
+        # resolved one: Codex installs itself as a symlink into
+        # ~/.codex/packages/standalone/current/bin, and that directory is not on
+        # PATH. Following the link would install into a place nothing looks.
+        codex_binary="$(command -v codex 2>/dev/null || true)"
+        if [[ -n "$codex_binary" ]]; then
+            binary="$(dirname "$codex_binary")/codext"
+        else
+            # No Codex at all on this host. codext is a complete Codex, so
+            # installing it is still the right answer — next to casr, which is
+            # the installer's --dest and the one directory install.sh's
+            # maybe_add_path puts on PATH. Anywhere else and `codext` would not
+            # be a command the user can type.
+            binary="${AGS_CONVERTER_BINARY:-}"
+            [[ -n "$binary" ]] || return 0
+            binary="$(dirname "$binary")/codext"
+        fi
+        fresh=1
+    fi
+    destination="$(dirname "$binary")"
+    [[ -w "$destination" ]] || {
+        log "codext 的目标目录不可写，跳过：$destination"
+        return 0
+    }
+
+    # The build we last installed, identified by the release asset's content
+    # digest and deliberately not by the tag.
+    #
+    # codext's version is the upstream Codex version, exactly, and carries no
+    # fork-local suffix — `codext --version` has to be readable as `codex
+    # --version` by anything that reads either. So successive codext builds on
+    # one upstream base all publish under the same tag, and the tag cannot say
+    # whether this host has the current one. The digest is what moves when the
+    # binary does, and it says "no change" for a rebuild of identical bytes.
+    #
+    # A first install ignores the stamp entirely. It outlives an uninstalled
+    # binary, and trusting it there would report "already current" about a
+    # codext that is not on the disk. So does a stamp from before this was a
+    # digest, which costs exactly one re-download to correct itself.
+    stamp="$state/codext-release"
+    current=
+    if (( fresh == 0 )) && [[ -s "$stamp" ]]; then
+        IFS= read -r current < "$stamp" || current=
+        [[ "$current" == sha256:* ]] || current=
+    fi
+
+    mapfile -t candidates < <(codext_asset_names) || true
+    (( ${#candidates[@]} > 0 )) || {
+        log "codext 没有为 $platform/$(uname -m) 发布的版本，跳过"
+        return 0
+    }
+
+    token="$(codext_update_token)"
+    auth=()
+    [[ -z "$token" ]] || auth=(-H "Authorization: Bearer $token")
+    response="$(curl -sSL --connect-timeout 5 --max-time 20 --max-filesize 1048576 \
+        -H 'Accept: application/vnd.github+json' "${auth[@]}" -w '\n%{http_code}' \
+        "https://api.github.com/repos/$owner/$repo/releases/latest" 2>/dev/null)" || {
+        log "连不上 api.github.com，跳过 codext 更新"
+        return 0
+    }
+    status="${response##*$'\n'}"
+    response="${response%$'\n'*}"
+    if [[ "$status" != 200 ]]; then
+        if [[ "$status" == 404 && -z "$token" ]]; then
+            log "读不到 $owner/$repo（私有仓库需要授权）：装个 gh 并 gh auth login，或设 CODEXT_UPDATE_TOKEN"
+        else
+            log "$owner/$repo 查不到发布（状态 $status），跳过 codext 更新"
+        fi
+        return 0
+    fi
+
+    tag="$(jq -er '.tag_name | select(type == "string" and test("^v[0-9]"))' \
+        <<< "$response" 2>/dev/null)" || {
+        log "$owner/$repo 最新发布没有可用的版本号，跳过"
+        return 0
+    }
+    # The API asset URL, not browser_download_url: the latter redirects to a
+    # signed CDN link that a private repository will not issue without the
+    # Authorization header, and curl drops that header across hosts.
+    #
+    # Resolved before the up-to-date check and not after it, because the digest
+    # that answers that question belongs to this asset.
+    asset_id=
+    digest=
+    for asset in "${candidates[@]}"; do
+        if entry="$(jq -er --arg name "$asset" '
+            .assets[] | select(.name == $name) | "\(.id) \(.digest // "")"
+        ' <<< "$response" 2>/dev/null)"; then
+            asset_id="${entry%% *}"
+            digest="${entry#* }"
+            break
+        fi
+    done
+    [[ -n "$asset_id" ]] || {
+        log "${tag#v} 里没有 ${candidates[0]}（或其它本机可用的包），跳过 codext 更新"
+        return 0
+    }
+    url="https://api.github.com/repos/$owner/$repo/releases/assets/$asset_id"
+
+    # An asset GitHub has not published a digest for cannot prove it is
+    # unchanged, so it reinstalls rather than being assumed current.
+    if [[ -n "$digest" && "$digest" == "$current" ]]; then
+        log "already current: codext ${tag#v}"
+        return 0
+    fi
+    if (( check_only == 1 )); then
+        if (( fresh == 1 )); then
+            log "codext 还没装；ags update 会把 ${tag#v} 装到 $destination"
+        else
+            log "update available: codext ${tag#v} 有新构建"
+        fi
+        return 0
+    fi
+
+    if (( fresh == 1 )); then
+        log "installing codext ${tag#v} into $destination"
+    else
+        log "updating codext to ${tag#v}"
+    fi
+    workspace="$(mktemp -d "${TMPDIR:-/tmp}/codext-update.XXXXXX")" ||
+        die "cannot create a temporary directory for the codext download"
+    curl -fsSL --connect-timeout 5 --max-time 900 \
+        -H 'Accept: application/octet-stream' "${auth[@]}" \
+        "$url" -o "$workspace/$asset" || {
+        rm -rf -- "$workspace"
+        log "codext ${tag#v} 下载失败，现有版本没有变动"
+        return 0
+    }
+    # The digest is about to be written down as "the build this host has", and
+    # every later update check trusts that record. A truncated download would
+    # make it a lie that never corrects itself — the check would keep answering
+    # "already current" about bytes that are not there. Verifying here is what
+    # makes the stamp mean anything, and it is also the only integrity check
+    # standing between a mangled download and an executable on PATH.
+    if [[ -n "$digest" ]]; then
+        actual="$(sha256_file "$workspace/$asset")" || actual=
+        if [[ "sha256:$actual" != "$digest" ]]; then
+            rm -rf -- "$workspace"
+            log "codext ${tag#v} 下载内容跟发布的 sha256 对不上，现有版本没有变动"
+            return 0
+        fi
+    fi
+    tar -xzf "$workspace/$asset" -C "$workspace" || {
+        rm -rf -- "$workspace"
+        log "codext ${tag#v} 解包失败，现有版本没有变动"
+        return 0
+    }
+    [[ -f "$workspace/codext" ]] || {
+        rm -rf -- "$workspace"
+        log "codext ${tag#v} 的包里没有 codext 可执行文件，现有版本没有变动"
+        return 0
+    }
+    chmod 755 "$workspace/codext"
+    # Same directory, so this is a rename and not a copy: the binary is never
+    # observed half-written, and a running codext keeps its own inode.
+    mv -- "$workspace/codext" "$binary.new.$$" &&
+        mv -- "$binary.new.$$" "$binary" || {
+        rm -f -- "$binary.new.$$"
+        rm -rf -- "$workspace"
+        die "cannot replace $binary"
+    }
+    rm -rf -- "$workspace"
+    install -d -m700 "$state"
+    printf '%s\n' "$digest" > "$stamp"
+    if (( fresh == 1 )); then
+        # Without a pool configured codext is exactly stock Codex, and it says
+        # nothing about it. Someone who never runs codex-init would keep using
+        # their own account and never learn why.
+        #
+        # The directory is already on PATH — it is the one Codex itself is in,
+        # or the one casr is in. What is not is zsh's command table: it is built
+        # once and a binary that appears afterwards stays invisible until
+        # `rehash`. AGS launches codext by absolute path and does not care, but
+        # someone typing `codext` in the shell they ran this from does.
+        log "installed codext ${tag#v} at $binary；跑 ags codex-init 配置凭据池"
+        log "直接敲 codext 需要新开一个终端（zsh 里 rehash 也行）"
+    else
+        log "updated codext to ${tag#v}"
+    fi
+}
+
+
 # `ags update` deliberately does not know how to update anything.
 #
 # install.sh already owns the hard parts — resolving the platform, verifying
@@ -9140,6 +9513,11 @@ update_ags() {
     done
 
     need curl; need jq
+
+    # codext first, and never fatally: it is a separate release train, and a
+    # machine that has not installed it at all is a normal machine. Running it
+    # before the casr update means a failure here still leaves casr updatable.
+    update_codext "$check_only" || true
 
     binary="$(resolve_ags_converter_binary)"
     destination="$(dirname "$binary")"
@@ -9368,7 +9746,7 @@ refresh_update_check_record() {
 # 由 install.sh 驱动并且它要解析它们的 stdout。（`-t` 那道闸已经挡住非交互式
 # 调用，这里是第二道——install.sh 也可能在终端里跑。）
 case "${1:-}" in
-    update|update-check-refresh) ;;
+    update|update-check-refresh|codext-update|codex-name) ;;
     *) offer_pending_update || true ;;
 esac
 
@@ -9386,6 +9764,23 @@ case "${1:-}" in
         shift
         (( $# == 0 )) || die "usage: ags codex-pool"
         codex_pool_status
+        ;;
+    codext-update)
+        # install.sh's hook into the same function `ags update` uses, so a
+        # fresh install lands codext too. Deliberately not `ags update` itself:
+        # that one would also self-update casr, and would therefore undo an
+        # explicit `install.sh --version` seconds after it landed.
+        shift
+        (( $# == 0 )) || die "usage: ags codext-update"
+        update_codext 0
+        ;;
+    codex-name)
+        # 安装器专用。这是唯一会去问「要不要用 codext 取代现有 codex」并在
+        # 允许时挪走对方二进制的入口，因为那是装一次就定下来的事，不该在
+        # `ags init` 这种可以随手重跑的命令里发生。
+        shift
+        (( $# == 0 )) || die "usage: ags codex-name"
+        reconcile_codex_binary_name install
         ;;
     set) shift; configure_local_storage "$@" ;;
     cloud) shift; cloud_command "$@" ;;
