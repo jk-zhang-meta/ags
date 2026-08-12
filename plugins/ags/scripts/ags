@@ -9367,7 +9367,15 @@ install_codext_package() {
     }
 
     # 换掉那一个文件。这就是 codext 与上游的全部差异。
-    cat -- "$workspace/codext" > "$pkg/$entrypoint" || return 1
+    # 磁盘满就是在这里炸的（1.2G 的二进制）。不解释一句的话，用户看到的只有内核那行
+    # 裸的 `cat: ... No space left on device`，然后是一句 "updated codext"——**装是装上
+    # 了，但退成了单文件布局**，`codex-code-mode-host` / `rg` / `bwrap` / `zsh` 全部
+    # 没有，而这件事没有任何提示。code mode 下一次就会失效，且看不出和这次更新有关。
+    if ! cat -- "$workspace/codext" > "$pkg/$entrypoint"; then
+        log "写入整包的 entrypoint 失败（多半是磁盘满），这次只装 codext 本身；"
+        log "腾出空间后重跑 ags codext-update 可以恢复整包布局（code mode 需要它）"
+        return 1
+    fi
     chmod 755 "$pkg/$entrypoint" || return 1
 
     root="${AGS_CODEXT_PACKAGE_ROOT:-$HOME/.local/share/codext}"
@@ -9584,7 +9592,13 @@ update_codext() {
     fi
     rm -rf -- "$workspace"
     install -d -m700 "$state"
-    printf '%s\n' "$digest" > "$stamp"
+    # 写不进去就说出来。这一行失败而无人知晓的后果是**每次都重下一遍**：下一次检查
+    # 读不到 stamp，就认定这台机器还没装过，于是又下 300MB、又失败、又不记账。磁盘满
+    # 的时候这会变成一个自己不会停的循环。
+    printf '%s\n' "$digest" > "$stamp" || {
+        log "记不下这次安装的版本（$stamp 写失败，多半是磁盘满）；"
+        log "下一次检查会当成没装过、再下一遍。先腾空间，再重跑 ags codext-update"
+    }
     if (( fresh == 1 )); then
         # Without a pool configured codext is exactly stock Codex, and it says
         # nothing about it. Someone who never runs codex-init would keep using
