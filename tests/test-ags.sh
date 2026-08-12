@@ -912,6 +912,22 @@ env "${managed_env[@]}" "$tool" storage list > /dev/null 2>&1 || true
 [[ -s "$tmp/state/update-check.stamp" ]]
 [[ "$(<"$tmp/state/update-check.stamp")" != 0 ]]
 
+# 实时查过之后，缓存里那条陈旧提示要被丢掉。
+#
+# 不丢的后果很具体：`ags codext-update` 报 already current，紧接着 `ags codex` 又问
+# "现在更新？"——因为后者读的是缓存，而缓存要等 86400 秒才刷新。用户看到的是"更新
+# 根本没生效"。
+printf '%s\n' \
+    'update available: ags 0.3.0-test -> v0.4.0' \
+    'update available: codext 0.146.0 -> v0.147.0' \
+    > "$tmp/state/update-check.lines"
+env "${managed_env[@]}" "$tool" codext-update > /dev/null 2>&1 || true
+# codext 那条没了……
+! grep -Fq 'update available: codext' "$tmp/state/update-check.lines"
+# ……而 ags 那条还在：它仍然有效，不该被连坐。
+grep -Fq 'update available: ags 0.3.0-test' "$tmp/state/update-check.lines"
+rm -f -- "$tmp/state/update-check.lines"
+
 # `update` 系列自己就要联网，不该再排一次后台检查。
 rm -f -- "$tmp/state/update-check.stamp"
 env "${managed_env[@]}" AGS_UPDATE_CHECK_INTERVAL=0 "$tool" codext-update \

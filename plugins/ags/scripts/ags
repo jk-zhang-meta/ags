@@ -9525,6 +9525,7 @@ update_codext() {
     # unchanged, so it reinstalls rather than being assumed current.
     if [[ -n "$digest" && "$digest" == "$current" ]]; then
         log "already current: codext ${tag#v}"
+        forget_update_notice "update available: codext"
         return 0
     fi
     if (( check_only == 1 )); then
@@ -9614,6 +9615,7 @@ update_codext() {
     else
         log "updated codext to ${tag#v}"
     fi
+    forget_update_notice "update available: codext"
 }
 
 
@@ -9684,6 +9686,7 @@ update_ags() {
     # A move in either direction is printed, so a downgrade is never silent.
     if [[ "$tag" == "v$current" ]]; then
         log "already current: ags $current is the latest release ($tag)"
+        forget_update_notice "update available: ags"
         return 0
     fi
 
@@ -9800,6 +9803,22 @@ announce_pending_updates() {
         log "$line"
     done <<< "$recorded"
     maybe_refresh_update_check
+}
+
+# 刚刚实时查过了，把缓存里那条关于它的陈旧提示丢掉。
+#
+# `offer_pending_update` 读的是缓存文件，而缓存只由后台刷新覆盖、间隔默认 86400 秒。
+# 于是"更新成功"之后接下来一整天，每一条 ags 命令都还在问"现在更新？"——用户刚跑完
+# `ags codext-update` 看到 already current，下一条 `ags codex` 又被问一遍，看起来像是
+# 更新根本没生效。
+#
+# 只删匹配的那一行，不清整个文件：另一个组件可能有一条**仍然有效**的提示等着报。
+forget_update_notice() {
+    local prefix="$1" temporary
+    [[ -f "$update_check_lines" && ! -L "$update_check_lines" ]] || return 0
+    temporary="$update_check_lines.tmp.$$"
+    grep -vF -e "$prefix" -- "$update_check_lines" > "$temporary" 2>/dev/null || :
+    mv -- "$temporary" "$update_check_lines" 2>/dev/null || rm -f -- "$temporary"
 }
 
 # 到点了就在后台补一次检查。
