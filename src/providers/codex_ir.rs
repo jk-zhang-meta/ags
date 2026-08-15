@@ -622,11 +622,18 @@ impl Builder {
             .and_then(Value::as_str)
             .map(Role::from_native)
             .unwrap_or(Role::Assistant);
-        let body = Body::Message {
-            role,
-            blocks: blocks_from_content(item.get("content")),
-        };
-        let mut event = self.build(source.clone(), ts, Visibility::Model, body, Vec::new());
+        // `content_parts` with the binding, not `blocks_from_content`: the
+        // messages inside `replacement_history` carry `encrypted_content` blocks
+        // just like a live `agent_message` does, and `blocks_from_content` passes
+        // `None` for the binding — which fails the capsule arm's `let Some(bound)`
+        // and files sealed material as an ordinary `Block::Unknown` instead. From
+        // there it is written back verbatim into whatever transcript comes next,
+        // and a foreign provider rejects the block at resume time.
+        //
+        // The binding is already a parameter here; it was simply not threaded in.
+        let (blocks, capsules) = content_parts(item.get("content"), Some(bound));
+        let body = Body::Message { role, blocks };
+        let mut event = self.build(source.clone(), ts, Visibility::Model, body, capsules);
         event.turn = turn;
         event
     }

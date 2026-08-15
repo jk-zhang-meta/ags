@@ -121,6 +121,8 @@ pub fn render(
         rewritten_arguments: 0,
         foreign_seals: 0,
         foreign_seal_bytes: 0,
+        foreign_blocks: 0,
+        foreign_block_bytes: 0,
         recast_roles: 0,
         dropped_empty: 0,
         reshaped_reasoning: 0,
@@ -422,6 +424,8 @@ struct Writer {
     rewritten_arguments: usize,
     foreign_seals: usize,
     foreign_seal_bytes: usize,
+    foreign_blocks: usize,
+    foreign_block_bytes: usize,
     recast_roles: usize,
     dropped_empty: usize,
     reshaped_reasoning: usize,
@@ -515,6 +519,20 @@ impl Writer {
                  Anthropic never issued and must reject, so they were dropped rather than \
                  re-labelled.",
                 self.foreign_seals, self.foreign_seal_bytes
+            ),
+        );
+        push(
+            LossKind::Reasoning,
+            self.foreign_blocks,
+            self.foreign_blocks,
+            self.foreign_block_bytes,
+            Fidelity::ContextNoReasoning,
+            format!(
+                "{} block(s) totalling {} bytes used a content type this version does not \
+                 understand and Anthropic does not define — Codex `encrypted_content` among \
+                 them. Written back they are rejected by the API on every resume, not at \
+                 write time, so they were dropped here where the loss can be counted.",
+                self.foreign_blocks, self.foreign_block_bytes
             ),
         );
         push(
@@ -871,6 +889,9 @@ impl Writer {
             if self.is_foreign_seal(block) {
                 continue;
             }
+            if self.is_foreign_block(block) {
+                continue;
+            }
             content.push(match block {
                 Block::Text { text } => json!({"type": "text", "text": text}),
                 Block::Image { url, media_type } => image_block(url, media_type.as_deref()),
@@ -924,6 +945,43 @@ impl Writer {
         };
         self.foreign_seals += 1;
         self.foreign_seal_bytes += sealed.len();
+        true
+    }
+
+    /// Would writing this block put a block type Anthropic does not define into
+    /// an Anthropic `content` array?
+    ///
+    /// [`Self::is_foreign_seal`] guards the two block shapes that would forge a
+    /// signature. This guards the rest, and it has to exist separately because
+    /// the failure is not about signatures at all: Anthropic's `content` accepts
+    /// a **closed set** of `type` tags, and anything else is rejected outright —
+    ///
+    /// ```text
+    /// API Error: 400 messages.1.content.1: Input tag 'encrypted_content' found
+    /// using 'type' does not match any of the expected tags: …
+    /// ```
+    ///
+    /// — which is a Codex `reasoning.encrypted_content` block reaching Anthropic
+    /// through `Block::Unknown`, written back verbatim. The reader files those
+    /// on [`Event::capsules`] when it has a binding to file them under, but the
+    /// compacted-history path had none, so they arrived here as ordinary blocks.
+    /// A converted session with one of these in it does not fail on write; it
+    /// fails on **every resume**, at the API, after the file already looks fine.
+    ///
+    /// The gate is "unknown *and* foreign", not a list of banned types: a type
+    /// this version does not understand is exactly the one we cannot vouch the
+    /// target accepts. Same-agent is exempt for the same reason as above — a
+    /// Claude transcript's own blocks really are Anthropic's, and refusing them
+    /// would delete content on the one path that conserves everything.
+    fn is_foreign_block(&mut self, block: &Block) -> bool {
+        let Block::Unknown { raw, .. } = block else {
+            return false;
+        };
+        if self.same_agent {
+            return false;
+        }
+        self.foreign_blocks += 1;
+        self.foreign_block_bytes += raw.to_string().len();
         true
     }
 }
@@ -1301,6 +1359,68 @@ mod tests {
         assert_eq!(out.losses.len(), 1);
         assert_eq!(out.losses[0].kind, LossKind::ToolProtocol);
         assert_eq!(out.fidelity, Fidelity::ConversationOnly);
+    }
+
+    /// A block type Anthropic does not define must not reach an Anthropic
+    /// transcript, however it got into the IR.
+    ///
+    /// The instance was Codex `encrypted_content` arriving as `Block::Unknown`
+    /// from the compacted-history path and being written back verbatim. Nothing
+    /// failed at write time — the file looked complete and graded itself
+    /// complete — and then **every** resume died at the API with
+    /// `400 … Input tag 'encrypted_content' … does not match any of the expected
+    /// tags`. Three converted sessions in the local corpus carried 90 of them.
+    #[test]
+    fn a_block_type_the_target_does_not_define_is_dropped_not_written() {
+        let mut source = ir(vec![event(
+            "a1",
+            1,
+            Body::Message {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::Text {
+                        text: "the words survive".into(),
+                    },
+                    Block::Unknown {
+                        native_type: Some("encrypted_content".into()),
+                        raw: json!({"type": "encrypted_content", "encrypted_content": "SEALED"}),
+                    },
+                ],
+            },
+        )]);
+        // Cross-agent: the same transcript written back to its own agent keeps
+        // its blocks, so the origin has to say "not us" for the gate to apply.
+        source.origin.agent = "codex".into();
+
+        let out = render(
+            &source,
+            "sid",
+            Utc::now(),
+            &ContextBudget {
+                max_context_tokens: 0,
+                max_tool_output: 0,
+                keep_reasoning: true,
+            },
+        )
+        .expect("non-empty replay");
+        let records = records(&out);
+        let content = &records[0]["message"]["content"];
+
+        assert_eq!(content.as_array().expect("array").len(), 1, "{content}");
+        assert_eq!(content[0]["type"], json!("text"));
+        assert!(
+            !out.lines.iter().any(|line| line.contains("encrypted_content")),
+            "no line may carry the foreign block: {:?}",
+            out.lines,
+        );
+        let loss = out
+            .losses
+            .iter()
+            .find(|loss| loss.note.contains("does not understand"))
+            .expect("the drop is counted, not silent");
+        assert_eq!(loss.kind, LossKind::Reasoning);
+        assert_eq!(loss.capsules, 1);
+        assert_eq!(loss.events, 1);
     }
 
     #[test]
