@@ -8,9 +8,11 @@ description: Save, inspect, restore, resume, delete, and synchronize encrypted l
 Use `casr checkpoint`. The installer also provides `ags` as a compatibility
 command. Use `$ags` in Codex and `/ags` in Claude.
 
-Preserve IDs, descriptions, paths, remote names, and client arguments exactly.
-Descriptions may use any language. Never edit native transcripts, manifests, or
-encrypted archives directly.
+Preserve user-supplied IDs, descriptions, paths, remote names, and client
+arguments exactly. Never invent client arguments or reconstruct native session
+selection from context; AGS owns that part of every managed resume. Descriptions
+may use any language. Never edit native transcripts, manifests, or encrypted
+archives directly.
 
 ## Primary commands
 
@@ -84,7 +86,11 @@ Complete only on `status=configured`.
 
 Require a separate ID and non-empty description. IDs use 1-64 letters, numbers,
 dots, underscores, or hyphens. Never invent, combine, slugify, or translate
-either value.
+either value. `save` takes exactly those two arguments. Pass no client arguments
+after `DESCRIPTION`, including `resume`, `--resume`, or a native session ID.
+AGS gets the active session and its original client arguments from the managed
+environment, then supplies the native resume selector when the checkpoint is
+resumed.
 
 Queue the active native session:
 
@@ -151,14 +157,25 @@ casr checkpoint resume "ID" --to codex --profile "PROFILE" -- CLIENT_ARGS...
 ```
 
 Use `--` before client arguments so AGS options and native client options
-remain unambiguous. Unknown arguments before `--` are errors; preserve every
-argument after `--` exactly. AGS owns `--to`, `--cwd`, and long `--profile`
-only before `--`. After `--`, both short and long options belong to the target
-Agent. Codex interprets `-p` and `--profile` as its native profile, while
-Claude interprets `-p` as `--print`. AGS inspects a Codex native profile only
-for cross-Agent resume, to select the same conversion provider; it forwards the
-option unchanged. Do not specify a
-Codex profile both before and after `--`.
+remain unambiguous. Unknown arguments before `--` are errors. Forward only
+additional native Agent options or an initial prompt that the user explicitly
+requested; preserve those values exactly. Never synthesize or forward native
+session-selection arguments:
+
+- For Codex, omit the `resume` subcommand, a session ID or name, `--last`, and
+  `--all`. AGS constructs `codex resume NATIVE_UUID` itself.
+- For Claude, omit `-r`/`--resume`, `-c`/`--continue`, `--from-pr`,
+  `--session-id`, and `--fork-session`. AGS constructs
+  `claude --resume NATIVE_UUID` itself.
+
+When `--` is omitted, AGS replays the checkpoint's saved client arguments; do
+not restate them. Use a bare `--` to clear them, or `-- CLIENT_ARGS...` to
+replace them. AGS owns `--to`, `--cwd`, and long `--profile` only before `--`.
+After `--`, both short and long options belong to the target Agent. Codex
+interprets `-p` and `--profile` as its native profile, while Claude interprets
+`-p` as `--print`. AGS inspects a Codex native profile only for cross-Agent
+resume, to select the same conversion provider; it forwards the option
+unchanged. Do not specify a Codex profile both before and after `--`.
 
 AGS resolves a profile selected before `--` for the target Agent:
 
