@@ -90,6 +90,15 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
   these records synchronize between machines. Decoding is never `eval`, and the
   manifest `format` is deliberately not bumped so an AGS that has not updated
   yet still reads these checkpoints.
+- **A remembered command line never names a session**: starting a session by
+  resuming one — `ags codex resume`, `ags claude --resume ID` — used to record
+  that selection as part of the session's arguments, and `ags resume` replayed
+  it after the `codex resume <restored>` it had just built. Both clients take
+  the later selection, so the checkpoint was restored and then a different
+  session was opened. The selection is now removed where it is captured, and
+  again from anything replayed or typed, so records written before this are
+  fixed on the way out too. Everything else the user typed survives, because
+  Codex's `resume` subcommand accepts the same options the bare command does.
 - **`ags list` is a picker, not a dump**: it renders through the same
   width-aware layout the piped table uses, so Chinese descriptions no longer
   leave the columns ragged, scrolls within the frame when there are more

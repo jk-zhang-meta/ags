@@ -89,8 +89,8 @@ dots, underscores, or hyphens. Never invent, combine, slugify, or translate
 either value. `save` takes exactly those two arguments. Pass no client arguments
 after `DESCRIPTION`, including `resume`, `--resume`, or a native session ID.
 AGS gets the active session and its original client arguments from the managed
-environment, then supplies the native resume selector when the checkpoint is
-resumed.
+environment — without the part of them that selected a native session — then
+supplies the native resume selector when the checkpoint is resumed.
 
 Queue the active native session:
 
@@ -167,6 +167,12 @@ session-selection arguments:
 - For Claude, omit `-r`/`--resume`, `-c`/`--continue`, `--from-pr`,
   `--session-id`, and `--fork-session`. AGS constructs
   `claude --resume NATIVE_UUID` itself.
+
+AGS also removes these arguments itself — from the command line a launch
+records, from a checkpoint's replayed one, and from a typed one, reporting
+`dropped native session selection` when it does. That exists so a session a
+person started with `ags codex resume` is not saved with a stale selection; it
+does not license sending them.
 
 When `--` is omitted, AGS replays the checkpoint's saved client arguments; do
 not restate them. Use a bare `--` to clear them, or `-- CLIENT_ARGS...` to

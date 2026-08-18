@@ -276,6 +276,7 @@ printf 'LAUNCH=%s %s\n' "$0" "$*" >> "$log"
 printf 'FAKE_CLAUDE'
 for argument in "$@"; do printf ' <%s>' "$argument"; done
 printf '\nFAKE_PWD=%s\n' "$PWD"
+printf 'FAKE_AGS_LAUNCH_ARGS=%s\n' "${AGS_LAUNCH_ARGS-unset}"
 EOF
 chmod +x "$tmp/home/.local/bin/claude"
 cat > "$tmp/home/.local/bin/casr" <<'EOF'
@@ -779,6 +780,23 @@ grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$fresh_codex"
 # line. The Agent still receives it unchanged.
 newline_codex="$(env "${managed_env[@]}" "$tool" codex --model $'a\nb')"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$newline_codex"
+# Starting a session by resuming one is an ordinary thing to do, and the Agent
+# still receives that command line whole. The record does not: `ags resume`
+# builds `codex resume <restored>` itself, so a replayed `resume` would name a
+# second session after the one just restored, and Codex takes the later name.
+resumed_codex="$(env "${managed_env[@]}" "$tool" codex resume --model o3)"
+grep -Fqx 'FAKE_CODEX <resume> <--model> <o3>' <<< "$resumed_codex"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$resumed_codex"
+# The session id is positional, so it leaves with the subcommand; the picker
+# flags leave because `--last` outranks the name AGS supplies.
+resumed_codex_id="$(
+    env "${managed_env[@]}" "$tool" codex resume \
+        99999999-8888-4777-8666-555555555555 --all --model o3
+)"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$resumed_codex_id"
+resumed_codex_last="$(env "${managed_env[@]}" "$tool" codex resume --last)"
+grep -Fqx 'FAKE_CODEX <resume> <--last>' <<< "$resumed_codex_last"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$resumed_codex_last"
 mkdir -p "$tmp/source/codex"
 printf '%s\n' 'model_provider = "sub2api"' \
     > "$tmp/source/codex/sub2api.config.toml"
@@ -851,6 +869,23 @@ fresh_claude_literal_option="$(
 grep -Fqx \
     'FAKE_CLAUDE <--> <--settings>' \
     <<< "$fresh_claude_literal_option"
+# Claude's selection value is optional, so the word after one of these flags
+# belongs to it only when that word is not the next flag.
+resumed_claude="$(
+    env "${managed_env[@]}" "$tool" claude --resume abc123 --model sonnet
+)"
+grep -Fqx 'FAKE_CLAUDE <--resume> <abc123> <--model> <sonnet>' <<< "$resumed_claude"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude"
+resumed_claude_bare="$(
+    env "${managed_env[@]}" "$tool" claude -r --model sonnet
+)"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude_bare"
+# `--fork-session` selects a session too: it resumes into a new id, so the
+# restored one would be loaded and then abandoned.
+resumed_claude_fork="$(
+    env "${managed_env[@]}" "$tool" claude --continue --fork-session --model sonnet
+)"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude_fork"
 
 # A launch reports what the last finished update check found, and reports it out
 # of a file: nothing between typing `ags claude` and the Agent starting touches
@@ -1951,6 +1986,41 @@ grep -Fq "codex arguments: --yolo --model 'o3 mini'" "$tmp/resume-saved-args.err
 # ...and they carry into the resumed session, so the next save records the
 # command line this session is really running under instead of losing it here.
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--yolo","--model","o3 mini"]' <<< "$resume_saved_args"
+
+# A record written before AGS dropped the selection still carries it, and
+# replaying `resume <other-id>` after the id this resume just restored would
+# open that other session instead. It is dropped here too, and said out loud.
+mkdir -p "$tmp/stale-args-checkpoints"
+(
+    cd "$tmp/work"
+    env "${source_env[@]}" \
+        AGENT_SESSION_DISABLE_GEO=1 \
+        AGENT_SESSION_LOCAL_DIR="$tmp/stale-args-checkpoints" \
+        AGS_LAUNCH_ARGS='["resume","01999999-aaaa-7bbb-8ccc-dddddddddddd","--last","--model","o3"]' \
+        "$tool" save-now local codex "$launch_args_session" stale-args '恢复中保存的会话'
+) > /dev/null
+resume_stale_args="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/stale-args-target/codex" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/stale-args-checkpoints" \
+        "$tool" resume stale-args 2> "$tmp/resume-stale-args.err"
+)"
+grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
+    <<< "$resume_stale_args"
+grep -Fq 'dropped native session selection from codex arguments' \
+    "$tmp/resume-stale-args.err"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$resume_stale_args"
+# A typed selection loses the same way, so the picker's editable argument line
+# cannot put one back either.
+resume_typed_selection="$(
+    env "${source_env[@]}" CODEX_HOME="$tmp/typed-selection-target/codex" \
+        AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
+        "$tool" resume with-args -- resume --last --model o3 \
+        2> "$tmp/resume-typed-selection.err"
+)"
+grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
+    <<< "$resume_typed_selection"
+grep -Fq 'dropped native session selection from codex arguments' \
+    "$tmp/resume-typed-selection.err"
 
 # `--` with nothing after it is a decision, not an omission: run this session
 # with no Agent arguments. Without that distinction a cleared argument line in

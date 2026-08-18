@@ -3470,6 +3470,74 @@ agent_display_name() {
     esac
 }
 
+# The native session selection inside a command line, removed. Result in
+# `stripped_launch_args`.
+#
+# `ags codex resume` and `ags claude --resume ID` are ordinary ways to start a
+# session, so the argv AGS captures at launch legitimately contains the very
+# arguments that pick one. Keeping them in the record is what makes the next
+# `ags resume` wrong: it has already rebuilt `codex resume <restored>` /
+# `claude --resume <restored>` from the checkpoint, the replayed selection
+# lands after that, and both clients let the later selection win — so the
+# record restores one session and then opens a different one. No validator
+# catches it either; the ones that exist guard the workspace, the
+# configuration, and the provider.
+#
+# Only the selection goes. Every other flag survives, because Codex's `resume`
+# subcommand accepts the same configuration options the bare command does, so
+# `--model`, `--profile` and the rest stay valid where AGS puts them.
+strip_session_selection_args() {
+    local agent="$1" argument
+    shift
+    stripped_launch_args=()
+    while (( $# > 0 )); do
+        argument="$1"
+        shift
+        # The same boundary the argument validators stop at: a bare `--` ends
+        # the part AGS reads, and the rest passes through untouched.
+        if [[ "$argument" == -- ]]; then
+            stripped_launch_args+=("$argument" "$@")
+            return 0
+        fi
+        if [[ "$agent" == codex ]]; then
+            case "$argument" in
+                resume)
+                    # Codex's subcommand. Its SESSION_ID is positional and
+                    # optional, so the next word is that id only when the next
+                    # word is not itself a flag.
+                    [[ $# -eq 0 || "$1" == -* ]] || shift
+                    continue
+                    ;;
+                --last|--all|--include-non-interactive)
+                    # Picker controls. Inert once AGS names the session at
+                    # best, and `--last` outranks that name at worst.
+                    continue
+                    ;;
+            esac
+        else
+            case "$argument" in
+                -r|--resume|--from-pr)
+                    # Claude's value is optional here too, so the same rule
+                    # decides whether the next word belongs to the flag.
+                    [[ $# -eq 0 || "$1" == -* ]] || shift
+                    continue
+                    ;;
+                --resume=*|--from-pr=*|--session-id=*|-c|--continue|--fork-session)
+                    # `--fork-session` selects a session as much as the rest:
+                    # it resumes into a *new* id, so the restored one would be
+                    # loaded and then abandoned.
+                    continue
+                    ;;
+                --session-id)
+                    (( $# == 0 )) || shift
+                    continue
+                    ;;
+            esac
+        fi
+        stripped_launch_args+=("$argument")
+    done
+}
+
 # The Agent arguments a session was started with, as a JSON array.
 #
 # JSON rather than a quoted command line because these records synchronize
@@ -3477,10 +3545,11 @@ agent_display_name() {
 # synchronized checkpoint a remote code execution primitive. A JSON array also
 # survives the line-oriented manifest intact, which a raw argv would not.
 #
-# Only arguments the user supplied are captured. The ones AGS injects itself —
-# `resume`, `--resume`, `--profile`, `--settings` — are rebuilt from the
-# checkpoint on every resume, and replaying a stale session id or a temporary
-# settings path would be wrong on the next machine.
+# What AGS injects itself — `resume`, `--resume`, `--profile`, `--settings` —
+# never reaches here, and `strip_session_selection_args` above removes the
+# session selection a user typed, because both are rebuilt from the checkpoint
+# on every resume. Replaying a stale session id or a temporary settings path
+# would be wrong on the next machine.
 encode_launch_args() {
     local argument
     (( $# > 0 )) && command -v jq >/dev/null || { printf '[]\n'; return 0; }
@@ -3766,8 +3835,12 @@ start_managed_agent() {
     shift
     scrub_transport_password_environment
     # Here "$@" is exactly what the user typed, before AGS adds anything of its
-    # own — which is the only point in the program where that is true.
-    export_launch_args "$@"
+    # own — which is the only point in the program where that is true. The
+    # launch below still receives it whole, so `ags codex resume` picks a
+    # session exactly as it always did; only the record drops that part,
+    # because a resume of this checkpoint rebuilds the selection itself.
+    strip_session_selection_args "$agent" "$@"
+    export_launch_args "${stripped_launch_args[@]}"
     prepare_storage_for_launch
     launch_binary="$(resolve_agent_binary "$agent")"
     if [[ "$agent" == codex ]]; then
@@ -7181,7 +7254,20 @@ resume_checkpoint() {
             die "saved Agent arguments are unreadable; resume with -- ARGS"
         client_args=("${launch_args_decoded[@]}")
     fi
+    # Replayed arguments go through the source Agent's rules because that is
+    # whose command line they are; typed ones through the Agent actually being
+    # launched. Both are needed: records written before this existed still
+    # carry `resume`, and nothing stops a caller from typing it.
+    strip_session_selection_args "$runtime_source_agent" "${client_args[@]}"
     runtime_effective_agent="${resume_target_agent:-$runtime_source_agent}"
+    strip_session_selection_args "$runtime_effective_agent" "${stripped_launch_args[@]}"
+    if (( ${#client_args[@]} != ${#stripped_launch_args[@]} )); then
+        client_args=("${stripped_launch_args[@]}")
+        # Said out loud rather than dropped quietly: something in that
+        # command line asked for a session, and this is AGS declining to let a
+        # second one be named alongside the checkpoint being restored.
+        log "dropped native session selection from $runtime_effective_agent arguments"
+    fi
     if [[ "$runtime_effective_agent" == codex ]]; then
         validate_codex_context_args "${client_args[@]}"
         agent_profile="$codex_audit_profile"
