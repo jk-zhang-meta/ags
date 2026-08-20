@@ -71,9 +71,10 @@ tombstone, transactional restore runtime, and RMUX-managed live terminals:
 ags                         # attach the most recently active live session
 ags claude                  # start Claude Code in an AGS terminal
 ags codex                   # start Codex in an AGS terminal
-ags claude --model opus     # everything after "claude" belongs to Claude Code
-ags codex --model o3        # everything after "codex" belongs to Codex
-ags --account me@example.com codex     # AGS options go before the command
+ags claude -- --model opus  # everything after "--" belongs to Claude Code
+ags codex -- --model o3     # everything after "--" belongs to Codex
+ags --account me@example.com codex     # everything before "--" belongs to AGS
+ags codex --account me@example.com     # AGS options read either side of it
 ags --pick-account codex               # choose the pool account interactively
 ags save release-fix "Continue the release fix"
 ags list                    # pick a saved session and open it
@@ -83,18 +84,24 @@ ags resume release-fix --to claude -- --model sonnet
 ags delete release-fix
 ```
 
-For `ags resume`, AGS options such as `--to`, `--cwd`, and `--profile` must
-precede an independent `--`; arguments after it are forwarded to the restored
-Agent in their original order. Direct launch has no mixed namespace:
-even a token named `--to`, `--cwd`, or `--profile` after `ags claude` or
-`ags codex` is an Agent token and is never consumed by AGS.
+One separator decides who owns an argument, and it means the same thing for
+every command:
 
-AGS options for a direct launch therefore go **before** the command name, the
-way `sudo`, `env`, `timeout` and `docker run` take theirs: parsing stops at the
-first non-option token, and everything from the command name onward reaches the
-Agent untouched. A `--` may end the AGS option zone explicitly, for the case
-where an option value would otherwise be mistaken for the command; it is not
-needed otherwise.
+```
+ags [AGS OPTIONS] <command> [AGS OPTIONS] [-- AGENT ARGS...]
+    \________________ AGS ______________/  \_____ Agent _____/
+```
+
+Everything before `--` is AGS's, on either side of the command name. Everything
+after `--` reaches the Agent verbatim, so a token named `--to`, `--profile` or
+even `--account` after `--` is an Agent token and is never consumed by AGS —
+which is what keeps a future Agent flag from colliding with an AGS one. This is
+the convention `cargo run --`, `npm run x --` and `kubectl exec pod --` use, and
+the one `ags resume ID [-- CLIENT_ARGS...]` already used.
+
+A direct launch therefore needs the separator for Agent flags:
+`ags codex -- --model o3`, not `ags codex --model o3`. AGS refuses the second
+form rather than guessing.
 
 `--account EMAIL` asks the credential pool for that account for this launch
 only, and `--pick-account` lists what the configured key may ask for. Both work on

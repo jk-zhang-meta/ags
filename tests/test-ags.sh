@@ -36,10 +36,13 @@ mapfile -t bare_var_before_multibyte < <(
 tmp="$(mktemp -d "$test_tmp_root/agent-session-test.XXXXXX")"
 declare -A test_child_pids=()
 
-# ags 自己的参数区在**命令名之前**，之后的一切原样透传给 agent——和 sudo / env /
-# timeout / docker run 同一个路子。放在文件最前面是因为它不需要 PTY、不需要编译
-# 产物，任何机器上都跑得到；而这个套件是 `set -e`，靠后的用例在一台机器上红了，
-# 后面的就全不会执行。
+# 参数归属只看一个分隔符：`--` 之前整段归 ags（命令名前后都行），`--` 之后原样
+# 交给 Agent。和 `cargo run --` / `kubectl exec pod --` 同一个约定，也和
+# `ags resume ID [-- CLIENT_ARGS…]` 本来就有的约定一致——同一个 `--` 在这个工具里
+# 只有一种含义。
+#
+# 放在文件最前面是因为它不需要 PTY、不需要编译产物，任何机器上都跑得到；而这个
+# 套件是 `set -e`，靠后的用例在一台机器上红了，后面的就全不会执行。
 ags_zone_home="$(mktemp -d "$tmp/ags-zone.XXXXXX")"
 mkdir -p "$ags_zone_home/bin"
 cat > "$ags_zone_home/bin/codext" <<'AGS_ZONE_FAKE'
@@ -65,66 +68,71 @@ ags_zone_field() {
     sed -n "s/^$1=//p" <<< "$2"
 }
 
-# 命令名之前的参数归 ags，之后的原样给 agent。
-ags_zone_out="$(ags_zone_launch --account zone@example.com codex --model o3)"
-[[ "$(ags_zone_field ARGS "$ags_zone_out")" == '--model o3' ]] || {
-    printf 'ags zone: agent args were not passed through verbatim: %s\n' \
-        "$ags_zone_out" >&2
-    exit 1
-}
-[[ "$(ags_zone_field ACCOUNT "$ags_zone_out")" == zone@example.com ]] || {
-    printf 'ags zone: --account did not reach the agent environment: %s\n' \
-        "$ags_zone_out" >&2
-    exit 1
-}
-# 光有账号不够：codext 的 device_id 默认按工作目录取，而服务端的租约表在
-# device_id 上有唯一约束——同一个目录里两个点不同号的会话会撞同一条租约行。
-[[ -n "$(ags_zone_field DEVICE "$ags_zone_out")" ]] || {
-    printf 'ags zone: --account must also pin a lease identity: %s\n' \
-        "$ags_zone_out" >&2
-    exit 1
+ags_zone_expect() {
+    local label="$1" field="$2" want="$3" got
+    shift 3
+    got="$(ags_zone_field "$field" "$(ags_zone_launch "$@")")" || {
+        printf 'ags zone: %s: launch failed\n' "$label" >&2
+        exit 1
+    }
+    [[ "$got" == "$want" ]] || {
+        printf 'ags zone: %s: %s was %q, wanted %q\n' \
+            "$label" "$field" "$got" "$want" >&2
+        exit 1
+    }
 }
 
+ags_zone_refuse() {
+    local label="$1"
+    shift
+    if ags_zone_launch "$@" >/dev/null 2>&1; then
+        printf 'ags zone: %s: expected a refusal\n' "$label" >&2
+        exit 1
+    fi
+}
+
+# `--` 之后原样交给 Agent，一个字都不解析。
+ags_zone_expect 'agent args reach the agent' ARGS '--model o3' \
+    codex -- --model o3
+# 哪怕它和 ags 自己的参数同名：Agent 将来新增任何参数都不会被 ags 抢走，这是这个
+# 约定最要紧的性质。
+ags_zone_expect 'an ags-looking token after -- still belongs to the agent' \
+    ARGS '--account not-ours@example.com' \
+    codex -- --account not-ours@example.com
+ags_zone_expect 'an ags-looking token after -- is not claimed by ags' \
+    ACCOUNT '' \
+    codex -- --account not-ours@example.com
+
+# `--` 之前的一切归 ags，命令名前后都行。
+ags_zone_expect 'an ags option before the command' ACCOUNT zone@example.com \
+    --account zone@example.com codex
+ags_zone_expect 'an ags option after the command' ACCOUNT zone@example.com \
+    codex --account zone@example.com
+ags_zone_expect 'both zones at once' ARGS '--model o3' \
+    --account zone@example.com codex -- --model o3
+
+# 光有账号不够：codext 的 device_id 默认按工作目录取，而服务端的租约表在
+# device_id 上有唯一约束——同一个目录里两个点不同号的会话会撞同一条租约行。
+ags_zone_first="$(ags_zone_field DEVICE \
+    "$(ags_zone_launch --account zone@example.com codex)")"
+[[ -n "$ags_zone_first" ]] || {
+    printf 'ags zone: --account must also pin a lease identity\n' >&2
+    exit 1
+}
 # 不同账号必须是不同的租约身份，同一个账号必须稳定——前者决定两个会话能不能并存，
 # 后者决定反复启动会不会每次都留一个幽灵持有者去抬高服务端的并发除数。
-ags_zone_first="$(ags_zone_field DEVICE "$ags_zone_out")"
-ags_zone_out="$(ags_zone_launch --account other@example.com codex)"
-[[ "$(ags_zone_field DEVICE "$ags_zone_out")" != "$ags_zone_first" ]] || {
+[[ "$(ags_zone_field DEVICE "$(ags_zone_launch --account other@example.com codex)")" \
+    != "$ags_zone_first" ]] || {
     printf 'ags zone: two accounts must not share one lease identity\n' >&2
     exit 1
 }
-ags_zone_out="$(ags_zone_launch --account zone@example.com codex)"
-[[ "$(ags_zone_field DEVICE "$ags_zone_out")" == "$ags_zone_first" ]] || {
-    printf 'ags zone: the same account must keep one lease identity\n' >&2
-    exit 1
-}
-
+ags_zone_expect 'the same account keeps one lease identity' DEVICE "$ags_zone_first" \
+    --account zone@example.com codex
 # 调用方显式给过的租约身份不能被覆盖。
-ags_zone_out="$(CODEXT_POOL_DEVICE_ID=explicit-id \
-    ags_zone_launch --account zone@example.com codex)"
-[[ "$(ags_zone_field DEVICE "$ags_zone_out")" == explicit-id ]] || {
+[[ "$(CODEXT_POOL_DEVICE_ID=explicit-id ags_zone_field DEVICE \
+    "$(CODEXT_POOL_DEVICE_ID=explicit-id ags_zone_launch --account zone@example.com codex)")" \
+    == explicit-id ]] || {
     printf 'ags zone: an explicit CODEXT_POOL_DEVICE_ID must win\n' >&2
-    exit 1
-}
-
-# 命令名之后的参数一律归 agent，哪怕它长得和 ags 的参数一模一样。codex 将来新增
-# 同名参数时这一条是唯一的保障。
-ags_zone_out="$(ags_zone_launch codex --account not-ours@example.com)"
-[[ "$(ags_zone_field ARGS "$ags_zone_out")" == '--account not-ours@example.com' ]] || {
-    printf 'ags zone: an option after the command belongs to the agent: %s\n' \
-        "$ags_zone_out" >&2
-    exit 1
-}
-[[ -z "$(ags_zone_field ACCOUNT "$ags_zone_out")" ]] || {
-    printf 'ags zone: ags must not claim an option written after the command\n' >&2
-    exit 1
-}
-
-# `--` 是没有位置可以分界时的补救，用得上时必须收尾干净。
-ags_zone_out="$(ags_zone_launch --account zone@example.com -- codex)"
-[[ "$(ags_zone_field ACCOUNT "$ags_zone_out")" == zone@example.com ]] || {
-    printf 'ags zone: -- must end the ags option zone cleanly: %s\n' \
-        "$ags_zone_out" >&2
     exit 1
 }
 
@@ -135,23 +143,16 @@ ags_zone_launch claude >/dev/null || {
     exit 1
 }
 
-# 拒绝路径：值缺失、两个开关互斥、用在非 agent 命令上、不认识的 ags 参数，
-# 以及给一个不从凭据池取号的 agent。最后这条尤其要拒而不是警告：静默注入
-# 会让人以为号钉住了、其实什么都没发生。
-for ags_zone_bad in \
-    "--account" \
-    "--account a@b.com --pick-account codex" \
-    "--account a@b.com list" \
-    "--bogus codex" \
-    "--account a@b.com claude" \
-    "--pick-account claude"
-do
-    if ags_zone_launch $ags_zone_bad >/dev/null 2>&1; then
-        printf 'ags zone: expected a refusal for: ags %s\n' "$ags_zone_bad" >&2
-        exit 1
-    fi
-done
-unset ags_zone_bad
+# 拒绝路径。最后两条尤其要拒而不是警告：静默注入会让人以为号钉住了、其实什么都
+# 没发生。倒数第三条是旧写法，报错里要指向 `--`。
+ags_zone_refuse 'a missing --account value' --account
+ags_zone_refuse 'both pool switches at once' --account a@b.com --pick-account codex
+ags_zone_refuse 'a pool option on a non-agent command' --account a@b.com list
+ags_zone_refuse 'an unknown ags option' --bogus codex
+ags_zone_refuse 'an agent option without --' codex --model o3
+ags_zone_refuse 'a pool option for claude' --account a@b.com claude
+ags_zone_refuse 'the interactive picker for claude' --pick-account claude
+ags_zone_refuse 'a resume-only option on a direct launch' codex --profile native
 
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
 # `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律
@@ -929,7 +930,7 @@ converted_codex_id=01999999-aaaa-7bbb-8ccc-dddddddddddd
 
 
 fresh_codex="$(
-    env "${managed_env[@]}" "$tool" codex --model o3 \
+    env "${managed_env[@]}" "$tool" codex -- --model o3 \
         2> "$tmp/fresh-codex.err"
 )"
 grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$fresh_codex"
@@ -941,23 +942,23 @@ grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$fresh_codex"
 # An argument carrying a line break cannot round-trip the line-oriented
 # manifest, so the launch records none of them rather than a truncated command
 # line. The Agent still receives it unchanged.
-newline_codex="$(env "${managed_env[@]}" "$tool" codex --model $'a\nb')"
+newline_codex="$(env "${managed_env[@]}" "$tool" codex -- --model $'a\nb')"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$newline_codex"
 # Starting a session by resuming one is an ordinary thing to do, and the Agent
 # still receives that command line whole. The record does not: `ags resume`
 # builds `codex resume <restored>` itself, so a replayed `resume` would name a
 # second session after the one just restored, and Codex takes the later name.
-resumed_codex="$(env "${managed_env[@]}" "$tool" codex resume --model o3)"
+resumed_codex="$(env "${managed_env[@]}" "$tool" codex -- resume --model o3)"
 grep -Fqx 'FAKE_CODEX <resume> <--model> <o3>' <<< "$resumed_codex"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$resumed_codex"
 # The session id is positional, so it leaves with the subcommand; the picker
 # flags leave because `--last` outranks the name AGS supplies.
 resumed_codex_id="$(
-    env "${managed_env[@]}" "$tool" codex resume \
+    env "${managed_env[@]}" "$tool" codex -- resume \
         99999999-8888-4777-8666-555555555555 --all --model o3
 )"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$resumed_codex_id"
-resumed_codex_last="$(env "${managed_env[@]}" "$tool" codex resume --last)"
+resumed_codex_last="$(env "${managed_env[@]}" "$tool" codex -- resume --last)"
 grep -Fqx 'FAKE_CODEX <resume> <--last>' <<< "$resumed_codex_last"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$resumed_codex_last"
 mkdir -p "$tmp/source/codex"
@@ -966,7 +967,7 @@ printf '%s\n' 'model_provider = "sub2api"' \
 assert_fresh_codex_profile() {
     local expected="$1" output
     shift
-    output="$(env "${managed_env[@]}" "$tool" codex "$@")"
+    output="$(env "${managed_env[@]}" "$tool" codex -- "$@")"
     grep -Fqx "$expected" <<< "$output"
 }
 assert_fresh_codex_profile \
@@ -982,7 +983,7 @@ assert_fresh_codex_profile \
     'FAKE_CODEX <--yolo> <-psub2api>' \
     --yolo -psub2api
 agent_owned_description="$(
-    env "${managed_env[@]}" "$tool" codex --description native-description
+    env "${managed_env[@]}" "$tool" codex -- --description native-description
 )"
 grep -Fqx 'FAKE_CODEX <--description> <native-description>' \
     <<< "$agent_owned_description"
@@ -996,57 +997,71 @@ scrubbed_codex="$(
         AGENT_SESSION_REMOTE_PASSWORD=remote-secret \
         AGENT_SESSION_CLOUD_PASSWORD=cloud-secret \
         RCLONE_SFTP_PASS=rclone-secret \
-        "$tool" codex --model scrubbed
+        "$tool" codex -- --model scrubbed
 )"
 grep -Fqx 'FAKE_CODEX <--model> <scrubbed>' <<< "$scrubbed_codex"
 grep -Eq '^LAUNCH=.*/codex --model o3$' \
     "$tmp/home/.local/ags.log"
 fresh_codex_owned_args="$(
-    env "${managed_env[@]}" "$tool" codex --to claude --model o3
+    env "${managed_env[@]}" "$tool" codex -- --to claude --model o3
 )"
 grep -Fqx \
     'FAKE_CODEX <--to> <claude> <--model> <o3>' \
     <<< "$fresh_codex_owned_args"
+# `--` 之后原样交给 Agent，哪怕那个名字和 ags 自己的参数一模一样（`--profile` 在
+# ags 里是 resume 的参数）。这是这个约定最要紧的性质：Agent 将来新增任何参数都不会
+# 被 ags 抢走。
+#
+# 断言看的是 `AGS_LAUNCH_ARGS` 而不是 argv：这个假 codex 会像真 codex 一样把开头的
+# `--profile <名字>` 自己消费掉（见上面那段 `shift 2`），所以它的 argv 打印出来是空
+# 的。argv 为空恰恰证明参数到达了 Agent 并被 Agent 吃掉，而不是被 ags 吞了。
 fresh_codex_literal_option="$(
     env "${managed_env[@]}" "$tool" codex -- --profile native
 )"
-grep -Fqx \
-    'FAKE_CODEX <--> <--profile> <native>' \
+grep -Fqx 'FAKE_CODEX' <<< "$fresh_codex_literal_option"
+grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--profile","native"]' \
     <<< "$fresh_codex_literal_option"
 
 fresh_claude="$(
-    env "${managed_env[@]}" "$tool" claude --model sonnet
+    env "${managed_env[@]}" "$tool" claude -- --model sonnet
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$fresh_claude"
 grep -Eq '^LAUNCH=.*/claude --model sonnet$' \
     "$tmp/home/.local/ags.log"
 fresh_claude_owned_args="$(
-    env "${managed_env[@]}" "$tool" claude --to codex --model sonnet
+    env "${managed_env[@]}" "$tool" claude -- --to codex --model sonnet
 )"
 grep -Fqx \
     'FAKE_CLAUDE <--to> <codex> <--model> <sonnet>' \
     <<< "$fresh_claude_owned_args"
+# `--settings` 会被 ags 校验（它限制能注入哪些 Claude 设置，是有意的安全边界），
+# 所以不带值的 `--settings` 必须被拒。以前写成 `-- --settings` 时那个字面量 `--`
+# 会让校验提前停下——那其实是个绕过口子，`--` 变成分隔符之后它没了。
+if env "${managed_env[@]}" "$tool" claude -- --settings >/dev/null 2>&1; then
+    printf 'a valueless --settings must still be refused\n' >&2
+    exit 1
+fi
 fresh_claude_literal_option="$(
-    env "${managed_env[@]}" "$tool" claude -- --settings
+    env "${managed_env[@]}" "$tool" claude -- --model sonnet
 )"
 grep -Fqx \
-    'FAKE_CLAUDE <--> <--settings>' \
+    'FAKE_CLAUDE <--model> <sonnet>' \
     <<< "$fresh_claude_literal_option"
 # Claude's selection value is optional, so the word after one of these flags
 # belongs to it only when that word is not the next flag.
 resumed_claude="$(
-    env "${managed_env[@]}" "$tool" claude --resume abc123 --model sonnet
+    env "${managed_env[@]}" "$tool" claude -- --resume abc123 --model sonnet
 )"
 grep -Fqx 'FAKE_CLAUDE <--resume> <abc123> <--model> <sonnet>' <<< "$resumed_claude"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude"
 resumed_claude_bare="$(
-    env "${managed_env[@]}" "$tool" claude -r --model sonnet
+    env "${managed_env[@]}" "$tool" claude -- -r --model sonnet
 )"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude_bare"
 # `--fork-session` selects a session too: it resumes into a new id, so the
 # restored one would be loaded and then abandoned.
 resumed_claude_fork="$(
-    env "${managed_env[@]}" "$tool" claude --continue --fork-session --model sonnet
+    env "${managed_env[@]}" "$tool" claude -- --continue --fork-session --model sonnet
 )"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude_fork"
 
@@ -1055,7 +1070,7 @@ grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","sonnet"]' <<< "$resumed_claude_fork"
 # the network. With no record there is nothing to say.
 rm -f -- "$tmp/state/update-check.lines" "$tmp/state/update-check.stamp"
 quiet_claude="$(
-    env "${managed_env[@]}" "$tool" claude --model sonnet \
+    env "${managed_env[@]}" "$tool" claude -- --model sonnet \
         2> "$tmp/quiet-claude.err"
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$quiet_claude"
@@ -1068,7 +1083,7 @@ printf '%s\n' \
 date +%s > "$tmp/state/update-check.stamp"
 update_stamp_before="$(<"$tmp/state/update-check.stamp")"
 announced_claude="$(
-    env "${managed_env[@]}" "$tool" claude --model sonnet \
+    env "${managed_env[@]}" "$tool" claude -- --model sonnet \
         2> "$tmp/announced-claude.err"
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$announced_claude"
@@ -1081,7 +1096,7 @@ grep -Fqx '[ags] update available: codext 0.146.0 -> v0.147.0' \
 ! grep -Fq 'rm -rf /' "$tmp/announced-claude.err"
 # Inside the interval nothing is re-checked and the record is left alone.
 [[ "$(<"$tmp/state/update-check.stamp")" == "$update_stamp_before" ]]
-env "${managed_env[@]}" AGS_UPDATE_CHECK=0 "$tool" claude --model sonnet \
+env "${managed_env[@]}" AGS_UPDATE_CHECK=0 "$tool" claude -- --model sonnet \
     > /dev/null 2> "$tmp/silenced-claude.err"
 ! grep -Fq 'update available:' "$tmp/silenced-claude.err"
 [[ "$(<"$tmp/state/update-check.stamp")" == "$update_stamp_before" ]]
@@ -1091,7 +1106,7 @@ env "${managed_env[@]}" AGS_UPDATE_CHECK=0 "$tool" claude --model sonnet \
 # opened at once from each starting one.
 printf '0\n' > "$tmp/state/update-check.stamp"
 stale_claude="$(
-    env "${managed_env[@]}" "$tool" claude --model sonnet \
+    env "${managed_env[@]}" "$tool" claude -- --model sonnet \
         2> "$tmp/stale-claude.err"
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$stale_claude"
@@ -1145,7 +1160,7 @@ jq -n '{
   effortLevel:"high"
 }' > "$safe_claude_settings"
 safe_claude_settings_output="$(
-    env "${managed_env[@]}" "$tool" claude \
+    env "${managed_env[@]}" "$tool" claude -- \
         --settings "$safe_claude_settings" --model sonnet
 )"
 grep -Fqx \
@@ -1155,7 +1170,7 @@ dash_claude_settings="$tmp/--safe-claude.settings.json"
 cp -- "$safe_claude_settings" "$dash_claude_settings"
 dash_claude_settings_output="$(
     cd -- "$tmp"
-    env "${managed_env[@]}" "$tool" claude \
+    env "${managed_env[@]}" "$tool" claude -- \
         --settings --safe-claude.settings.json --model opus
 )"
 grep -Fqx \
@@ -1163,7 +1178,7 @@ grep -Fqx \
     <<< "$dash_claude_settings_output"
 inline_claude_settings='{"env":{"ANTHROPIC_BASE_URL":"https://provider.example.test"}}'
 inline_claude_settings_output="$(
-    env "${managed_env[@]}" "$tool" claude \
+    env "${managed_env[@]}" "$tool" claude -- \
         "--settings=$inline_claude_settings" --model haiku
 )"
 grep -Fqx \
@@ -1174,7 +1189,7 @@ jq -n '{enabledPlugins:{"some-plugin@example":false}}' \
     > "$unsafe_claude_settings"
 launch_count_before="$(grep -c '^LAUNCH=' \
     "$tmp/home/.local/ags.log" || true)"
-if env "${managed_env[@]}" "$tool" claude \
+if env "${managed_env[@]}" "$tool" claude -- \
     --settings "$unsafe_claude_settings" \
     >"$tmp/unsafe-claude-settings.out" \
     2>"$tmp/unsafe-claude-settings.err"; then
@@ -1192,7 +1207,7 @@ assert_managed_claude_settings_rejected() {
     launch_count_before="$(
         grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
-    if env "${managed_env[@]}" "$tool" claude --settings "$settings" \
+    if env "${managed_env[@]}" "$tool" claude -- --settings "$settings" \
         >"$tmp/claude-settings-$label.out" \
         2>"$tmp/claude-settings-$label.err"; then
         echo "managed Claude accepted unsafe settings: $label" >&2
@@ -1260,7 +1275,7 @@ assert_managed_claude_source_settings_rejected() {
     )"
     if (
         cd -- "$workdir"
-        env "${managed_env[@]}" "$tool" claude --model source-settings-test
+        env "${managed_env[@]}" "$tool" claude -- --model source-settings-test
     ) >"$tmp/claude-source-settings-$label.out" \
       2>"$tmp/claude-source-settings-$label.err"; then
         echo "managed Claude accepted unsafe source settings: $label" >&2
@@ -1350,7 +1365,7 @@ launch_count_before="$(grep -c '^LAUNCH=' \
     "$tmp/home/.local/ags.log" || true)"
 if (
     cd -- "$claude_settings_repo/subdir"
-    env "${managed_env[@]}" "$managed_settings_tool" claude \
+    env "${managed_env[@]}" "$managed_settings_tool" claude -- \
         --model managed-settings-test
 ) > "$tmp/claude-source-settings-managed.out" \
   2> "$tmp/claude-source-settings-managed.err"; then
@@ -1383,7 +1398,7 @@ jq -n '{
 }' > "$tmp/source/claude/settings.json"
 safe_source_settings_output="$(
     cd -- "$claude_settings_repo/subdir"
-    env "${managed_env[@]}" "$tool" claude --model safe-source-settings
+    env "${managed_env[@]}" "$tool" claude -- --model safe-source-settings
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <safe-source-settings>' \
     <<< "$safe_source_settings_output"
@@ -1396,7 +1411,7 @@ assert_managed_claude_arg_rejected() {
     launch_count_before="$(
         grep -c '^LAUNCH=' "$tmp/home/.local/ags.log" || true
     )"
-    if env "${managed_env[@]}" "$tool" claude "$@" \
+    if env "${managed_env[@]}" "$tool" claude -- "$@" \
         >"$tmp/claude-arg-$label.out" \
         2>"$tmp/claude-arg-$label.err"; then
         echo "managed Claude accepted a forbidden argument: $label" >&2
@@ -3931,7 +3946,7 @@ quiet_remote_launch="$(
         AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
         AGENT_SESSION_LOCAL_DIR="$quiet_launch_local" \
         AGENT_SESSION_STORAGE_MODE=remote:quiet-launch \
-        "$tool" codex --model o3 2> "$tmp/quiet-remote-launch.err"
+        "$tool" codex -- --model o3 2> "$tmp/quiet-remote-launch.err"
 )"
 grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$quiet_remote_launch"
 [[ ! -s "$tmp/quiet-remote-launch.err" ]]
@@ -3947,7 +3962,7 @@ if env "${source_env[@]}" \
     AGENT_SESSION_STATE_DIR="$quiet_launch_state" \
     AGENT_SESSION_LOCAL_DIR="$quiet_launch_local" \
     AGENT_SESSION_STORAGE_MODE=remote:broken-launch \
-    "$tool" codex --model o3 \
+    "$tool" codex -- --model o3 \
         > "$tmp/broken-remote-launch.out" \
         2> "$tmp/broken-remote-launch.err"; then
     echo 'managed launch ignored an unavailable storage remote' >&2

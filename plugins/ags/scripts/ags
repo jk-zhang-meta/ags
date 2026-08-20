@@ -205,8 +205,8 @@ Usage:
                                        Agent arguments, Del delete, Esc quit)
   ags show ID|AGENT/RECORD_ID          Show complete local checkpoint details
   ags save ID DESCRIPTION              Save this active Codex or Claude session
-  ags resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH]
-             [--profile PROFILE] [-- CLIENT_ARGS...]
+  ags resume ID|AGENT/RECORD_ID [AGENT_ARGS...]
+             [-- --to codex|claude --cwd PATH --profile NAME --no-agent-args]
                                        Restore and launch a local checkpoint
   ags delete ID|AGENT/RECORD_ID        Move a local checkpoint to recoverable trash
   ags update [--check]                 Update to the latest release (--check only reports)
@@ -235,8 +235,8 @@ Legacy direct SFTP repository:
   ags cloud set SFTP_URL [--key ABSOLUTE_KEY|--agent|--password]
   ags cloud list
   ags cloud save ID DESCRIPTION
-  ags cloud resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH]
-                   [--profile PROFILE] [-- CLIENT_ARGS...]
+  ags cloud resume ID|AGENT/RECORD_ID [AGENT_ARGS...]
+                   [-- --to codex|claude --cwd PATH --profile NAME]
   ags cloud delete ID|AGENT/RECORD_ID
 
 Legacy whole-history backup:
@@ -3640,6 +3640,50 @@ pick_pool_account() {
         <<< "$payload")"
     [[ -n "$account" ]] || die "选中的号没有可用的标识"
     printf '%s\n' "$account"
+}
+
+# 消费一个 ags 参数，把消费掉的个数放进 `ags_consumed`（0 = 这不是 ags 的参数）。
+#
+# 两个参数区共用这一份：命令名**之前**那个区遇到 0 就停下（后面是命令名），
+# `--` **之后**那个区遇到 0 就报错（那一段只能是 ags 的）。一份实现，两种收尾，
+# 免得两个区将来各自漂移出不同的参数集。
+#
+# 值本身不在这里校验：`--to` / `--cwd` / `--profile` 的校验留在 `resume_checkpoint`
+# 里，那样报错措辞和以前一模一样。
+ags_consume_option() {
+    ags_consumed=0
+    case "${1:-}" in
+        --account)
+            (( $# >= 2 )) || die "--account 需要一个邮箱或账号标识"
+            ags_account="$2"
+            ags_consumed=2
+            ;;
+        --account=*)
+            ags_account="${1#--account=}"
+            [[ -n "$ags_account" ]] || die "--account 需要一个邮箱或账号标识"
+            ags_consumed=1
+            ;;
+        --pick-account) ags_pick_account=1; ags_consumed=1 ;;
+        --no-agent-args) ags_no_agent_args=1; ags_consumed=1 ;;
+        --to)
+            (( $# >= 2 )) || die "--to requires codex or claude"
+            ags_to="$2"
+            ags_consumed=2
+            ;;
+        --to=*) ags_to="${1#--to=}"; ags_consumed=1 ;;
+        --cwd)
+            (( $# >= 2 )) || die "--cwd requires a path"
+            ags_cwd_option="$2"
+            ags_consumed=2
+            ;;
+        --cwd=*) ags_cwd_option="${1#--cwd=}"; ags_consumed=1 ;;
+        --profile)
+            (( $# >= 2 )) || die "--profile requires a profile name"
+            ags_profile_option="$2"
+            ags_consumed=2
+            ;;
+        --profile=*) ags_profile_option="${1#--profile=}"; ags_consumed=1 ;;
+    esac
 }
 
 terminal_can_set_title() {
@@ -7341,71 +7385,36 @@ resume_checkpoint() {
         fi
     }
     shift
-    while (( $# > 0 )); do
-        case "$1" in
-            --to)
-                (( $# >= 2 )) || die "--to requires codex or claude"
-                [[ -z "$resume_target_agent" ]] || die "--to may be specified only once"
-                [[ "$2" == codex || "$2" == claude ]] ||
-                    die "--to requires codex or claude"
-                resume_target_agent="$2"
-                shift 2
-                ;;
-            --to=*)
-                [[ -z "$resume_target_agent" ]] || die "--to may be specified only once"
-                resume_target_agent="${1#--to=}"
-                [[ "$resume_target_agent" == codex ||
-                   "$resume_target_agent" == claude ]] ||
-                    die "--to requires codex or claude"
-                shift
-                ;;
-            --cwd)
-                (( $# >= 2 )) || die "--cwd requires a path"
-                [[ -z "$resume_cwd" ]] || die "--cwd may be specified only once"
-                [[ -d "$2" ]] || die "--cwd is not a directory: $2"
-                resume_cwd="$(cd -- "$2" && pwd -P)"
-                shift 2
-                ;;
-            --cwd=*)
-                [[ -z "$resume_cwd" ]] || die "--cwd may be specified only once"
-                resume_cwd="${1#--cwd=}"
-                [[ -d "$resume_cwd" ]] ||
-                    die "--cwd is not a directory: $resume_cwd"
-                resume_cwd="$(cd -- "$resume_cwd" && pwd -P)"
-                shift
-                ;;
-            --force-unsupported-version)
-                die "--force-unsupported-version was removed; ags validates current formats directly"
-                ;;
-            --profile)
-                (( $# >= 2 )) || die "--profile requires a profile name"
-                [[ -z "$profile" ]] ||
-                    die "--profile may be specified only once"
-                profile="$2"
-                validate_profile_name "$profile"
-                shift 2
-                ;;
-            --profile=*)
-                [[ -z "$profile" ]] ||
-                    die "--profile may be specified only once"
-                profile="${1#--profile=}"
-                validate_profile_name "$profile"
-                shift
-                ;;
-            --)
-                # `--` on its own is a decision, not an omission: it means run
-                # this session with no Agent arguments, which is how a cleared
-                # argument line in the menu survives the checkpoint's own.
-                client_args_explicit=1
-                shift
-                client_args+=("$@")
-                break
-                ;;
-            *)
-                die "unknown AGS resume argument: $1; put Agent arguments after --"
-                ;;
-        esac
-    done
+    # ags 自己的参数（`--to` / `--cwd` / `--profile` / `--no-agent-args` …）由顶层
+    # 的两个参数区解析完了，这里只取结果。检查点 ID 之后剩下的一律是 agent 的参数
+    # ——`--` 之后那一段属于 ags，不会流到这里。
+    if [[ -n "${ags_to:-}" ]]; then
+        [[ "$ags_to" == codex || "$ags_to" == claude ]] ||
+            die "--to requires codex or claude"
+        resume_target_agent="$ags_to"
+    fi
+    if [[ -n "${ags_cwd_option:-}" ]]; then
+        [[ -d "$ags_cwd_option" ]] || die "--cwd is not a directory: $ags_cwd_option"
+        resume_cwd="$(cd -- "$ags_cwd_option" && pwd -P)"
+    fi
+    if [[ -n "${ags_profile_option:-}" ]]; then
+        profile="$ags_profile_option"
+        validate_profile_name "$profile"
+    fi
+    # 「这次就是不要 agent 参数」必须能和「没说」区分开，否则会被检查点里存的参数
+    # 覆盖回去。以前靠单独一个 `--` 表达，而 `--` 现在是 ags 的参数区，所以给了它
+    # 一个名字。
+    if (( ${ags_no_agent_args:-0} == 1 )); then
+        client_args_explicit=1
+    fi
+    (( $# == 0 )) ||
+        die "ags resume 只接受一个检查点标识：$1（给 Agent 的参数写在 -- 之后）"
+    if (( ${ags_agent_args_given:-0} == 1 )); then
+        # `--` 出现过就是一个决定：哪怕后面什么都没有，也表示"这次不要 Agent
+        # 参数"，而不是"没说"——否则会被检查点里存的参数覆盖回去。
+        client_args_explicit=1
+        client_args+=(${ags_agent_args[@]+"${ags_agent_args[@]}"})
+    fi
     if [[ "$target" == local ]]; then
         load_local_storage
         if ! local_checkpoint_selector_exists "$local_checkpoints" "$checkpoint_id"; then
@@ -10212,47 +10221,97 @@ refresh_update_check_record() {
 #   ags codex --account a@b.com                --account 归 codex，报未知参数
 ags_account=
 ags_pick_account=0
-while (( $# > 0 )); do
-    case "$1" in
-        --account)
-            shift
-            (( $# > 0 )) || die "--account 需要一个邮箱或账号标识"
-            ags_account="$1"
-            shift
-            ;;
-        --account=*)
-            ags_account="${1#--account=}"
-            [[ -n "$ags_account" ]] || die "--account 需要一个邮箱或账号标识"
-            shift
-            ;;
-        --pick-account)
-            ags_pick_account=1
-            shift
-            ;;
-        --)
-            shift
-            break
-            ;;
+ags_no_agent_args=0
+ags_to=
+ags_cwd_option=
+ags_profile_option=
+ags_consumed=0
+
+# 参数归属只看一个分隔符：
+#
+#   ags [ags 参数] <命令> [ags 参数] [-- agent 参数]
+#       └────────── 归 ags ─────────┘  └── 归 agent ──┘
+#
+# `--` **之前**的一切由 ags 解析（命令名前后都行）；`--` **之后**的一切原样交给
+# Agent，ags 一个字都不碰。和 `cargo run --` / `npm run x --` / `kubectl exec pod --`
+# 同一个约定，也和 `ags resume ID [--to …] [-- CLIENT_ARGS…]` 本来就有的约定一致
+# ——同一个 `--` 在这个工具里只有一种含义。
+#
+# 代价说清楚：`ags codex --model o3` 这种写法从此要写成 `ags codex -- --model o3`。
+# 换来的是"这个参数归谁"永远不用猜。
+ags_account=
+ags_pick_account=0
+ags_no_agent_args=0
+ags_to=
+ags_cwd_option=
+ags_profile_option=
+ags_consumed=0
+ags_agent_args=()
+ags_agent_args_given=0
+
+ags_words=()
+ags_separator_seen=0
+for ags_word in "$@"; do
+    if (( ags_separator_seen == 0 )) && [[ "$ags_word" == "--" ]]; then
+        ags_separator_seen=1
+        ags_agent_args_given=1
+        continue
+    fi
+    if (( ags_separator_seen == 1 )); then
+        ags_agent_args+=("$ags_word")
+    else
+        ags_words+=("$ags_word")
+    fi
+done
+unset ags_word ags_separator_seen
+
+# `--` 之前：ags 的参数和命令的位置参数混在一起，按顺序拆开。
+ags_positionals=()
+while (( ${#ags_words[@]} > 0 )); do
+    case "${ags_words[0]}" in
         -h|--help|help)
-            break
-            ;;
-        -*)
-            die "ags 不认识这个参数：$1（给 agent 的参数写在命令名之后）"
-            ;;
-        *)
-            break
+            ags_positionals+=("${ags_words[0]}")
+            ags_words=(${ags_words[@]:1})
+            continue
             ;;
     esac
+    if [[ "${ags_words[0]}" == -* ]]; then
+        ags_consume_option "${ags_words[@]}"
+        if (( ags_consumed > 0 )); then
+            ags_words=(${ags_words[@]:$ags_consumed})
+            continue
+        fi
+        # 顶层不认识它，不代表它是错的：ags 的每个子命令都有自己的参数
+        # （`init --identity`、`storage use`、`remote add` …）。原样往下传，由
+        # 子命令去解析。真正没人认领的会在子命令那里报错——`codex`/`claude`
+        # 不接受任何位置参数，所以 `ags codex --model o3` 会在分发处被挡下并
+        # 指向 `--`。
+    fi
+    ags_positionals+=("${ags_words[0]}")
+    ags_words=(${ags_words[@]:1})
 done
-if [[ -n "$ags_account" ]] && (( ags_pick_account == 1 )); then
-    die "--account 和 --pick-account 二选一"
-fi
+unset ags_words
+set -- ${ags_positionals[@]+"${ags_positionals[@]}"}
+unset ags_positionals
+
+# ags 的参数用在不吃它的命令上，只会被解析走然后没人读——那是静默无视，比报错
+# 糟得多：你以为设上了，其实什么都没发生。
 if [[ -n "$ags_account" ]] || (( ags_pick_account == 1 )); then
     case "${1:-}" in
         codex|claude|resume|cloud) ;;
-        *) die "--account / --pick-account 只对启动 agent 的命令有意义（codex、claude、resume、cloud resume）" ;;
+        *) die "--account / --pick-account 只对启动 Agent 的命令有意义（codex、claude、resume、cloud resume）" ;;
     esac
 fi
+case "${1:-}" in
+    resume|cloud) ;;
+    *)
+        [[ -z "$ags_to" ]] || die "--to 只对 resume / cloud resume 有意义"
+        [[ -z "$ags_cwd_option" ]] || die "--cwd 只对 resume / cloud resume 有意义"
+        [[ -z "$ags_profile_option" ]] || die "--profile 只对 resume / cloud resume 有意义"
+        (( ags_no_agent_args == 0 )) ||
+            die "--no-agent-args 只对 resume / cloud resume 有意义"
+        ;;
+esac
 
 case "${1:-}" in
     update|update-check-refresh|codext-update|codex-name) ;;
@@ -10264,8 +10323,14 @@ esac
 
 case "${1:-}" in
     '') enter_ags ;;
-    claude) shift; start_managed_agent claude "$@" ;;
-    codex) shift; start_managed_agent codex "$@" ;;
+    claude|codex)
+        ags_agent_command="$1"
+        shift
+        (( $# == 0 )) ||
+            die "ags $ags_agent_command 不接受位置参数：$1（给 Agent 的参数写在 -- 之后）"
+        start_managed_agent "$ags_agent_command" \
+            ${ags_agent_args[@]+"${ags_agent_args[@]}"}
+        ;;
     init) shift; initialize_ags "$@" ;;
     codex-init)
         shift
