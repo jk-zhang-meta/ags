@@ -139,6 +139,52 @@ do
     fi
 done
 unset ags_zone_bad
+
+# 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
+# `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律
+# 拒绝会让它完全不可用。放行的前提是解析后的目录归当前用户、组和其他人都不可写
+# ——否则别人改一下那个目录就能把还原写到任意位置。
+ags_link_dir="$(mktemp -d "$tmp/ags-link.XXXXXX")"
+ags_link_fns="$(
+    sed -n '/^path_owner_mode() {/,/^}/p;/^resolve_restore_component() {/,/^}/p' "$tool"
+)"
+grep -q '^resolve_restore_component() {' <<< "$ags_link_fns" || {
+    printf 'ags link: could not extract resolve_restore_component from %s\n' "$tool" >&2
+    exit 1
+}
+ags_link_probe() {
+    bash -c '
+        set -uo pipefail
+        log() { printf "[ags] %s\n" "$*" >&2; }
+        eval "$1"
+        resolve_restore_component "$2"
+    ' _ "$ags_link_fns" "$1" 2>/dev/null
+}
+
+mkdir -p "$ags_link_dir/real" "$ags_link_dir/loose"
+chmod 755 "$ags_link_dir/real"
+chmod 777 "$ags_link_dir/loose"
+ln -sfn "$ags_link_dir/real" "$ags_link_dir/ok"
+ln -sfn "$ags_link_dir/loose" "$ags_link_dir/world-writable"
+ln -sfn "$ags_link_dir/nowhere" "$ags_link_dir/dangling"
+
+[[ "$(ags_link_probe "$ags_link_dir/real")" == "$ags_link_dir/real" ]] || {
+    printf 'ags link: a plain directory must pass through unchanged\n' >&2
+    exit 1
+}
+[[ "$(ags_link_probe "$ags_link_dir/ok")" == "$ags_link_dir/real" ]] || {
+    printf 'ags link: a link to an own, mode-clean directory must resolve\n' >&2
+    exit 1
+}
+if ags_link_probe "$ags_link_dir/world-writable" >/dev/null 2>&1; then
+    printf 'ags link: a link into a world-writable directory must be refused\n' >&2
+    exit 1
+fi
+if ags_link_probe "$ags_link_dir/dangling" >/dev/null 2>&1; then
+    printf 'ags link: a dangling link must be refused\n' >&2
+    exit 1
+fi
+unset ags_link_fns ags_link_dir
 export FAKE_REAL_NODE_BINARY="$(command -v node)"
 export FAKE_REAL_RM_BINARY="$(command -v rm)"
 export FAKE_REAL_MV_BINARY="$(command -v mv)"

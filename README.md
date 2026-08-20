@@ -97,7 +97,9 @@ where an option value would otherwise be mistaken for the command; it is not
 needed otherwise.
 
 `--account EMAIL` asks the credential pool for that account for this launch
-only, and `--pick-account` lists what the configured key may ask for. Both pin
+only, and `--pick-account` lists what the configured key may ask for. Both work
+on every command that starts an Agent — `codex`, `claude`, `resume` and
+`cloud resume`. Both pin
 a distinct lease identity as well as the account, so two sessions started from
 the same directory can name different accounts without disturbing each other's
 lease. The named account is a strong preference rather than the only option:
@@ -110,6 +112,12 @@ Resuming a checkpoint uses its AGS ID automatically, while a direct native
 resume uses the explicit native session ID when one was supplied. AGS emits the
 standard OSC title sequence, so terminals that do not implement tab titles
 simply ignore it; non-interactive launches and `TERM=dumb` are unchanged.
+
+A restore refuses to write through a path it cannot vouch for. A symbolic link
+on the way to `<CODEX_HOME>/sessions` is allowed when it resolves to a directory
+this user owns that is not group- or world-writable, which is what lets two
+`CODEX_HOME` directories share one session history; a link into a directory
+someone else can write to, or one that leads nowhere, is still refused.
 
 ### Agent arguments are remembered
 

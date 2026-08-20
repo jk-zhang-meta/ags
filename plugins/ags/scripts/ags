@@ -193,7 +193,8 @@ Usage:
   ags claude [CLAUDE_ARGS...]          Start Claude
   ags [--account EMAIL|--pick-account] codex [CODEX_ARGS...]
                                        Start Codex; ags options go before
-                                       the command, agent args after it
+                                       the command, agent args after it.
+                                       They work on claude/resume/cloud too
   ags context review-codex             Open Codex's official hook review UI
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
@@ -3911,6 +3912,13 @@ terminal_menu() {
 launch_managed_agent() {
     local launch_binary="$1" agent="$2" launch_cwd
     shift 2
+    # ags 自己的参数在命令名之前就解析完了（见文件末尾的分发）。落地放在这里而不是
+    # `start_managed_agent`：`ags resume` 那条路不经过它，只经过这里，而恢复一个
+    # 会话同样需要能点名要号。
+    if (( ${ags_pick_account:-0} == 1 )); then
+        ags_account="$(pick_pool_account)"
+    fi
+    apply_pool_account "${ags_account:-}"
     scrub_transport_password_environment
     launch_cwd="$(pwd -P)"
     if [[ "$agent" == claude ]]; then
@@ -3964,11 +3972,6 @@ read_checkpoint_runtime_manifest() {
 start_managed_agent() {
     local agent="$1" launch_binary
     shift
-    # ags 自己的参数在命令名之前就解析完了（见文件末尾的分发），这里只负责落地。
-    if (( ${ags_pick_account:-0} == 1 )); then
-        ags_account="$(pick_pool_account)"
-    fi
-    apply_pool_account "${ags_account:-}"
     scrub_transport_password_environment
     # Here "$@" is exactly what the user typed, before AGS adds anything of its
     # own — which is the only point in the program where that is true. The
@@ -5665,6 +5668,50 @@ validate_tar() {
     done < <(tar -tvzf "$archive")
 }
 
+path_owner_mode() {
+    local path="$1"
+    stat -c '%u %a' -- "$path" 2>/dev/null && return 0
+    stat -f '%u %Lp' -- "$path" 2>/dev/null
+}
+
+# 还原路径上的一级目录：不是符号链接就原样返回，是的话解析并按 StrictModes 判。
+#
+# 允许链接本身，是因为把两个 `CODEX_HOME` 的 `sessions` 指到同一份是正当用法
+# （共用一份会话历史）。但**解析之后**的目录必须归当前用户所有、且组和其他人都
+# 不可写——否则别人改一下那个目录就能把还原写到任意位置，而那正是当初一律拒绝
+# 符号链接要防的事。规则和 ssh 对 `authorized_keys` 的 StrictModes 同一套。
+#
+# 代价说清楚：解析和写入之间存在 TOCTOU 窗口，一律拒绝符号链接是**没有**这个
+# 窗口的。换来的是这个用法能成立。
+resolve_restore_component() {
+    local path="$1" resolved owner mode
+    if [[ ! -L "$path" ]]; then
+        printf '%s\n' "$path"
+        return 0
+    fi
+    resolved="$(readlink -f -- "$path" 2>/dev/null)" || {
+        log "restore destination has an unresolvable symbolic link: $path"
+        return 1
+    }
+    [[ -d "$resolved" ]] || {
+        log "restore destination link does not lead to a directory: $path -> $resolved"
+        return 1
+    }
+    read -r owner mode < <(path_owner_mode "$resolved") || {
+        log "cannot inspect restore destination link target: $resolved"
+        return 1
+    }
+    [[ "$owner" == "$(id -u)" ]] || {
+        log "restore destination link target is not owned by this user: $resolved"
+        return 1
+    }
+    (( (8#$mode & 8#022) == 0 )) || {
+        log "restore destination link target is writable by others: $resolved ($mode)"
+        return 1
+    }
+    printf '%s\n' "$resolved"
+}
+
 validate_restore_destination() {
     local root="$1" destination="$2" parent component current=/
     local -a components=()
@@ -5681,10 +5728,7 @@ validate_restore_destination() {
         else
             current="$current/$component"
         fi
-        if [[ -L "$current" ]]; then
-            log "restore destination has a symbolic-link ancestor: $current"
-            return 1
-        fi
+        current="$(resolve_restore_component "$current")" || return 1
         if [[ -e "$current" && ! -d "$current" ]]; then
             log "restore destination has a non-directory ancestor: $current"
             return 1
@@ -5841,10 +5885,8 @@ ensure_restore_directory() {
         else
             current="$current/$component"
         fi
-        if [[ -L "$current" ]]; then
-            log "restore destination has a symbolic-link ancestor: $current"
-            return 1
-        elif [[ -e "$current" ]]; then
+        current="$(resolve_restore_component "$current")" || return 1
+        if [[ -e "$current" ]]; then
             [[ -d "$current" ]] || {
                 log "restore destination has a non-directory ancestor: $current"
                 return 1
@@ -10200,8 +10242,8 @@ if [[ -n "$ags_account" ]] && (( ags_pick_account == 1 )); then
 fi
 if [[ -n "$ags_account" ]] || (( ags_pick_account == 1 )); then
     case "${1:-}" in
-        codex|claude) ;;
-        *) die "--account / --pick-account 只对 codex 和 claude 有意义" ;;
+        codex|claude|resume|cloud) ;;
+        *) die "--account / --pick-account 只对启动 agent 的命令有意义（codex、claude、resume、cloud resume）" ;;
     esac
 fi
 
