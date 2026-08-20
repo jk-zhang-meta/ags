@@ -191,7 +191,9 @@ usage() {
 Usage:
   ags                                  Choose an Agent and start it
   ags claude [CLAUDE_ARGS...]          Start Claude
-  ags codex [CODEX_ARGS...]            Start Codex
+  ags [--account EMAIL|--pick-account] codex [CODEX_ARGS...]
+                                       Start Codex; ags options go before
+                                       the command, agent args after it
   ags context review-codex             Open Codex's official hook review UI
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
@@ -451,6 +453,17 @@ storage_path_has_safe_components() {
 
 
 
+
+sha256_text() {
+    local text="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$text" | sha256sum | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$text" | shasum -a 256 | awk '{print $1}'
+    else
+        return 1
+    fi
+}
 
 sha256_file() {
     local file="$1"
@@ -3490,6 +3503,8 @@ strip_session_selection_args() {
     local agent="$1" argument
     shift
     stripped_launch_args=()
+    stripped_session_selected=0
+    stripped_session_id=
     while (( $# > 0 )); do
         argument="$1"
         shift
@@ -3505,7 +3520,11 @@ strip_session_selection_args() {
                     # Codex's subcommand. Its SESSION_ID is positional and
                     # optional, so the next word is that id only when the next
                     # word is not itself a flag.
-                    [[ $# -eq 0 || "$1" == -* ]] || shift
+                    stripped_session_selected=1
+                    if [[ $# -gt 0 && "$1" != -* ]]; then
+                        stripped_session_id="$1"
+                        shift
+                    fi
                     continue
                     ;;
                 --last|--all|--include-non-interactive)
@@ -3519,23 +3538,134 @@ strip_session_selection_args() {
                 -r|--resume|--from-pr)
                     # Claude's value is optional here too, so the same rule
                     # decides whether the next word belongs to the flag.
-                    [[ $# -eq 0 || "$1" == -* ]] || shift
+                    stripped_session_selected=1
+                    if [[ $# -gt 0 && "$1" != -* ]]; then
+                        stripped_session_id="$1"
+                        shift
+                    fi
                     continue
                     ;;
-                --resume=*|--from-pr=*|--session-id=*|-c|--continue|--fork-session)
+                --resume=*|--from-pr=*|--session-id=*)
+                    stripped_session_selected=1
+                    stripped_session_id="${argument#*=}"
+                    continue
+                    ;;
+                -c|--continue|--fork-session)
                     # `--fork-session` selects a session as much as the rest:
                     # it resumes into a *new* id, so the restored one would be
                     # loaded and then abandoned.
+                    stripped_session_selected=1
                     continue
                     ;;
                 --session-id)
-                    (( $# == 0 )) || shift
+                    stripped_session_selected=1
+                    if (( $# > 0 )); then
+                        stripped_session_id="$1"
+                        shift
+                    fi
                     continue
                     ;;
             esac
         fi
         stripped_launch_args+=("$argument")
     done
+}
+
+# Set a useful terminal tab title where the terminal implements the standard
+# OSC title sequence. Unsupported terminals simply ignore it; non-interactive
+# launches do not prompt and do not write terminal control bytes to captured
+# output.
+# 把 `--account` 变成 codext 认得的两个环境变量。
+#
+# **两个，不是一个。** `CODEXT_POOL_ACCOUNT` 说这次要哪个号；
+# `CODEXT_POOL_DEVICE_ID` 决定服务端按哪条租约认人——codext 的 device_id 默认按
+# **工作目录**取（同一个项目反复调用复用同一条租约），而服务端的租约表在
+# device_id 上有唯一约束。只给账号不给 device_id 的话，同一个目录里两个点不同号
+# 的会话会撞在同一条租约行上互相顶掉，也就是"指定账号影响了别的会话"。
+#
+# 已经显式设了 `CODEXT_POOL_DEVICE_ID` 就不动它：那是调用方明确表达过的意图。
+# 摘要里放的是账号的哈希而不是账号本身，因为这个值会发到服务端、显示在后台界面上。
+apply_pool_account() {
+    local account="$1" host workspace
+    [[ -n "$account" ]] || return 0
+    export CODEXT_POOL_ACCOUNT="$account"
+    [[ -z "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
+    host="${HOSTNAME:-${COMPUTERNAME:-codext}}"
+    workspace="$(sha256_text "$PWD" 2>/dev/null)" || workspace=""
+    account="$(sha256_text "$account" 2>/dev/null)" || account=""
+    export CODEXT_POOL_DEVICE_ID="$host-${workspace:0:16}-${account:0:16}"
+}
+
+# 让用户从池子里挑一个号（`--pick-account`）。
+#
+# 走 curl 而不是引一个 HTTP 客户端：这是脚本里为数不多的网络调用，而 curl 和 jq
+# 本来就是依赖。服务端那边问 `/usage` 同样是 shell 出去调 curl，理由一致。
+pick_pool_account() {
+    local config url key payload count choice account
+    need jq
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || die "还没配置 codext 凭据池，先跑 ags codex-init"
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" ||
+        die "配置文件读不出来：$config"
+    key="$(jq -er '.key' "$config" 2>/dev/null)" ||
+        die "配置文件里没有密钥：$config"
+    payload="$(curl -sS --connect-timeout 8 --max-time 20 -X POST \
+        -H "X-Codex-Pool-Token: $key" \
+        "$url$codex_pool_prefix/accounts" 2>/dev/null)" ||
+        die "问不到凭据池：$url"
+    count="$(jq -r '.data.accounts | length' <<< "$payload" 2>/dev/null)" ||
+        die "凭据池回的不是预期的 JSON"
+    (( count > 0 )) || die "这把密钥没有可点名的号"
+    # 余量和状态一起印出来：挑号时看不见这两样等于盲选，很容易挑中一个已经跑满
+    # 的号，然后以为是指定账号没生效。
+    jq -r '.data.accounts | to_entries[] |
+        "  \(.key + 1)) \(.value.email)  \(.value.plan)  余量 \((.value.headroom * 100) | floor)%" +
+        (if .value.assigned then "  [专属]"
+         elif (.value.schedulable | not) then "  [冷却中]"
+         else "" end)' <<< "$payload" > /dev/tty
+    printf '选一个号 [1-%s]: ' "$count" > /dev/tty
+    IFS= read -r choice < /dev/tty || choice=
+    [[ "$choice" =~ ^[0-9]+$ ]] || die "不是数字：$choice"
+    (( choice >= 1 && choice <= count )) || die "没有这个选项：$choice"
+    # 发邮箱而不是 account_key：服务端两个都认，而邮箱是人看得懂的那个,它会出现
+    # 在日志和后台界面上。
+    account="$(jq -r --argjson i "$((choice - 1))" \
+        '.data.accounts[$i] | (.email // "" | select(. != "")) // .account_key' \
+        <<< "$payload")"
+    [[ -n "$account" ]] || die "选中的号没有可用的标识"
+    printf '%s\n' "$account"
+}
+
+terminal_can_set_title() {
+    [[ "${TERM:-dumb}" != dumb && -t 0 && -t 1 &&
+       -r /dev/tty && -w /dev/tty ]]
+}
+
+set_terminal_tab_title() {
+    local title="${1:-}"
+    terminal_can_set_title || return 0
+    [[ -n "$title" ]] || return 0
+    text_has_no_control_characters "$title" || return 0
+    printf '\033]0;%s\007' "$title" > /dev/tty 2>/dev/null || true
+}
+
+prepare_terminal_tab_title() {
+    local launch_cwd="$1" title default_title
+    terminal_can_set_title || return 0
+    if [[ "${launch_terminal_title_mode:-new}" == resume ]]; then
+        set_terminal_tab_title "${launch_terminal_title:-}"
+        return 0
+    fi
+    default_title="${launch_cwd##*/}"
+    [[ -n "$default_title" ]] || default_title=/
+    printf 'Terminal tab name [%s]: ' "$default_title" > /dev/tty
+    IFS= read -r title < /dev/tty || title=
+    [[ -n "$title" ]] || title="$default_title"
+    if ! text_has_no_control_characters "$title"; then
+        log "terminal tab name contains control characters; using $default_title"
+        title="$default_title"
+    fi
+    set_terminal_tab_title "$title"
 }
 
 # The Agent arguments a session was started with, as a JSON array.
@@ -3790,6 +3920,7 @@ launch_managed_agent() {
         validate_claude_context_args "$@"
         validate_claude_settings_sources "$launch_cwd"
     fi
+    prepare_terminal_tab_title "$launch_cwd"
     # After every check that can refuse this launch, so a pending update is
     # never the last thing printed before a refusal — and never mistaken for
     # part of one. `|| true` states the contract where it matters: an update
@@ -3833,6 +3964,11 @@ read_checkpoint_runtime_manifest() {
 start_managed_agent() {
     local agent="$1" launch_binary
     shift
+    # ags 自己的参数在命令名之前就解析完了（见文件末尾的分发），这里只负责落地。
+    if (( ${ags_pick_account:-0} == 1 )); then
+        ags_account="$(pick_pool_account)"
+    fi
+    apply_pool_account "${ags_account:-}"
     scrub_transport_password_environment
     # Here "$@" is exactly what the user typed, before AGS adds anything of its
     # own — which is the only point in the program where that is true. The
@@ -3840,6 +3976,13 @@ start_managed_agent() {
     # session exactly as it always did; only the record drops that part,
     # because a resume of this checkpoint rebuilds the selection itself.
     strip_session_selection_args "$agent" "$@"
+    if (( stripped_session_selected == 1 )); then
+        launch_terminal_title_mode=resume
+        launch_terminal_title="$stripped_session_id"
+    else
+        launch_terminal_title_mode=new
+        launch_terminal_title=
+    fi
     export_launch_args "${stripped_launch_args[@]}"
     prepare_storage_for_launch
     launch_binary="$(resolve_agent_binary "$agent")"
@@ -7133,7 +7276,8 @@ resume_checkpoint() {
     shift
     local checkpoint_id="${1:-}" launch_binary resume_cwd= resume_target_agent=
     local profile= agent_profile= effective_profile=
-    local runtime_manifest runtime_source_agent runtime_record_id runtime_saved_cwd
+    local runtime_manifest runtime_checkpoint_id runtime_source_agent runtime_record_id
+    local runtime_saved_cwd
     local runtime_selected_record_id
     local runtime_effective_agent runtime_effective_cwd
     local storage_reconciled=0
@@ -7236,6 +7380,7 @@ resume_checkpoint() {
     resolve_checkpoint_record_for_live "$target" "$checkpoint_id"
     runtime_manifest="$(read_checkpoint_runtime_manifest "$target")" ||
         die "cannot read checkpoint manifest for managed resume"
+    runtime_checkpoint_id="$(sed -n 's/^checkpoint_id=//p' <<< "$runtime_manifest")"
     runtime_source_agent="$(sed -n 's/^agent=//p' <<< "$runtime_manifest")"
     runtime_record_id="$(sed -n 's/^record_id=//p' <<< "$runtime_manifest")"
     [[ -n "$runtime_record_id" ]] ||
@@ -7343,6 +7488,8 @@ resume_checkpoint() {
     # chose here, which is what a synchronized checkpoint can carry.
     (( client_args_explicit == 1 || ${#client_args[@]} == 0 )) ||
         log "$restored_agent arguments: $(format_launch_args "$AGS_LAUNCH_ARGS")"
+    launch_terminal_title_mode=resume
+    launch_terminal_title="$runtime_checkpoint_id"
     case "$restored_agent" in
         codex)
             if [[ -n "$profile" ]]; then
@@ -10003,6 +10150,61 @@ refresh_update_check_record() {
 #
 # 排除的那四个也不刷新：`update` 自己就要联网查一遍，`update-check-refresh` 就是
 # 那个后台检查本身，另外两个由 install.sh 驱动。
+# ags 自己的参数区在**命令名之前**——位置本身就把两边分开了，和 sudo / env /
+# timeout / docker run 同一个路子：解析到第一个非选项就停，之后的一切原样透传给
+# agent。所以 `ags codex --model o3`、`ags codex resume <id>` 全都照旧可用，
+# codex 将来新增任何同名参数也撞不着我们。
+#
+# `--` 只是**没有位置可以分界时**的补救（POSIX 的选项结束标记）：ags 参数的值
+# 本身长得像命令名时用它收尾。用不上就不用写。
+#
+#   ags --account a@b.com codex --model o3     位置分界，不需要 --
+#   ags --account a@b.com -- codex             显式收尾
+#   ags codex --account a@b.com                --account 归 codex，报未知参数
+ags_account=
+ags_pick_account=0
+while (( $# > 0 )); do
+    case "$1" in
+        --account)
+            shift
+            (( $# > 0 )) || die "--account 需要一个邮箱或账号标识"
+            ags_account="$1"
+            shift
+            ;;
+        --account=*)
+            ags_account="${1#--account=}"
+            [[ -n "$ags_account" ]] || die "--account 需要一个邮箱或账号标识"
+            shift
+            ;;
+        --pick-account)
+            ags_pick_account=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -h|--help|help)
+            break
+            ;;
+        -*)
+            die "ags 不认识这个参数：$1（给 agent 的参数写在命令名之后）"
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+if [[ -n "$ags_account" ]] && (( ags_pick_account == 1 )); then
+    die "--account 和 --pick-account 二选一"
+fi
+if [[ -n "$ags_account" ]] || (( ags_pick_account == 1 )); then
+    case "${1:-}" in
+        codex|claude) ;;
+        *) die "--account / --pick-account 只对 codex 和 claude 有意义" ;;
+    esac
+fi
+
 case "${1:-}" in
     update|update-check-refresh|codext-update|codex-name) ;;
     *)

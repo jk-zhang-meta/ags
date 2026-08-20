@@ -35,6 +35,110 @@ mapfile -t bare_var_before_multibyte < <(
 
 tmp="$(mktemp -d "$test_tmp_root/agent-session-test.XXXXXX")"
 declare -A test_child_pids=()
+
+# ags 自己的参数区在**命令名之前**，之后的一切原样透传给 agent——和 sudo / env /
+# timeout / docker run 同一个路子。放在文件最前面是因为它不需要 PTY、不需要编译
+# 产物，任何机器上都跑得到；而这个套件是 `set -e`，靠后的用例在一台机器上红了，
+# 后面的就全不会执行。
+ags_zone_home="$(mktemp -d "$tmp/ags-zone.XXXXXX")"
+mkdir -p "$ags_zone_home/bin"
+cat > "$ags_zone_home/bin/codext" <<'AGS_ZONE_FAKE'
+#!/bin/sh
+{ echo "ARGS=$*"
+  echo "ACCOUNT=${CODEXT_POOL_ACCOUNT:-}"
+  echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
+} > "$AGS_ZONE_OUT"
+AGS_ZONE_FAKE
+chmod +x "$ags_zone_home/bin/codext"
+
+ags_zone_launch() {
+    local out="$ags_zone_home/out"
+    rm -f "$out"
+    AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
+        AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>&1 || return $?
+    cat "$out"
+}
+
+ags_zone_field() {
+    sed -n "s/^$1=//p" <<< "$2"
+}
+
+# 命令名之前的参数归 ags，之后的原样给 agent。
+ags_zone_out="$(ags_zone_launch --account zone@example.com codex --model o3)"
+[[ "$(ags_zone_field ARGS "$ags_zone_out")" == '--model o3' ]] || {
+    printf 'ags zone: agent args were not passed through verbatim: %s\n' \
+        "$ags_zone_out" >&2
+    exit 1
+}
+[[ "$(ags_zone_field ACCOUNT "$ags_zone_out")" == zone@example.com ]] || {
+    printf 'ags zone: --account did not reach the agent environment: %s\n' \
+        "$ags_zone_out" >&2
+    exit 1
+}
+# 光有账号不够：codext 的 device_id 默认按工作目录取，而服务端的租约表在
+# device_id 上有唯一约束——同一个目录里两个点不同号的会话会撞同一条租约行。
+[[ -n "$(ags_zone_field DEVICE "$ags_zone_out")" ]] || {
+    printf 'ags zone: --account must also pin a lease identity: %s\n' \
+        "$ags_zone_out" >&2
+    exit 1
+}
+
+# 不同账号必须是不同的租约身份，同一个账号必须稳定——前者决定两个会话能不能并存，
+# 后者决定反复启动会不会每次都留一个幽灵持有者去抬高服务端的并发除数。
+ags_zone_first="$(ags_zone_field DEVICE "$ags_zone_out")"
+ags_zone_out="$(ags_zone_launch --account other@example.com codex)"
+[[ "$(ags_zone_field DEVICE "$ags_zone_out")" != "$ags_zone_first" ]] || {
+    printf 'ags zone: two accounts must not share one lease identity\n' >&2
+    exit 1
+}
+ags_zone_out="$(ags_zone_launch --account zone@example.com codex)"
+[[ "$(ags_zone_field DEVICE "$ags_zone_out")" == "$ags_zone_first" ]] || {
+    printf 'ags zone: the same account must keep one lease identity\n' >&2
+    exit 1
+}
+
+# 调用方显式给过的租约身份不能被覆盖。
+ags_zone_out="$(CODEXT_POOL_DEVICE_ID=explicit-id \
+    ags_zone_launch --account zone@example.com codex)"
+[[ "$(ags_zone_field DEVICE "$ags_zone_out")" == explicit-id ]] || {
+    printf 'ags zone: an explicit CODEXT_POOL_DEVICE_ID must win\n' >&2
+    exit 1
+}
+
+# 命令名之后的参数一律归 agent，哪怕它长得和 ags 的参数一模一样。codex 将来新增
+# 同名参数时这一条是唯一的保障。
+ags_zone_out="$(ags_zone_launch codex --account not-ours@example.com)"
+[[ "$(ags_zone_field ARGS "$ags_zone_out")" == '--account not-ours@example.com' ]] || {
+    printf 'ags zone: an option after the command belongs to the agent: %s\n' \
+        "$ags_zone_out" >&2
+    exit 1
+}
+[[ -z "$(ags_zone_field ACCOUNT "$ags_zone_out")" ]] || {
+    printf 'ags zone: ags must not claim an option written after the command\n' >&2
+    exit 1
+}
+
+# `--` 是没有位置可以分界时的补救，用得上时必须收尾干净。
+ags_zone_out="$(ags_zone_launch --account zone@example.com -- codex)"
+[[ "$(ags_zone_field ACCOUNT "$ags_zone_out")" == zone@example.com ]] || {
+    printf 'ags zone: -- must end the ags option zone cleanly: %s\n' \
+        "$ags_zone_out" >&2
+    exit 1
+}
+
+# 拒绝路径：值缺失、两个开关互斥、用在非 agent 命令上、不认识的 ags 参数。
+for ags_zone_bad in \
+    "--account" \
+    "--account a@b.com --pick-account codex" \
+    "--account a@b.com list" \
+    "--bogus codex"
+do
+    if ags_zone_launch $ags_zone_bad >/dev/null 2>&1; then
+        printf 'ags zone: expected a refusal for: ags %s\n' "$ags_zone_bad" >&2
+        exit 1
+    fi
+done
+unset ags_zone_bad
 export FAKE_REAL_NODE_BINARY="$(command -v node)"
 export FAKE_REAL_RM_BINARY="$(command -v rm)"
 export FAKE_REAL_MV_BINARY="$(command -v mv)"
@@ -1807,6 +1911,27 @@ EOF
         sed -e 's/\x1b\[[?0-9;]*[a-zA-Z]//g' -e 's/\r//g' -e 's/\x1b//g'
     }
 
+    mkdir -p "$tmp/tab-state" "$tmp/tab-checkpoints"
+    tab_env=(
+        "${managed_env[@]}"
+        AGENT_SESSION_STATE_DIR="$tmp/tab-state"
+        AGENT_SESSION_LOCAL_DIR="$tmp/tab-checkpoints"
+    )
+    run_agent_pty() {
+        local input="$1" output="$2" launch_dir="$3" terminal_type="$4"
+        local pty_command
+        shift 4
+        printf -v pty_command '%q ' \
+            env "${tab_env[@]}" TERM="$terminal_type" \
+            "$tmp/stty-guard" "$tool" "$@"
+        (
+            cd "$launch_dir"
+            printf '%s' "$input" | \
+                SHELL=/bin/bash /usr/bin/script -q -e -f \
+                    -c "$pty_command" /dev/null > "$output" 2>&1
+        )
+    }
+
     checkpoint_root_before="$(
         find "$tmp/local-checkpoints" -type f -print0 |
             LC_ALL=C sort -z | xargs -0 sha256sum
@@ -1899,6 +2024,7 @@ EOF
         "$args_menu_root" CODEX_HOME="$tmp/cwd-here-target/codex"
     cwd_here_frame="$(strip_terminal_control < "$tmp/checkpoint-cwd-here.out")"
     grep -Fqx "FAKE_PWD=$pty_cwd" <<< "$cwd_here_frame"
+    grep -Fq $'\033]0;with-args\007' "$tmp/checkpoint-cwd-here.out"
 
     # Same directory, nothing to choose between: the question must not appear.
     cwd_same_out="$(
@@ -1933,6 +2059,30 @@ EOF
     [[ ! -e "$ui_checkpoint_root/codex/$checkpoint_record_id.checkpoint.tar.gz.age" ]]
     [[ -f "$ui_checkpoint_root/tombstones/codex/$checkpoint_record_id.tombstone" ]]
     grep -Fq 'it remains recoverable' "$tmp/checkpoint-delete-yes.out"
+
+    # A genuinely new interactive launch asks once. Enter accepts the current
+    # directory name, a typed name wins, and duplicate names need no special
+    # handling because terminal titles are not identifiers.
+    run_agent_pty $'focused work\n' "$tmp/tab-custom.out" \
+        "$tmp/work" xterm-256color codex --model o3
+    grep -Fq 'Terminal tab name [work]:' "$tmp/tab-custom.out"
+    grep -Fq $'\033]0;focused work\007' "$tmp/tab-custom.out"
+    run_agent_pty $'\n' "$tmp/tab-default.out" \
+        "$tmp/work" xterm-256color codex --model o3
+    grep -Fq $'\033]0;work\007' "$tmp/tab-default.out"
+
+    # A native resume with an explicit id does not ask a new-session question.
+    # TERM=dumb represents terminals that cannot consume the title sequence:
+    # those launches remain completely untouched.
+    native_tab_id=99999999-8888-4777-8666-555555555555
+    run_agent_pty '' "$tmp/tab-resume.out" \
+        "$tmp/work" xterm-256color codex resume "$native_tab_id"
+    ! grep -Fq 'Terminal tab name' "$tmp/tab-resume.out"
+    grep -Fq $'\033]0;'"$native_tab_id"$'\007' "$tmp/tab-resume.out"
+    run_agent_pty '' "$tmp/tab-dumb.out" \
+        "$tmp/work" dumb codex --model o3
+    ! grep -Fq 'Terminal tab name' "$tmp/tab-dumb.out"
+    ! grep -Fq $'\033]0;' "$tmp/tab-dumb.out"
 fi
 
 checkpoint_show="$(env "${source_env[@]}" "$tool" show "$checkpoint_id")"

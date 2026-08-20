@@ -73,6 +73,8 @@ ags claude                  # start Claude Code in an AGS terminal
 ags codex                   # start Codex in an AGS terminal
 ags claude --model opus     # everything after "claude" belongs to Claude Code
 ags codex --model o3        # everything after "codex" belongs to Codex
+ags --account me@example.com codex     # AGS options go before the command
+ags --pick-account codex               # choose the pool account interactively
 ags save release-fix "Continue the release fix"
 ags list                    # pick a saved session and open it
 ags show release-fix
@@ -86,6 +88,28 @@ precede an independent `--`; arguments after it are forwarded to the restored
 Agent in their original order. Direct launch has no mixed namespace:
 even a token named `--to`, `--cwd`, or `--profile` after `ags claude` or
 `ags codex` is an Agent token and is never consumed by AGS.
+
+AGS options for a direct launch therefore go **before** the command name, the
+way `sudo`, `env`, `timeout` and `docker run` take theirs: parsing stops at the
+first non-option token, and everything from the command name onward reaches the
+Agent untouched. A `--` may end the AGS option zone explicitly, for the case
+where an option value would otherwise be mistaken for the command; it is not
+needed otherwise.
+
+`--account EMAIL` asks the credential pool for that account for this launch
+only, and `--pick-account` lists what the configured key may ask for. Both pin
+a distinct lease identity as well as the account, so two sessions started from
+the same directory can name different accounts without disturbing each other's
+lease. The named account is a strong preference rather than the only option:
+when it is cooling or out of quota the pool falls back so the session keeps
+working, and returns to it once it recovers.
+
+In an interactive terminal, a new `ags claude` or `ags codex` launch asks for
+the terminal tab name; Enter uses the current directory's final component.
+Resuming a checkpoint uses its AGS ID automatically, while a direct native
+resume uses the explicit native session ID when one was supplied. AGS emits the
+standard OSC title sequence, so terminals that do not implement tab titles
+simply ignore it; non-interactive launches and `TERM=dumb` are unchanged.
 
 ### Agent arguments are remembered
 
