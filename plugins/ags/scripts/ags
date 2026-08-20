@@ -3586,8 +3586,31 @@ strip_session_selection_args() {
 #
 # 已经显式设了 `CODEXT_POOL_DEVICE_ID` 就不动它：那是调用方明确表达过的意图。
 # 摘要里放的是账号的哈希而不是账号本身，因为这个值会发到服务端、显示在后台界面上。
+# 这次会话在凭据池那边的租约身份。
+#
+# 三段：`<主机>-<目录哈希>-<会话哈希>`。最后一段以前是**点名账号串**的摘要，现在
+# 是 **AGS ID** 的，因为身份该由会话决定，不该由它点了哪些号决定：
+#
+#   - 同一条工作线换一组点名账号，以前 device_id 会变，于是留下一条孤儿租约，原来
+#     那个号被白占到 600 秒过期。现在不变。
+#   - 同一个目录里的两个会话，以前只有点名不同的号才互不干扰；现在 ID 必然不同，
+#     所以必然互不干扰。
+#   - 服务端能把租约和会话上报对上，靠的正是这个值两边一致。
+#
+# 调用方显式给过 `CODEXT_POOL_DEVICE_ID` 就不覆盖。
+export_pool_device_id() {
+    local agent="$1" host workspace session
+    [[ "$agent" == codex ]] || return 0
+    [[ -n "${ags_session_id:-}" ]] || return 0
+    [[ -z "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
+    host="${HOSTNAME:-${COMPUTERNAME:-codext}}"
+    workspace="$(sha256_text "$PWD" 2>/dev/null)" || workspace=""
+    session="$(sha256_text "$ags_session_id" 2>/dev/null)" || session=""
+    export CODEXT_POOL_DEVICE_ID="$host-${workspace:0:16}-${session:0:16}"
+}
+
 apply_pool_account() {
-    local agent="$1" account="$2" host workspace
+    local agent="$1" account="$2"
     [[ -n "$account" ]] || return 0
     # 凭据池是 codext 独有的（`CODEXT_POOL_*` 只有它读）。给别的 agent 注入等于
     # 让人以为号钉住了、其实什么都没发生——**静默无视比报错糟得多**，所以这里
@@ -3595,11 +3618,6 @@ apply_pool_account() {
     [[ "$agent" == codex ]] || die "--account / --pick-account 只对 Codex 有意义：$agent 不从凭据池取号"
 
     export CODEXT_POOL_ACCOUNT="$account"
-    [[ -z "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
-    host="${HOSTNAME:-${COMPUTERNAME:-codext}}"
-    workspace="$(sha256_text "$PWD" 2>/dev/null)" || workspace=""
-    account="$(sha256_text "$account" 2>/dev/null)" || account=""
-    export CODEXT_POOL_DEVICE_ID="$host-${workspace:0:16}-${account:0:16}"
 }
 
 # 让用户从池子里挑一个号（`--pick-account`）。
@@ -3754,23 +3772,169 @@ set_terminal_tab_title() {
     printf '\033]0;%s\007' "$title" > /dev/tty 2>/dev/null || true
 }
 
-prepare_terminal_tab_title() {
-    local launch_cwd="$1" title default_title
-    terminal_can_set_title || return 0
-    if [[ "${launch_terminal_title_mode:-new}" == resume ]]; then
-        set_terminal_tab_title "${launch_terminal_title:-}"
+# 一个目录名里能进 AGS ID 的部分。ID 的字符集是
+# `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`（见 `validate_new_checkpoint_id`），而目录名
+# 里什么都可能有。
+sanitize_ags_id_fragment() {
+    local text="${1:-}"
+    text="${text//[^A-Za-z0-9._-]/-}"      # 非法字符一律换成连字符
+    # 削掉开头的非字母数字。刻意不用 `${text##+([-._])}`：那要 `extglob`，而这个
+    # 脚本没开——不开的话那个模式**一个字符都不删**，还不报错，正是最难发现的那
+    # 种失效。
+    while [[ -n "$text" && "$text" != [A-Za-z0-9]* ]]; do
+        text="${text:1}"
+    done
+    text="${text:0:32}"
+    [[ -n "$text" ]] || text=session
+    printf '%s\n' "$text"
+}
+
+# 没起名字时用的默认 ID：`<目录名>-<月日-时分秒>`，例如 `05_MyWork-0821-031745`。
+#
+# 刻意**不用随机串**。这个 ID 会出现在标签页上、检查点里、后台的会话列表里，几天
+# 后还要靠它认出"这是哪一条工作线"——`a7f3c1` 认不出来，`05_MyWork-0821` 认得出。
+#
+# **精确到秒**而不是分钟：ID 现在决定租约身份，两个撞了 ID 的会话会争同一条租约
+# 行。分钟粒度看着更干净，但同一目录里一分钟内起两个无名会话就会撞上——实测撞到
+# 过。下面那个序号循环挡不住它，因为刚启动、还没保存也还没上报的会话，本地和池子
+# 都还看不见。
+default_ags_id() {
+    local launch_cwd="$1" base stamp candidate index=2
+    base="$(sanitize_ags_id_fragment "${launch_cwd##*/}")"
+    stamp="$(date +%m%d-%H%M%S)"
+    candidate="$base-$stamp"
+    while ags_id_is_taken "$candidate"; do
+        candidate="$base-$stamp-$index"
+        index=$(( index + 1 ))
+        (( index < 100 )) || break
+    done
+    printf '%s\n' "${candidate:0:64}"
+}
+
+# 这把密钥此刻占用了哪些 ID。问不到就当没有——查重名失败不该拦住启动。
+pool_live_ags_ids() {
+    local config url key payload
+    command -v jq >/dev/null 2>&1 || return 0
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    payload="$(curl -sS --connect-timeout 4 --max-time 8 -X POST \
+        -H "X-Codex-Pool-Token: $key" \
+        "$url$codex_pool_prefix/sessions" 2>/dev/null)" || return 0
+    jq -r '.data.sessions[]?.ags_id // empty' <<< "$payload" 2>/dev/null || true
+}
+
+# 这个 ID 现在能不能用。
+#
+# 两个命名空间，规则不同：本地检查点库里的 ID 是**永久**的（一条工作线的名字），
+# 池子里的只在**活着的会话**之间唯一（会话结束就把名字放出来）。两边任意一边占着
+# 就算被占。
+ags_id_is_taken() {
+    local candidate="$1" taken
+    [[ -n "$candidate" ]] || return 0
+    if checkpoint_id_exists local "$candidate" 2>/dev/null; then
         return 0
     fi
-    default_title="${launch_cwd##*/}"
-    [[ -n "$default_title" ]] || default_title=/
-    printf 'Terminal tab name [%s]: ' "$default_title" > /dev/tty
-    IFS= read -r title < /dev/tty || title=
-    [[ -n "$title" ]] || title="$default_title"
-    if ! text_has_no_control_characters "$title"; then
-        log "terminal tab name contains control characters; using $default_title"
-        title="$default_title"
+    for taken in ${ags_pool_live_ids[@]+"${ags_pool_live_ids[@]}"}; do
+        [[ "$taken" == "$candidate" ]] && return 0
+    done
+    return 1
+}
+
+# 这次会话叫什么。
+#
+# 以前这里问的是"标签页叫什么"，答案用完即弃。现在同一个答案就是 **AGS ID**：标签
+# 页名、`ags save` 用的 ID、上报给池子的名字，三者是同一个东西。
+#
+# 为什么合并：`ags resume` 早就是这样了（标签页名就是检查点 ID），只有全新启动那条
+# 路让人在启动时起一个名字、保存时再起一个，于是同一条工作线有两个名字，而后台看
+# 到的那个（哈希）两个都不是。
+#
+# 本地已经有同名检查点就**拒绝**，不是警告：放行的话，人会干一小时活，然后在
+# `ags save` 那一步撞上"checkpoint ID already exists"，那时已经没有别的保存路径了。
+prepare_session_identity() {
+    local launch_cwd="$1" agent="$2" suggestion answer
+    if [[ "${launch_terminal_title_mode:-new}" == resume ]]; then
+        # 恢复一条已有的工作线：名字就是它的检查点 ID，不该再问一次。
+        ags_session_id="${launch_terminal_title:-}"
+        [[ -z "$ags_session_id" ]] || export AGS_ID="$ags_session_id"
+        set_terminal_tab_title "$ags_session_id"
+        return 0
     fi
-    set_terminal_tab_title "$title"
+
+    ags_pool_live_ids=()
+    if [[ "$agent" == codex ]]; then
+        while IFS= read -r answer; do
+            [[ -n "$answer" ]] && ags_pool_live_ids+=("$answer")
+        done < <(pool_live_ags_ids)
+    fi
+
+    suggestion="$(default_ags_id "$launch_cwd")"
+    if terminal_can_set_title; then
+        if (( ${#ags_pool_live_ids[@]} > 0 )); then
+            printf '这把密钥正在跑的会话：%s\n' \
+                "$(IFS=, ; printf '%s' "${ags_pool_live_ids[*]}")" > /dev/tty
+        fi
+        while :; do
+            printf '会话 ID [%s]: ' "$suggestion" > /dev/tty
+            # 回车（读成功、内容为空）= 用默认值，这是一个选择。
+            # 读**失败**（EOF）= 没人回答，这不是选择——此时静默换上默认 ID 会让
+            # 一个刚被拒绝的名字悄悄变成另一个名字，而人以为自己起的名生效了。
+            if ! IFS= read -r answer < /dev/tty; then
+                [[ -n "$answer" ]] || die "没读到会话 ID"
+            fi
+            [[ -n "$answer" ]] || { answer="$suggestion"; break; }
+            if ! [[ "$answer" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+                printf 'ID 只能是 1-64 个字母、数字、点、下划线或连字符，且以字母或数字开头。\n' > /dev/tty
+                continue
+            fi
+            if checkpoint_id_exists local "$answer" 2>/dev/null; then
+                printf '本地已经有叫「%s」的检查点。接着那条线用 `ags resume %s`；要开新的换个名字。\n' \
+                    "$answer" "$answer" > /dev/tty
+                continue
+            fi
+            if ags_id_is_taken "$answer"; then
+                printf '「%s」正被这把密钥的另一个会话占着，换一个。\n' "$answer" > /dev/tty
+                continue
+            fi
+            break
+        done
+    else
+        # 没有终端就没法问。自动生成的 ID 本来就是为这种情况准备的。
+        answer="$suggestion"
+    fi
+
+    ags_session_id="$answer"
+    export AGS_ID="$ags_session_id"
+    set_terminal_tab_title "$ags_session_id"
+}
+
+# 把这次会话的身份告诉凭据池：ID、目录、主机、启动时刻。
+#
+# **绝不阻塞启动**：问不到池子、没配置、服务端还是老版本——一律静默跳过。上报的
+# 用处是让后台能认出这个会话，认不出只是不方便，而拦住启动是真的损失。
+#
+# 由 ags 发而不是 codext 发：ags 自己就在算 device_id，而 codext 那边加一个字段
+# 意味着再发一版 codext。
+report_pool_session() {
+    local agent="$1" launch_cwd="$2" config url key
+    [[ "$agent" == codex ]] || return 0
+    [[ -n "${ags_session_id:-}" ]] || return 0
+    [[ -n "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    curl -sS --connect-timeout 4 --max-time 8 -X POST \
+        -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
+        -d "$(jq -nc \
+              --arg d "$CODEXT_POOL_DEVICE_ID" --arg i "$ags_session_id" \
+              --arg c "$launch_cwd" --arg h "${HOSTNAME:-${COMPUTERNAME:-}}" \
+              --arg s "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+              '{device_id:$d, ags_id:$i, cwd:$c, host:$h, started_at:$s}')" \
+        "$url$codex_pool_prefix/session" >/dev/null 2>&1 || true
 }
 
 # The Agent arguments a session was started with, as a JSON array.
@@ -4034,7 +4198,10 @@ launch_managed_agent() {
         validate_claude_context_args "$@"
         validate_claude_settings_sources "$launch_cwd"
     fi
-    prepare_terminal_tab_title "$launch_cwd"
+    # 会话身份要在租约身份之前定下来——后者是从前者派生的。
+    prepare_session_identity "$launch_cwd" "$agent"
+    export_pool_device_id "$agent"
+    report_pool_session "$agent" "$launch_cwd"
     # After every check that can refuse this launch, so a pending update is
     # never the last thing printed before a refusal — and never mistaken for
     # part of one. `|| true` states the contract where it matters: an update
@@ -5644,6 +5811,17 @@ save_active_checkpoint() {
     local target="${1:-}" agent="${AGENT_SESSION_AGENT:-}" session_id="${AGENT_SESSION_ID:-}"
     shift || true
     [[ "$target" == local || "$target" == cloud ]] || die "target must be local or cloud"
+    # 会话 ID 在**启动时**就定好了（见 `prepare_session_identity`），所以保存时只
+    # 需要给描述：`ags save "描述"`。
+    #
+    # 老写法 `ags save <ID> "描述"` 继续有效——有肌肉记忆，也可能有脚本。判定只看
+    # 第一个参数长不长得像 ID，因为描述几乎不可能长成 ID 的样子（ID 不许有空格）。
+    #
+    # 两者都不成立就报错，不猜：猜错的后果是这次保存挂在一个谁也想不到的名字下。
+    if [[ -n "${AGS_ID:-}" ]] && (( $# > 0 )) &&
+       ! [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+        set -- "$AGS_ID" "$@"
+    fi
     if [[ -z "$agent" || -z "$session_id" ]]; then
         if [[ -n "${CODEX_THREAD_ID:-}" ]]; then
             agent=codex session_id="$CODEX_THREAD_ID"
@@ -10303,6 +10481,10 @@ ags_profile_option=
 ags_consumed=0
 ags_agent_args=()
 ags_agent_args_given=0
+# 这次会话的 AGS ID，以及这把密钥此刻占用的 ID。都在 `prepare_session_identity`
+# 里填；声明在这里是因为 `export_pool_device_id` 和 `report_pool_session` 也要读。
+ags_session_id=
+ags_pool_live_ids=()
 
 ags_words=()
 ags_separator_seen=0

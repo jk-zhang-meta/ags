@@ -111,23 +111,19 @@ ags_zone_expect 'an ags option after the command' ACCOUNT zone@example.com \
 ags_zone_expect 'both zones at once' ARGS '--model o3' \
     --account zone@example.com codex -- --model o3
 
-# 光有账号不够：codext 的 device_id 默认按工作目录取，而服务端的租约表在
-# device_id 上有唯一约束——同一个目录里两个点不同号的会话会撞同一条租约行。
+# 每次启动都必须有租约身份：codext 的 device_id 默认按工作目录取，而服务端的租约
+# 表在 device_id 上有唯一约束——同一个目录里的两个会话会撞同一条租约行。
+#
+# 身份**由会话决定，不由它点了哪些号决定**（见 `export_pool_device_id`）。所以
+# "两个不同账号是两个身份""同一个账号是同一个身份"这两条已经不是这里的契约了，
+# 它们搬去了下面的会话 ID 用例：那里断言的是"两个会话是两个身份""同一个会话换一
+# 组点名账号仍是同一个身份"。
 ags_zone_first="$(ags_zone_field DEVICE \
     "$(ags_zone_launch --account zone@example.com codex)")"
 [[ -n "$ags_zone_first" ]] || {
     printf 'ags zone: --account must also pin a lease identity\n' >&2
     exit 1
 }
-# 不同账号必须是不同的租约身份，同一个账号必须稳定——前者决定两个会话能不能并存，
-# 后者决定反复启动会不会每次都留一个幽灵持有者去抬高服务端的并发除数。
-[[ "$(ags_zone_field DEVICE "$(ags_zone_launch --account other@example.com codex)")" \
-    != "$ags_zone_first" ]] || {
-    printf 'ags zone: two accounts must not share one lease identity\n' >&2
-    exit 1
-}
-ags_zone_expect 'the same account keeps one lease identity' DEVICE "$ags_zone_first" \
-    --account zone@example.com codex
 # 调用方显式给过的租约身份不能被覆盖。
 [[ "$(CODEXT_POOL_DEVICE_ID=explicit-id ags_zone_field DEVICE \
     "$(CODEXT_POOL_DEVICE_ID=explicit-id ags_zone_launch --account zone@example.com codex)")" \
@@ -203,6 +199,10 @@ ags_pick_account_json() {
 
 # `read < /dev/tty` 要一个真的终端，所以借 `script` 开一个 pty，把答案从它的标准
 # 输入喂进去。
+#
+# 末尾多喂一个空行：挑完号之后启动流程还要问一次**会话 ID**，空行表示"用默认的"。
+# 少这一行的话，那个提问会读到 EOF 而 `prepare_session_identity` 在那种情况下是
+# 报错的（被拒之后静默换个名字，正是这套改动要消灭的失败方式）。
 ags_pick_run() {
     local answers="$1" second="${2:-}"
     : > "$ags_pick_home/calls"
@@ -213,8 +213,8 @@ ags_pick_run() {
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
     CODEX_HOME="$ags_pick_home/codex" \
     PATH="$ags_pick_home/bin:$PATH" \
-        script -qec "$tool --pick-account codex" /dev/null <<< "$answers" \
-        >/dev/null 2>&1 || true
+        script -qec "$tool --pick-account codex" /dev/null \
+        <<< "$answers"$'\n' >/dev/null 2>&1 || true
     tr -d '\r' < "$ags_pick_home/out"
 }
 
@@ -242,6 +242,97 @@ ags_pick_expect 'an account taken meanwhile forces a re-pick' a@x.com \
 # 负对照：没被占走时不该触发重挑（否则上一条可能只是每次都重挑）。
 ags_pick_expect 'a still-available account is not re-picked' a@x.com \
     '1' "$ags_pick_home/three.json"
+
+# 会话 ID：启动时就定下来，同时是标签页名、`ags save` 用的 ID、上报给池子的名字。
+#
+# 以前这里问的是"标签页叫什么"，答案用完即弃；保存时再起一个 ID。于是同一条工作线
+# 有两个名字，而后台看到的第三个（一串哈希）两个都不是。
+ags_sid_home="$(mktemp -d "$tmp/ags-sid.XXXXXX")"
+mkdir -p "$ags_sid_home/bin" "$ags_sid_home/codex" "$ags_sid_home/work/Proj"
+printf '{"base_url":"http://pool.invalid","key":"k"}\n' > "$ags_sid_home/codex/pool.json"
+cat > "$ags_sid_home/bin/codext" <<'AGS_SID_FAKE'
+#!/bin/sh
+{ echo "AGS_ID=${AGS_ID:-}"
+  echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
+  echo "ACCOUNT=${CODEXT_POOL_ACCOUNT:-}"
+} > "$AGS_SID_OUT"
+AGS_SID_FAKE
+chmod +x "$ags_sid_home/bin/codext"
+
+# `read < /dev/tty` 要一个真终端，所以借 `script` 开一个 pty 把答案喂进去。
+ags_sid_launch() {
+    local answers="$1"
+    shift
+    rm -f "$ags_sid_home/out"
+    (
+        cd "$ags_sid_home/work/Proj" || exit 1
+        AGS_SID_OUT="$ags_sid_home/out" \
+        AGENT_SESSION_CODEX_BINARY="$ags_sid_home/bin/codext" \
+        CODEX_HOME="$ags_sid_home/codex" \
+            script -qec "$tool codex $*" /dev/null <<< "$answers" >/dev/null 2>&1
+    ) || true
+    [[ -s "$ags_sid_home/out" ]] && tr -d '\r' < "$ags_sid_home/out"
+}
+
+ags_sid_field() {
+    sed -n "s/^$1=//p" <<< "$2"
+}
+
+ags_sid_expect() {
+    local label="$1" field="$2" want="$3" answers="$4" got
+    shift 4
+    got="$(ags_sid_field "$field" "$(ags_sid_launch "$answers" "$@")")"
+    [[ "$got" == "$want" ]] || {
+        printf 'ags sid: %s: %s was %q, wanted %q\n' \
+            "$label" "$field" "$got" "$want" >&2
+        exit 1
+    }
+}
+
+# 起了名字就用它，而且它会到达 Agent——`ags save` 只能靠环境变量拿到这个值。
+ags_sid_expect 'a named session reaches the agent' AGS_ID work-line 'work-line'
+
+# 自动生成的 ID 要有信息量：目录名 + 月日-时分。刻意不是随机串——几天后还要靠它
+# 认出"这是哪一条工作线"，`a7f3c1` 认不出来。
+ags_sid_auto="$(ags_sid_field AGS_ID "$(ags_sid_launch '')")"
+[[ "$ags_sid_auto" == Proj-* ]] || {
+    printf 'ags sid: an auto id must start with the directory name, got %q\n' \
+        "$ags_sid_auto" >&2
+    exit 1
+}
+[[ "$ags_sid_auto" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+    printf 'ags sid: an auto id must be a legal checkpoint id, got %q\n' \
+        "$ags_sid_auto" >&2
+    exit 1
+}
+
+# 租约身份由**会话**决定，不由它点了哪些号决定。
+ags_sid_one="$(ags_sid_field DEVICE "$(ags_sid_launch 'line-one')")"
+[[ -n "$ags_sid_one" ]] || {
+    printf 'ags sid: a session must pin a lease identity\n' >&2
+    exit 1
+}
+ags_sid_expect 'the same session keeps one lease identity' \
+    DEVICE "$ags_sid_one" 'line-one'
+# 换一组点名账号不该换身份。以前会换——于是原来那个号被一条没人认领的租约白占到
+# 600 秒过期。
+ags_sid_expect 'changing the account queue keeps the lease identity' \
+    DEVICE "$ags_sid_one" 'line-one' --account a@x.com
+[[ "$(ags_sid_field DEVICE "$(ags_sid_launch 'line-two')")" != "$ags_sid_one" ]] || {
+    printf 'ags sid: two sessions must not share one lease identity\n' >&2
+    exit 1
+}
+
+# 非法 ID 重问，不静默改写。
+ags_sid_expect 'an illegal id is refused and re-asked' AGS_ID good-one \
+    "$(printf 'bad name\ngood-one\n')"
+
+# 被拒之后读到 EOF 必须**报错**。静默换上自动生成的 ID，会让一个刚被拒绝的名字
+# 悄悄变成另一个，而人以为自己起的名生效了——这正是这套改动要消灭的失败方式。
+[[ -z "$(ags_sid_launch "$(printf 'bad name\n')")" ]] || {
+    printf 'ags sid: EOF after a refusal must not silently pick another id\n' >&2
+    exit 1
+}
 
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
 # `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律

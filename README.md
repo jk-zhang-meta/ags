@@ -77,7 +77,7 @@ ags --account me@example.com codex     # everything before "--" belongs to AGS
 ags codex --account me@example.com     # AGS options read either side of it
 ags --account a@x.com,b@y.com codex    # a queue: the pool schedules within it
 ags --pick-account codex               # choose interactively; select several
-ags save release-fix "Continue the release fix"
+ags save "Continue the release fix"    # saved under the session's own ID
 ags list                    # pick a saved session and open it
 ags show release-fix
 ags resume release-fix
@@ -132,8 +132,31 @@ starts, because a Plus account can be taken during the seconds you spend typing
 — without that check the launch would fall back to the shared pool silently
 while you believed the account was pinned.
 
+Every session has an **AGS ID**, chosen when it starts. It is the terminal tab
+name, the ID `ags save` writes the checkpoint under, and — for Codex — the name
+the credential pool records for the session, so all three finally agree. Press
+Enter to accept a generated one, which names the directory and the moment
+(`05_MyWork-0821-031745`) rather than a random string you cannot recognise a
+week later.
+
+The ID identifies a *work line*, not a process: it lives permanently in the
+local checkpoint store, while the pool only requires it to be unique among a
+key's **live** sessions, so ending a session frees the name for the same work
+line to reclaim on its next resume. Launching under an ID that already has a
+local checkpoint is refused — continuing that work line is `ags resume <ID>`,
+and allowing it would mean an hour of work that `ags save` then has nowhere to
+go.
+
+Because the ID is fixed up front, `ags save "description"` needs no ID.
+`ags save <ID> "description"` still works for a session AGS did not start.
+
+For Codex the ID also decides the pool lease identity, which used to be derived
+from the pinned accounts. Changing a session's account queue therefore no longer
+strands its previous lease, and two sessions in one directory are always
+independent rather than only when they name different accounts.
+
 In an interactive terminal, a new `ags claude` or `ags codex` launch asks for
-the terminal tab name; Enter uses the current directory's final component.
+the session ID; Enter uses the generated suggestion.
 Resuming a checkpoint uses its AGS ID automatically, while a direct native
 resume uses the explicit native session ID when one was supplied. AGS emits the
 standard OSC title sequence, so terminals that do not implement tab titles
