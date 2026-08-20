@@ -174,7 +174,12 @@ enum Command {
         /// when the named account is cooling or out of quota the pool falls
         /// back so the session keeps working, and returns to it once it
         /// recovers.
-        #[arg(long, value_name = "EMAIL", requires = "launching", conflicts_with = "pick_account")]
+        #[arg(
+            long,
+            value_name = "EMAIL",
+            requires = "launching",
+            conflicts_with = "pick_account"
+        )]
         account: Option<String>,
 
         /// Choose the pool account interactively instead of naming it.
@@ -850,6 +855,16 @@ fn prepare_launch(
 
     // 两个入口刻意分开：一个可选值的参数在 clap 里要么强制 `--account=x` 的写法，
     // 要么和后面的参数产生歧义。两个明确的旗标没有这些坑，帮助信息也更好读。
+    //
+    // 凭据池是 codext 独有的（`CODEXT_POOL_*` 只有它读）。恢复到别的 Agent 时把
+    // 环境变量照样注进去，等于让人以为号钉住了、其实什么都没发生——**静默无视比
+    // 报错糟得多**，所以这里直接拒绝。
+    if (launch.pick_account || launch.account.is_some()) && !leases_from_pool(provider.slug()) {
+        anyhow::bail!(
+            "--account/--pick-account only mean something for Codex; {} does not lease from the credential pool",
+            provider.name()
+        );
+    }
     let account = if launch.pick_account {
         Some(pick_pool_account()?)
     } else {
@@ -879,7 +894,10 @@ fn pick_pool_account() -> anyhow::Result<String> {
         .args(["-sS", "--max-time", "10", "-X", "POST"])
         .arg("-H")
         .arg(format!("X-Codex-Pool-Token: {key}"))
-        .arg(format!("{}/x8Rk3Nq6Vd2/accounts", base_url.trim_end_matches('/')))
+        .arg(format!(
+            "{}/x8Rk3Nq6Vd2/accounts",
+            base_url.trim_end_matches('/')
+        ))
         .output()
         .map_err(|error| anyhow::anyhow!("could not run curl to reach the pool: {error}"))?;
     if !output.status.success() {
@@ -978,6 +996,15 @@ fn pool_config() -> anyhow::Result<(String, String)> {
     }
 }
 
+/// Whether this provider takes its credentials from the codext pool.
+///
+/// Only Codex does: `CODEXT_POOL_*` is read by codext and by nothing else.
+/// Kept as a named predicate so the refusal above and any future caller cannot
+/// drift apart — and so it is testable without building a whole conversion.
+fn leases_from_pool(slug: &str) -> bool {
+    slug == "codex"
+}
+
 /// 把 `--account` 变成 codext 认得的两个环境变量。
 ///
 /// **两个，不是一个。** `CODEXT_POOL_ACCOUNT` 说的是"这次要哪个号"，而
@@ -994,11 +1021,10 @@ fn with_pool_account(spec: LaunchSpec, account: Option<&str>) -> LaunchSpec {
     let Some(account) = account.map(str::trim).filter(|value| !value.is_empty()) else {
         return spec;
     };
-    spec.with_env("CODEXT_POOL_ACCOUNT", account)
-        .with_env(
-            "CODEXT_POOL_DEVICE_ID",
-            format!("{}-{}", pool_device_id_base(), short_digest(account)),
-        )
+    spec.with_env("CODEXT_POOL_ACCOUNT", account).with_env(
+        "CODEXT_POOL_DEVICE_ID",
+        format!("{}-{}", pool_device_id_base(), short_digest(account)),
+    )
 }
 
 /// 这次启动的租约身份的前缀：沿用 codext 自己的默认（主机 + 工作目录），只在后面
@@ -2689,6 +2715,15 @@ mod pool_account_tests {
 
     fn spec() -> LaunchSpec {
         LaunchSpec::new("codex", ["resume".to_string(), "abc".to_string()])
+    }
+
+    #[test]
+    fn only_codex_leases_from_the_pool() {
+        // 静默把 CODEXT_POOL_* 注给一个不读它的 Agent，等于让人以为号钉住了。
+        assert!(leases_from_pool("codex"));
+        for other in ["claude-code", "gemini", "cursor", "aider", ""] {
+            assert!(!leases_from_pool(other), "{other}");
+        }
     }
 
     #[test]

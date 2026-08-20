@@ -3587,8 +3587,13 @@ strip_session_selection_args() {
 # 已经显式设了 `CODEXT_POOL_DEVICE_ID` 就不动它：那是调用方明确表达过的意图。
 # 摘要里放的是账号的哈希而不是账号本身，因为这个值会发到服务端、显示在后台界面上。
 apply_pool_account() {
-    local account="$1" host workspace
+    local agent="$1" account="$2" host workspace
     [[ -n "$account" ]] || return 0
+    # 凭据池是 codext 独有的（`CODEXT_POOL_*` 只有它读）。给别的 agent 注入等于
+    # 让人以为号钉住了、其实什么都没发生——**静默无视比报错糟得多**，所以这里
+    # 直接拒绝而不是打个警告了事。
+    [[ "$agent" == codex ]] || die "--account / --pick-account 只对 Codex 有意义：$agent 不从凭据池取号"
+
     export CODEXT_POOL_ACCOUNT="$account"
     [[ -z "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
     host="${HOSTNAME:-${COMPUTERNAME:-codext}}"
@@ -3916,9 +3921,11 @@ launch_managed_agent() {
     # `start_managed_agent`：`ags resume` 那条路不经过它，只经过这里，而恢复一个
     # 会话同样需要能点名要号。
     if (( ${ags_pick_account:-0} == 1 )); then
+        [[ "$agent" == codex ]] ||
+            die "--pick-account 只对 Codex 有意义：$agent 不从凭据池取号"
         ags_account="$(pick_pool_account)"
     fi
-    apply_pool_account "${ags_account:-}"
+    apply_pool_account "$agent" "${ags_account:-}"
     scrub_transport_password_environment
     launch_cwd="$(pwd -P)"
     if [[ "$agent" == claude ]]; then

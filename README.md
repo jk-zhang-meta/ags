@@ -97,9 +97,11 @@ where an option value would otherwise be mistaken for the command; it is not
 needed otherwise.
 
 `--account EMAIL` asks the credential pool for that account for this launch
-only, and `--pick-account` lists what the configured key may ask for. Both work
-on every command that starts an Agent — `codex`, `claude`, `resume` and
-`cloud resume`. Both pin
+only, and `--pick-account` lists what the configured key may ask for. Both work on
+every command that starts Codex — `codex`, and `resume`/`cloud resume` when the
+checkpoint restores into Codex. Naming an account for an Agent that does not
+lease from the pool is refused rather than ignored: the environment would be
+set and nothing would read it, which looks exactly like a pin that worked. Both pin
 a distinct lease identity as well as the account, so two sessions started from
 the same directory can name different accounts without disturbing each other's
 lease. The named account is a strong preference rather than the only option:

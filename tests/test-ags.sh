@@ -49,12 +49,14 @@ cat > "$ags_zone_home/bin/codext" <<'AGS_ZONE_FAKE'
   echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
 } > "$AGS_ZONE_OUT"
 AGS_ZONE_FAKE
-chmod +x "$ags_zone_home/bin/codext"
+cp "$ags_zone_home/bin/codext" "$ags_zone_home/bin/claude"
+chmod +x "$ags_zone_home/bin/codext" "$ags_zone_home/bin/claude"
 
 ags_zone_launch() {
     local out="$ags_zone_home/out"
     rm -f "$out"
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
+        AGENT_SESSION_CLAUDE_BINARY="$ags_zone_home/bin/claude" \
         AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>&1 || return $?
     cat "$out"
 }
@@ -126,12 +128,23 @@ ags_zone_out="$(ags_zone_launch --account zone@example.com -- codex)"
     exit 1
 }
 
-# 拒绝路径：值缺失、两个开关互斥、用在非 agent 命令上、不认识的 ags 参数。
+# 正对照：不带 --account 时 claude 必须起得来。没有这一条，下面"给 claude 必须被
+# 拒"就可能只是因为测试环境里没有 claude 二进制——负对照抓到过一次。
+ags_zone_launch claude >/dev/null || {
+    printf 'ags zone: claude must launch when no pool option is given\n' >&2
+    exit 1
+}
+
+# 拒绝路径：值缺失、两个开关互斥、用在非 agent 命令上、不认识的 ags 参数，
+# 以及给一个不从凭据池取号的 agent。最后这条尤其要拒而不是警告：静默注入
+# 会让人以为号钉住了、其实什么都没发生。
 for ags_zone_bad in \
     "--account" \
     "--account a@b.com --pick-account codex" \
     "--account a@b.com list" \
-    "--bogus codex"
+    "--bogus codex" \
+    "--account a@b.com claude" \
+    "--pick-account claude"
 do
     if ags_zone_launch $ags_zone_bad >/dev/null 2>&1; then
         printf 'ags zone: expected a refusal for: ags %s\n' "$ags_zone_bad" >&2
