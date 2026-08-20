@@ -154,6 +154,95 @@ ags_zone_refuse 'a pool option for claude' --account a@b.com claude
 ags_zone_refuse 'the interactive picker for claude' --pick-account claude
 ags_zone_refuse 'a resume-only option on a direct launch' codex --profile native
 
+# `--pick-account` 挑号：可多选组成队列，列表是**现取**的，且挑完到启动之间还要
+# 复核一次。
+#
+# 复核那一步是这里最要紧的断言：列表和启动之间隔着人打字的时间，一个 Plus 号完全
+# 可能在这几秒里被别的密钥占走。不复核的话那次启动会静默回落到公共池，而人以为
+# 自己钉住了号——静默回落正是点名功能最怕的失败方式。
+#
+# 用假的 `curl` 冒充池子，走**真实的 CLI**，所以顺带证明了挑出来的队列确实落进了
+# `CODEXT_POOL_ACCOUNT`（只测函数不测这一段的话，队列可能挑对了却没传下去）。
+ags_pick_home="$(mktemp -d "$tmp/ags-pick.XXXXXX")"
+mkdir -p "$ags_pick_home/bin" "$ags_pick_home/codex"
+printf '{"base_url":"http://pool.invalid","key":"k"}\n' \
+    > "$ags_pick_home/codex/pool.json"
+cat > "$ags_pick_home/bin/curl" <<'AGS_PICK_POOL'
+#!/bin/sh
+# 第一次答完整名单，之后答 $AGS_PICK_SECOND（不设就一直答同一份）。
+echo x >> "$AGS_PICK_CALLS"
+if [ "$(wc -l < "$AGS_PICK_CALLS")" -le 1 ]; then
+    cat "$AGS_PICK_FIRST"
+else
+    cat "${AGS_PICK_SECOND:-$AGS_PICK_FIRST}"
+fi
+AGS_PICK_POOL
+chmod +x "$ags_pick_home/bin/curl"
+
+ags_pick_account_json() {
+    printf '{"email":"%s","account_key":"u::%s","plan":"%s","headroom":0.5,' \
+        "$1" "$1" "$2"
+    printf '"assigned":false,"schedulable":true}'
+}
+{
+    printf '{"data":{"accounts":['
+    ags_pick_account_json a@x.com plus
+    printf ','
+    ags_pick_account_json b@y.com pro
+    printf ','
+    ags_pick_account_json c@z.com plus
+    printf ']}}\n'
+} > "$ags_pick_home/three.json"
+{
+    printf '{"data":{"accounts":['
+    ags_pick_account_json a@x.com plus
+    printf ','
+    ags_pick_account_json b@y.com pro
+    printf ']}}\n'
+} > "$ags_pick_home/two.json"
+
+# `read < /dev/tty` 要一个真的终端，所以借 `script` 开一个 pty，把答案从它的标准
+# 输入喂进去。
+ags_pick_run() {
+    local answers="$1" second="${2:-}"
+    : > "$ags_pick_home/calls"
+    AGS_PICK_FIRST="$ags_pick_home/three.json" \
+    AGS_PICK_SECOND="$second" \
+    AGS_PICK_CALLS="$ags_pick_home/calls" \
+    AGS_ZONE_OUT="$ags_pick_home/out" \
+    AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
+    CODEX_HOME="$ags_pick_home/codex" \
+    PATH="$ags_pick_home/bin:$PATH" \
+        script -qec "$tool --pick-account codex" /dev/null <<< "$answers" \
+        >/dev/null 2>&1 || true
+    tr -d '\r' < "$ags_pick_home/out"
+}
+
+ags_pick_expect() {
+    local label="$1" want="$2" answers="$3" second="${4:-}" got
+    rm -f "$ags_pick_home/out"
+    got="$(sed -n 's/^ACCOUNT=//p' <<< "$(ags_pick_run "$answers" "$second")")"
+    [[ "$got" == "$want" ]] || {
+        printf 'ags pick: %s: ACCOUNT was %q, wanted %q\n' \
+            "$label" "$got" "$want" >&2
+        exit 1
+    }
+}
+
+ags_pick_expect 'one account' a@x.com '1'
+# 多选就是队列。顺序不影响调度（队列内部由服务端的 rank() 定先后），保留写的顺序
+# 只是让回显和人写的一致。
+ags_pick_expect 'several accounts become a queue' a@x.com,c@z.com '1,3'
+ags_pick_expect 'spacing and repeats are tolerated' c@z.com,a@x.com '3 , 1 ,3'
+ags_pick_expect 'an out-of-range choice re-prompts' b@y.com "$(printf '9\n2\n')"
+ags_pick_expect 'r re-reads the list' a@x.com "$(printf 'r\n1\n')"
+# 正题：c@z.com 在确认前消失了，必须重挑而不是带着一个拿不到的号启动。
+ags_pick_expect 'an account taken meanwhile forces a re-pick' a@x.com \
+    "$(printf '1,3\n1\n')" "$ags_pick_home/two.json"
+# 负对照：没被占走时不该触发重挑（否则上一条可能只是每次都重挑）。
+ags_pick_expect 'a still-available account is not re-picked' a@x.com \
+    '1' "$ags_pick_home/three.json"
+
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
 # `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律
 # 拒绝会让它完全不可用。放行的前提是解析后的目录归当前用户、组和其他人都不可写

@@ -3606,9 +3606,13 @@ apply_pool_account() {
 #
 # 走 curl 而不是引一个 HTTP 客户端：这是脚本里为数不多的网络调用，而 curl 和 jq
 # 本来就是依赖。服务端那边问 `/usage` 同样是 shell 出去调 curl，理由一致。
-pick_pool_account() {
-    local config url key payload count choice account
-    need jq
+# 现在这把密钥能点名要哪些号（原样返回服务端那段 JSON）。
+#
+# **每次都重新问**，不缓存：能不能点名一个号取决于此刻谁占着它，是会变的。服务端
+# 已经把"此刻被别的密钥独占着"的号排除在外，所以这份列表就是这一刻真能点的全集
+# ——但也仅限这一刻。
+fetch_pool_accounts() {
+    local config url key payload
     config="$(codex_pool_config_path)"
     [[ -s "$config" ]] || die "还没配置 codext 凭据池，先跑 ags codex-init"
     url="$(jq -er '.base_url' "$config" 2>/dev/null)" ||
@@ -3619,27 +3623,78 @@ pick_pool_account() {
         -H "X-Codex-Pool-Token: $key" \
         "$url$codex_pool_prefix/accounts" 2>/dev/null)" ||
         die "问不到凭据池：$url"
-    count="$(jq -r '.data.accounts | length' <<< "$payload" 2>/dev/null)" ||
+    jq -e '.data.accounts | type == "array"' <<< "$payload" >/dev/null 2>&1 ||
         die "凭据池回的不是预期的 JSON"
-    (( count > 0 )) || die "这把密钥没有可点名的号"
-    # 余量和状态一起印出来：挑号时看不见这两样等于盲选，很容易挑中一个已经跑满
-    # 的号，然后以为是指定账号没生效。
-    jq -r '.data.accounts | to_entries[] |
-        "  \(.key + 1)) \(.value.email)  \(.value.plan)  余量 \((.value.headroom * 100) | floor)%" +
-        (if .value.assigned then "  [专属]"
-         elif (.value.schedulable | not) then "  [冷却中]"
-         else "" end)' <<< "$payload" > /dev/tty
-    printf '选一个号 [1-%s]: ' "$count" > /dev/tty
-    IFS= read -r choice < /dev/tty || choice=
-    [[ "$choice" =~ ^[0-9]+$ ]] || die "不是数字：$choice"
-    (( choice >= 1 && choice <= count )) || die "没有这个选项：$choice"
-    # 发邮箱而不是 account_key：服务端两个都认，而邮箱是人看得懂的那个,它会出现
-    # 在日志和后台界面上。
-    account="$(jq -r --argjson i "$((choice - 1))" \
+    printf '%s\n' "$payload"
+}
+
+# 一个号在挑号界面上的名字：发邮箱而不是 account_key，服务端两个都认，而邮箱是人
+# 看得懂的那个——它会出现在日志和后台界面上。
+pool_account_identity() {
+    jq -r --argjson i "$2" \
         '.data.accounts[$i] | (.email // "" | select(. != "")) // .account_key' \
-        <<< "$payload")"
-    [[ -n "$account" ]] || die "选中的号没有可用的标识"
-    printf '%s\n' "$account"
+        <<< "$1"
+}
+
+# 让用户从池子里挑号。可以挑**多个**，组成一个队列。
+#
+# 队列的含义：你圈定范围，具体用哪个交给调度器——档位、余量、风险那套原样作用在
+# 这个子集上；手上这个跑满了在队列内换，整组都不可用了才回落公共池。
+#
+# 挑完会**再问一次池子**才返回。列表和启动之间隔着人打字的时间，一个 Plus 号完全
+# 可能在这几秒里被别的密钥占走；不复核的话，那次启动会静默回落到公共池，而人以为
+# 自己钉住了号——这正是点名功能最怕的失败方式。
+pick_pool_account() {
+    local payload count choice token index identity fresh
+    local -a picked names gone
+    need jq
+    while :; do
+        payload="$(fetch_pool_accounts)" || return 1
+        count="$(jq -r '.data.accounts | length' <<< "$payload")"
+        (( count > 0 )) || die "这把密钥现在没有可点名的号"
+        # 余量和状态一起印出来：挑号时看不见这两样等于盲选，很容易挑中一个已经
+        # 跑满的号，然后以为是指定账号没生效。
+        jq -r '.data.accounts | to_entries[] |
+            "  \(.key + 1)) \(.value.email)  \(.value.plan)  余量 \((.value.headroom * 100) | floor)%" +
+            (if .value.assigned then "  [专属]"
+             elif (.value.schedulable | not) then "  [冷却中]"
+             else "" end)' <<< "$payload" > /dev/tty
+        printf '选号 [1-%s]，多选用逗号组成队列（如 1,3）；r 重新拉取: ' "$count" > /dev/tty
+        # 读到 EOF 就必须退出。少了这一条，非交互地跑到这里会在循环里空转。
+        IFS= read -r choice < /dev/tty || die "没挑号"
+        [[ "$choice" == [rR] ]] && continue
+
+        picked=(); names=()
+        for token in ${choice//,/ }; do
+            if [[ ! "$token" =~ ^[0-9]+$ ]] || (( token < 1 || token > count )); then
+                printf '没有这个选项：%s，重挑。\n' "$token" > /dev/tty
+                continue 2
+            fi
+            index=$(( token - 1 ))
+            # 去重，保留写的顺序。顺序不影响调度（队列内部由调度算法定先后，见
+            # 服务端的 rank()），保留它只是让回显和人写的一致。
+            [[ " ${picked[*]-} " == *" $index "* ]] && continue
+            picked+=("$index")
+            names+=("$(pool_account_identity "$payload" "$index")")
+        done
+        (( ${#picked[@]} > 0 )) || { printf '没挑号，重挑。\n' > /dev/tty; continue; }
+
+        fresh="$(fetch_pool_accounts)" || return 1
+        gone=()
+        for identity in "${names[@]}"; do
+            jq -e --arg a "$identity" '.data.accounts | any(
+                ((.email // "") | ascii_downcase) == ($a | ascii_downcase)
+                or .account_key == $a)' <<< "$fresh" >/dev/null 2>&1 ||
+                gone+=("$identity")
+        done
+        if (( ${#gone[@]} > 0 )); then
+            printf '这几个号刚被占走了，重挑：%s\n' "${gone[*]}" > /dev/tty
+            continue
+        fi
+
+        (IFS=,; printf '%s\n' "${names[*]}")
+        return 0
+    done
 }
 
 # 消费一个 ags 参数，把消费掉的个数放进 `ags_consumed`（0 = 这不是 ags 的参数）。

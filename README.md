@@ -75,7 +75,8 @@ ags claude -- --model opus  # everything after "--" belongs to Claude Code
 ags codex -- --model o3     # everything after "--" belongs to Codex
 ags --account me@example.com codex     # everything before "--" belongs to AGS
 ags codex --account me@example.com     # AGS options read either side of it
-ags --pick-account codex               # choose the pool account interactively
+ags --account a@x.com,b@y.com codex    # a queue: the pool schedules within it
+ags --pick-account codex               # choose interactively; select several
 ags save release-fix "Continue the release fix"
 ags list                    # pick a saved session and open it
 ags show release-fix
@@ -114,6 +115,22 @@ the same directory can name different accounts without disturbing each other's
 lease. The named account is a strong preference rather than the only option:
 when it is cooling or out of quota the pool falls back so the session keeps
 working, and returns to it once it recovers.
+
+`--account` also takes a comma-separated queue — `--account a@x.com,b@y.com` —
+and `--pick-account` builds one when you select several entries (`1,3`). A queue
+narrows *which* accounts may serve this session; it does not order them. Inside
+it the pool runs the same scheduler it runs on the shared pool — priority tier
+first, then quota headroom and risk — so the written order carries no meaning.
+When the account in hand runs out, the session moves to another queue member,
+and only falls back to the shared pool once every member is unavailable; it
+returns to the queue as soon as one recovers.
+
+The interactive list shows what the key may ask for **at that moment**: an
+account another key holds exclusively is not listed at all, and `r` re-reads the
+list. What you selected is checked against the pool once more before the Agent
+starts, because a Plus account can be taken during the seconds you spend typing
+— without that check the launch would fall back to the shared pool silently
+while you believed the account was pinned.
 
 In an interactive terminal, a new `ags claude` or `ags codex` launch asks for
 the terminal tab name; Enter uses the current directory's final component.

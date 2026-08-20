@@ -19,9 +19,7 @@ use tracing_subscriber::EnvFilter;
 use casr::budget::ContextBudget;
 use casr::discovery::ProviderRegistry;
 use casr::ir::Fidelity;
-use casr::launch::{
-    LaunchSpec, SessionTargeting,
-};
+use casr::launch::{LaunchSpec, SessionTargeting};
 use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
 use casr::providers::{Provider, SessionListing, read_dir_reporting, walk_entry_reporting};
 use casr::responses::{
@@ -168,11 +166,16 @@ enum Command {
 
         /// Ask the credential pool for this account (email or account key).
         ///
+        /// Accepts a comma-separated queue — `a@x.com,b@y.com` — in which case
+        /// you are choosing the candidate set and the pool's own scheduler
+        /// picks within it, by the same rules it uses on the shared pool
+        /// (priority tier first, then quota headroom and risk).
+        ///
         /// Per launch, not per machine: two sessions started from the same
         /// directory can name different accounts and neither disturbs the
         /// other's lease. It is a strong preference, not the only option —
-        /// when the named account is cooling or out of quota the pool falls
-        /// back so the session keeps working, and returns to it once it
+        /// when every named account is cooling or out of quota the pool falls
+        /// back so the session keeps working, and returns to them once one
         /// recovers.
         #[arg(
             long,
@@ -184,9 +187,12 @@ enum Command {
 
         /// Choose the pool account interactively instead of naming it.
         ///
-        /// Lists what this key may ask for, with how much quota each account
-        /// has left — picking blind is how you end up on an account that is
-        /// already out and conclude the pin did not work.
+        /// Lists what this key may ask for **right now**, with how much quota
+        /// each account has left — picking blind is how you end up on an
+        /// account that is already out and conclude the pin did not work.
+        /// Accounts another key holds exclusively are not listed at all.
+        ///
+        /// Select several (`1,3`) to build a queue; `r` re-reads the list.
         #[arg(long, requires = "launching")]
         pick_account: bool,
 
@@ -547,7 +553,7 @@ struct LaunchRequest {
     agent_args: Vec<String>,
     /// `--account`：这次启动点名要池子里的哪个号（邮箱或账号标识）。
     account: Option<String>,
-    /// `--pick-account`：不直接给名字，列出来现挑。
+    /// `--pick-account`：不直接给名字，列出来现挑（可多选，组成一个队列）。
     pick_account: bool,
 }
 
@@ -883,12 +889,28 @@ fn prepare_launch(
     Ok(with_pool_account(spec, account.as_deref()))
 }
 
-/// 让用户从池子里挑一个号。
+/// 一个号在挑号界面上的名字。
+///
+/// 发邮箱而不是 account_key：服务端两个都认，而邮箱是人看得懂的那个——它会出现在
+/// 日志和后台界面上。
+fn account_identity(account: &serde_json::Value) -> String {
+    account["email"]
+        .as_str()
+        .filter(|email| !email.is_empty())
+        .unwrap_or_else(|| account["account_key"].as_str().unwrap_or_default())
+        .to_string()
+}
+
+/// 现在这把密钥能点名要哪些号。
 ///
 /// 走 `curl` 而不是引一个 HTTP 客户端：这是整个二进制里唯一一次网络调用，为它拉
 /// 进一棵 TLS 依赖树不值当。服务端那边同样是 shell 出去调 curl（见
 /// `services/codex_oauth.py`），理由一致。
-fn pick_pool_account() -> anyhow::Result<String> {
+///
+/// **每次都重新问**，不缓存：能不能点名一个号取决于此刻谁占着它，是会变的。服务
+/// 端已经把"此刻被别的密钥独占着"的号排除在外，所以这份列表就是这一刻真能点的
+/// 全集——但也仅限这一刻。
+fn fetch_pool_accounts() -> anyhow::Result<Vec<serde_json::Value>> {
     let (base_url, key) = pool_config()?;
     let output = std::process::Command::new("curl")
         .args(["-sS", "--max-time", "10", "-X", "POST"])
@@ -907,55 +929,126 @@ fn pick_pool_account() -> anyhow::Result<String> {
         );
     }
 
-    let body: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|error| anyhow::anyhow!("the pool answered with something that is not JSON: {error}"))?;
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+        anyhow::anyhow!("the pool answered with something that is not JSON: {error}")
+    })?;
     let accounts = body
         .pointer("/data/accounts")
         .and_then(serde_json::Value::as_array)
         .filter(|rows| !rows.is_empty())
         .ok_or_else(|| anyhow::anyhow!("the pool has no account this key may ask for"))?;
+    Ok(accounts.clone())
+}
 
-    for (index, account) in accounts.iter().enumerate() {
-        let email = account["email"].as_str().unwrap_or("");
-        let plan = account["plan"].as_str().unwrap_or("");
-        // 余量和可调度状态都印出来：挑号时看不见这两样等于盲选，很容易挑中一个
-        // 已经跑满的号，然后以为是指定账号没生效。
-        let headroom = account["headroom"].as_f64().unwrap_or(0.0);
-        let mark = if account["assigned"].as_bool().unwrap_or(false) {
-            " [专属]"
-        } else if !account["schedulable"].as_bool().unwrap_or(false) {
-            " [冷却中]"
-        } else {
-            ""
-        };
-        println!(
-            "  {:>2}) {email}  {plan}  余量 {:.0}%{mark}",
-            index + 1,
-            headroom * 100.0
-        );
+/// 把 `1,3` / `1 3` 这样的输入解析成 0 起的下标，去重、保留写的顺序。
+///
+/// 顺序不影响调度（队列内部由调度算法定先后，见服务端的 `rank()`），保留它只是
+/// 让回显和人写的一致。
+fn parse_account_choices(answer: &str, count: usize) -> anyhow::Result<Vec<usize>> {
+    let mut picked: Vec<usize> = Vec::new();
+    for token in answer
+        .split([',', ' ', '\t'])
+        .filter(|part| !part.is_empty())
+    {
+        let choice: usize = token
+            .parse()
+            .map_err(|_| anyhow::anyhow!("not a number: {token:?}"))?;
+        let index = choice
+            .checked_sub(1)
+            .filter(|index| *index < count)
+            .ok_or_else(|| anyhow::anyhow!("no such choice: {choice}"))?;
+        if !picked.contains(&index) {
+            picked.push(index);
+        }
     }
-    print!("选一个号 [1-{}]: ", accounts.len());
-    use std::io::Write as _;
-    std::io::stdout().flush().ok();
+    if picked.is_empty() {
+        anyhow::bail!("nothing was selected");
+    }
+    Ok(picked)
+}
 
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| anyhow::anyhow!("could not read the choice: {error}"))?;
-    let choice: usize = answer
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("not a number: {:?}", answer.trim()))?;
-    let account = accounts
-        .get(choice.wrapping_sub(1))
-        .ok_or_else(|| anyhow::anyhow!("no such choice: {choice}"))?;
-    // 发邮箱而不是 account_key：服务端两个都认，而邮箱是人看得懂的那个——它会
-    // 出现在日志和后台界面上。
-    Ok(account["email"]
-        .as_str()
-        .filter(|email| !email.is_empty())
-        .unwrap_or_else(|| account["account_key"].as_str().unwrap_or_default())
-        .to_string())
+/// 让用户从池子里挑号。可以挑**多个**，组成一个队列。
+///
+/// 队列的含义：你圈定范围，具体用哪个交给调度器——档位、余量、风险那套原样作用
+/// 在这个子集上；手上这个跑满了在队列内换，整组都不可用了才回落公共池。
+///
+/// 挑完会**再问一次池子**才返回。列表和启动之间隔着人打字的时间，一个 Plus 号
+/// 完全可能在这几秒里被别的密钥占走；不复核的话，那次启动会静默回落到公共池，
+/// 而人以为自己钉住了号——这正是点名功能最怕的失败方式。
+fn pick_pool_account() -> anyhow::Result<String> {
+    use std::io::Write as _;
+    loop {
+        let accounts = fetch_pool_accounts()?;
+        for (index, account) in accounts.iter().enumerate() {
+            let email = account["email"].as_str().unwrap_or("");
+            let plan = account["plan"].as_str().unwrap_or("");
+            // 余量和可调度状态都印出来：挑号时看不见这两样等于盲选，很容易挑中
+            // 一个已经跑满的号，然后以为是指定账号没生效。
+            let headroom = account["headroom"].as_f64().unwrap_or(0.0);
+            let mark = if account["assigned"].as_bool().unwrap_or(false) {
+                " [专属]"
+            } else if !account["schedulable"].as_bool().unwrap_or(false) {
+                " [冷却中]"
+            } else {
+                ""
+            };
+            println!(
+                "  {:>2}) {email}  {plan}  余量 {:.0}%{mark}",
+                index + 1,
+                headroom * 100.0
+            );
+        }
+        print!(
+            "选号 [1-{}]，多选用逗号组成队列（如 1,3）；r 重新拉取: ",
+            accounts.len()
+        );
+        std::io::stdout().flush().ok();
+
+        let mut answer = String::new();
+        let read = std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|error| anyhow::anyhow!("could not read the choice: {error}"))?;
+        // 读到 EOF 就必须退出。少了这一条，非交互地跑到这里会在循环里空转。
+        if read == 0 {
+            anyhow::bail!("no choice was made");
+        }
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("r") {
+            continue;
+        }
+        let picked = match parse_account_choices(answer, accounts.len()) {
+            Ok(picked) => picked,
+            Err(error) => {
+                println!("{error}，重挑。");
+                continue;
+            }
+        };
+        let chosen: Vec<String> = picked
+            .iter()
+            .map(|index| account_identity(&accounts[*index]))
+            .collect();
+
+        let fresh = fetch_pool_accounts()?;
+        let gone: Vec<&String> = chosen
+            .iter()
+            .filter(|wanted| {
+                !fresh
+                    .iter()
+                    .any(|account| account_identity(account).eq_ignore_ascii_case(wanted))
+            })
+            .collect();
+        if !gone.is_empty() {
+            println!(
+                "这几个号刚被占走了，重挑：{}",
+                gone.iter()
+                    .map(|name| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、")
+            );
+            continue;
+        }
+        return Ok(chosen.join(","));
+    }
 }
 
 /// 池子的地址和密钥，来源和 codext 一致：环境变量优先，其次
@@ -2715,6 +2808,24 @@ mod pool_account_tests {
 
     fn spec() -> LaunchSpec {
         LaunchSpec::new("codex", ["resume".to_string(), "abc".to_string()])
+    }
+
+    #[test]
+    fn a_choice_line_may_name_several_accounts() {
+        // 多选就是队列：你圈定范围，池子在这个范围里跑它自己那套调度。
+        assert_eq!(parse_account_choices("1,3", 4).unwrap(), vec![0, 2]);
+        // 空格、混排、重复都容忍——手打的一行不该因为多敲一个空格就报错。
+        assert_eq!(parse_account_choices(" 3 , 1 ,3", 4).unwrap(), vec![2, 0]);
+        assert_eq!(parse_account_choices("2", 4).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn a_choice_line_refuses_what_it_cannot_honour() {
+        // 越界和非数字必须报错而不是静默丢掉：静默丢掉会让人以为钉了三个号，
+        // 实际只钉住两个，而这种偏差在跑起来之前看不出来。
+        for bad in ["0", "5", "x", "1,9", "", "   ", "-1"] {
+            assert!(parse_account_choices(bad, 4).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
