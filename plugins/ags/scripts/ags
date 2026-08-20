@@ -3910,6 +3910,48 @@ prepare_session_identity() {
     set_terminal_tab_title "$ags_session_id"
 }
 
+# 启动前核一遍点名的名字，**只**挑出匹配不到任何账号的那些。
+#
+# 这一类是打错字、全角逗号、号被删了——会话会静默跑在公共池上，而人以为自己钉住
+# 了号，事后只能靠翻后台发现。2026-08-21 那次三个号只生效一个就是这么藏住的。
+#
+# 冷却中、被别的密钥占着、指给了别人——一律**不**拦。点名是强首选而不是唯一选项，
+# 回落公共池继续干活是设计如此，在启动前拒掉才是错的。
+#
+# 刻意**不拿** `/accounts` 来核：那个接口故意隐藏此刻被别的密钥独占的号，拿它当
+# 白名单会把一个完全合法的号误判成打错字，拒掉一次本该成功的启动。判定走服务端的
+# `/resolve`，它分得清"没有这个号"和"有但此刻拿不到"。
+#
+# 问不到池子就放行：核对失败不该拦住启动，那比漏一次提示糟。
+unresolvable_pool_accounts() {
+    local account="$1" config url key payload
+    [[ -n "$account" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    payload="$(curl -sS --connect-timeout 4 --max-time 8 -X POST \
+        -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg a "$account" '{want_account:$a}')" \
+        "$url$codex_pool_prefix/resolve" 2>/dev/null)" || return 0
+    jq -e '.data.wanted | type == "array"' <<< "$payload" >/dev/null 2>&1 || return 0
+    jq -r '.data.wanted[] | select(.state == "unknown") | .name' \
+        <<< "$payload" 2>/dev/null || true
+}
+
+check_pool_account_names() {
+    local agent="$1" account="$2" missing name
+    [[ "$agent" == codex ]] || return 0
+    [[ -n "$account" ]] || return 0
+    missing=()
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && missing+=("$name")
+    done < <(unresolvable_pool_accounts "$account")
+    (( ${#missing[@]} > 0 )) || return 0
+    die "这些名字在凭据池里找不到对应账号：$(IFS=, ; printf '%s' "${missing[*]}")（检查拼写；中文输入法的全角逗号「，」也算，虽然服务端认它）"
+}
+
 # 把这次会话的身份告诉凭据池：ID、目录、主机、启动时刻。
 #
 # **绝不阻塞启动**：问不到池子、没配置、服务端还是老版本——一律静默跳过。上报的
@@ -4189,6 +4231,7 @@ launch_managed_agent() {
         ags_account="$(pick_pool_account)"
     fi
     apply_pool_account "$agent" "${ags_account:-}"
+    check_pool_account_names "$agent" "${ags_account:-}"
     scrub_transport_password_environment
     launch_cwd="$(pwd -P)"
     if [[ "$agent" == claude ]]; then
@@ -5811,16 +5854,25 @@ save_active_checkpoint() {
     local target="${1:-}" agent="${AGENT_SESSION_AGENT:-}" session_id="${AGENT_SESSION_ID:-}"
     shift || true
     [[ "$target" == local || "$target" == cloud ]] || die "target must be local or cloud"
-    # 会话 ID 在**启动时**就定好了（见 `prepare_session_identity`），所以保存时只
-    # 需要给描述：`ags save "描述"`。
+    # 会话 ID 在**启动时**就定好了（见 `prepare_session_identity`），所以在一个 AGS
+    # 起的会话里保存只需要给描述：`ags save "描述"`。
     #
-    # 老写法 `ags save <ID> "描述"` 继续有效——有肌肉记忆，也可能有脚本。判定只看
-    # 第一个参数长不长得像 ID，因为描述几乎不可能长成 ID 的样子（ID 不许有空格）。
+    #   ags save "描述"              ID 用这个会话自己的
+    #   ags save --id 别的名字 "描述"  显式换一个（分支一条新工作线）
+    #   ags save <ID> "描述"          只在**没有** AGS_ID 时有效，即这个会话不是
+    #                                 AGS 起的——那种会话没有自己的 ID 可用
     #
-    # 两者都不成立就报错，不猜：猜错的后果是这次保存挂在一个谁也想不到的名字下。
-    if [[ -n "${AGS_ID:-}" ]] && (( $# > 0 )) &&
-       ! [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
-        set -- "$AGS_ID" "$@"
+    # 刻意**不去猜**第一个参数是 ID 还是描述。猜过一版："长得像 ID 就当 ID"，于是
+    # `ags save "fixed"` 这种单词英文描述被当成了 ID，描述变空，报出来的却是
+    # "description must be 1-80 characters"——人明明给了描述。判据一旦是启发式的，
+    # 错的那一侧就总会有人踩到。
+    if [[ -n "${AGS_ID:-}" ]]; then
+        if [[ "${1:-}" == --id ]]; then
+            (( $# >= 2 )) || die "--id 需要一个会话 ID"
+            shift
+        else
+            set -- "$AGS_ID" "$@"
+        fi
     fi
     if [[ -z "$agent" || -z "$session_id" ]]; then
         if [[ -n "${CODEX_THREAD_ID:-}" ]]; then

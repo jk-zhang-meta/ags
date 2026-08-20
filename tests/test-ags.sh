@@ -334,6 +334,167 @@ ags_sid_expect 'an illegal id is refused and re-asked' AGS_ID good-one \
     exit 1
 }
 
+# 启动前要看得见"这把密钥已经有哪些会话在跑"，并且拒绝撞名。
+#
+# 有两个来源：本地检查点库（**永久**唯一，一条工作线的名字）和池子里的活会话
+# （只在活着的会话之间唯一）。两条路都要能拒——只测其中一条的话，另一条静默放行
+# 会让两个会话争同一条租约行。
+ags_sidpool_home="$(mktemp -d "$tmp/ags-sidpool.XXXXXX")"
+mkdir -p "$ags_sidpool_home/bin" "$ags_sidpool_home/codex" \
+         "$ags_sidpool_home/work/Proj"
+printf '{"base_url":"http://pool.invalid","key":"k"}\n' \
+    > "$ags_sidpool_home/codex/pool.json"
+cat > "$ags_sidpool_home/bin/codext" <<'AGS_SIDPOOL_FAKE'
+#!/bin/sh
+echo "AGS_ID=${AGS_ID:-}" > "$AGS_SIDPOOL_OUT"
+AGS_SIDPOOL_FAKE
+cat > "$ags_sidpool_home/bin/curl" <<'AGS_SIDPOOL_POOL'
+#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        */sessions) cat "$AGS_SIDPOOL_SESSIONS"; exit 0 ;;
+    esac
+done
+echo '{"code":0,"data":{}}'
+AGS_SIDPOOL_POOL
+chmod +x "$ags_sidpool_home/bin/codext" "$ags_sidpool_home/bin/curl"
+cat > "$ags_sidpool_home/sessions.json" <<'AGS_SIDPOOL_JSON'
+{"data":{"sessions":[{"ags_id":"pool-line-one"},{"ags_id":"pool-line-two"}]}}
+AGS_SIDPOOL_JSON
+
+ags_sidpool_run() {
+    rm -f "$ags_sidpool_home/out"
+    (
+        cd "$ags_sidpool_home/work/Proj" || exit 1
+        AGS_SIDPOOL_OUT="$ags_sidpool_home/out" \
+        AGS_SIDPOOL_SESSIONS="$ags_sidpool_home/sessions.json" \
+        AGENT_SESSION_CODEX_BINARY="$ags_sidpool_home/bin/codext" \
+        CODEX_HOME="$ags_sidpool_home/codex" \
+        PATH="$ags_sidpool_home/bin:$PATH" \
+            script -qec "$tool codex" /dev/null <<< "$1" 2>&1
+    ) | tr -d '\r'
+}
+
+# 正在跑的会话要印出来。看不见的话，"换一个名字"只能靠试。
+ags_sidpool_seen="$(ags_sidpool_run "$(printf '\n')")"
+grep -q 'pool-line-one' <<< "$ags_sidpool_seen" || {
+    printf 'ags sid: the live session ids must be listed before asking\n' >&2
+    exit 1
+}
+
+# 池子里活着的 ID 要拒。这一条**本地没有**同名检查点，所以只有池子那条路能拦住
+# 它——两条路混在一起测的话，本地那条会把池子那条的失效掩盖掉。
+ags_sidpool_taken="$(ags_sidpool_run "$(printf 'pool-line-two\nfresh-line\n')")"
+grep -q '正被这把密钥的另一个会话占着' <<< "$ags_sidpool_taken" || {
+    printf 'ags sid: an id live in the pool must be refused\n' >&2
+    exit 1
+}
+[[ "$(sed -n 's/^AGS_ID=//p' "$ags_sidpool_home/out")" == fresh-line ]] || {
+    printf 'ags sid: the replacement id must be the one that launches\n' >&2
+    exit 1
+}
+
+# `ags save` 的参数归属：会话 ID 在启动时定好了，保存只给描述。
+#
+# 刻意**不猜**第一个参数是 ID 还是描述。猜过一版："长得像 ID 就当 ID"，于是
+# `ags save "fixed"` 这种单词英文描述被当成 ID、描述变空，而报出来的是
+# "description must be 1-80 characters"——人明明给了描述。
+ags_save_argv() {
+    local AGS_ID="$1"
+    shift
+    if [[ -n "${AGS_ID:-}" ]]; then
+        if [[ "${1:-}" == --id ]]; then
+            (( $# >= 2 )) || { printf 'DIE\n'; return 0; }
+            shift
+        else
+            set -- "$AGS_ID" "$@"
+        fi
+    fi
+    printf '%s|%s\n' "${1:-}" "${*:2}"
+}
+
+ags_save_expect() {
+    local label="$1" want="$2" got
+    shift 2
+    got="$(ags_save_argv "$@")"
+    [[ "$got" == "$want" ]] || {
+        printf 'ags save: %s: got %q, wanted %q\n' "$label" "$got" "$want" >&2
+        exit 1
+    }
+}
+
+ags_save_expect 'a description alone uses the session id' \
+    'work-line|fix the release' work-line 'fix the release'
+# 单词英文描述是这条规则存在的理由。
+ags_save_expect 'a one-word description is still a description' \
+    'work-line|fixed' work-line 'fixed'
+ags_save_expect '--id branches a new work line' \
+    'other-line|描述' work-line --id other-line '描述'
+ags_save_expect '--id without a value is refused' 'DIE' work-line --id
+# 不是 AGS 起的会话没有自己的 ID，老写法仍然是唯一的写法。
+ags_save_expect 'a session AGS did not start still names its id' \
+    'rel-fix|描述' '' rel-fix '描述'
+
+# 启动前核一遍点名的名字：**只**拦匹配不到任何账号的那些。
+#
+# 那一类是打错字、全角逗号、号被删了——会话会静默跑在公共池上，而人以为自己钉住了
+# 号。冷却中、被别的密钥占着一律不拦：点名是强首选而不是唯一选项，回落公共池继续
+# 干活是设计如此。
+ags_pf_home="$(mktemp -d "$tmp/ags-pf.XXXXXX")"
+mkdir -p "$ags_pf_home/bin" "$ags_pf_home/codex" "$ags_pf_home/work/Proj"
+printf '{"base_url":"http://pool.invalid","key":"k"}\n' > "$ags_pf_home/codex/pool.json"
+cat > "$ags_pf_home/bin/codext" <<'AGS_PF_FAKE'
+#!/bin/sh
+echo "ACCOUNT=${CODEXT_POOL_ACCOUNT:-}" > "$AGS_PF_OUT"
+AGS_PF_FAKE
+cat > "$ags_pf_home/bin/curl" <<'AGS_PF_POOL'
+#!/bin/sh
+for a in "$@"; do
+    case "$a" in
+        */resolve) cat "$AGS_PF_RESOLVE"; exit 0 ;;
+    esac
+done
+echo '{"code":0,"data":{}}'
+AGS_PF_POOL
+chmod +x "$ags_pf_home/bin/codext" "$ags_pf_home/bin/curl"
+printf '%s\n' \
+    '{"data":{"wanted":[{"name":"a@x.com","state":"ok"},{"name":"typo@x","state":"unknown"}]}}' \
+    > "$ags_pf_home/unknown.json"
+printf '%s\n' \
+    '{"data":{"wanted":[{"name":"a@x.com","state":"held"},{"name":"b@y.com","state":"cooling"}]}}' \
+    > "$ags_pf_home/busy.json"
+printf '%s\n' '{"data":{}}' > "$ags_pf_home/silent.json"
+
+ags_pf_run() {
+    rm -f "$ags_pf_home/out"
+    (
+        cd "$ags_pf_home/work/Proj" || exit 1
+        AGS_PF_RESOLVE="$ags_pf_home/$1" \
+        AGS_PF_OUT="$ags_pf_home/out" \
+        AGENT_SESSION_CODEX_BINARY="$ags_pf_home/bin/codext" \
+        CODEX_HOME="$ags_pf_home/codex" \
+        PATH="$ags_pf_home/bin:$PATH" \
+            script -qec "$tool --account a@x.com,b@y.com codex" /dev/null \
+            <<< $'\n' >/dev/null 2>&1
+    ) || true
+    [[ -s "$ags_pf_home/out" ]] && printf 'launched\n'
+}
+
+[[ -z "$(ags_pf_run unknown.json)" ]] || {
+    printf 'ags preflight: a name matching no account must refuse the launch\n' >&2
+    exit 1
+}
+# 负对照两条。少了它们，上一条可能只是因为"任何回执都拒"。
+[[ "$(ags_pf_run busy.json)" == launched ]] || {
+    printf 'ags preflight: a held or cooling account must still launch\n' >&2
+    exit 1
+}
+# 问不到池子也要放行：核对失败比漏一次提示糟得多。
+[[ "$(ags_pf_run silent.json)" == launched ]] || {
+    printf 'ags preflight: an unreachable pool must not block the launch\n' >&2
+    exit 1
+}
+
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
 # `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律
 # 拒绝会让它完全不可用。放行的前提是解析后的目录归当前用户、组和其他人都不可写

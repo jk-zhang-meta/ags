@@ -147,8 +147,18 @@ local checkpoint is refused — continuing that work line is `ags resume <ID>`,
 and allowing it would mean an hour of work that `ags save` then has nowhere to
 go.
 
-Because the ID is fixed up front, `ags save "description"` needs no ID.
-`ags save <ID> "description"` still works for a session AGS did not start.
+Because the ID is fixed up front, `ags save "description"` needs no ID, and
+`ags save --id <ID> "description"` branches a new work line. `ags save <ID>
+"description"` remains the form for a session AGS did not start, which has no ID
+of its own. Which argument is which is never guessed: an earlier attempt treated
+anything ID-shaped as an ID, so `ags save "fixed"` filed the checkpoint under
+`fixed` with no description at all.
+
+A name given to `--account` that matches no account in the pool refuses the
+launch, naming what it could not find. Such a session would otherwise run on the
+shared pool in silence while you believed it was pinned. An account that exists
+but is cooling, out of quota, or held by another key does *not* refuse: falling
+back is the design, and the session returns to it once it frees up.
 
 For Codex the ID also decides the pool lease identity, which used to be derived
 from the pinned accounts. Changing a session's account queue therefore no longer
