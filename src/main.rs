@@ -166,6 +166,25 @@ enum Command {
         #[arg(long, requires = "launching")]
         launch_anyway: bool,
 
+        /// Ask the credential pool for this account (email or account key).
+        ///
+        /// Per launch, not per machine: two sessions started from the same
+        /// directory can name different accounts and neither disturbs the
+        /// other's lease. It is a strong preference, not the only option —
+        /// when the named account is cooling or out of quota the pool falls
+        /// back so the session keeps working, and returns to it once it
+        /// recovers.
+        #[arg(long, value_name = "EMAIL", requires = "launching", conflicts_with = "pick_account")]
+        account: Option<String>,
+
+        /// Choose the pool account interactively instead of naming it.
+        ///
+        /// Lists what this key may ask for, with how much quota each account
+        /// has left — picking blind is how you end up on an account that is
+        /// already out and conclude the pin did not work.
+        #[arg(long, requires = "launching")]
+        pick_account: bool,
+
         /// Do not consult the session store: read the session named here, write
         /// where told, and record nothing.
         ///
@@ -406,6 +425,8 @@ fn main() -> ExitCode {
             launch,
             launch_dry_run,
             launch_anyway,
+            account,
+            pick_account,
             no_store,
             agent_args,
         } => cmd_resume(
@@ -425,6 +446,8 @@ fn main() -> ExitCode {
                 dry_run: launch_dry_run,
                 anyway: launch_anyway,
                 agent_args,
+                account,
+                pick_account,
             },
         ),
         Command::List {
@@ -517,6 +540,10 @@ struct LaunchRequest {
     dry_run: bool,
     anyway: bool,
     agent_args: Vec<String>,
+    /// `--account`：这次启动点名要池子里的哪个号（邮箱或账号标识）。
+    account: Option<String>,
+    /// `--pick-account`：不直接给名字，列出来现挑。
+    pick_account: bool,
 }
 
 impl LaunchRequest {
@@ -821,7 +848,14 @@ fn prepare_launch(
         .as_ref()
         .expect("a launched conversion is never a dry run");
 
-    provider
+    // 两个入口刻意分开：一个可选值的参数在 clap 里要么强制 `--account=x` 的写法，
+    // 要么和后面的参数产生歧义。两个明确的旗标没有这些坑，帮助信息也更好读。
+    let account = if launch.pick_account {
+        Some(pick_pool_account()?)
+    } else {
+        launch.account.clone()
+    };
+    let spec = provider
         .launch_spec(&written.session_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -830,8 +864,165 @@ fn prepare_launch(
                 written.resume_command
             )
         })?
-        .try_passthrough(launch.agent_args.iter().cloned())
-        .map_err(Into::into)
+        .try_passthrough(launch.agent_args.iter().cloned())?;
+    Ok(with_pool_account(spec, account.as_deref()))
+}
+
+/// 让用户从池子里挑一个号。
+///
+/// 走 `curl` 而不是引一个 HTTP 客户端：这是整个二进制里唯一一次网络调用，为它拉
+/// 进一棵 TLS 依赖树不值当。服务端那边同样是 shell 出去调 curl（见
+/// `services/codex_oauth.py`），理由一致。
+fn pick_pool_account() -> anyhow::Result<String> {
+    let (base_url, key) = pool_config()?;
+    let output = std::process::Command::new("curl")
+        .args(["-sS", "--max-time", "10", "-X", "POST"])
+        .arg("-H")
+        .arg(format!("X-Codex-Pool-Token: {key}"))
+        .arg(format!("{}/x8Rk3Nq6Vd2/accounts", base_url.trim_end_matches('/')))
+        .output()
+        .map_err(|error| anyhow::anyhow!("could not run curl to reach the pool: {error}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "the pool did not answer: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| anyhow::anyhow!("the pool answered with something that is not JSON: {error}"))?;
+    let accounts = body
+        .pointer("/data/accounts")
+        .and_then(serde_json::Value::as_array)
+        .filter(|rows| !rows.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("the pool has no account this key may ask for"))?;
+
+    for (index, account) in accounts.iter().enumerate() {
+        let email = account["email"].as_str().unwrap_or("");
+        let plan = account["plan"].as_str().unwrap_or("");
+        // 余量和可调度状态都印出来：挑号时看不见这两样等于盲选，很容易挑中一个
+        // 已经跑满的号，然后以为是指定账号没生效。
+        let headroom = account["headroom"].as_f64().unwrap_or(0.0);
+        let mark = if account["assigned"].as_bool().unwrap_or(false) {
+            " [专属]"
+        } else if !account["schedulable"].as_bool().unwrap_or(false) {
+            " [冷却中]"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>2}) {email}  {plan}  余量 {:.0}%{mark}",
+            index + 1,
+            headroom * 100.0
+        );
+    }
+    print!("选一个号 [1-{}]: ", accounts.len());
+    use std::io::Write as _;
+    std::io::stdout().flush().ok();
+
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| anyhow::anyhow!("could not read the choice: {error}"))?;
+    let choice: usize = answer
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("not a number: {:?}", answer.trim()))?;
+    let account = accounts
+        .get(choice.wrapping_sub(1))
+        .ok_or_else(|| anyhow::anyhow!("no such choice: {choice}"))?;
+    // 发邮箱而不是 account_key：服务端两个都认，而邮箱是人看得懂的那个——它会
+    // 出现在日志和后台界面上。
+    Ok(account["email"]
+        .as_str()
+        .filter(|email| !email.is_empty())
+        .unwrap_or_else(|| account["account_key"].as_str().unwrap_or_default())
+        .to_string())
+}
+
+/// 池子的地址和密钥，来源和 codext 一致：环境变量优先，其次
+/// `CODEX_HOME/pool.json`。两边必须同一套，否则挑号问的是一个池子、跑起来连的是
+/// 另一个。
+fn pool_config() -> anyhow::Result<(String, String)> {
+    let from_env = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let home = std::env::var("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|path| path.join(".codex")));
+    let stored = home
+        .and_then(|home| std::fs::read_to_string(home.join("pool.json")).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let pick = |name: &str, env: &str| {
+        from_env(env).or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|value| value[name].as_str())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+    };
+    match (
+        pick("base_url", "CODEXT_POOL_URL"),
+        pick("key", "CODEXT_POOL_KEY"),
+    ) {
+        (Some(base_url), Some(key)) => Ok((base_url, key)),
+        _ => anyhow::bail!(
+            "no credential pool configured: set CODEXT_POOL_URL and CODEXT_POOL_KEY, \
+             or write them into CODEX_HOME/pool.json"
+        ),
+    }
+}
+
+/// 把 `--account` 变成 codext 认得的两个环境变量。
+///
+/// **两个，不是一个。** `CODEXT_POOL_ACCOUNT` 说的是"这次要哪个号"，而
+/// `CODEXT_POOL_DEVICE_ID` 决定服务端按哪条租约认人——codext 的 device_id 默认按
+/// **工作目录**取（同一个项目反复调用复用同一条租约），而服务端的租约表在
+/// device_id 上有唯一约束。只给账号不给 device_id 的话，同一个目录里开两个点不同
+/// 号的会话会撞在同一条租约行上，互相把对方顶掉——那正是"指定账号影响了别的会话"。
+///
+/// device_id 里塞的是账号的摘要而不是账号本身：这个值会发到服务端、显示在后台
+/// 界面上，而账号是邮箱。
+///
+/// 只动子进程的环境（`Command::env`），当前 shell 和别的会话都不受影响。
+fn with_pool_account(spec: LaunchSpec, account: Option<&str>) -> LaunchSpec {
+    let Some(account) = account.map(str::trim).filter(|value| !value.is_empty()) else {
+        return spec;
+    };
+    spec.with_env("CODEXT_POOL_ACCOUNT", account)
+        .with_env(
+            "CODEXT_POOL_DEVICE_ID",
+            format!("{}-{}", pool_device_id_base(), short_digest(account)),
+        )
+}
+
+/// 这次启动的租约身份的前缀：沿用 codext 自己的默认（主机 + 工作目录），只在后面
+/// 追加账号摘要。保持前缀一致，后台界面上还看得出这些会话来自同一台机器同一个项目。
+fn pool_device_id_base() -> String {
+    std::env::var("CODEXT_POOL_DEVICE_ID").unwrap_or_else(|_| {
+        let host = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "codext".to_string());
+        let workspace = std::env::current_dir()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "unknown".to_string());
+        format!("{host}-{}", short_digest(&workspace))
+    })
+}
+
+/// FNV-1a，和 codext 里那个同一套：够用、不引依赖，也不是安全边界。
+fn short_digest(value: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Why this launch is not going to happen, decided before anything is printed.
@@ -2478,4 +2669,67 @@ fn cmd_completions(shell: &str) -> anyhow::Result<()> {
     generate(parsed_shell, &mut cmd, "casr", &mut std::io::stdout());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod pool_account_tests {
+    use super::*;
+
+    fn envs(spec: &LaunchSpec) -> std::collections::HashMap<String, String> {
+        spec.command()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    fn spec() -> LaunchSpec {
+        LaunchSpec::new("codex", ["resume".to_string(), "abc".to_string()])
+    }
+
+    #[test]
+    fn no_account_touches_no_environment() {
+        assert!(envs(&with_pool_account(spec(), None)).is_empty());
+        assert!(envs(&with_pool_account(spec(), Some("   "))).is_empty());
+    }
+
+    #[test]
+    fn an_account_becomes_both_pool_variables() {
+        let env = envs(&with_pool_account(spec(), Some("someone@example.com")));
+        assert_eq!(
+            env.get("CODEXT_POOL_ACCOUNT").map(String::as_str),
+            Some("someone@example.com")
+        );
+        // 光有账号不够：codext 的 device_id 默认按工作目录取，而服务端的租约表在
+        // device_id 上有唯一约束——同一个目录里两个点不同号的会话会撞同一条租约行。
+        assert!(env.contains_key("CODEXT_POOL_DEVICE_ID"));
+    }
+
+    #[test]
+    fn two_accounts_get_two_lease_identities() {
+        // 这一条就是"不影响其他会话"：同一个目录、同一把密钥，两个会话的租约身份
+        // 必须不同，否则服务端认不出是两个人。
+        let first = envs(&with_pool_account(spec(), Some("a@example.com")));
+        let second = envs(&with_pool_account(spec(), Some("b@example.com")));
+        assert_ne!(
+            first.get("CODEXT_POOL_DEVICE_ID"),
+            second.get("CODEXT_POOL_DEVICE_ID")
+        );
+    }
+
+    #[test]
+    fn the_same_account_keeps_the_same_lease_identity() {
+        // 反复启动同一个号必须复用同一条租约，否则每次启动都留一个幽灵持有者，
+        // 把服务端的并发除数抬高、调度算歪。
+        let first = envs(&with_pool_account(spec(), Some("a@example.com")));
+        let second = envs(&with_pool_account(spec(), Some("a@example.com")));
+        assert_eq!(
+            first.get("CODEXT_POOL_DEVICE_ID"),
+            second.get("CODEXT_POOL_DEVICE_ID")
+        );
+    }
 }
