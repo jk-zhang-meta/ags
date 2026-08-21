@@ -136,8 +136,10 @@ Every session has an **AGS ID**, chosen when it starts. It is the terminal tab
 name, the ID `ags save` writes the checkpoint under, and — for Codex — the name
 the credential pool records for the session, so all three finally agree. Press
 Enter to accept a generated one, which names the directory and the moment
-(`05_MyWork-0821-031745`) rather than a random string you cannot recognise a
-week later.
+(`05_MyWork-2026.08.21-03.17.45`) rather than a random string you cannot
+recognise a week later. It carries the year because checkpoints are kept
+indefinitely, and separates with `.` because an ID becomes a filename — `/`
+would be a path separator, and the character set is `[A-Za-z0-9._-]`.
 
 The ID identifies a *work line*, not a process: it lives permanently in the
 local checkpoint store, while the pool only requires it to be unique among a

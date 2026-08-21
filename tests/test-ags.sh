@@ -315,14 +315,24 @@ ags_sid_expect() {
 # 起了名字就用它，而且它会到达 Agent——`ags save` 只能靠环境变量拿到这个值。
 ags_sid_expect 'a named session reaches the agent' AGS_ID work-line 'work-line'
 
-# 自动生成的 ID 要有信息量：目录名 + 月日-时分。刻意不是随机串——几天后还要靠它
-# 认出"这是哪一条工作线"，`a7f3c1` 认不出来。
+# 自动生成的 ID 要有信息量：`<目录>-<年.月.日>-<时.分.秒>`。刻意不是随机串——几个
+# 月后还要靠它认出"这是哪一条工作线"，`a7f3c1` 认不出来。
+#
+# 这里断言的是**完整形状**，不只是前缀和字符集：只断言那两样的话，格式怎么改都不
+# 会红，而"带不带年份""分隔符是什么"正是这个 ID 唯一的用处所在。
 ags_sid_auto="$(ags_sid_field AGS_ID "$(ags_sid_launch '')")"
-[[ "$ags_sid_auto" == Proj-* ]] || {
-    printf 'ags sid: an auto id must start with the directory name, got %q\n' \
+[[ "$ags_sid_auto" =~ ^Proj-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]{2}\.[0-9]{2}\.[0-9]{2}$ ]] || {
+    printf 'ags sid: an auto id must read <dir>-<Y.m.d>-<H.M.S>, got %q\n' \
         "$ags_sid_auto" >&2
     exit 1
 }
+# 年份要是**今年**，不是写死的四位数字。
+[[ "$ags_sid_auto" == "Proj-$(date +%Y)."* ]] || {
+    printf 'ags sid: an auto id must carry the current year, got %q\n' \
+        "$ags_sid_auto" >&2
+    exit 1
+}
+# 而且仍然要是一个合法的检查点 ID——它就是 `ags save` 要用的那个。
 [[ "$ags_sid_auto" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
     printf 'ags sid: an auto id must be a legal checkpoint id, got %q\n' \
         "$ags_sid_auto" >&2

@@ -3789,10 +3789,18 @@ sanitize_ags_id_fragment() {
     printf '%s\n' "$text"
 }
 
-# 没起名字时用的默认 ID：`<目录名>-<月日-时分秒>`，例如 `05_MyWork-0821-031745`。
+# 没起名字时用的默认 ID：`<目录名>-<年.月.日>-<时.分.秒>`，例如
+# `05_MyWork-2026.08.21-03.17.45`。
 #
-# 刻意**不用随机串**。这个 ID 会出现在标签页上、检查点里、后台的会话列表里，几天
-# 后还要靠它认出"这是哪一条工作线"——`a7f3c1` 认不出来，`05_MyWork-0821` 认得出。
+# 刻意**不用随机串**。这个 ID 会出现在标签页上、检查点里、后台的会话列表里，几个
+# 月后还要靠它认出"这是哪一条工作线"——`a7f3c1` 认不出来，上面那个认得出。
+#
+# **带年份**：检查点是长期存着的，只有月日的话，隔一年再看 `0821` 分不出是哪年。
+#
+# 分隔符用 `.` 而不是 `/`：ID 的字符集是 `[A-Za-z0-9._-]`（见
+# `validate_new_checkpoint_id`），而且它会进文件名——`/` 在那里是路径分隔符。`.`
+# 是允许的字符里唯一读起来像分隔符的，日期和时间各用它分段之后，`-` 就只用来分
+# 隔"目录 / 日期 / 时间"三块，一眼能扫开。
 #
 # **精确到秒**而不是分钟：ID 现在决定租约身份，两个撞了 ID 的会话会争同一条租约
 # 行。分钟粒度看着更干净，但同一目录里一分钟内起两个无名会话就会撞上——实测撞到
@@ -3801,7 +3809,7 @@ sanitize_ags_id_fragment() {
 default_ags_id() {
     local launch_cwd="$1" base stamp candidate index=2
     base="$(sanitize_ags_id_fragment "${launch_cwd##*/}")"
-    stamp="$(date +%m%d-%H%M%S)"
+    stamp="$(date +%Y.%m.%d-%H.%M.%S)"
     candidate="$base-$stamp"
     while ags_id_is_taken "$candidate"; do
         candidate="$base-$stamp-$index"
