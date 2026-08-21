@@ -10306,6 +10306,14 @@ update_ags() {
         --version "$tag" --dest "$destination" --yes ||
         die "the $tag installer failed; the previous installation is unchanged"
 
+    # 更新完必须把提示清掉。以前只有"已是最新"那条早返回分支清，真正更新完的
+    # 这条不清——于是升级之后每次启动还在提示同一个已经装好的版本，直到下一次
+    # 后台检查碰巧跑过一遍才消失。实测：装到 0.4.27 之后，提示里还留着
+    # `update available: ags 0.4.24 -> v0.4.27`。
+    #
+    # 清在这里而不是安装之前：安装失败时提示应当留着，那台机器确实还没更新。
+    forget_update_notice "update available: ags"
+
     log "updated to $tag"
 }
 
@@ -10626,8 +10634,13 @@ case "${1:-}" in
     claude|codex)
         ags_agent_command="$1"
         shift
-        (( $# == 0 )) ||
+        if (( $# > 0 )); then
+            # 分开两句：`--yolo` 不是"位置参数"，照那么说人会去找自己哪里写了个
+            # 位置参数。既然已经知道该怎么改，就把改好的命令直接写出来。
+            [[ "$1" != -* ]] ||
+                die "ags $ags_agent_command 不认识 $1；给 Agent 的参数要写在 -- 之后：ags $ags_agent_command -- $*"
             die "ags $ags_agent_command 不接受位置参数：$1（给 Agent 的参数写在 -- 之后）"
+        fi
         start_managed_agent "$ags_agent_command" \
             ${ags_agent_args[@]+"${ags_agent_args[@]}"}
         ;;

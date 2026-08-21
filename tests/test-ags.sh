@@ -36,6 +36,20 @@ mapfile -t bare_var_before_multibyte < <(
 tmp="$(mktemp -d "$test_tmp_root/agent-session-test.XXXXXX")"
 declare -A test_child_pids=()
 
+# 整套测试都不查更新，也不接受更新提示。
+#
+# 不关的话，测试会读到跑测试这台机器的真实状态。踩到过一次，而症状离原因很远：
+# 本机 `update-check.lines` 里留着一条"有新版本"，于是启动 Agent 前弹出
+# `现在更新？[Y/n]`，把喂给**下一个**提问的那行答案截走了，测试于是拿假 curl 去
+# 更新、然后炸掉——报出来的却是"挑号用例失败"。
+#
+# 这类问题的形状是固定的：某条用例自己记得隔离，后加的那条忘了。所以隔离写在这
+# 里，一次覆盖所有用例，而不是每条各写一遍。
+#
+# 只关更新，不换状态目录：换了的话早期这几组用例就没有检查点库可用（`storage
+# mode is not configured`），而它们本来也不碰库。
+export AGS_UPDATE_CHECK=0
+
 # 参数归属只看一个分隔符：`--` 之前整段归 ags（命令名前后都行），`--` 之后原样
 # 交给 Agent。和 `cargo run --` / `kubectl exec pod --` 同一个约定，也和
 # `ags resume ID [-- CLIENT_ARGS…]` 本来就有的约定一致——同一个 `--` 在这个工具里
@@ -501,6 +515,69 @@ ags_pf_run() {
 # 问不到池子也要放行：核对失败比漏一次提示糟得多。
 [[ "$(ags_pf_run silent.json)" == launched ]] || {
     printf 'ags preflight: an unreachable pool must not block the launch\n' >&2
+    exit 1
+}
+
+# 更新之后，"有新版本"的提示必须消失。
+#
+# 这条用例刻意断言的是**不变量**而不是分支：`update_ags` 走完之后，提示文件里不
+# 能再留着一条指向已经装好的版本的行——无论它走的是"已经是最新"那条早返回，还是
+# 真的装了一遍。
+#
+# 只测分支正是这个 bug 活下来的原因：清提示那一句只写在"已经是最新"那条路上，真
+# 正更新完的那条没有。于是升级之后每次启动都还在提示同一个已经装好的版本，直到下
+# 一次后台检查碰巧跑过一遍。实测在 0.4.27 上抓到了
+# `update available: ags 0.4.24 -> v0.4.27`。
+ags_upd_home="$(mktemp -d "$tmp/ags-upd.XXXXXX")"
+mkdir -p "$ags_upd_home/bin" "$ags_upd_home/state"
+cat > "$ags_upd_home/bin/casr" <<'AGS_UPD_CASR'
+#!/bin/sh
+echo "casr $AGS_UPD_INSTALLED (test)"
+AGS_UPD_CASR
+# 假 GitHub：既答发布信息，也答 install.sh 的下载。
+cat > "$ags_upd_home/bin/curl" <<'AGS_UPD_CURL'
+#!/bin/sh
+out=""
+prev=""
+for a in "$@"; do
+    [ "$prev" = "-o" ] && out="$a"
+    prev="$a"
+done
+if [ -n "$out" ]; then
+    printf '#!/usr/bin/env bash\ntrue\n' > "$out"
+    exit 0
+fi
+printf '{"tag_name":"v%s"}\n200\n' "$AGS_UPD_LATEST"
+AGS_UPD_CURL
+chmod +x "$ags_upd_home/bin/casr" "$ags_upd_home/bin/curl"
+
+# 跑一次 `ags update`，回答完事之后提示文件里还剩什么。
+ags_upd_run() {
+    local installed="$1" latest="$2"
+    printf 'update available: ags %s -> v%s\n' "$installed" "$latest" \
+        > "$ags_upd_home/state/update-check.lines"
+    (
+        AGENT_SESSION_STATE_DIR="$ags_upd_home/state" \
+        AGS_UPDATE_CHECK=0 \
+        AGS_CONVERTER_BINARY="$ags_upd_home/bin/casr" \
+        AGS_CONVERTER_VERSION="$installed" \
+        AGS_UPD_INSTALLED="$installed" \
+        AGS_UPD_LATEST="$latest" \
+        PATH="$ags_upd_home/bin:$PATH" \
+            "$tool" update >/dev/null 2>&1
+    ) || true
+    cat "$ags_upd_home/state/update-check.lines" 2>/dev/null
+}
+
+# 真的更新了一版：提示必须没了。
+[[ -z "$(ags_upd_run 0.4.24 0.4.27)" ]] || {
+    printf 'ags update: a completed update must clear the pending notice\n' >&2
+    exit 1
+}
+# 本来就是最新：同样没了（这条以前就是对的，留着当对照，免得上面那条是靠改坏这条
+# 换来的）。
+[[ -z "$(ags_upd_run 0.4.27 0.4.27)" ]] || {
+    printf 'ags update: an already-current host must clear the notice too\n' >&2
     exit 1
 }
 
