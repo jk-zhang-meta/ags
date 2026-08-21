@@ -913,7 +913,13 @@ fn account_identity(account: &serde_json::Value) -> String {
 fn fetch_pool_accounts() -> anyhow::Result<Vec<serde_json::Value>> {
     let (base_url, key) = pool_config()?;
     let output = std::process::Command::new("curl")
-        .args(["-sS", "--max-time", "10", "-X", "POST"])
+        // 跟随重定向，见 ags 脚本里 `codex_pool_curl_redirect` 的说明：服务端换
+        // 端口时不跟随会让这个调用静默失效。`--proto-redir` 封死降级到明文——
+        // 请求里带着池子的密钥。
+        .args([
+            "-sS", "--max-time", "10", "-X", "POST",
+            "-L", "--proto-redir", "=https", "--max-redirs", "3",
+        ])
         .arg("-H")
         .arg(format!("X-Codex-Pool-Token: {key}"))
         .arg(format!(

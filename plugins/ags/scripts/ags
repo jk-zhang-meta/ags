@@ -3175,9 +3175,21 @@ codex_pool_config_path() {
 # Deliberately `/ping` and not `/lease`: leasing would occupy a scheduling slot
 # for a full lease period, so a connectivity check would leave a phantom holder
 # behind that skews which account the next real session gets.
+# 池子的调用一律跟随重定向。
+#
+# 不跟随的话，服务端换个端口（`https://…:844` → `https://…`，nginx 回 308）就会让
+# 这几个调用**静默失效**：`/sessions` 的查重跳过、`/session` 的上报跳过、`/resolve`
+# 的启动前核对跳过——会话再也不出现在后台，而没有任何提示。2026-08-21 换端口之后
+# 在 MacBook 上量到过：`curl` 不带 `-L` 拿到 308，带上就是 200；而 codext 自己会
+# 跟随，所以"号照样租得到"，坏掉的部分刚好全是安静的那些。
+#
+# 跟随但设界：`--proto-redir '=https'` 让重定向永远不能降级到明文——这些请求带着
+# 池子的密钥，跳到 http 上等于把它明文发出去。跳数也封死，免得绕圈。
+codex_pool_curl_redirect="-L --proto-redir =https --max-redirs 3"
+
 codex_pool_probe() {
     local url="$1" key="$2" status
-    status="$(curl -sS --connect-timeout 8 --max-time 20 \
+    status="$(curl -sS $codex_pool_curl_redirect --connect-timeout 8 --max-time 20 \
         -o /dev/null -w '%{http_code}' \
         -H "X-Codex-Pool-Token: $key" \
         "$url$codex_pool_prefix/ping" 2>/dev/null)" || return 2
@@ -3192,7 +3204,7 @@ codex_pool_probe() {
 
 codex_pool_usable_accounts() {
     local url="$1" key="$2"
-    curl -sS --connect-timeout 8 --max-time 20 \
+    curl -sS $codex_pool_curl_redirect --connect-timeout 8 --max-time 20 \
         -H "X-Codex-Pool-Token: $key" "$url$codex_pool_prefix/ping" 2>/dev/null |
         jq -er '.data.accounts' 2>/dev/null || printf '?\n'
 }
@@ -3637,7 +3649,7 @@ fetch_pool_accounts() {
         die "配置文件读不出来：$config"
     key="$(jq -er '.key' "$config" 2>/dev/null)" ||
         die "配置文件里没有密钥：$config"
-    payload="$(curl -sS --connect-timeout 8 --max-time 20 -X POST \
+    payload="$(curl -sS $codex_pool_curl_redirect --connect-timeout 8 --max-time 20 -X POST \
         -H "X-Codex-Pool-Token: $key" \
         "$url$codex_pool_prefix/accounts" 2>/dev/null)" ||
         die "问不到凭据池：$url"
@@ -3827,7 +3839,7 @@ pool_live_ags_ids() {
     [[ -s "$config" ]] || return 0
     url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
     key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
-    payload="$(curl -sS --connect-timeout 4 --max-time 8 -X POST \
+    payload="$(curl -sS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
         -H "X-Codex-Pool-Token: $key" \
         "$url$codex_pool_prefix/sessions" 2>/dev/null)" || return 0
     jq -r '.data.sessions[]?.ags_id // empty' <<< "$payload" 2>/dev/null || true
@@ -3939,7 +3951,7 @@ unresolvable_pool_accounts() {
     [[ -s "$config" ]] || return 0
     url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
     key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
-    payload="$(curl -sS --connect-timeout 4 --max-time 8 -X POST \
+    payload="$(curl -sS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
         -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
         -d "$(jq -nc --arg a "$account" '{want_account:$a}')" \
         "$url$codex_pool_prefix/resolve" 2>/dev/null)" || return 0
@@ -3986,7 +3998,7 @@ report_pool_session() {
     #
     # 没写 `--account` 时发空数组，意思是"这次不点名"，和"没提这件事"不同——后者
     # 会让上一轮的队列莫名其妙地留着。
-    curl -sS --connect-timeout 4 --max-time 8 -X POST \
+    curl -sS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
         -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
         -d "$(jq -nc \
               --arg d "$CODEXT_POOL_DEVICE_ID" --arg i "$ags_session_id" \
