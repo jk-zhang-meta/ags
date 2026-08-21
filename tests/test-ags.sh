@@ -36,19 +36,16 @@ mapfile -t bare_var_before_multibyte < <(
 tmp="$(mktemp -d "$test_tmp_root/agent-session-test.XXXXXX")"
 declare -A test_child_pids=()
 
-# 整套测试都不查更新，也不接受更新提示。
+# 下面那几组"启动一个假 Agent"的用例，一律关掉更新检查（见各自的启动辅助函数）。
 #
-# 不关的话，测试会读到跑测试这台机器的真实状态。踩到过一次，而症状离原因很远：
-# 本机 `update-check.lines` 里留着一条"有新版本"，于是启动 Agent 前弹出
+# 不关的话它们会读到跑测试这台机器的真实状态。踩到过一次，症状离原因很远：本机
+# `update-check.lines` 里留着一条"有新版本"，于是启动 Agent 前弹出
 # `现在更新？[Y/n]`，把喂给**下一个**提问的那行答案截走了，测试于是拿假 curl 去
 # 更新、然后炸掉——报出来的却是"挑号用例失败"。
 #
-# 这类问题的形状是固定的：某条用例自己记得隔离，后加的那条忘了。所以隔离写在这
-# 里，一次覆盖所有用例，而不是每条各写一遍。
-#
-# 只关更新，不换状态目录：换了的话早期这几组用例就没有检查点库可用（`storage
-# mode is not configured`），而它们本来也不碰库。
-export AGS_UPDATE_CHECK=0
+# 刻意**不**在这里 `export` 一个全局的关闭开关：本文件后面有几条用例测的就是"该不
+# 该提示"，全局关掉会让它们无论对错都绿——那比红更糟。隔离要够，但不能盖过被测的
+# 东西本身。
 
 # 参数归属只看一个分隔符：`--` 之前整段归 ags（命令名前后都行），`--` 之后原样
 # 交给 Agent。和 `cargo run --` / `kubectl exec pod --` 同一个约定，也和
@@ -82,6 +79,7 @@ ags_zone_launch() {
     # 份代码，连不上池子时全绿，连上时红）。
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
         AGENT_SESSION_CLAUDE_BINARY="$ags_zone_home/bin/claude" \
+        AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_zone_home/nopool" \
         AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>&1 || return $?
     cat "$out"
@@ -233,6 +231,7 @@ ags_pick_run() {
     AGS_PICK_SECOND="$second" \
     AGS_PICK_CALLS="$ags_pick_home/calls" \
     AGS_ZONE_OUT="$ags_pick_home/out" \
+    AGS_UPDATE_CHECK=0 \
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
     CODEX_HOME="$ags_pick_home/codex" \
     PATH="$ags_pick_home/bin:$PATH" \
@@ -283,16 +282,16 @@ AGS_SID_FAKE
 chmod +x "$ags_sid_home/bin/codext"
 
 # `read < /dev/tty` 要一个真终端，所以借 `script` 开一个 pty 把答案喂进去。
+# 起会话**不提问**：给了 `--id` 就用它，没给就自动生成。所以这里不再喂答案。
 ags_sid_launch() {
-    local answers="$1"
-    shift
     rm -f "$ags_sid_home/out"
     (
         cd "$ags_sid_home/work/Proj" || exit 1
         AGS_SID_OUT="$ags_sid_home/out" \
         AGENT_SESSION_CODEX_BINARY="$ags_sid_home/bin/codext" \
+        AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_sid_home/codex" \
-            script -qec "$tool codex $*" /dev/null <<< "$answers" >/dev/null 2>&1
+            "$tool" codex "$@" >/dev/null 2>&1 </dev/null
     ) || true
     [[ -s "$ags_sid_home/out" ]] && tr -d '\r' < "$ags_sid_home/out"
 }
@@ -302,9 +301,9 @@ ags_sid_field() {
 }
 
 ags_sid_expect() {
-    local label="$1" field="$2" want="$3" answers="$4" got
-    shift 4
-    got="$(ags_sid_field "$field" "$(ags_sid_launch "$answers" "$@")")"
+    local label="$1" field="$2" want="$3" got
+    shift 3
+    got="$(ags_sid_field "$field" "$(ags_sid_launch "$@")")"
     [[ "$got" == "$want" ]] || {
         printf 'ags sid: %s: %s was %q, wanted %q\n' \
             "$label" "$field" "$got" "$want" >&2
@@ -312,15 +311,26 @@ ags_sid_expect() {
     }
 }
 
+ags_sid_refuse() {
+    local label="$1"
+    shift
+    if [[ -n "$(ags_sid_launch "$@")" ]]; then
+        printf 'ags sid: %s: expected a refusal\n' "$label" >&2
+        exit 1
+    fi
+}
+
 # 起了名字就用它，而且它会到达 Agent——`ags save` 只能靠环境变量拿到这个值。
-ags_sid_expect 'a named session reaches the agent' AGS_ID work-line 'work-line'
+ags_sid_expect 'a named session reaches the agent' AGS_ID work-line --id work-line
+# 位置无所谓：`--` 之前都归 ags。
+ags_sid_expect 'the id may follow the command name' AGS_ID after-cmd --id after-cmd
 
 # 自动生成的 ID 要有信息量：`<目录>-<年.月.日>-<时.分.秒>`。刻意不是随机串——几个
 # 月后还要靠它认出"这是哪一条工作线"，`a7f3c1` 认不出来。
 #
 # 这里断言的是**完整形状**，不只是前缀和字符集：只断言那两样的话，格式怎么改都不
 # 会红，而"带不带年份""分隔符是什么"正是这个 ID 唯一的用处所在。
-ags_sid_auto="$(ags_sid_field AGS_ID "$(ags_sid_launch '')")"
+ags_sid_auto="$(ags_sid_field AGS_ID "$(ags_sid_launch)")"
 [[ "$ags_sid_auto" =~ ^Proj-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9]{2}\.[0-9]{2}\.[0-9]{2}$ ]] || {
     printf 'ags sid: an auto id must read <dir>-<Y.m.d>-<H.M.S>, got %q\n' \
         "$ags_sid_auto" >&2
@@ -340,32 +350,34 @@ ags_sid_auto="$(ags_sid_field AGS_ID "$(ags_sid_launch '')")"
 }
 
 # 租约身份由**会话**决定，不由它点了哪些号决定。
-ags_sid_one="$(ags_sid_field DEVICE "$(ags_sid_launch 'line-one')")"
+ags_sid_one="$(ags_sid_field DEVICE "$(ags_sid_launch --id line-one)")"
 [[ -n "$ags_sid_one" ]] || {
     printf 'ags sid: a session must pin a lease identity\n' >&2
     exit 1
 }
 ags_sid_expect 'the same session keeps one lease identity' \
-    DEVICE "$ags_sid_one" 'line-one'
+    DEVICE "$ags_sid_one" --id line-one
 # 换一组点名账号不该换身份。以前会换——于是原来那个号被一条没人认领的租约白占到
 # 600 秒过期。
 ags_sid_expect 'changing the account queue keeps the lease identity' \
-    DEVICE "$ags_sid_one" 'line-one' --account a@x.com
-[[ "$(ags_sid_field DEVICE "$(ags_sid_launch 'line-two')")" != "$ags_sid_one" ]] || {
+    DEVICE "$ags_sid_one" --id line-one --account a@x.com
+[[ "$(ags_sid_field DEVICE "$(ags_sid_launch --id line-two)")" != "$ags_sid_one" ]] || {
     printf 'ags sid: two sessions must not share one lease identity\n' >&2
     exit 1
 }
 
-# 非法 ID 重问，不静默改写。
-ags_sid_expect 'an illegal id is refused and re-asked' AGS_ID good-one \
-    "$(printf 'bad name\ngood-one\n')"
-
-# 被拒之后读到 EOF 必须**报错**。静默换上自动生成的 ID，会让一个刚被拒绝的名字
-# 悄悄变成另一个，而人以为自己起的名生效了——这正是这套改动要消灭的失败方式。
-[[ -z "$(ags_sid_launch "$(printf 'bad name\n')")" ]] || {
-    printf 'ags sid: EOF after a refusal must not silently pick another id\n' >&2
+# 非法的 `--id` **拒绝启动**，不悄悄换一个自动生成的：换了的话这个会话会挂在一个
+# 人没起过的名字下，而后台指派要靠这个名字找到它。
+ags_sid_refuse 'an illegal id refuses the launch' --id 'bad name'
+ags_sid_refuse 'an empty id refuses the launch' --id ''
+# `--id` 用在不起会话的命令上也要拒——被解析走然后没人读，那是静默无视。
+(
+    cd "$ags_sid_home/work/Proj" || exit 1
+    "$tool" --id whatever ls >/dev/null 2>&1
+) && {
+    printf 'ags sid: --id on a non-launching command must be refused\n' >&2
     exit 1
-}
+} || true
 
 # 启动前要看得见"这把密钥已经有哪些会话在跑"，并且拒绝撞名。
 #
@@ -402,28 +414,37 @@ ags_sidpool_run() {
         AGS_SIDPOOL_OUT="$ags_sidpool_home/out" \
         AGS_SIDPOOL_SESSIONS="$ags_sidpool_home/sessions.json" \
         AGENT_SESSION_CODEX_BINARY="$ags_sidpool_home/bin/codext" \
+        AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_sidpool_home/codex" \
         PATH="$ags_sidpool_home/bin:$PATH" \
-            script -qec "$tool codex" /dev/null <<< "$1" 2>&1
+            "$tool" codex "$@" </dev/null 2>&1
     ) | tr -d '\r'
-}
-
-# 正在跑的会话要印出来。看不见的话，"换一个名字"只能靠试。
-ags_sidpool_seen="$(ags_sidpool_run "$(printf '\n')")"
-grep -q 'pool-line-one' <<< "$ags_sidpool_seen" || {
-    printf 'ags sid: the live session ids must be listed before asking\n' >&2
-    exit 1
+    # 被拒的那次退出码非 0，而套件是 `set -o pipefail`——不吞掉的话
+    # `var=$(ags_sidpool_run …)` 会直接把整个套件带停，而且一个字都不打。
+    return 0
 }
 
 # 池子里活着的 ID 要拒。这一条**本地没有**同名检查点，所以只有池子那条路能拦住
 # 它——两条路混在一起测的话，本地那条会把池子那条的失效掩盖掉。
-ags_sidpool_taken="$(ags_sidpool_run "$(printf 'pool-line-two\nfresh-line\n')")"
+ags_sidpool_taken="$(ags_sidpool_run --id pool-line-two)"
 grep -q '正被这把密钥的另一个会话占着' <<< "$ags_sidpool_taken" || {
     printf 'ags sid: an id live in the pool must be refused\n' >&2
     exit 1
 }
+[[ ! -s "$ags_sidpool_home/out" ]] || {
+    printf 'ags sid: a refused id must not launch anything\n' >&2
+    exit 1
+}
+# 报错要**说清楚谁在占**。启动不再提问，所以这是人唯一一次看到"这把密钥有哪些会话
+# 在跑"的机会；只说一句"被占了"等于让人靠猜去换名字。
+grep -q 'pool-line-one' <<< "$ags_sidpool_taken" || {
+    printf 'ags sid: the refusal must name the sessions already running\n' >&2
+    exit 1
+}
+# 负对照：没撞上的名字照常起得来。
+ags_sidpool_free="$(ags_sidpool_run --id fresh-line)"
 [[ "$(sed -n 's/^AGS_ID=//p' "$ags_sidpool_home/out")" == fresh-line ]] || {
-    printf 'ags sid: the replacement id must be the one that launches\n' >&2
+    printf 'ags sid: a free id must launch, got %q\n' "$ags_sidpool_free" >&2
     exit 1
 }
 
@@ -505,6 +526,7 @@ ags_pf_run() {
         AGS_PF_RESOLVE="$ags_pf_home/$1" \
         AGS_PF_OUT="$ags_pf_home/out" \
         AGENT_SESSION_CODEX_BINARY="$ags_pf_home/bin/codext" \
+        AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_pf_home/codex" \
         PATH="$ags_pf_home/bin:$PATH" \
             script -qec "$tool --account a@x.com,b@y.com codex" /dev/null \
@@ -590,6 +612,40 @@ ags_upd_run() {
     printf 'ags update: an already-current host must clear the notice too\n' >&2
     exit 1
 }
+
+# `ls` 是 `list` 的别名，四处 list 子命令都认。
+"$tool" ls --help >/dev/null 2>&1 || true
+[[ "$("$tool" ls 2>&1 | head -1)" == "$("$tool" list 2>&1 | head -1)" ]] || {
+    printf 'ags ls: must behave like ags list\n' >&2
+    exit 1
+}
+
+# 帮助分两层：默认只印常用的，`ags help all` 印全部。一条都不能少——分层是为了好读，
+# 不是为了藏起来。
+ags_help_short="$("$tool" --help 2>&1)"
+ags_help_all="$("$tool" help all 2>&1)"
+(( $(wc -l <<< "$ags_help_short") < 20 )) || {
+    printf 'ags help: the default help must stay short, got %s lines\n' \
+        "$(wc -l <<< "$ags_help_short")" >&2
+    exit 1
+}
+(( $(wc -l <<< "$ags_help_all") > $(wc -l <<< "$ags_help_short") )) || {
+    printf 'ags help: `help all` must print more than the default\n' >&2
+    exit 1
+}
+# 短帮助必须指路，否则分层就是把命令藏了。
+grep -q 'ags help all' <<< "$ags_help_short" || {
+    printf 'ags help: the short help must point at `ags help all`\n' >&2
+    exit 1
+}
+# 每个顶层动词都要在 `help all` 里出现过，一个都不能因为分层丢掉。
+for ags_help_verb in init set list show save resume delete update remote storage cloud; do
+    grep -q "ags $ags_help_verb" <<< "$ags_help_all" || {
+        printf 'ags help: `help all` lost the %s command\n' "$ags_help_verb" >&2
+        exit 1
+    }
+done
+unset ags_help_verb ags_help_short ags_help_all
 
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
 # `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律
@@ -1375,7 +1431,21 @@ grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$fresh_codex"
 # runs as a child of the Agent and the environment is the only channel that
 # reaches it — the argv itself is consumed by exec.
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$fresh_codex"
-[[ ! -s "$tmp/fresh-codex.err" ]]
+# 启动路径上除了"这次会话叫什么"那一行，不许有别的 stderr。
+#
+# 原来断言的是"stderr 必须为空"。会话 ID 改成自动生成之后，那一行是人知道自己这次
+# 叫什么的**唯一**途径（`ags resume` / `ags save --id` / 后台指派都要用它），所以它
+# 必须留着。断言因此改成"只许有它"，而不是放宽成"随便"——放宽的话，将来任何一条
+# 意外的报错都能混进这条路而没人发现。
+[[ "$(grep -cv '^\[ags\] 会话 ' "$tmp/fresh-codex.err" || true)" == 0 ]] || {
+    printf 'launch stderr carried more than the session line:\n%s\n' \
+        "$(cat "$tmp/fresh-codex.err")" >&2
+    exit 1
+}
+grep -q '^\[ags\] 会话 ' "$tmp/fresh-codex.err" || {
+    printf 'launch must announce the session id on stderr\n' >&2
+    exit 1
+}
 # An argument carrying a line break cannot round-trip the line-oriented
 # manifest, so the launch records none of them rather than a truncated command
 # line. The Agent still receives it unchanged.
@@ -1519,8 +1589,10 @@ printf '%s\n' \
     > "$tmp/state/update-check.lines"
 date +%s > "$tmp/state/update-check.stamp"
 update_stamp_before="$(<"$tmp/state/update-check.stamp")"
+# 这一段测的**就是**更新提示，所以在这里把套件头部关掉的开关重新打开。
+# 全局关、局部按需打开：隔离留给所有用例，例外只留给真正要用它的那几条。
 announced_claude="$(
-    env "${managed_env[@]}" "$tool" claude -- --model sonnet \
+    env "${managed_env[@]}" AGS_UPDATE_CHECK=1 "$tool" claude -- --model sonnet \
         2> "$tmp/announced-claude.err"
 )"
 grep -Fqx 'FAKE_CLAUDE <--model> <sonnet>' <<< "$announced_claude"

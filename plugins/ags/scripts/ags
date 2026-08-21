@@ -186,12 +186,40 @@ machine_id_fragment() {
     printf '%s' "$identifier" | sha256sum | cut -c1-8
 }
 
+# 帮助分两层。
+#
+# 顶层动词有 30 个，全印出来是 76 行；而日常真正会用到的是最上面那几条。76 行里找
+# 5 条，本身就是"这工具好复杂"的主要来源——不是命令多，是每次都要从头读一遍。
+#
+# 所以默认只印常用的，全部放在 `ags help all` 后面。**一条都没删**，只是分了层。
 usage() {
+    if [[ "${1:-}" == all ]]; then
+        usage_all
+        return 0
+    fi
     cat <<'EOF'
+用法:
+  ags                          接上最近还活着的会话
+  ags codex [--id 名字]        起一个 Codex 会话
+  ags claude [--id 名字]       起一个 Claude 会话
+  ags ls                       列出检查点，挑一个打开
+  ags save "描述"              保存当前这个会话
+  ags resume ID                恢复一个检查点
+  ags update                   更新到最新版
+
+  给 Agent 的参数写在 -- 之后：ags codex -- --model o3
+  不写 --id 就自动起一个（<目录>-<年.月.日>-<时.分.秒>），启动时会印出来
+  全部命令： ags help all
+EOF
+}
+
+usage_all() {
+    cat <<'EOF' 
 Usage:
   ags                                  Choose an Agent and start it
-  ags claude [CLAUDE_ARGS...]          Start Claude
-  ags [--account EMAIL|--pick-account] codex [CODEX_ARGS...]
+  ags [--id NAME] claude [-- CLAUDE_ARGS...]
+                                       Start Claude
+  ags [--id NAME] [--account EMAIL|--pick-account] codex [-- CODEX_ARGS...]
                                        Start Codex; ags options go before
                                        the command, agent args after it.
                                        They work on claude/resume/cloud too
@@ -200,11 +228,13 @@ Usage:
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
   ags set ABSOLUTE_DIR                 Configure local checkpoint storage
-  ags list                             Pick a local checkpoint and open it
+  ags list | ags ls                    Pick a local checkpoint and open it
                                        (Up/Down or j/k, Enter open, a edit the
                                        Agent arguments, Del delete, Esc quit)
   ags show ID|AGENT/RECORD_ID          Show complete local checkpoint details
-  ags save ID DESCRIPTION              Save this active Codex or Claude session
+  ags save [--id ID] DESCRIPTION       Save this active Codex or Claude session
+                                       The ID is fixed when the session starts;
+                                       --id only to branch a new work line
   ags resume ID|AGENT/RECORD_ID [AGENT_ARGS...]
              [-- --to codex|claude --cwd PATH --profile NAME --no-agent-args]
                                        Restore and launch a local checkpoint
@@ -3748,6 +3778,16 @@ ags_consume_option() {
             [[ -n "$ags_account" ]] || die "--account 需要一个邮箱或账号标识"
             ags_consumed=1
             ;;
+        --id)
+            (( $# >= 2 )) || die "--id 需要一个会话 ID"
+            ags_id_option="$2"
+            ags_consumed=2
+            ;;
+        --id=*)
+            ags_id_option="${1#--id=}"
+            [[ -n "$ags_id_option" ]] || die "--id 需要一个会话 ID"
+            ags_consumed=1
+            ;;
         --pick-account) ags_pick_account=1; ags_consumed=1 ;;
         --no-agent-args) ags_no_agent_args=1; ags_consumed=1 ;;
         --to)
@@ -3890,44 +3930,34 @@ prepare_session_identity() {
         done < <(pool_live_ags_ids)
     fi
 
-    suggestion="$(default_ags_id "$launch_cwd")"
-    if terminal_can_set_title; then
-        if (( ${#ags_pool_live_ids[@]} > 0 )); then
-            printf '这把密钥正在跑的会话：%s\n' \
-                "$(IFS=, ; printf '%s' "${ags_pool_live_ids[*]}")" > /dev/tty
+    # 给了 `--id` 就用它，没给就用自动生成的。**不问。**
+    #
+    # 起一个会话是这个工具里最频繁的动作。为它加一个提问，等于每次开工都要先按一次
+    # 回车；而绝大多数会话根本不需要人起名字——`<目录>-<年.月.日>-<时.分.秒>` 已经
+    # 够认出是哪一条。要起名字的那几次写 `--id` 就行。
+    if [[ -n "${ags_id_option:-}" ]]; then
+        answer="$ags_id_option"
+        [[ "$answer" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] ||
+            die "--id 只能是 1-64 个字母、数字、点、下划线或连字符，且以字母或数字开头：$answer"
+        # 人显式给的名字撞上了就**报错**，不悄悄换一个：换了的话这个会话会挂在一个
+        # 他没起过的名字下，而后台要靠这个名字找到它。
+        if checkpoint_id_exists local "$answer" 2>/dev/null; then
+            die "本地已经有叫「${answer}」的检查点；接着那条线用 ags resume ${answer}，要开新的换个名字"
         fi
-        while :; do
-            printf '会话 ID [%s]: ' "$suggestion" > /dev/tty
-            # 回车（读成功、内容为空）= 用默认值，这是一个选择。
-            # 读**失败**（EOF）= 没人回答，这不是选择——此时静默换上默认 ID 会让
-            # 一个刚被拒绝的名字悄悄变成另一个名字，而人以为自己起的名生效了。
-            if ! IFS= read -r answer < /dev/tty; then
-                [[ -n "$answer" ]] || die "没读到会话 ID"
-            fi
-            [[ -n "$answer" ]] || { answer="$suggestion"; break; }
-            if ! [[ "$answer" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
-                printf 'ID 只能是 1-64 个字母、数字、点、下划线或连字符，且以字母或数字开头。\n' > /dev/tty
-                continue
-            fi
-            if checkpoint_id_exists local "$answer" 2>/dev/null; then
-                printf '本地已经有叫「%s」的检查点。接着那条线用 `ags resume %s`；要开新的换个名字。\n' \
-                    "$answer" "$answer" > /dev/tty
-                continue
-            fi
-            if ags_id_is_taken "$answer"; then
-                printf '「%s」正被这把密钥的另一个会话占着，换一个。\n' "$answer" > /dev/tty
-                continue
-            fi
-            break
-        done
+        if ags_id_is_taken "$answer"; then
+            die "「${answer}」正被这把密钥的另一个会话占着；在跑的有：$(IFS=, ; printf '%s' "${ags_pool_live_ids[*]-}")"
+        fi
     else
-        # 没有终端就没法问。自动生成的 ID 本来就是为这种情况准备的。
-        answer="$suggestion"
+        answer="$(default_ags_id "$launch_cwd")"
     fi
 
     ags_session_id="$answer"
     export AGS_ID="$ags_session_id"
     set_terminal_tab_title "$ags_session_id"
+    # 提问没了，这一行就是人知道"这次叫什么"的唯一途径——而 `ags resume`、
+    # `ags save --id`、后台的会话管理都要用这个名字。标签页上也有，但没有标签页的
+    # 终端就只剩这里了。
+    log "会话 $ags_session_id"
 }
 
 # 启动前核一遍点名的名字，**只**挑出匹配不到任何账号的那些。
@@ -9792,7 +9822,7 @@ cloud_command() {
     shift || true
     case "$command" in
         set) configure_cloud_storage "$@" ;;
-        list) list_cloud_checkpoints "$@" ;;
+        list|ls) list_cloud_checkpoints "$@" ;;
         save) save_active_checkpoint cloud "$@" ;;
         resume) resume_checkpoint cloud "$@" ;;
         delete) delete_cloud_checkpoint "$@" ;;
@@ -9806,7 +9836,7 @@ remote_command() {
     shift || true
     case "$command" in
         add) add_named_remote "$@" ;;
-        list) list_named_remotes "$@" ;;
+        list|ls) list_named_remotes "$@" ;;
         show) show_named_remote "$@" ;;
         use|default) use_named_remote "$@" ;;
         remove) remove_named_remote "$@" ;;
@@ -9819,7 +9849,7 @@ storage_command() {
     local command="${1:-}"
     shift || true
     case "$command" in
-        list) list_storage_modes "$@" ;;
+        list|ls) list_storage_modes "$@" ;;
         use) use_storage_mode "$@" ;;
         merge) merge_storage_command "$@" ;;
         retire) retire_storage_command "$@" ;;
@@ -10549,6 +10579,7 @@ ags_no_agent_args=0
 ags_to=
 ags_cwd_option=
 ags_profile_option=
+ags_id_option=
 ags_consumed=0
 
 # 参数归属只看一个分隔符：
@@ -10570,6 +10601,7 @@ ags_to=
 ags_cwd_option=
 ags_profile_option=
 ags_consumed=0
+ags_id_option=
 ags_agent_args=()
 ags_agent_args_given=0
 # 这次会话的 AGS ID，以及这把密钥此刻占用的 ID。都在 `prepare_session_identity`
@@ -10628,6 +10660,14 @@ if [[ -n "$ags_account" ]] || (( ags_pick_account == 1 )); then
     case "${1:-}" in
         codex|claude|resume|cloud) ;;
         *) die "--account / --pick-account 只对启动 Agent 的命令有意义（codex、claude、resume、cloud resume）" ;;
+    esac
+fi
+# 同理，`--id` 用在别处会被解析走然后没人读——那是静默无视。`resume` 不在里面：恢复
+# 一条工作线用的是检查点自己的 ID，再给一个只会矛盾。
+if [[ -n "$ags_id_option" ]]; then
+    case "${1:-}" in
+        codex|claude|save) ;;
+        *) die "--id 只对新起会话（codex、claude）和 ags save 有意义；ags resume 用检查点自己的 ID" ;;
     esac
 fi
 case "${1:-}" in
@@ -10696,7 +10736,10 @@ case "${1:-}" in
     cloud) shift; cloud_command "$@" ;;
     remote) shift; remote_command "$@" ;;
     storage) shift; storage_command "$@" ;;
-    list) shift; list_local_checkpoints "$@" ;;
+    # `ls` 是 `list` 的别名。这是手上敲得最多的一个，而 `ls` 是所有人肌肉记忆里
+    # "列出来"的那个词。只给这一个加别名：别名不减少复杂度，它增加表面积，只有
+    # 高频那一个才划算。
+    list|ls) shift; list_local_checkpoints "$@" ;;
     show) shift; show_local_checkpoint "$@" ;;
     save) shift; save_active_checkpoint local "$@" ;;
     resume) shift; resume_checkpoint local "$@" ;;
@@ -10714,6 +10757,6 @@ case "${1:-}" in
     rehome-claude) rehome_claude "${2:-}" ;;
     update) shift; update_ags "$@" ;;
     update-check-refresh) shift; refresh_update_check_record "$@" ;;
-    -h|--help|help) usage ;;
+    -h|--help|help) shift || true; usage "${1:-}" ;;
     *) usage >&2; exit 2 ;;
 esac

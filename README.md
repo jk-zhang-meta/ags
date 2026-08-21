@@ -132,12 +132,18 @@ starts, because a Plus account can be taken during the seconds you spend typing
 — without that check the launch would fall back to the shared pool silently
 while you believed the account was pinned.
 
+`ags ls` is `ags list`; `ags --help` shows the handful of commands you use daily
+and `ags help all` shows everything.
+
 Every session has an **AGS ID**, chosen when it starts. It is the terminal tab
 name, the ID `ags save` writes the checkpoint under, and — for Codex — the name
 the credential pool records for the session, so all three finally agree. Press
-Enter to accept a generated one, which names the directory and the moment
+Nothing is asked for at launch: `--id NAME` names the session, and without it
+one is generated, which names the directory and the moment
 (`05_MyWork-2026.08.21-03.17.45`) rather than a random string you cannot
-recognise a week later. It carries the year because checkpoints are kept
+recognise a week later. Either way the launch prints the ID once, because that
+name is what `ags resume`, `ags save --id` and the admin console all address the
+session by. It carries the year because checkpoints are kept
 indefinitely, and separates with `.` because an ID becomes a filename — `/`
 would be a path separator, and the character set is `[A-Za-z0-9._-]`.
 
