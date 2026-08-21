@@ -3969,13 +3969,24 @@ report_pool_session() {
     [[ -s "$config" ]] || return 0
     url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
     key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    # `accounts` 一并发过去：**启动是一个显式动作**，人刚刚亲口说了这次要哪几个
+    # 号，服务端据此重置这条队列。
+    #
+    # 和 `/lease` 上那串的区别是所有权：那一串每个请求都会再发一次，服务端只在
+    # 队列为空时拿它播种，否则后台刚给这个会话追加的号下一秒就被抹掉。这里发的
+    # 是"这一次启动我要这些"，一次性的，所以可以覆盖。
+    #
+    # 没写 `--account` 时发空数组，意思是"这次不点名"，和"没提这件事"不同——后者
+    # 会让上一轮的队列莫名其妙地留着。
     curl -sS --connect-timeout 4 --max-time 8 -X POST \
         -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
         -d "$(jq -nc \
               --arg d "$CODEXT_POOL_DEVICE_ID" --arg i "$ags_session_id" \
               --arg c "$launch_cwd" --arg h "${HOSTNAME:-${COMPUTERNAME:-}}" \
               --arg s "$(date +%Y-%m-%dT%H:%M:%S%z)" \
-              '{device_id:$d, ags_id:$i, cwd:$c, host:$h, started_at:$s}')" \
+              --arg a "${ags_account:-}" \
+              '{device_id:$d, ags_id:$i, cwd:$c, host:$h, started_at:$s,
+                accounts:($a | if . == "" then [] else split(",") end)}')" \
         "$url$codex_pool_prefix/session" >/dev/null 2>&1 || true
 }
 

@@ -52,14 +52,23 @@ cat > "$ags_zone_home/bin/codext" <<'AGS_ZONE_FAKE'
   echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
 } > "$AGS_ZONE_OUT"
 AGS_ZONE_FAKE
+mkdir -p "$ags_zone_home/nopool"
 cp "$ags_zone_home/bin/codext" "$ags_zone_home/bin/claude"
 chmod +x "$ags_zone_home/bin/codext" "$ags_zone_home/bin/claude"
 
 ags_zone_launch() {
     local out="$ags_zone_home/out"
     rm -f "$out"
+    # `CODEX_HOME` 指向一个**空**目录，所以 `codex_pool_config_path` 找不到
+    # `pool.json`，启动前的点名核对直接跳过。
+    #
+    # 不指的话它会读到跑测试这个人**真实的** `~/.codex/pool.json`，拿
+    # `zone@example.com` 去真池子里查，查不到就拒绝启动——这些用例测的是参数归属，
+    # 不该依赖任何人的真实凭据，更不该因为网络通不通而时红时绿（实测遇到过：同一
+    # 份代码，连不上池子时全绿，连上时红）。
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
         AGENT_SESSION_CLAUDE_BINARY="$ags_zone_home/bin/claude" \
+        CODEX_HOME="$ags_zone_home/nopool" \
         AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>&1 || return $?
     cat "$out"
 }

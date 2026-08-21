@@ -154,6 +154,17 @@ of its own. Which argument is which is never guessed: an earlier attempt treated
 anything ID-shaped as an ID, so `ags save "fixed"` filed the checkpoint under
 `fixed` with no description at all.
 
+`--account` seeds the session's queue on the pool the first time it is heard, and
+after that the **pool owns the queue**: it can be extended, trimmed, and
+re-ordered from the admin console while the session runs, and the client
+repeating its original list on every request no longer erases those edits. A
+launch that names accounts replaces the queue outright, because a launch is an
+explicit act; the per-request value never does.
+
+Ordering inside a queue is the pool's own scheduler, unchanged. A member may
+also carry a queue-local tier that promotes it **for that session only**, leaving
+its standing in the shared pool untouched.
+
 A name given to `--account` that matches no account in the pool refuses the
 launch, naming what it could not find. Such a session would otherwise run on the
 shared pool in silence while you believed it was pinned. An account that exists
