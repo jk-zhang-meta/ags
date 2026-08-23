@@ -189,10 +189,7 @@ impl HubClient {
             anyhow::bail!("Cline Hub discovery host is not local");
         };
 
-        let protocol = format!(
-            "{HUB_AUTH_PROTOCOL_PREFIX}{}",
-            discovery.auth_token.trim()
-        );
+        let protocol = format!("{HUB_AUTH_PROTOCOL_PREFIX}{}", discovery.auth_token.trim());
         request.headers_mut().insert(
             SEC_WEBSOCKET_PROTOCOL,
             HeaderValue::try_from(protocol).context("invalid Cline Hub authentication token")?,
@@ -206,8 +203,8 @@ impl HubClient {
         stream
             .set_write_timeout(timeout)
             .context("failed to set Cline Hub write timeout")?;
-        let (socket, _) = tungstenite::client(request, stream)
-            .context("Cline Hub WebSocket handshake failed")?;
+        let (socket, _) =
+            tungstenite::client(request, stream).context("Cline Hub WebSocket handshake failed")?;
 
         Ok(Self {
             socket,
@@ -242,26 +239,25 @@ impl HubClient {
             .with_context(|| format!("failed to send Cline Hub command {command}"))?;
 
         loop {
-            let frame = match self
-                .socket
-                .read()
-                .with_context(|| format!("failed while waiting for Cline Hub command {command}"))?
-            {
-                Message::Text(text) => serde_json::from_str::<serde_json::Value>(text.as_str())
-                    .context("Cline Hub returned invalid JSON")?,
-                Message::Binary(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .context("Cline Hub returned invalid binary JSON")?,
-                Message::Ping(bytes) => {
-                    self.socket
-                        .send(Message::Pong(bytes))
-                        .context("failed to answer Cline Hub ping")?;
-                    continue;
-                }
-                Message::Close(reason) => {
-                    anyhow::bail!("Cline Hub closed the connection: {reason:?}");
-                }
-                Message::Pong(_) | Message::Frame(_) => continue,
-            };
+            let frame =
+                match self.socket.read().with_context(|| {
+                    format!("failed while waiting for Cline Hub command {command}")
+                })? {
+                    Message::Text(text) => serde_json::from_str::<serde_json::Value>(text.as_str())
+                        .context("Cline Hub returned invalid JSON")?,
+                    Message::Binary(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .context("Cline Hub returned invalid binary JSON")?,
+                    Message::Ping(bytes) => {
+                        self.socket
+                            .send(Message::Pong(bytes))
+                            .context("failed to answer Cline Hub ping")?;
+                        continue;
+                    }
+                    Message::Close(reason) => {
+                        anyhow::bail!("Cline Hub closed the connection: {reason:?}");
+                    }
+                    Message::Pong(_) | Message::Frame(_) => continue,
+                };
 
             if frame.get("kind").and_then(serde_json::Value::as_str) != Some("reply") {
                 continue;
@@ -269,18 +265,12 @@ impl HubClient {
             let Some(reply) = frame.get("envelope").and_then(serde_json::Value::as_object) else {
                 continue;
             };
-            if reply
-                .get("requestId")
-                .and_then(serde_json::Value::as_str)
+            if reply.get("requestId").and_then(serde_json::Value::as_str)
                 != Some(request_id.as_str())
             {
                 continue;
             }
-            if reply
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                != Some("v1")
-            {
+            if reply.get("version").and_then(serde_json::Value::as_str) != Some("v1") {
                 anyhow::bail!("Cline Hub returned an incompatible reply protocol");
             }
             return Ok(reply.clone());
@@ -294,11 +284,7 @@ impl HubClient {
         session_id: Option<&str>,
     ) -> anyhow::Result<serde_json::Value> {
         let reply = self.command_reply(command, payload, session_id)?;
-        if reply
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
+        if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
             return Ok(reply
                 .get("payload")
                 .cloned()
@@ -345,11 +331,7 @@ impl HubClient {
             serde_json::json!({"sessionId": session_id}),
             Some(session_id),
         )?;
-        if reply
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true)
-        {
+        if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
             return Ok(true);
         }
         if reply
@@ -447,14 +429,20 @@ impl Cline {
 
     fn ensure_hub(binary: &Path, data_dir: &Path, cwd: &Path) -> anyhow::Result<HubDiscovery> {
         std::fs::create_dir_all(data_dir).with_context(|| {
-            format!("failed to create Cline data directory {}", data_dir.display())
+            format!(
+                "failed to create Cline data directory {}",
+                data_dir.display()
+            )
         })?;
         let output = Self::cli_command(binary, data_dir, cwd)
             .args(["hub", "ensure"])
             .output()
             .with_context(|| format!("failed to start {}", binary.display()))?;
         if !output.status.success() {
-            anyhow::bail!("Cline `hub ensure` failed: {}", Self::command_status(&output));
+            anyhow::bail!(
+                "Cline `hub ensure` failed: {}",
+                Self::command_status(&output)
+            );
         }
 
         let discovery_path = data_dir.join(HUB_DISCOVERY_PATH);
@@ -498,13 +486,16 @@ impl Cline {
         }
 
         let cwd = std::env::current_dir().context("could not determine a workspace for Cline")?;
-        let warnings = session.workspace.as_ref().map_or_else(Vec::new, |workspace| {
-            vec![format!(
-                "The source workspace {} does not exist; Cline imported the session into {}.",
-                workspace.display(),
-                cwd.display()
-            )]
-        });
+        let warnings = session
+            .workspace
+            .as_ref()
+            .map_or_else(Vec::new, |workspace| {
+                vec![format!(
+                    "The source workspace {} does not exist; Cline imported the session into {}.",
+                    workspace.display(),
+                    cwd.display()
+                )]
+            });
         Ok((cwd, warnings))
     }
 
@@ -926,9 +917,7 @@ impl Cline {
                         .filter(|id| !id.trim().is_empty())
                         .map(String::from)
                         .or_else(|| unmatched_calls.pop_front())
-                        .unwrap_or_else(|| {
-                            format!("ags-result-{message_index}-{result_index}")
-                        });
+                        .unwrap_or_else(|| format!("ags-result-{message_index}-{result_index}"));
                     if let Some(position) = unmatched_calls
                         .iter()
                         .position(|candidate| candidate == &call_id)
@@ -985,8 +974,10 @@ impl Cline {
     }
 
     fn read_current_session(path: &Path) -> anyhow::Result<CanonicalSession> {
-        let (_storage_root, session_id) = Self::current_session_from_path(path)
-            .ok_or_else(|| anyhow::anyhow!("not a current Cline session path: {}", path.display()))?;
+        let (_storage_root, session_id) =
+            Self::current_session_from_path(path).ok_or_else(|| {
+                anyhow::anyhow!("not a current Cline session path: {}", path.display())
+            })?;
         let root = Self::read_json(path)?;
         let items = root
             .as_array()

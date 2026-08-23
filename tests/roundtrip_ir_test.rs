@@ -100,20 +100,30 @@ fn claude_corpus() -> Vec<PathBuf> {
 
 /// Render `ir` as Codex and parse the result. `None` when the replay is empty.
 fn through_codex(ir: &SessionIr) -> Option<(SessionIr, Fidelity)> {
-    let rendered = codex_ir_write::render(ir, "roundtrip-session", chrono::Utc::now(), &ContextBudget::UNLIMITED)?;
+    let rendered = codex_ir_write::render(
+        ir,
+        "roundtrip-session",
+        chrono::Utc::now(),
+        &ContextBudget::UNLIMITED,
+    )?;
     Some((reparse(&rendered.lines, codex_ir::read), rendered.fidelity))
 }
 
 /// Render `ir` as Claude Code and parse the result.
 fn through_claude(ir: &SessionIr) -> Option<(SessionIr, Fidelity)> {
-    let rendered = claude_code_ir_write::render(ir, "roundtrip-session", chrono::Utc::now(), &ContextBudget::UNLIMITED)?;
-    Some((reparse(&rendered.lines, claude_code_ir::read), rendered.fidelity))
+    let rendered = claude_code_ir_write::render(
+        ir,
+        "roundtrip-session",
+        chrono::Utc::now(),
+        &ContextBudget::UNLIMITED,
+    )?;
+    Some((
+        reparse(&rendered.lines, claude_code_ir::read),
+        rendered.fidelity,
+    ))
 }
 
-fn reparse(
-    lines: &[String],
-    read: fn(&Path) -> anyhow::Result<SessionIr>,
-) -> SessionIr {
+fn reparse(lines: &[String], read: fn(&Path) -> anyhow::Result<SessionIr>) -> SessionIr {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     for line in lines {
         writeln!(file, "{line}").expect("write");
@@ -337,10 +347,11 @@ impl Tally {
             self.before, self.after, self.capsules_before, self.capsules_after
         );
         println!("  readable text blocks lost: {}", self.text_lost);
-        println!("  structured tool results: {} -> {}", self.structured_before, self.structured_after);
-        for (name, before, after) in [
-            ("kind", &self.kinds_before, &self.kinds_after),
-        ] {
+        println!(
+            "  structured tool results: {} -> {}",
+            self.structured_before, self.structured_after
+        );
+        for (name, before, after) in [("kind", &self.kinds_before, &self.kinds_after)] {
             let mut keys: Vec<&&str> = before.keys().chain(after.keys()).collect();
             keys.sort_unstable();
             keys.dedup();
@@ -547,7 +558,11 @@ fn codex_to_claude_loses_only_what_cannot_cross() {
         "reasoning and sealed context may cross-agent be lost; ordinary text may not"
     );
     assert_eq!(
-        tally.kinds_after.get("sealed_context").copied().unwrap_or(0),
+        tally
+            .kinds_after
+            .get("sealed_context")
+            .copied()
+            .unwrap_or(0),
         0,
         "Claude has no sealed-context record"
     );
@@ -767,13 +782,13 @@ fn claude_fixture_crosses_to_codex_with_its_tool_pairs_intact() {
     let source = claude_code_ir::read(&fixture("cc_real_world_sanitized.jsonl")).expect("parses");
     let (target, _) = through_codex(&source).expect("has a replay");
     let calls = |ir: &SessionIr| -> (usize, usize) {
-        ir.model_visible().iter().fold((0, 0), |(c, r), event| {
-            match &event.body {
+        ir.model_visible()
+            .iter()
+            .fold((0, 0), |(c, r), event| match &event.body {
                 Body::ToolCall { .. } => (c + 1, r),
                 Body::ToolResult { .. } => (c, r + 1),
                 _ => (c, r),
-            }
-        })
+            })
     };
     assert_eq!(
         calls(&source),
@@ -853,7 +868,11 @@ fn codex_write_session_ir_lands_where_codex_looks_for_it() {
 
     let source = synthetic(CODEX_ROLLOUT);
     let written = casr::providers::codex::Codex
-        .write_session_ir(&source, &WriteOptions { force: false }, &ContextBudget::UNLIMITED)
+        .write_session_ir(
+            &source,
+            &WriteOptions { force: false },
+            &ContextBudget::UNLIMITED,
+        )
         .expect("write")
         .expect("Codex is on the structured track");
 
@@ -899,16 +918,21 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
     let source =
         claude_code_ir::read(&fixture("cc_real_world_sanitized.jsonl")).expect("fixture parses");
     let written = casr::providers::claude_code::ClaudeCode
-        .write_session_ir(&source, &WriteOptions { force: false }, &ContextBudget::UNLIMITED)
+        .write_session_ir(
+            &source,
+            &WriteOptions { force: false },
+            &ContextBudget::UNLIMITED,
+        )
         .expect("write")
         .expect("Claude Code is on the structured track");
 
     let path = &written.written.paths[0];
-    let expected_dir = home.path().join("projects").join(
-        casr::providers::claude_code::project_dir_key(
-            source.workspace.cwd.as_deref().unwrap_or(Path::new("/tmp")),
-        ),
-    );
+    let expected_dir =
+        home.path()
+            .join("projects")
+            .join(casr::providers::claude_code::project_dir_key(
+                source.workspace.cwd.as_deref().unwrap_or(Path::new("/tmp")),
+            ));
     assert_eq!(path.parent(), Some(expected_dir.as_path()));
     assert_eq!(
         path.file_name().and_then(|name| name.to_str()),
@@ -917,7 +941,9 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
     assert_eq!(written.fidelity, Fidelity::ContextComplete);
     assert!(written.written.warnings.is_empty());
     assert!(
-        std::fs::read_to_string(path).expect("read back").ends_with('\n'),
+        std::fs::read_to_string(path)
+            .expect("read back")
+            .ends_with('\n'),
         "Claude Code appends to this file on resume; a missing final newline \
          corrupts its first appended record"
     );

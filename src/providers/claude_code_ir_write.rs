@@ -690,7 +690,9 @@ impl Writer {
                         (blocks, readable)
                     }
                     CapsuleKind::AnthropicThinkingSignature => (
-                        vec![json!({"type": "thinking", "thinking": thinking, "signature": sealed})],
+                        vec![
+                            json!({"type": "thinking", "thinking": thinking, "signature": sealed}),
+                        ],
                         false,
                     ),
                     // `keeps` returns true only for `CapsuleFit::SameVendor`, so
@@ -768,7 +770,10 @@ impl Writer {
             }
 
             Body::SealedContext { .. } => {
-                let kept = event.capsules.iter().any(|capsule| self.keeps(capsule, true));
+                let kept = event
+                    .capsules
+                    .iter()
+                    .any(|capsule| self.keeps(capsule, true));
                 if !kept && event.capsules.is_empty() {
                     self.dropped_history += 1;
                 }
@@ -1222,7 +1227,8 @@ mod tests {
         ]);
         source.origin.agent = "codex".into();
 
-        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay");
+        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED)
+            .expect("non-empty replay");
         assert_eq!(records(&out).len(), 1);
         assert_eq!(out.fidelity, Fidelity::ContextNoReasoning);
     }
@@ -1243,7 +1249,8 @@ mod tests {
         )]);
         source.origin.agent = "codex".into();
 
-        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay");
+        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED)
+            .expect("non-empty replay");
         let block = &records(&out)[0]["message"]["content"][0];
         assert_eq!(block["name"], json!("shell"), "the tool name is history");
         assert_eq!(block["input"], json!({"value": "ls -la"}));
@@ -1409,7 +1416,9 @@ mod tests {
         assert_eq!(content.as_array().expect("array").len(), 1, "{content}");
         assert_eq!(content[0]["type"], json!("text"));
         assert!(
-            !out.lines.iter().any(|line| line.contains("encrypted_content")),
+            !out.lines
+                .iter()
+                .any(|line| line.contains("encrypted_content")),
             "no line may carry the foreign block: {:?}",
             out.lines,
         );
@@ -1444,7 +1453,8 @@ mod tests {
         let mut source = ir(vec![sealed]);
         source.origin.agent = "codex".into();
 
-        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED).expect("non-empty replay");
+        let out = render(&source, "sid", Utc::now(), &ContextBudget::UNLIMITED)
+            .expect("non-empty replay");
         assert_eq!(
             out.fidelity,
             Fidelity::HistoryIncomplete,

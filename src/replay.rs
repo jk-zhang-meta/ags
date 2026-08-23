@@ -462,9 +462,11 @@ fn prune_forks(
         if !walked.insert(record) {
             break;
         }
-        let Some(ids) = records.get(record) else { break };
-        let reached_checkpoint = checkpoint_marker == Some(record)
-            || ids.iter().any(|id| checkpoint_ids.contains(id));
+        let Some(ids) = records.get(record) else {
+            break;
+        };
+        let reached_checkpoint =
+            checkpoint_marker == Some(record) || ids.iter().any(|id| checkpoint_ids.contains(id));
         keep.extend(ids.iter().copied());
         // Stop *at* the boundary. Everything the compaction kept is already in
         // `keep`; everything above it was superseded and must not be walked

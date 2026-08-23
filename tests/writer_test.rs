@@ -1352,7 +1352,9 @@ fn writer_chatgpt_refuses_default_and_force_without_creating_files() {
             .write_session(&simple_session(), &WriteOptions { force })
             .expect_err("ChatGPT target writes must fail closed");
         assert!(
-            error.to_string().contains("no supported session import path"),
+            error
+                .to_string()
+                .contains("no supported session import path"),
             "unexpected refusal: {error:#}"
         );
     }
@@ -2012,8 +2014,7 @@ fn writer_vibe_refuses_an_ambiguous_short_prefix_even_with_force() {
     let session = simple_session();
     let target_id = {
         let _env = EnvGuard::set("VIBE_HOME", probe.path());
-        Vibe
-            .write_session(&session, &WriteOptions { force: false })
+        Vibe.write_session(&session, &WriteOptions { force: false })
             .unwrap()
             .session_id
     };
@@ -2059,7 +2060,10 @@ fn writer_vibe_refuses_an_ambiguous_short_prefix_even_with_force() {
         .write_session(&session, &WriteOptions { force: true })
         .expect_err("--force must not overwrite or bless a short-id collision");
 
-    assert!(error.to_string().contains("short-id collision"), "{error:#}");
+    assert!(
+        error.to_string().contains("short-id collision"),
+        "{error:#}"
+    );
     assert_eq!(
         std::fs::read(collision_dir.join("messages.jsonl")).unwrap(),
         foreign_before,
@@ -2965,7 +2969,10 @@ mod structured_ir {
         .expect("renders");
 
         assert!(
-            !rendered.lines.iter().any(|line| line.contains(anthropic_blob)),
+            !rendered
+                .lines
+                .iter()
+                .any(|line| line.contains(anthropic_blob)),
             "an Anthropic blob written into a Codex rollout is bytes OpenAI must reject"
         );
 
@@ -3389,9 +3396,7 @@ mod structured_ir {
                     call_id: "c1".into(),
                     name: "shell".into(),
                     namespace: None,
-                    input: ToolInput::Freeform {
-                        text: "ls".into(),
-                    },
+                    input: ToolInput::Freeform { text: "ls".into() },
                 },
             ),
             event(
@@ -3407,9 +3412,13 @@ mod structured_ir {
             ),
         ];
 
-        let rendered =
-            codex_ir_write::render(&source, "sid", chrono::Utc::now(), &ContextBudget::UNLIMITED)
-                .expect("renders");
+        let rendered = codex_ir_write::render(
+            &source,
+            "sid",
+            chrono::Utc::now(),
+            &ContextBudget::UNLIMITED,
+        )
+        .expect("renders");
         let compacted: Value = rendered
             .lines
             .iter()

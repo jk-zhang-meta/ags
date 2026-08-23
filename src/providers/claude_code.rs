@@ -592,8 +592,12 @@ impl Provider for ClaudeCode {
         // casr's last line, corrupting it.
         let mut content = rendered.lines.join("\n");
         content.push('\n');
-        let outcome =
-            crate::pipeline::atomic_write(&target_path, content.as_bytes(), opts.force, self.slug())?;
+        let outcome = crate::pipeline::atomic_write(
+            &target_path,
+            content.as_bytes(),
+            opts.force,
+            self.slug(),
+        )?;
 
         info!(
             target_session_id,

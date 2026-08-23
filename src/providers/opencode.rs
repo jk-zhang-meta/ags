@@ -184,7 +184,8 @@ impl OpenCode {
             return Ok((workspace.clone(), Vec::new()));
         }
 
-        let cwd = std::env::current_dir().context("could not determine a workspace for OpenCode")?;
+        let cwd =
+            std::env::current_dir().context("could not determine a workspace for OpenCode")?;
         let warnings = session.workspace.as_ref().map_or_else(Vec::new, |workspace| {
             vec![format!(
                 "The source workspace {} does not exist; OpenCode imported the session into {}.",
@@ -209,10 +210,7 @@ impl OpenCode {
             "google"
         } else if lower.contains("grok") {
             "xai"
-        } else if lower.starts_with("gpt")
-            || lower.starts_with('o')
-            || lower.contains("codex")
-        {
+        } else if lower.starts_with("gpt") || lower.starts_with('o') || lower.contains("codex") {
             "openai"
         } else {
             "opencode"
@@ -1159,8 +1157,7 @@ impl Provider for OpenCode {
         session: &CanonicalSession,
         _opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
-        let binary = Self::binary_path()
-            .map_err(|_| anyhow::anyhow!("{OPENCODE_CLI_REQUIRED}"))?;
+        let binary = Self::binary_path().map_err(|_| anyhow::anyhow!("{OPENCODE_CLI_REQUIRED}"))?;
         let db_path = Self::write_db_path()?;
         let (workspace, warnings) = Self::workspace_for_write(session)?;
         if let Some(parent) = db_path.parent() {
@@ -1197,12 +1194,8 @@ impl Provider for OpenCode {
 
         if !output.status.success() {
             let import_error = Self::command_detail(&output);
-            let rollback = Self::delete_imported_session(
-                &binary,
-                &db_path,
-                &session_id,
-                &workspace,
-            );
+            let rollback =
+                Self::delete_imported_session(&binary, &db_path, &session_id, &workspace);
             return Err(match rollback {
                 Ok(()) => anyhow::anyhow!("OpenCode import failed: {import_error}"),
                 Err(error) => anyhow::anyhow!(
@@ -1211,16 +1204,11 @@ impl Provider for OpenCode {
             });
         }
 
-        let readback = Self::open_db(&db_path).and_then(|conn| {
-            Self::read_session_by_id(&conn, &db_path, &session_id)
-        });
+        let readback = Self::open_db(&db_path)
+            .and_then(|conn| Self::read_session_by_id(&conn, &db_path, &session_id));
         if let Err(read_error) = readback {
-            let rollback = Self::delete_imported_session(
-                &binary,
-                &db_path,
-                &session_id,
-                &workspace,
-            );
+            let rollback =
+                Self::delete_imported_session(&binary, &db_path, &session_id, &workspace);
             return Err(match rollback {
                 Ok(()) => anyhow::anyhow!(
                     "OpenCode imported session {session_id}, but its native store could not be read back: {read_error:#}; rollback succeeded"
@@ -1242,9 +1230,10 @@ impl Provider for OpenCode {
     }
 
     fn rollback_write(&self, written: &WrittenSession) -> anyhow::Result<()> {
-        let locator = written.paths.first().context(
-            "OpenCode rollback has no virtual session locator",
-        )?;
+        let locator = written
+            .paths
+            .first()
+            .context("OpenCode rollback has no virtual session locator")?;
         let (db_path, locator_session_id) = Self::parse_virtual_path(locator)
             .context("OpenCode rollback received an invalid virtual session locator")?;
         if locator_session_id != written.session_id {
@@ -1259,7 +1248,9 @@ impl Provider for OpenCode {
     }
 
     fn write_refusal(&self) -> Option<&'static str> {
-        Self::binary_path().is_err().then_some(OPENCODE_CLI_REQUIRED)
+        Self::binary_path()
+            .is_err()
+            .then_some(OPENCODE_CLI_REQUIRED)
     }
 
     fn resume_command(&self, session_id: &str) -> String {

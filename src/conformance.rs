@@ -148,7 +148,15 @@ pub fn run(tier: &str, files: &[PathBuf], sandbox: &Path) -> Report {
         let source_kinds = kinds_of(&ir, &plan);
 
         for &target in &providers {
-            cross(&mut report, source, target, path, &ir, &source_kinds, sandbox);
+            cross(
+                &mut report,
+                source,
+                target,
+                path,
+                &ir,
+                &source_kinds,
+                sandbox,
+            );
         }
     }
 
@@ -519,7 +527,11 @@ fn cross(
     // `resume` now passes — the caps are opt-in — so this is the ordinary path
     // and not a special case. The budget has its own tests, including that
     // `UNLIMITED` writes byte-identical output.
-    let written = match target.write_session_ir(ir, &WriteOptions { force: false }, &ContextBudget::UNLIMITED) {
+    let written = match target.write_session_ir(
+        ir,
+        &WriteOptions { force: false },
+        &ContextBudget::UNLIMITED,
+    ) {
         Ok(Some(written)) => written,
         Ok(None) => {
             report.finding(&format!(
@@ -593,7 +605,13 @@ fn cross(
     let derived = comparison.fidelity();
     let key = (source.slug().to_string(), target.slug().to_string());
     let tally = report.crossings.entry(key).or_default();
-    tally.add(&comparison, claimed, &written.losses, source_kinds, &kinds_of(&back, &back_plan));
+    tally.add(
+        &comparison,
+        claimed,
+        &written.losses,
+        source_kinds,
+        &kinds_of(&back, &back_plan),
+    );
 
     // The comparator's own two findings, in both directions.
     if !comparison.unexplained.is_empty() {
@@ -673,7 +691,11 @@ fn cross(
                 source.slug(),
                 path.display(),
                 written.losses.len(),
-                written.losses.first().map(|l| l.note.as_str()).unwrap_or("")
+                written
+                    .losses
+                    .first()
+                    .map(|l| l.note.as_str())
+                    .unwrap_or("")
             ));
         }
         if comparison.source_events != comparison.target_events
@@ -2180,7 +2202,12 @@ mod tests {
         let mut report = Report::new("unit", 1, &[] as &[&dyn Provider]);
         let counts = invariants(&mut report, Path::new("<unit>"), &ir, &plan);
 
-        assert_eq!(report.findings(), &[] as &[String], "{:?}", report.findings());
+        assert_eq!(
+            report.findings(),
+            &[] as &[String],
+            "{:?}",
+            report.findings()
+        );
         assert_eq!(counts.captured, 7);
         assert_eq!(counts.replayed, 1, "only the compaction's context survives");
         assert_eq!(counts.superseded, 1);

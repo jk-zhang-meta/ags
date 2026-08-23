@@ -2449,7 +2449,8 @@ mod tests {
 
         let registry = ProviderRegistry::default_registry();
 
-        let to_codex = store.best_source_for(&record, registry.find_by_slug("codex").unwrap(), &registry);
+        let to_codex =
+            store.best_source_for(&record, registry.find_by_slug("codex").unwrap(), &registry);
         assert_eq!(to_codex.target_vendor, Some("openai"));
         assert_eq!(
             to_codex.chosen().expect("a source").key,
@@ -2458,7 +2459,11 @@ mod tests {
         );
         assert_eq!(to_codex.chosen().unwrap().capsules.fitting(), 7);
 
-        let to_cc = store.best_source_for(&record, registry.find_by_slug("claude-code").unwrap(), &registry);
+        let to_cc = store.best_source_for(
+            &record,
+            registry.find_by_slug("claude-code").unwrap(),
+            &registry,
+        );
         assert_eq!(to_cc.target_vendor, Some("anthropic"));
         assert_eq!(
             to_cc.chosen().expect("a source").key,
@@ -2499,7 +2504,8 @@ mod tests {
             .expect("cache");
 
         let registry = ProviderRegistry::default_registry();
-        let choice = store.best_source_for(&record, registry.find_by_slug("codex").unwrap(), &registry);
+        let choice =
+            store.best_source_for(&record, registry.find_by_slug("codex").unwrap(), &registry);
         let line = choice.explain(Some(&cc_key));
         assert!(line.starts_with("source: codex 01J (origin;"), "got {line}");
         assert!(

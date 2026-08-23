@@ -113,10 +113,7 @@ impl Aider {
     /// working directory only when there is no repository at all.
     fn find_history_files() -> Vec<PathBuf> {
         let mut unreadable = Vec::new();
-        Self::history_files_from(
-            std::env::current_dir().ok().as_deref(),
-            &mut unreadable,
-        )
+        Self::history_files_from(std::env::current_dir().ok().as_deref(), &mut unreadable)
     }
 
     fn is_history_file_name(name: &str) -> bool {
@@ -580,9 +577,7 @@ impl Aider {
                 }
             } else {
                 if let Some(line) = text.lines().find(|line| {
-                    line.starts_with("# ")
-                        || line.starts_with("#### ")
-                        || line.starts_with("> ")
+                    line.starts_with("# ") || line.starts_with("#### ") || line.starts_with("> ")
                 }) {
                     anyhow::bail!(
                         "Aider's official history parser treats assistant line {line:?} as \
@@ -599,11 +594,7 @@ impl Aider {
         Ok(out)
     }
 
-    fn resume_spec_for_path(
-        session_id: &str,
-        history_path: &Path,
-        workspace: &Path,
-    ) -> LaunchSpec {
+    fn resume_spec_for_path(session_id: &str, history_path: &Path, workspace: &Path) -> LaunchSpec {
         LaunchSpec::new(
             "aider",
             [
@@ -760,8 +751,12 @@ impl Provider for Aider {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let root = Self::write_root()?;
-        std::fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create Aider history directory {}", root.display()))?;
+        std::fs::create_dir_all(&root).with_context(|| {
+            format!(
+                "failed to create Aider history directory {}",
+                root.display()
+            )
+        })?;
         let session_id = format!("ags-{}", uuid::Uuid::new_v4().simple());
         let target_path = root.join(format!(".aider.chat.history.{session_id}.md"));
         let workspace = session
@@ -837,8 +832,7 @@ impl Provider for Aider {
                 }
             };
             for session in Self::split_sessions(&content) {
-                let virtual_path =
-                    Self::virtual_session_path(history_file, &session.session_id);
+                let virtual_path = Self::virtual_session_path(history_file, &session.session_id);
                 listing.sessions.push((session.session_id, virtual_path));
             }
         }

@@ -1184,7 +1184,11 @@ mod tests {
             "claude-code",
             vec![
                 message("a", Role::User, "hi"),
-                message("m", Role::Assistant, "[converted by casr] history was sealed"),
+                message(
+                    "m",
+                    Role::Assistant,
+                    "[converted by casr] history was sealed",
+                ),
             ],
         );
 

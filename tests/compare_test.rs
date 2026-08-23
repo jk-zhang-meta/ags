@@ -126,7 +126,8 @@ fn crossing(source: &SessionIr, target: Agent) -> Option<(Comparison, Fidelity)>
         let rendered = codex_ir_write::render(source, session, now, &ContextBudget::UNLIMITED)?;
         (rendered.lines, rendered.fidelity)
     } else {
-        let rendered = claude_code_ir_write::render(source, session, now, &ContextBudget::UNLIMITED)?;
+        let rendered =
+            claude_code_ir_write::render(source, session, now, &ContextBudget::UNLIMITED)?;
         (rendered.lines, rendered.fidelity)
     };
 
@@ -245,7 +246,10 @@ impl Totals {
                 println!("  {name:<12} {kind:<16} {events:>7} event(s)");
             }
         }
-        println!("  foreign capsules carried across: {}", self.carried_foreign);
+        println!(
+            "  foreign capsules carried across: {}",
+            self.carried_foreign
+        );
         println!("  grade claimed by writer:   {:?}", self.claimed);
         println!("  grade the file supports:   {:?}", self.observed);
         if !self.overclaimed.is_empty() {

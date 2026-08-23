@@ -176,7 +176,10 @@ fn assert_target_refuses(
                 );
             }
             Ok(written) => {
-                panic!("[{label}] a refusing target unexpectedly wrote {:?}", written.paths)
+                panic!(
+                    "[{label}] a refusing target unexpectedly wrote {:?}",
+                    written.paths
+                )
             }
         }
     }
@@ -234,11 +237,8 @@ fn assert_aider_roundtrip(
         readback.messages.len(),
         "[{path_label}] Aider message count changed"
     );
-    for (index, (original, restored)) in original
-        .messages
-        .iter()
-        .zip(&readback.messages)
-        .enumerate()
+    for (index, (original, restored)) in
+        original.messages.iter().zip(&readback.messages).enumerate()
     {
         let expected_role = if original.role == MessageRole::Assistant {
             MessageRole::Assistant
@@ -400,12 +400,7 @@ fn opencode_without_cli_refuses_cc_as_a_target() {
     let _binary = EnvGuard::set("OPENCODE_BIN", &tmp.path().join("missing-opencode"));
 
     let original = read_cc_fixture("cc_simple");
-    assert_target_refuses(
-        &OpenCode,
-        &original,
-        "official `opencode` CLI",
-        "CC→Opc",
-    );
+    assert_target_refuses(&OpenCode, &original, "official `opencode` CLI", "CC→Opc");
     assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
 }
 
@@ -445,12 +440,7 @@ fn cline_refuses_cc_as_a_target() {
     let _binary = EnvGuard::set("CLINE_BIN", &tmp.path().join("missing-cline"));
 
     let original = read_cc_fixture("cc_simple");
-    assert_target_refuses(
-        &Cline,
-        &original,
-        "official `cline` CLI",
-        "CC→Cline",
-    );
+    assert_target_refuses(&Cline, &original, "official `cline` CLI", "CC→Cline");
     assert_eq!(
         std::fs::read_dir(tmp.path()).unwrap().count(),
         0,
@@ -1055,7 +1045,12 @@ fn openclaw_refuses_cc_as_a_target() {
     let _binary = EnvGuard::set("OPENCLAW_BIN", &tmp.path().join("missing-openclaw"));
 
     let original = read_cc_fixture("cc_simple");
-    assert_target_refuses(&OpenClaw, &original, "official `openclaw` CLI", "CC→OpenClaw");
+    assert_target_refuses(
+        &OpenClaw,
+        &original,
+        "official `openclaw` CLI",
+        "CC→OpenClaw",
+    );
     assert_eq!(
         std::fs::read_dir(tmp.path()).unwrap().count(),
         0,

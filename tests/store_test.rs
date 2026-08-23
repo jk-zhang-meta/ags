@@ -832,7 +832,8 @@ fn an_archived_origin_is_still_selectable_after_its_live_file_is_gone() {
     );
     let chosen = choice.resolve(Some(&cc_key)).expect("a source");
     assert_eq!(
-        chosen.key, codex_key,
+        chosen.key,
+        codex_key,
         "converting back to codex has to read the archive, not the derivative: {}",
         choice.explain(Some(&cc_key))
     );

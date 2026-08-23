@@ -504,7 +504,10 @@ fn an_archived_origin_is_what_the_second_hop_reads_once_the_rollout_is_gone() {
     let origin = tmp.path().join("rollout.jsonl");
     std::fs::copy(fixture(CODEX_WITH_CAPSULES), &origin).expect("copy the fixture");
     let origin_capsules = capsules_in("codex", &origin);
-    assert!(origin_capsules > 0, "the fixture must carry sealed material");
+    assert!(
+        origin_capsules > 0,
+        "the fixture must carry sealed material"
+    );
 
     let stored = pipeline(Some(
         Store::open_at(tmp.path().join("store")).expect("open store"),
@@ -535,7 +538,8 @@ fn an_archived_origin_is_what_the_second_hop_reads_once_the_rollout_is_gone() {
     let selection = second.source.as_ref().expect("a reported source");
     let chosen = selection.chosen().expect("a chosen source");
     assert_eq!(
-        chosen.key, codex_key,
+        chosen.key,
+        codex_key,
         "the archive is still the best source for a codex target: {}",
         selection.line()
     );

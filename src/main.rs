@@ -917,8 +917,16 @@ fn fetch_pool_accounts() -> anyhow::Result<Vec<serde_json::Value>> {
         // 端口时不跟随会让这个调用静默失效。`--proto-redir` 封死降级到明文——
         // 请求里带着池子的密钥。
         .args([
-            "-sS", "--max-time", "10", "-X", "POST",
-            "-L", "--proto-redir", "=https", "--max-redirs", "3",
+            "-sS",
+            "--max-time",
+            "10",
+            "-X",
+            "POST",
+            "-L",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "3",
         ])
         .arg("-H")
         .arg(format!("X-Codex-Pool-Token: {key}"))
