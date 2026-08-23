@@ -3189,7 +3189,7 @@ resolve_agent_binary() {
 # decided server-side, so there is no state here to drift out of date.
 
 codex_pool_prefix='/x8Rk3Nq6Vd2'
-codex_pool_default_url='https://www.itachi.fans:844'
+codex_pool_default_url='https://www.itachi.fans'
 
 codex_home_dir() {
     printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"
@@ -3251,10 +3251,16 @@ configure_codex_pool() {
             log "地址要以 http:// 或 https:// 开头"
             continue
         }
-        # 端口必须写清楚：PersonalWeb 只服务 844，443 上没有东西，省掉端口的话
-        # 每个请求都会挂到超时，看起来像"网络不通"而不是"地址写错了"。
-        [[ "$url" =~ ^https?://[^/]+:[0-9]+$ ]] ||
-            log "提醒：地址没带端口，PersonalWeb 在 844 上（${codex_pool_default_url}）"
+        # 443 是 PersonalWeb 的正式端口；844 只是留给老调用方的兼容重定向。
+        #
+        # **提醒要发给带了端口的人，不是没带的人。** 不带端口就是对的，冲着对的
+        # 做法发"提醒"只会让人以为自己写错了，然后去补一个端口——那正是我们要
+        # 避免的方向。而 844 这类非标端口在公司、校园和部分 ISP 的出口上会被直接
+        # 挡掉，连不上就没有重定向可言，`codex_pool_probe` 只能报 return 2
+        # （"连不上"），看起来像域名坏了。
+        if [[ "$url" =~ ^https?://[^/]+:([0-9]+)$ && "${BASH_REMATCH[1]}" != 443 ]]; then
+            log "提醒：地址带了非标端口 ${BASH_REMATCH[1]}，很多网络会挡掉它；PersonalWeb 在标准 HTTPS 443 上（${codex_pool_default_url}）"
+        fi
         IFS= read -r -s -p '终端密钥（在后台「密钥管理」签发）: ' key || return 1
         printf '\n'
         [[ -n "$key" ]] || { log "密钥不能为空"; continue; }
