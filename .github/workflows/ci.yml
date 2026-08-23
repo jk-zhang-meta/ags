@@ -17,7 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `components` 必须显式写出来：这个 action 默认装 minimal profile，只有
+      # rustc 和 cargo。少了它，下面的 `cargo fmt --check` 会以
+      # "'cargo-fmt' is not installed for the toolchain 'nightly-…'" 失败——
+      # 那是 CI 自己坏了，不是代码有问题，而它长得像后者。这个仓库因此连续红了
+      # 至少 6 个提交，等于一直没有 CI。
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
 
