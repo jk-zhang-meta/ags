@@ -7005,14 +7005,20 @@ run_summary_model() {
     printf '%s\n' "$answer"
 }
 
-# 一句话最多多少个字符。
+# 让模型往多少字上收。
 #
-# 这一列和工作区、时间挤在一行里，长了就把别的挤掉；而"认出是哪条会话"这件事本来
-# 也不需要一整句话。模型有时候不听长度要求，所以拿到之后还要自己截一刀。
+# 这是**给模型的目标**，不是显示宽度。两者必须分开：显示宽度由终端决定、每次都
+# 可能不一样，而总结是**存下来**的——按某一次的终端宽度砍完存进去，换一个更宽的
+# 终端也长不回来了。所以这里只要求"短"，砍到具体宽度那一刀交给表格渲染去做。
 ags_summary_max_chars() {
     local limit="${AGS_SUMMARY_MAX_CHARS:-24}"
     [[ "$limit" =~ ^[1-9][0-9]{0,2}$ ]] || limit=24
     printf '%s\n' "$limit"
+}
+
+# 存进注解的硬上限。只防"模型答了一整段"，不是排版。
+ags_summary_store_limit() {
+    printf '%s\n' "$(( $(ags_summary_max_chars) * 3 ))"
 }
 
 summary_prompt() {
@@ -7052,11 +7058,13 @@ ensure_session_summary() {
     [[ -n "${digest//[[:space:]]/}" ]] || return 1
     limit="$(ags_summary_max_chars)"
     answer="$(run_summary_model "$(summary_prompt "$limit" "$digest")")" || return 1
-    # 模型不听话是常事，长度这一刀必须自己补。用 bash 的子串而不是 `cut -c` 或
-    # `awk substr`：那两个在这台机器上按字节算，一刀会切在一个汉字中间。这个文件
-    # 里 `workspace_cell` 截工作区路径用的也是同一种写法。
-    if (( ${#answer} > limit )); then
-        answer="${answer:0:${limit}}"
+    # 只在模型答了一整段时兜底截一刀，**不按显示宽度砍**——存下来的东西要能在更宽
+    # 的终端里显示得更全。用 bash 的子串而不是 `cut -c` 或 `awk substr`：那两个在
+    # 这台机器上按字节算，一刀会切在一个汉字中间。
+    local store_limit
+    store_limit="$(ags_summary_store_limit)"
+    if (( ${#answer} > store_limit )); then
+        answer="${answer:0:${store_limit}}"
     fi
     [[ -n "${answer//[[:space:]]/}" ]] || return 1
     write_session_summary "$provider" "$session_id" "$answer" "$stamp" || return 1
@@ -7146,7 +7154,13 @@ native_session_limit() {
 
 # 原生会话，最近的在前。
 #
-# 输出：provider \t session_id \t 时间 \t 工作区 \t 标题 \t 路径
+# 字段用 `\x1f`（US）分隔，**不用制表符**。bash 把制表符算作 IFS 空白字符，于是
+# `IFS=$'\t' read` 把连续的制表符当成一个分隔符——一个空字段（Codex 没有
+# `native_name`，那一列就是空的）会直接消失，后面所有字段整体左移一位。表现是
+# 描述那列显示成了标题、标题列显示成了路径，而且不报任何错。`\x1f` 不是 IFS 空白
+# 字符，空字段照样保留。
+#
+# 输出：provider · session_id · 时间 · 工作区 · Agent 自己起的名字 · 标题 · 路径
 #
 # 排序在 jq 里做而不是交给 `sort`：`casr list` 是按 provider 分组各自截断的，跨
 # provider 的先后只有把两边合起来看才成立。
@@ -7192,11 +7206,12 @@ native_session_rows() {
             | [ .provider,
                 .session_id,
                 (if ._when > 0 then (._when / 1000 | floor | strflocaltime("%m-%d %H:%M")) else "" end),
-                ((.workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
-                (((.native_name // .title) // "") | display_line),
+                ((.workspace // .workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
+                ((.native_name // "") | tostring | gsub("[\t\r\n]"; " ")),
+                ((.title // "") | display_line),
                 ((.path // "") | tostring)
               ]
-            | @tsv' 2>/dev/null
+            | map(tostring) | join("\u001f")' 2>/dev/null
 }
 
 # provider slug -> AGS 自己会启动的那两个 Agent 的名字。
@@ -7270,7 +7285,7 @@ workspace_cell() {
 
 load_native_session_menu() {
     local include_archives="${1:-0}" for_menu="${2:-1}" table_width
-    local provider session_id when workspace title path
+    local provider session_id when workspace native_name title path
     table_width="$(terminal_width)"
     local checkpoint_id agent saved_date description selector args
     local marker kind label_id archive_agent
@@ -7285,13 +7300,14 @@ load_native_session_menu() {
     # 先把整批读进来：短号要一次性发完（一次写，不是几十次），而每行显示什么也
     # 要等这一批都在手里才定得下来。
     local -a live_provider=() live_id=() live_when=() live_workspace=() live_title=()
-    local -a live_path=() live_key=()
-    while IFS=$'\t' read -r provider session_id when workspace title path; do
+    local -a live_path=() live_key=() live_native=()
+    while IFS=$'\x1f' read -r provider session_id when workspace native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
         live_provider+=("$provider")
         live_id+=("$session_id")
         live_when+=("$when")
         live_workspace+=("$workspace")
+        live_native+=("$native_name")
         live_title+=("$title")
         live_path+=("$path")
         live_key+=("$provider/$session_id")
@@ -7305,6 +7321,7 @@ load_native_session_menu() {
         session_id="${live_id[$index]}"
         when="${live_when[$index]}"
         workspace="${live_workspace[$index]}"
+        native_name="${live_native[$index]}"
         title="${live_title[$index]}"
         read_session_annotation "$provider" "$session_id"
         marker=' '
@@ -7316,9 +7333,13 @@ load_native_session_menu() {
         terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
         terminal_menu_args+=("$annotation_args")
         terminal_menu_details+=("$(format_launch_args "$annotation_args")")
-        # 人写的 > 模型总结的 > Agent 自己起的名字或第一句话。模型不该有机会盖掉
-        # 人亲手起的名字，而 `title` 是原话的第一行、不是概括，所以排在最后。
-        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${annotation_summary:-$title}}")
+        # 人写的 > Agent 自己起的 > 我们总结的 > 原话第一行。
+        #
+        # Agent 自己起的名字排在我们的总结**前面**：那一份是它在会话里边干边起的，
+        # 通常更准，而且不花钱。顺序反过来的话，`ags summarize --force` 会给一条
+        # 本来就有好名字的 Claude 会话生成一份总结，然后**永久压住**那个好名字。
+        # `title` 是原话的第一行、不是概括，所以垫底。
+        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${native_name:-${annotation_summary:-$title}}}")
     done
 
     if (( include_archives == 1 )); then
@@ -7563,16 +7584,17 @@ split_live_selector() {
 # 继续用标题而已。
 summarize_native_sessions() {
     local force="${1:-0}"
-    local provider session_id when workspace title path
-    local made=0 kept=0 failed=0 native_name
-    local -a queue_provider=() queue_id=() queue_path=() queue_title=()
+    local provider session_id when workspace native_name title path
+    local made=0 kept=0 failed=0
+    local -a queue_provider=() queue_id=() queue_path=() queue_title=() queue_native=()
     need jq
-    while IFS=$'\t' read -r provider session_id when workspace title path; do
+    while IFS=$'\x1f' read -r provider session_id when workspace native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
         queue_provider+=("$provider")
         queue_id+=("$session_id")
         queue_path+=("$path")
         queue_title+=("$title")
+        queue_native+=("$native_name")
     done < <(native_session_rows)
     (( ${#queue_id[@]} > 0 )) || { log "没有会话"; return 0; }
     log "总结 ${#queue_id[@]} 条会话（已有的跳过）…"
@@ -7580,9 +7602,9 @@ summarize_native_sessions() {
     for index in "${!queue_id[@]}"; do
         provider="${queue_provider[$index]}"
         session_id="${queue_id[$index]}"
-        # Agent 自己起过名字的不必再花一次模型调用。`native_session_rows` 已经把
-        # `native_name` 和 `title` 合成一列了，所以这里单独问一次 casr。
-        native_name="$(native_session_name "$provider" "$session_id" "${queue_path[$index]}")"
+        # 名字直接从行里取。以前这里为每条会话单独跑一次 `casr info`——上百条会话
+        # 就是上百次进程启动，而这个值列表本来就已经拿到了。
+        native_name="${queue_native[$index]}"
         read_session_annotation "$provider" "$session_id"
         if [[ -n "$annotation_description" ]] ||
            { (( force == 0 )) && [[ -n "$native_name" ]]; }; then
@@ -8085,7 +8107,7 @@ gc_candidate_rows() {
             | [ .provider,
                 .session_id,
                 (((.last_active_at // .started_at // 0) | floor) | tostring),
-                ((.workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
+                ((.workspace // .workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
                 (((.native_name // .title) // "") | tostring | gsub("[\t\r\n]"; " ")),
                 ((.path // "") | tostring)
               ]
