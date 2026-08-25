@@ -63,7 +63,8 @@ cat > "$ags_zone_home/bin/codext" <<'AGS_ZONE_FAKE'
   echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
 } > "$AGS_ZONE_OUT"
 AGS_ZONE_FAKE
-mkdir -p "$ags_zone_home/nopool"
+mkdir -p "$ags_zone_home/nopool" "$ags_zone_home/home" \
+    "$ags_zone_home/store" "$ags_zone_home/state"
 cp "$ags_zone_home/bin/codext" "$ags_zone_home/bin/claude"
 chmod +x "$ags_zone_home/bin/codext" "$ags_zone_home/bin/claude"
 
@@ -77,10 +78,24 @@ ags_zone_launch() {
     # `zone@example.com` 去真池子里查，查不到就拒绝启动——这些用例测的是参数归属，
     # 不该依赖任何人的真实凭据，更不该因为网络通不通而时红时绿（实测遇到过：同一
     # 份代码，连不上池子时全绿，连上时红）。
+    #
+    # `HOME` 和存储也一样要隔离，而且理由更硬：启动前会走
+    # `prepare_storage_for_launch`，它在没有配置过存储的机器上直接
+    # `no storage configured; run ags init` 退出——假 Agent 根本不会被执行，
+    # 于是 `ARGS` 是空的，报出来的却是"参数没传到"。
+    #
+    # 在**开发者自己的机器上看不出来**：那里早就 `ags init` 过了，读到的是真实的
+    # `$HOME`，于是全绿。CI 的 runner 是干净的，所以这几条在 CI 上从第一条起就红，
+    # 而且红的是一个和存储毫无关系的断言。这正是本文件开头那段注释说的
+    # "不该依赖任何人的真实状态"，只是当时只堵了 `CODEX_HOME` 一个口子。
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
         AGENT_SESSION_CLAUDE_BINARY="$ags_zone_home/bin/claude" \
         AGS_UPDATE_CHECK=0 \
+        HOME="$ags_zone_home/home" \
         CODEX_HOME="$ags_zone_home/nopool" \
+        AGENT_SESSION_STORAGE_MODE=local \
+        AGENT_SESSION_LOCAL_DIR="$ags_zone_home/store" \
+        AGENT_SESSION_STATE_DIR="$ags_zone_home/state" \
         AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>&1 || return $?
     cat "$out"
 }
@@ -218,6 +233,8 @@ ags_pick_account_json() {
     printf ']}}\n'
 } > "$ags_pick_home/two.json"
 
+mkdir -p "$ags_pick_home/home" "$ags_pick_home/store" "$ags_pick_home/state"
+
 # `read < /dev/tty` 要一个真的终端，所以借 `script` 开一个 pty，把答案从它的标准
 # 输入喂进去。
 #
@@ -234,6 +251,10 @@ ags_pick_run() {
     AGS_UPDATE_CHECK=0 \
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
     CODEX_HOME="$ags_pick_home/codex" \
+    HOME="$ags_pick_home/home" \
+    AGENT_SESSION_STORAGE_MODE=local \
+    AGENT_SESSION_LOCAL_DIR="$ags_pick_home/store" \
+    AGENT_SESSION_STATE_DIR="$ags_pick_home/state" \
     PATH="$ags_pick_home/bin:$PATH" \
         script -qec "$tool --pick-account codex" /dev/null \
         <<< "$answers"$'\n' >/dev/null 2>&1 || true
@@ -270,7 +291,8 @@ ags_pick_expect 'a still-available account is not re-picked' a@x.com \
 # 以前这里问的是"标签页叫什么"，答案用完即弃；保存时再起一个 ID。于是同一条工作线
 # 有两个名字，而后台看到的第三个（一串哈希）两个都不是。
 ags_sid_home="$(mktemp -d "$tmp/ags-sid.XXXXXX")"
-mkdir -p "$ags_sid_home/bin" "$ags_sid_home/codex" "$ags_sid_home/work/Proj"
+mkdir -p "$ags_sid_home/bin" "$ags_sid_home/codex" "$ags_sid_home/work/Proj" \
+    "$ags_sid_home/home" "$ags_sid_home/store" "$ags_sid_home/state"
 printf '{"base_url":"http://pool.invalid","key":"k"}\n' > "$ags_sid_home/codex/pool.json"
 cat > "$ags_sid_home/bin/codext" <<'AGS_SID_FAKE'
 #!/bin/sh
@@ -291,6 +313,10 @@ ags_sid_launch() {
         AGENT_SESSION_CODEX_BINARY="$ags_sid_home/bin/codext" \
         AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_sid_home/codex" \
+        HOME="$ags_sid_home/home" \
+        AGENT_SESSION_STORAGE_MODE=local \
+        AGENT_SESSION_LOCAL_DIR="$ags_sid_home/store" \
+        AGENT_SESSION_STATE_DIR="$ags_sid_home/state" \
             "$tool" codex "$@" >/dev/null 2>&1 </dev/null
     ) || true
     [[ -s "$ags_sid_home/out" ]] && tr -d '\r' < "$ags_sid_home/out"
@@ -386,7 +412,8 @@ ags_sid_refuse 'an empty id refuses the launch' --id ''
 # 会让两个会话争同一条租约行。
 ags_sidpool_home="$(mktemp -d "$tmp/ags-sidpool.XXXXXX")"
 mkdir -p "$ags_sidpool_home/bin" "$ags_sidpool_home/codex" \
-         "$ags_sidpool_home/work/Proj"
+         "$ags_sidpool_home/work/Proj" \
+    "$ags_sidpool_home/home" "$ags_sidpool_home/store" "$ags_sidpool_home/state"
 printf '{"base_url":"http://pool.invalid","key":"k"}\n' \
     > "$ags_sidpool_home/codex/pool.json"
 cat > "$ags_sidpool_home/bin/codext" <<'AGS_SIDPOOL_FAKE'
@@ -416,6 +443,10 @@ ags_sidpool_run() {
         AGENT_SESSION_CODEX_BINARY="$ags_sidpool_home/bin/codext" \
         AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_sidpool_home/codex" \
+        HOME="$ags_sidpool_home/home" \
+        AGENT_SESSION_STORAGE_MODE=local \
+        AGENT_SESSION_LOCAL_DIR="$ags_sidpool_home/store" \
+        AGENT_SESSION_STATE_DIR="$ags_sidpool_home/state" \
         PATH="$ags_sidpool_home/bin:$PATH" \
             "$tool" codex "$@" </dev/null 2>&1
     ) | tr -d '\r'
@@ -495,7 +526,8 @@ ags_save_expect 'a session AGS did not start still names its id' \
 # 号。冷却中、被别的密钥占着一律不拦：点名是强首选而不是唯一选项，回落公共池继续
 # 干活是设计如此。
 ags_pf_home="$(mktemp -d "$tmp/ags-pf.XXXXXX")"
-mkdir -p "$ags_pf_home/bin" "$ags_pf_home/codex" "$ags_pf_home/work/Proj"
+mkdir -p "$ags_pf_home/bin" "$ags_pf_home/codex" "$ags_pf_home/work/Proj" \
+    "$ags_pf_home/home" "$ags_pf_home/store" "$ags_pf_home/state"
 printf '{"base_url":"http://pool.invalid","key":"k"}\n' > "$ags_pf_home/codex/pool.json"
 cat > "$ags_pf_home/bin/codext" <<'AGS_PF_FAKE'
 #!/bin/sh
@@ -528,6 +560,10 @@ ags_pf_run() {
         AGENT_SESSION_CODEX_BINARY="$ags_pf_home/bin/codext" \
         AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_pf_home/codex" \
+        HOME="$ags_pf_home/home" \
+        AGENT_SESSION_STORAGE_MODE=local \
+        AGENT_SESSION_LOCAL_DIR="$ags_pf_home/store" \
+        AGENT_SESSION_STATE_DIR="$ags_pf_home/state" \
         PATH="$ags_pf_home/bin:$PATH" \
             script -qec "$tool --account a@x.com,b@y.com codex" /dev/null \
             <<< $'\n' >/dev/null 2>&1
@@ -613,7 +649,8 @@ ags_upd_run() {
     exit 1
 }
 
-# `ls` 是 `list` 的别名，四处 list 子命令都认。
+# `ls` 和 `list` 是同一个命令：列 Agent 自己的会话。存档是另一个命令
+# （`ags archives`），两者列的是不同的东西，所以这里只比 `ls` 和 `list`。
 "$tool" ls --help >/dev/null 2>&1 || true
 [[ "$("$tool" ls 2>&1 | head -1)" == "$("$tool" list 2>&1 | head -1)" ]] || {
     printf 'ags ls: must behave like ags list\n' >&2
@@ -2217,7 +2254,7 @@ age_checkpoint_path="$(sed -n 's/^path=//p' <<< "$age_checkpoint_output")"
 age -d -i "$init_identity" "$age_checkpoint_path" | tar -tzf - | grep -Fqx manifest
 env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
     -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
-    "${age_env[@]}" "$tool" list | grep -Fq 'Native age identity'
+    "${age_env[@]}" "$tool" archives | grep -Fq 'Native age identity'
 env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
     -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
     "${age_env[@]}" "$tool" show age-only | grep -Eq '^ID +age-only$'
@@ -2274,13 +2311,13 @@ env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
 run_clean_init "$legacy_init_home" >/dev/null 2>&1
 env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
     -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
-    "${legacy_init_env[@]}" "$tool" list | grep -Fq 'Legacy SSH identity'
+    "${legacy_init_env[@]}" "$tool" archives | grep -Fq 'Legacy SSH identity'
 env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
     -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
     "${legacy_init_env[@]}" "$tool" show legacy-before-init |
     grep -Eq '^ID +legacy-before-init$'
 
-if env "${source_env[@]}" "$tool" list >/dev/null 2>&1; then
+if env "${source_env[@]}" "$tool" archives >/dev/null 2>&1; then
     echo 'list accepted missing storage configuration' >&2
     exit 1
 fi
@@ -2441,7 +2478,7 @@ grep -Fqx \
     "$(sha256sum "$tmp/source/codex/$session_rel" | cut -d' ' -f1)"$'\t'"$(stat -c %s "$tmp/source/codex/$session_rel")"$'\t'"$session_rel"$'\t'"$codex_mode"$'\t'"$codex_mtime" \
     "$tmp/extracted/codex/artifacts.tsv"
 
-checkpoint_list="$(env "${source_env[@]}" "$tool" list)"
+checkpoint_list="$(env "${source_env[@]}" "$tool" archives)"
 grep -Eq '^ID +AGENT +SAVED +DESCRIPTION$' <<< "$checkpoint_list"
 [[ "$checkpoint_list" != *$'\t'* ]]
 grep -Eq '^sat-index +CODEX +[^ ]+ +SAT 抽取索引$' <<< "$checkpoint_list"
@@ -2449,7 +2486,7 @@ grep -Eq '^sat-index +CODEX +[^ ]+ +SAT 抽取索引$' <<< "$checkpoint_list"
 [[ "$checkpoint_list" != *"$tmp/home/.local/bin/codex"* ]]
 [[ "$checkpoint_list" != *"$tmp/work"* ]]
 for terminal_width in 80 120; do
-    width_list="$(env "${source_env[@]}" COLUMNS="$terminal_width" "$tool" list)"
+    width_list="$(env "${source_env[@]}" COLUMNS="$terminal_width" "$tool" archives)"
     (( $(LC_ALL="$test_utf8_locale" wc -L <<< "$width_list") <= terminal_width ))
     [[ "$(grep -Ec '^ID +AGENT +SAVED +DESCRIPTION$' <<< "$width_list")" == 1 ]]
     [[ "$(grep -Ec '^list-layout +CODEX +' <<< "$width_list")" == 1 ]]
@@ -2474,7 +2511,7 @@ EOF
         printf -v pty_command '%q ' \
             env "${source_env[@]}" \
             AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
-            "$tmp/stty-guard" "$tool" list
+            "$tmp/stty-guard" "$tool" archives
         printf '%s' "$input" | \
             SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
                 > "$output" 2>&1
@@ -3654,7 +3691,7 @@ grep -Fqx "agent_binary=$tmp/vanishing-bin/codex" <<< "$vanishing_pending"
 rm -f -- "$tmp/vanishing-bin/codex"
 printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
     env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" "$tool" hook
-vanishing_list="$(env "${source_env[@]}" "$tool" list)"
+vanishing_list="$(env "${source_env[@]}" "$tool" archives)"
 grep -Eq '^vanishing-binary +CODEX +' <<< "$vanishing_list"
 vanishing_show="$(env "${source_env[@]}" "$tool" show vanishing-binary)"
 grep -Eq "^Binary invoked +$tmp/vanishing-bin/codex$" <<< "$vanishing_show"
@@ -4120,7 +4157,7 @@ ssh-keygen -y -f "$tmp/key" > "$tmp/legacy-recipient.pub"
 tar -C "$legacy_payload" -czf - manifest session.jsonl | \
     age -R "$tmp/legacy-recipient.pub" \
         -o "$tmp/local-checkpoints/codex/$legacy_id.checkpoint.tar.gz.age"
-legacy_list="$(env "${source_env[@]}" "$tool" list)"
+legacy_list="$(env "${source_env[@]}" "$tool" archives)"
 grep -Fq "$legacy_id" <<< "$legacy_list"
 grep -Fq '旧版检查点' <<< "$legacy_list"
 grep -Eq '^sat-index +CODEX +' <<< "$legacy_list"
@@ -4157,7 +4194,7 @@ tar -C "$legacy_payload" -czf - manifest session.jsonl | \
 tar -C "$legacy_payload" -czf - manifest session.jsonl | \
     age -R "$tmp/legacy-recipient.pub" \
         -o "$tmp/local-checkpoints/codex/$collision_record_id.checkpoint.tar.gz.age"
-[[ "$(env "${source_env[@]}" "$tool" list | grep -Ec '^collision +CODEX +')" == 2 ]]
+[[ "$(env "${source_env[@]}" "$tool" archives | grep -Ec '^collision +CODEX +')" == 2 ]]
 if env "${source_env[@]}" "$tool" resume "$collision_id" \
     >"$tmp/collision.out" 2>"$tmp/collision.err"; then
     echo 'resume allowed a format 2/3 logical-ID collision' >&2
@@ -4274,12 +4311,12 @@ startup_path="$(sed -n 's/^path=//p' <<< "$startup_output")"
 printf '%s\n' '{"hook_event_name":"SessionStart","session_id":"99999999-9999-4999-8999-999999999999"}' | \
     env "${source_env[@]}" "$tool" hook
 [[ -f "$startup_path" ]]
-env "${source_env[@]}" "$tool" list | grep -Fq "$startup_id"
+env "${source_env[@]}" "$tool" archives | grep -Fq "$startup_id"
 delete_output="$(env "${source_env[@]}" "$tool" delete "$startup_id")"
 grep -Fqx 'status=deleted' <<< "$delete_output"
 recoverable_path="$(sed -n 's/^recoverable_path=//p' <<< "$delete_output")"
 [[ -f "$recoverable_path" && ! -e "$startup_path" ]]
-! env "${source_env[@]}" "$tool" list | grep -Fq "$startup_id"
+! env "${source_env[@]}" "$tool" archives | grep -Fq "$startup_id"
 
 cloud_delete="$(env "${source_env[@]}" "$tool" cloud delete "$cloud_id")"
 grep -Fqx 'status=deleted' <<< "$cloud_delete"
@@ -4583,7 +4620,7 @@ grep -Fqx 'status=synchronized' <<< "$tombstone_pull"
 [[ -f "$tmp/sync-b/local/tombstones/codex/$sync_record_id.tombstone" ]]
 find "$tmp/sync-b/state/trash/sync/codex" -type f \
     -name "$sync_record_id.checkpoint.tar.gz.age.deleted.*" | grep -q .
-! env "${sync_b_env[@]}" "$tool" list | grep -Fq active-window
+! env "${sync_b_env[@]}" "$tool" archives | grep -Fq active-window
 
 mv -- "$tmp/git/records.git" "$tmp/git/records.offline.git"
 if pending_delete="$(env "${sync_a_env[@]}" "$tool" delete auto-git \

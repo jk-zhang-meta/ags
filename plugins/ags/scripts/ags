@@ -36,6 +36,7 @@ declare -a terminal_menu_ids=() terminal_menu_labels=()
 declare -a terminal_menu_args=() terminal_menu_details=()
 terminal_menu_selected=
 terminal_menu_selected_args='[]'
+terminal_menu_agents=()
 terminal_menu_header=
 terminal_menu_notice=
 ags_state_lock_depth=0
@@ -98,12 +99,14 @@ init_terminal_style() {
     style_reset= style_dim= style_bold= style_accent= style_select=
     style_pointer='> ' style_rule='-' style_separator='  ' style_more='...'
     style_hint_move='Up/Down move' style_hint_open='Enter open'
+    style_hint_page='Left/Right page'
     if [[ -n "$(resolve_utf8_locale || true)" ]]; then
         style_pointer='❯ '
         style_rule='─'
         style_separator='   '
         style_more='⋯'
         style_hint_move='↑↓ move'
+        style_hint_page='←→ page'
         style_hint_open='⏎ open'
     fi
     [[ -z "${NO_COLOR:-}" && -t 1 && "${TERM:-dumb}" != dumb ]] || return 0
@@ -202,9 +205,10 @@ usage() {
   ags                          接上最近还活着的会话
   ags codex [--id 名字]        起一个 Codex 会话
   ags claude [--id 名字]       起一个 Claude 会话
-  ags ls                       列出检查点，挑一个打开
-  ags save "描述"              保存当前这个会话
-  ags resume ID                恢复一个检查点
+  ags ls [-a]                  列出会话，挑一个接着干（-a 连存档一起列）
+  ags summarize                调模型给会话起名，列表里才认得出来（--force 重算）
+  ags save "描述"              把这个会话导出成一份存档
+  ags resume N|ID              接着第 N 号会话干，或者打开一份存档
   ags update                   更新到最新版
 
   给 Agent 的参数写在 -- 之后：ags codex -- --model o3
@@ -228,16 +232,57 @@ Usage:
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
   ags set ABSOLUTE_DIR                 Configure local checkpoint storage
-  ags list | ags ls                    Pick a local checkpoint and open it
+  ags ls | ags list [-a]               Pick one of this machine's Agent sessions
+                                       and carry on with it. Newest first, every
+                                       workspace. -a also lists the archives
+                                       `ags save` wrote, in the same view.
+                                       The leading `#` is this machine's short
+                                       number for that session: `ags resume 7`.
+                                       It is stable, so a number stays with the
+                                       session it was handed to.
                                        (Up/Down or j/k, Enter open, a edit the
-                                       Agent arguments, Del delete, Esc quit)
-  ags show ID|AGENT/RECORD_ID          Show complete local checkpoint details
-  ags save [--id ID] DESCRIPTION       Save this active Codex or Claude session
+                                       Agent arguments, p pin, s save, Del
+                                       delete, Esc quit)
+  ags summarize [--force]              Have a model name each session in one
+                                       line, so the list can be read. Claude
+                                       Code names its own sessions and those are
+                                       left alone; Codex names none, which is
+                                       why its rows are otherwise the first line
+                                       the user typed. Cached against the
+                                       session file, so this only pays for what
+                                       changed; --force recomputes everything.
+                                       Set AGS_SUMMARY_CMD to use something
+                                       other than `codex exec`.
+  ags archives                         List only the saved archives
+  ags set retention [--agent codex|claude] DAYS
+                                       One retention period for both Agents.
+                                       Claude Code has its own cleanup, so this
+                                       writes `cleanupPeriodDays` into its
+                                       settings and lets it do the deleting;
+                                       Codex has none, so `ags gc` does it.
+  ags gc [--agent codex|claude] [--yes]
+                                       Delete Codex sessions past the retention
+                                       period. Dry-run unless --yes, never
+                                       automatic, and never touches a pinned
+                                       session, one that has been saved, or
+                                       anything AGS does not recognise.
+  ags show ID|AGENT/RECORD_ID          Show complete local archive details
+  ags save [--id ID] DESCRIPTION       Export this active Codex or Claude session
                                        The ID is fixed when the session starts;
                                        --id only to branch a new work line
+  ags save --session PROVIDER/SESSION_ID [DESCRIPTION]
+                                       Export any session `ags ls` lists, whether
+                                       or not AGS started it and whether or not
+                                       it is still running
   ags resume ID|AGENT/RECORD_ID [AGENT_ARGS...]
              [-- --to codex|claude --cwd PATH --profile NAME --no-agent-args]
-                                       Restore and launch a local checkpoint
+                                       Restore and launch a local archive
+  ags resume live:PROVIDER/SESSION_ID [AGENT_ARGS...]
+                                       Carry on with a session that still
+                                       exists, by handing it to the Agent's own
+                                       resume. Nothing is restored and nothing
+                                       in the Agent's home is written. This is
+                                       what Enter does in `ags ls`.
   ags delete ID|AGENT/RECORD_ID        Move a local checkpoint to recoverable trash
   ags update [--check]                 Update to the latest release (--check only reports)
                                        Launching an Agent reports a pending update once a
@@ -4046,6 +4091,7 @@ report_pool_session() {
         "$url$codex_pool_prefix/session" >/dev/null 2>&1 || true
 }
 
+
 # The Agent arguments a session was started with, as a JSON array.
 #
 # JSON rather than a quoted command line because these records synchronize
@@ -4137,7 +4183,7 @@ terminal_menu_leave() {
 }
 
 terminal_menu_edit_args() {
-    local index="$1" edited= prefill=
+    local index="$1" edited= prefill= agent=
     # Only offer a prefill that decoded. A record whose arguments are unreadable
     # displays as the word "unreadable", and prefilling that would let one Enter
     # turn it into a literal argument handed to the Agent.
@@ -4151,9 +4197,27 @@ terminal_menu_edit_args() {
         return 0
     }
     if parse_launch_args "$edited"; then
-        terminal_menu_args[index]="$(encode_launch_args "${launch_args_decoded[@]}")"
+        # 和恢复时同一条规矩，在**写下来**的时候就执行一次。
+        #
+        # 恢复那一侧本来就会剥掉选会话的参数（两处，见 `resume_checkpoint` 和
+        # `resume_live_session`），所以这里漏掉不会开错会话。它解决的是另一件事：
+        # 不这么做，记录里就存着一段永远会被丢掉的参数，而列表把它照原样显示成
+        # 「这个会话带着这些参数」——写下来的和真正会跑的不是一回事。
+        agent="${terminal_menu_agents[$index]:-}"
+        if [[ -n "$agent" ]]; then
+            strip_session_selection_args "$agent" \
+                ${launch_args_decoded[@]+"${launch_args_decoded[@]}"}
+            if (( ${#launch_args_decoded[@]} != ${#stripped_launch_args[@]} )); then
+                launch_args_decoded=(${stripped_launch_args[@]+"${stripped_launch_args[@]}"})
+                terminal_menu_notice='Dropped the session selection: AGS names the session itself.'
+            else
+                terminal_menu_notice=
+            fi
+        else
+            terminal_menu_notice=
+        fi
+        terminal_menu_args[index]="$(encode_launch_args ${launch_args_decoded[@]+"${launch_args_decoded[@]}"})"
         terminal_menu_details[index]="$(format_launch_args "${terminal_menu_args[index]}")"
-        terminal_menu_notice=
     else
         terminal_menu_notice='Could not read those arguments; check the quoting.'
     fi
@@ -4161,7 +4225,7 @@ terminal_menu_edit_args() {
 }
 
 terminal_menu() {
-    local title="$1" allow_delete="$2" key second third fourth confirm
+    local title="$1" allow_delete="$2" allow_actions="${3:-0}" key second third fourth confirm
     local index=0 row width height body count hint pad
     local total chrome visible first=0
     (( ${#terminal_menu_ids[@]} > 0 )) || return 1
@@ -4224,8 +4288,9 @@ terminal_menu() {
                     "$style_dim" "$style_reset" "$style_dim" "$style_reset"
             fi
         fi
-        hint="$style_hint_move$style_separator$style_hint_open"
+        hint="$style_hint_move$style_separator$style_hint_page$style_separator$style_hint_open"
         (( ${#terminal_menu_details[@]} == 0 )) || hint+="${style_separator}a args"
+        [[ "$allow_actions" != 1 ]] || hint+="${style_separator}p pin${style_separator}s save"
         [[ "$allow_delete" != 1 ]] || hint+="${style_separator}del delete"
         hint+="${style_separator}esc quit"
         printf '\n  %s%s%s\n' "$style_dim" "$hint" "$style_reset"
@@ -4251,6 +4316,20 @@ terminal_menu() {
                 terminal_menu_edit_args "$index"
                 continue
                 ;;
+            p|P)
+                [[ "$allow_actions" == 1 ]] || continue
+                terminal_menu_selected="${terminal_menu_ids[$index]}"
+                terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                terminal_menu_leave
+                return 3
+                ;;
+            s|S)
+                [[ "$allow_actions" == 1 ]] || continue
+                terminal_menu_selected="${terminal_menu_ids[$index]}"
+                terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                terminal_menu_leave
+                return 4
+                ;;
             q|Q)
                 terminal_menu_leave
                 return 1
@@ -4267,12 +4346,55 @@ terminal_menu() {
         case "$third" in
             A) (( index > 0 )) && index=$((index - 1)) ;;
             B) (( index + 1 < ${#terminal_menu_ids[@]} )) && index=$((index + 1)) ;;
+            # 整页地翻。一次一行在一百多个会话里没法用，而这三组键是终端里
+            # 「翻页」的三种肌肉记忆，都接上：左右方向键、PageUp/PageDown、
+            # 以及 Home/End 直接到头和到尾。
+            #
+            # 步长用的是这一屏**实际画了几行**（`visible`），不是一个写死的数字：
+            # 窗口多高就翻多少，翻完光标停的位置和眼睛看的位置才对得上。
+            C) index=$((index + visible)); (( index < total )) || index=$((total - 1)) ;;
+            D) index=$((index - visible)); (( index >= 0 )) || index=0 ;;
+            H) index=0 ;;
+            F) index=$((total - 1)) ;;
+            5)
+                [[ "$second" == '[' ]] || continue
+                IFS= read -rsn1 -t 0.05 fourth || continue
+                [[ "$fourth" == '~' ]] || continue
+                index=$((index - visible)); (( index >= 0 )) || index=0
+                ;;
+            6)
+                [[ "$second" == '[' ]] || continue
+                IFS= read -rsn1 -t 0.05 fourth || continue
+                [[ "$fourth" == '~' ]] || continue
+                index=$((index + visible)); (( index < total )) || index=$((total - 1))
+                ;;
+            1|7)
+                [[ "$second" == '[' ]] || continue
+                IFS= read -rsn1 -t 0.05 fourth || continue
+                [[ "$fourth" == '~' ]] || continue
+                index=0
+                ;;
+            4|8)
+                [[ "$second" == '[' ]] || continue
+                IFS= read -rsn1 -t 0.05 fourth || continue
+                [[ "$fourth" == '~' ]] || continue
+                index=$((total - 1))
+                ;;
             3)
                 [[ "$second" == '[' ]] || continue
                 IFS= read -rsn1 -t 0.05 fourth || continue
                 [[ "$fourth" == '~' && "$allow_delete" == 1 ]] || continue
-                printf '\n  %sDelete this saved session?%s [y/N] ' \
-                    "$style_bold" "$style_reset"
+                # 两种东西，两种问法。删存档是删我们自己目录里的一份副本；删活
+                # 会话是删 **Agent 自己 home 里的**东西，那是不一样的一件事，问的
+                # 时候就得说清楚，而不是共用一句「Delete this saved session?」——
+                # 对着一个从没存过的会话，那句话本身就是假的。
+                if [[ "${terminal_menu_ids[$index]}" == live:* ]]; then
+                    printf '\n  %sDelete this session from the Agent? Any archive of it stays.%s [y/N] ' \
+                        "$style_bold" "$style_reset"
+                else
+                    printf '\n  %sDelete this saved session?%s [y/N] ' \
+                        "$style_bold" "$style_reset"
+                fi
                 IFS= read -rsn1 confirm || confirm=
                 printf '\n'
                 if [[ "$confirm" == y || "$confirm" == Y ]]; then
@@ -4809,7 +4931,7 @@ prepare_cross_agent_restore() {
     stderr="$sandbox/convert.err"
     if ! run_ags_isolated "$binary" "$sandbox" \
         --json resume "$target_alias" "$source_session_id" \
-        --source "$source_input" --force --no-store \
+        --source "$source_input" --force --exact-source \
         > "$result_file" 2> "$stderr"; then
         error_message="$(jq -r '.message // empty' "$stderr" 2>/dev/null || true)"
         [[ -n "$error_message" ]] ||
@@ -5919,8 +6041,19 @@ finalize_pending_file() {
 
 save_active_checkpoint() {
     local target="${1:-}" agent="${AGENT_SESSION_AGENT:-}" session_id="${AGENT_SESSION_ID:-}"
+    local selected_provider selected_session_id
     shift || true
     [[ "$target" == local || "$target" == cloud ]] || die "target must be local or cloud"
+    # 明确点名一个会话。这是 `ags ls` 里按 s 走的同一条路，也是在任何地方导出一个
+    # 早就结束了的会话的方式——`ags save` 以前只认「AGS 起的、此刻正在跑的」那个，
+    # 而列表里的会话绝大多数两条都不满足。
+    if [[ "${1:-}" == --session ]]; then
+        (( $# >= 2 )) || die "--session 需要 <provider>/<session_id>"
+        split_live_selector "live:$2"
+        shift 2
+        save_live_session "$selected_provider" "$selected_session_id" "$*"
+        return
+    fi
     # 会话 ID 在**启动时**就定好了（见 `prepare_session_identity`），所以在一个 AGS
     # 起的会话里保存只需要给描述：`ags save "描述"`。
     #
@@ -5947,7 +6080,7 @@ save_active_checkpoint() {
         elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
             agent=claude session_id="$CLAUDE_CODE_SESSION_ID"
         else
-            die "save must run from the ags Skill inside an active Codex or Claude session"
+            die "save 需要知道存哪个会话：在 AGS 起的会话里直接 \`ags save 描述\`，在外面用 \`ags save --session <provider>/<id> 描述\`，或从 \`ags ls\` 里按 s"
         fi
     fi
     queue_checkpoint "$target" "$agent" "$session_id" "$@"
@@ -6594,15 +6727,23 @@ list_checkpoint_root() {
 # where a character is two columns wide and one byte-counted `printf '%-*s'`
 # would leave the table ragged and the highlight bar torn. `column` measures in
 # characters, so it is the one thing on this machine that already knows.
+# `truncate` 是**哪几列可以被砍**，逗号分隔，1 起数。
+#
+# 必须由调用者给，不能写死：它是列布局的函数，而这个渲染器现在服务两张列数不同的
+# 表。写死成 `4` 的时候，存档表（ID/AGENT/SAVED/DESCRIPTION）第 4 列正好是最长的
+# 描述，看起来一切正常；会话表多了 KIND 和 WORKSPACE 之后，第 4 列变成 ACTIVE ——
+# 一个定宽日期，砍它一个字符都省不出来，而真正会撑爆宽度的 WORKSPACE 和
+# DESCRIPTION 反而不在可砍名单里。`column` 于是按最宽内容给它们排版，整张表直接
+# 超出 `-c` 给的宽度，中间拉出一大片空白。
 render_checkpoint_table() {
-    local reserve="${1:-0}" pad="${2:-0}" width
+    local reserve="${1:-0}" pad="${2:-0}" truncate="${3:-4}" width
     width="$(terminal_width)"
     (( width == 0 )) || width=$((width - reserve))
     if (( width >= 40 )) && column --help 2>&1 | grep -q -- '--table-truncate'; then
         if [[ "$pad" == 1 ]]; then
-            render_columns -t -s $'\t' -T 4 -c "$width" -m
+            render_columns -t -s $'\t' -T "$truncate" -c "$width" -m
         else
-            render_columns -t -s $'\t' -T 4 -c "$width"
+            render_columns -t -s $'\t' -T "$truncate" -c "$width"
         fi
     else
         render_columns -t -s $'\t'
@@ -6616,11 +6757,13 @@ load_local_checkpoint_menu() {
     terminal_menu_labels=()
     terminal_menu_args=()
     terminal_menu_details=()
+    terminal_menu_agents=()
     terminal_menu_header=
     while IFS=$'\t' read -r checkpoint_id agent saved_date description selector args; do
         [[ -n "$selector" ]] || continue
         [[ -n "$args" ]] || args='[]'
         terminal_menu_ids+=("$selector")
+        terminal_menu_agents+=("${selector%%/*}")
         terminal_menu_args+=("$args")
         terminal_menu_details+=("$(format_launch_args "$args")")
         rows+=("$checkpoint_id"$'\t'"$agent"$'\t'"$saved_date"$'\t'"$description")
@@ -6646,6 +6789,1302 @@ load_local_checkpoint_menu() {
     else
         terminal_menu_labels=("${rows[@]//$'\t'/  }")
     fi
+}
+
+# ---------------------------------------------------------------------------
+# 原生会话清单
+# ---------------------------------------------------------------------------
+#
+# `ags ls` 列的是 **Agent 自己的会话**，不是 AGS 的存档。
+#
+# 每个 Agent 本来就在管自己的会话，恢复也是它自己的能力：同一个 Agent 要接着上次
+# 干，正确的做法是把 `codex resume <id>` / `claude --resume <id>` 交给它，而不是
+# 先把一份冻结的副本写回它的 home 再让它读。后者是 `ags save` 存下来的东西才需要
+# 的动作，`restore_checkpoint_file` 那一整套覆盖 + 回滚日志只为它存在。
+#
+# 存档因此退成第二类：`ags ls -a` 才会把它们和活会话并排列出来，KIND 一列区分。
+#
+# 描述、启动参数、pin 这三样原生会话里没有，AGS 记在自己的状态目录下，键是
+# `<provider>/<session_id>`。两个地方刻意不放：
+#
+# - **不写进 Agent 自己的会话文件。** 那是它的数据，往里塞字段等于让它自己的解析
+#   器去猜我们的意思。
+# - **不放进 casr 的 store。** 那里的规矩写在 `src/store.rs` 开头——除了 `Loss` /
+#   `Fidelity` 这类「当时发生过、事后再也算不出来」的记录，其余一切都必须能从原生
+#   字节重建，版本不认就删掉重建。人手写的描述既不能重建，也不该在版本升级时被
+#   当成缓存丢掉。
+
+# 一个注解键是否可以直接当路径用。
+#
+# 会话 ID 来自 casr，不同 Agent 的形状不一样（Codex 是 UUID，别家可能是文件名），
+# 所以这里不能用 `validate_session_id` 那条 UUID 规则。要求的是「能安全地当一段
+# 文件名」：没有分隔符、没有控制字符、不以点开头、有长度上限。不合格的会话仍然
+# 照常列出，只是没有注解可存——注解是附加信息，不该让一个列不出的名字变成错误。
+valid_annotation_key() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._@:-]{0,127}$ ]]
+}
+
+session_annotation_file() {
+    local provider="$1" session_id="$2"
+    valid_annotation_key "$provider" && valid_annotation_key "$session_id" || return 1
+    printf '%s\n' "$state/annotations/$provider/$session_id.json"
+}
+
+# 读注解到 `annotation_description` / `annotation_args` / `annotation_pinned`。
+#
+# 没有注解不是错误，是最常见的情况：绝大多数会话是直接用 Agent 起的，AGS 从没见过
+# 它们。所以缺文件、坏 JSON 都退回默认值，不 die。
+read_session_annotation() {
+    local provider="$1" session_id="$2" file payload
+    annotation_description=
+    annotation_args='[]'
+    annotation_pinned=0
+    annotation_summary=
+    annotation_summary_stamp=
+    file="$(session_annotation_file "$provider" "$session_id")" || return 0
+    [[ -f "$file" ]] || return 0
+    payload="$(jq -c . "$file" 2>/dev/null)" || return 0
+    annotation_description="$(jq -r '.description // "" | gsub("[\t\r\n]"; " ")' <<< "$payload" 2>/dev/null || printf '')"
+    annotation_args="$(jq -c 'if (.args | type) == "array" then .args else [] end' <<< "$payload" 2>/dev/null || printf '[]')"
+    decode_launch_args "$annotation_args" || annotation_args='[]'
+    [[ "$(jq -r '.pinned // false' <<< "$payload" 2>/dev/null)" == true ]] && annotation_pinned=1
+    annotation_summary="$(jq -r '.summary // "" | gsub("[\t\r\n]"; " ")' <<< "$payload" 2>/dev/null || printf '')"
+    annotation_summary_stamp="$(jq -r '.summary_stamp // ""' <<< "$payload" 2>/dev/null || printf '')"
+    return 0
+}
+
+# 写注解。**已有的机器生成字段原样留着。**
+#
+# 这个函数的三个参数是人改的那些（描述、参数、置顶），而同一个文件里还存着总结
+# 和它的指纹——那是 `ags ls --summarize` 花了一次模型调用换来的。整份覆盖的话，
+# 在菜单里按一下置顶就会把总结抹掉，下次列表又变回没有名字，而且没有任何报错。
+write_session_annotation() {
+    local provider="$1" session_id="$2" description="$3" args="$4" pinned="$5"
+    local file temporary kept='{}'
+    file="$(session_annotation_file "$provider" "$session_id")" ||
+        die "cannot record notes for $provider/$session_id"
+    mkdir -p "$(dirname "$file")"
+    if [[ -f "$file" ]]; then
+        kept="$(jq -c '{summary: (.summary // ""), summary_stamp: (.summary_stamp // "")}
+                       | with_entries(select(.value != ""))' "$file" 2>/dev/null)" || kept='{}'
+        [[ -n "$kept" ]] || kept='{}'
+    fi
+    temporary="$(mktemp "$file.XXXXXX")"
+    jq -nc --arg description "$description" \
+        --argjson args "$args" \
+        --argjson pinned "$( ((pinned == 1)) && printf true || printf false )" \
+        --argjson kept "$kept" \
+        '$kept + {description: $description, args: $args, pinned: $pinned}' > "$temporary" ||
+        { rm -f -- "$temporary"; die "cannot encode session notes"; }
+    chmod 600 "$temporary"
+    mv -- "$temporary" "$file"
+}
+
+# 只写总结和它的指纹，人改的那些不动。
+#
+# 和 `write_session_annotation` 分开是同一条理由反过来：总结是后台批量算出来的，
+# 它不该有机会覆盖人刚刚在菜单里敲进去的描述或参数。
+write_session_summary() {
+    local provider="$1" session_id="$2" summary="$3" stamp="$4"
+    local file temporary kept='{"description":"","args":[],"pinned":false}'
+    file="$(session_annotation_file "$provider" "$session_id")" || return 1
+    mkdir -p "$(dirname "$file")"
+    if [[ -f "$file" ]]; then
+        kept="$(jq -c '{description: (.description // ""),
+                        args: (if (.args | type) == "array" then .args else [] end),
+                        pinned: (.pinned // false)}' "$file" 2>/dev/null)" ||
+            kept='{"description":"","args":[],"pinned":false}'
+    fi
+    temporary="$(mktemp "$file.XXXXXX")" || return 1
+    if jq -nc --arg summary "$summary" --arg stamp "$stamp" --argjson kept "$kept" \
+        '$kept + {summary: $summary, summary_stamp: $stamp}' > "$temporary" 2>/dev/null; then
+        chmod 600 "$temporary"
+        mv -- "$temporary" "$file"
+    else
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 会话总结
+# ---------------------------------------------------------------------------
+#
+# 列表要认得出一条会话，靠的是"它在干什么"。这件事只有两个来源：
+#
+#   - **Agent 自己写的。** Claude Code 会给会话起名（casr 读出来叫 `native_name`），
+#     一台机器上最近 40 条里 25 条有。这一份是白捡的，优先用。
+#   - **我们自己算的。** Codex 一个字都不写——同一批 40 条里 0 条有——所以只能退回
+#     "第一条用户消息"，而那条消息前面往往挂着客户端注入的一大块上下文。实测最近
+#     14 条 codex 里 8 条的标题是 `# AGENTS.md instructions for /mnt/c/…`，其中 6
+#     条一模一样。列表于是完全没法用来认会话。
+#
+# casr 那边已经把注入块跳掉了，所以标题现在是人写的话。但那是**原话的第一行**，
+# 不是概括——"帮我看看codex和claude的近期会话 全部被杀死了 大概有5个…"这样的一行
+# 塞不进一列。这里把它交给模型压成一句。
+#
+# 三条规矩：
+#
+#   1. **人写的永远赢。** 菜单里敲进去的描述优先于总结，总结优先于标题。模型不该
+#      有机会覆盖人亲手起的名字。
+#   2. **算过就不再算。** 总结连同会话文件的指纹（大小:mtime）一起存；文件没变就
+#      直接用缓存。不然每次 `ls` 都要为几十条会话各调一次模型。
+#   3. **不污染列表。** 见 `run_summary_model`。
+
+# 会话文件此刻的指纹。文件没了就是空串——空串和任何存下来的指纹都不相等，于是
+# 缓存自然失效，这正是想要的。
+session_content_stamp() {
+    local path="$1" size mtime
+    [[ -n "$path" && -f "$path" ]] || { printf '\n'; return 0; }
+    size="$(wc -c < "$path" 2>/dev/null | tr -d ' ')" || size=
+    mtime="$(date -r "$path" +%s 2>/dev/null)" || mtime=
+    [[ -n "$size" && -n "$mtime" ]] || { printf '\n'; return 0; }
+    printf '%s:%s\n' "$size" "$mtime"
+}
+
+# 交给模型的原料：这段会话里人自己说过的话，掐头去尾。
+#
+# 不发整段会话——中间绝大部分是工具往返，既贵又不改变答案。casr 的 `--digest`
+# 已经把注入块和非用户消息剔掉了。
+session_digest_text() {
+    local provider="$1" session_id="$2" path="$3" binary
+    binary="$(resolve_ags_converter_binary)"
+    "$binary" --json info "$session_id" --from "$provider" --digest \
+        ${path:+--source "$path"} 2>/dev/null |
+        jq -r '(.digest // []) | .[]' 2>/dev/null
+}
+
+# 总结这一段话的命令。
+#
+# 默认走 `codex exec`，但**必须带 `--ephemeral`**：不带的话每总结一条会话，codex
+# 就在 `~/.codex/sessions` 里新建一条 rollout——于是列表里多出一条它自己制造的、
+# 同样没有名字的会话。实测过：一次 `codex exec` 让 rollout 从 2845 涨到 2846，
+# `claude -p` 同理。`--ephemeral` 之后实测 delta 为 0。
+#
+# `--ignore-user-config` 顺带把 AGENTS.md 和插件目录挡在外面：同一句"回 PONG"
+# 带用户配置是 21,034 token，不带是 5,818。总结几十条会话时这是四倍的差别。
+#
+# `AGS_SUMMARY_CMD` 可以换成任何"读 stdin、打印一行"的命令——自建的模型网关、
+# 号池、或者别家的 CLI。换掉之后上面两件事由调用方自己负责。
+ags_summary_supports_ephemeral() {
+    [[ -n "${ags_summary_ephemeral_probe:-}" ]] && return "$ags_summary_ephemeral_probe"
+    ags_summary_ephemeral_probe=1
+    if codex exec --help 2>/dev/null | grep -q -- '--ephemeral'; then
+        ags_summary_ephemeral_probe=0
+    fi
+    return "$ags_summary_ephemeral_probe"
+}
+
+# 跑一次模型，把 stdin 那段话变成一行。失败返回非零且不输出任何东西。
+run_summary_model() {
+    local prompt="$1" answer output status=0
+    if [[ -n "${AGS_SUMMARY_CMD:-}" ]]; then
+        # `sh -c` 而不是 `eval`：这条命令是环境变量给的（和 `$PAGER` 一个性质），
+        # 但它没有理由能改到当前 shell 的变量。这个文件里对 `eval` 的禁令来自
+        # "同步过来的数据绝不能当代码跑"，这里虽然不是那种数据，规矩照守。
+        answer="$(printf '%s' "$prompt" | sh -c "$AGS_SUMMARY_CMD" 2>/dev/null)" || return 1
+        printf '%s\n' "$answer" | tail -n 1
+        return 0
+    fi
+    command -v codex >/dev/null 2>&1 || return 1
+    ags_summary_supports_ephemeral ||
+        { log "codex 太老，没有 --ephemeral；总结会污染会话列表，跳过。用 AGS_SUMMARY_CMD 指定别的命令"; return 1; }
+    output="$(mktemp "${TMPDIR:-/tmp}/ags-summary.XXXXXX")" || return 1
+    # `-o` 把最终答复单独写进文件：stdout 上还混着横幅和 token 统计，靠 `tail -1`
+    # 去猜哪一行是答案，换个版本就会猜错。
+    printf '%s' "$prompt" |
+        codex exec --skip-git-repo-check --ephemeral --ignore-user-config \
+            -o "$output" - >/dev/null 2>&1 || status=$?
+    if (( status != 0 )); then
+        rm -f -- "$output"
+        return 1
+    fi
+    answer="$(tr '\r\n' '  ' < "$output" 2>/dev/null | sed 's/  */ /g; s/^ *//; s/ *$//')"
+    rm -f -- "$output"
+    [[ -n "$answer" ]] || return 1
+    printf '%s\n' "$answer"
+}
+
+# 一句话最多多少个字符。
+#
+# 这一列和工作区、时间挤在一行里，长了就把别的挤掉；而"认出是哪条会话"这件事本来
+# 也不需要一整句话。模型有时候不听长度要求，所以拿到之后还要自己截一刀。
+ags_summary_max_chars() {
+    local limit="${AGS_SUMMARY_MAX_CHARS:-24}"
+    [[ "$limit" =~ ^[1-9][0-9]{0,2}$ ]] || limit=24
+    printf '%s\n' "$limit"
+}
+
+summary_prompt() {
+    local limit="$1" digest="$2"
+    cat <<PROMPT
+下面是一段编码会话里**用户**说过的话（掐头去尾，中间省略）。
+
+请用一句话概括这段会话在做什么，好让人在会话列表里一眼认出它。
+
+要求：
+- 不超过 ${limit} 个字符，宁可更短
+- 只说做的事，不要"用户要求""这段会话"之类的开头，不要结尾标点
+- 用和原文相同的语言
+- 只输出这一句，不要解释、不要引号
+
+---
+${digest}
+PROMPT
+}
+
+# 给一条会话算出总结并存起来。已经有的直接返回。
+#
+# 返回 0 表示这条现在有总结了（本来就有、或者刚算出来），非零表示没有。
+ensure_session_summary() {
+    local provider="$1" session_id="$2" path="$3" native_name="$4" force="${5:-0}"
+    local stamp digest answer limit
+    read_session_annotation "$provider" "$session_id"
+    # 人自己写的描述、以及 Agent 自己起的名字，都不该被模型盖掉。
+    [[ -z "$annotation_description" ]] || return 0
+    (( force == 1 )) || [[ -z "$native_name" ]] || return 0
+    stamp="$(session_content_stamp "$path")"
+    if (( force == 0 )) && [[ -n "$annotation_summary" && -n "$stamp" &&
+          "$annotation_summary_stamp" == "$stamp" ]]; then
+        return 0
+    fi
+    digest="$(session_digest_text "$provider" "$session_id" "$path")"
+    [[ -n "${digest//[[:space:]]/}" ]] || return 1
+    limit="$(ags_summary_max_chars)"
+    answer="$(run_summary_model "$(summary_prompt "$limit" "$digest")")" || return 1
+    # 模型不听话是常事，长度这一刀必须自己补。用 bash 的子串而不是 `cut -c` 或
+    # `awk substr`：那两个在这台机器上按字节算，一刀会切在一个汉字中间。这个文件
+    # 里 `workspace_cell` 截工作区路径用的也是同一种写法。
+    if (( ${#answer} > limit )); then
+        answer="${answer:0:${limit}}"
+    fi
+    [[ -n "${answer//[[:space:]]/}" ]] || return 1
+    write_session_summary "$provider" "$session_id" "$answer" "$stamp" || return 1
+    return 0
+}
+
+# 会话在列表里的短号，放进 `session_ordinals`（"provider/id" -> N）。
+#
+# 十六进制的会话 ID 认不出来。`01a0269a-094f` 里没有一个字符是给人读的，而一屏
+# 十几行全长这样——列表于是只能靠描述认，短号那一列纯属占地方。
+#
+# 换成一个小整数。规矩只有两条，都来自它要顶替的那个东西的缺陷：
+#
+#   - **稳定**。按当前列表的第几行编号最省事，但那个号会在下一条会话起来之后
+#     指向别的东西——人看完列表、过一会儿敲 `ags resume 7`，打开的不是他刚看
+#     的那条。号一旦发出去就跟着这条会话不变。
+#   - **一个文件**。给每条会话各写一个注解文件，意味着一次 `ls` 要写几十个文件，
+#     而其中绝大多数人这辈子都不会去动。这里只有一份映射。
+#
+# 发出去的号不回收：一条会话被删掉之后它的号就空着。复用会让一个记在纸上（或者
+# 记在脑子里）的号指向另一条会话，而这正是"稳定"要防的事。
+session_ordinal_file() {
+    printf '%s\n' "$state/ordinals.json"
+}
+
+load_session_ordinals() {
+    local file payload
+    session_ordinals_json='{"next":1,"ids":{}}'
+    file="$(session_ordinal_file)"
+    [[ -f "$file" ]] || return 0
+    payload="$(jq -c 'if (.ids | type) == "object" then
+                          {next: ((.next // 1) | if type == "number" then floor else 1 end),
+                           ids: .ids}
+                      else empty end' "$file" 2>/dev/null)" || return 0
+    [[ -n "$payload" ]] && session_ordinals_json="$payload"
+    return 0
+}
+
+# 给这一批里还没有号的会话发号，并把结果写回去。
+#
+# 一次写完而不是发一个写一次：`ls` 每次都会把整批过一遍，逐个落盘等于把一次
+# 写变成几十次。
+assign_session_ordinals() {
+    local keys_json file temporary
+    keys_json="$(printf '%s\n' "$@" | jq -R . | jq -sc .)" || return 0
+    session_ordinals_json="$(jq -c --argjson keys "$keys_json" '
+        reduce $keys[] as $key (.;
+            if (.ids[$key] // null) == null
+            then .ids[$key] = .next | .next = (.next + 1)
+            else . end)
+    ' <<< "$session_ordinals_json" 2>/dev/null)" || return 0
+    file="$(session_ordinal_file)"
+    mkdir -p "$(dirname "$file")"
+    temporary="$(mktemp "$file.XXXXXX")" || return 0
+    if printf '%s\n' "$session_ordinals_json" > "$temporary" 2>/dev/null; then
+        chmod 600 "$temporary"
+        mv -- "$temporary" "$file"
+    else
+        rm -f -- "$temporary"
+    fi
+    return 0
+}
+
+# 一个短号对应哪条会话，放进 `ordinal_selector`。认不出来就返回非零。
+selector_for_ordinal() {
+    local wanted="$1" key
+    [[ "$wanted" =~ ^[0-9]{1,9}$ ]] || return 1
+    load_session_ordinals
+    key="$(jq -r --argjson n "$wanted" '
+        (.ids | to_entries | map(select(.value == $n)) | .[0].key) // empty
+    ' <<< "$session_ordinals_json" 2>/dev/null)" || return 1
+    [[ -n "$key" ]] || return 1
+    ordinal_selector="live:$key"
+    return 0
+}
+
+# 每个 Agent 最多取多少条。
+#
+# casr 的 `--limit` 是**按 provider** 算的，这里取完之后再全局按时间排一次，所以
+# 这个数字是「每家最多贡献多少」，不是屏幕上最终看到多少。给得比一屏多，翻页才有
+# 东西可翻。
+native_session_limit() {
+    local limit="${AGS_LIST_LIMIT:-50}"
+    [[ "$limit" =~ ^[1-9][0-9]{0,3}$ ]] || limit=50
+    printf '%s\n' "$limit"
+}
+
+# 原生会话，最近的在前。
+#
+# 输出：provider \t session_id \t 时间 \t 工作区 \t 标题 \t 路径
+#
+# 排序在 jq 里做而不是交给 `sort`：`casr list` 是按 provider 分组各自截断的，跨
+# provider 的先后只有把两边合起来看才成立。
+native_session_rows() {
+    local binary
+    binary="$(resolve_ags_converter_binary)"
+    "$binary" --json list --all-workspaces --sort date \
+        --limit "$(native_session_limit)" 2>/dev/null |
+        jq -r '
+            # 一行给人看的标题。
+            #
+            # Codex 的标题是会话第一条用户消息，而那条消息在真正的问题前面往往
+            # 先挂着客户端注入的一大块上下文——`<recommended_plugins>`、
+            # `<user_instructions>`、`# AGENTS.md instructions for …`。照原样显示
+            # 的结果是**整屏每一行都一样**（在一台真机上实测：11 行全是
+            # `<recommended_plugins>`），列表于是完全没法用来认会话。
+            #
+            # 所以跳过开头这些包装，取第一段真正是人写的文字。只影响显示：
+            # casr 那边的 `title` 一个字都不改，这里也不猜内容，只是不把注入块
+            # 当成标题。跳完还是空的（整条消息都是注入的）就退回原文，因为
+            # 「显示不出好的」不该变成「什么都不显示」。
+            def human_line:
+                  split("\n")
+                | map(select(length > 0))
+                | map(select(
+                      (startswith("<") | not)
+                      and (startswith("</") | not)
+                      and (test("^#+ +AGENTS\\.md") | not)
+                      and (test("^#+ +[A-Za-z.]+ instructions") | not)
+                  ))
+                | .[0] // "";
+            def display_line:
+                  tostring
+                | gsub("\t"; " ")
+                | gsub("\r"; "\n")
+                | (human_line as $line
+                   | if ($line | length) > 0 then $line else (gsub("\n"; " ")) end)
+                | gsub("\n"; " ");
+            (.items // [])
+            | map(. + {_when: ((.last_active_at // .started_at // 0) | floor)})
+            | sort_by(-._when)
+            | .[]
+            | [ .provider,
+                .session_id,
+                (if ._when > 0 then (._when / 1000 | floor | strflocaltime("%m-%d %H:%M")) else "" end),
+                ((.workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
+                (((.native_name // .title) // "") | display_line),
+                ((.path // "") | tostring)
+              ]
+            | @tsv' 2>/dev/null
+}
+
+# provider slug -> AGS 自己会启动的那两个 Agent 的名字。
+#
+# 空字符串表示「这个 provider AGS 不负责启动」。列表照列——你在这台机器上有哪些
+# 会话是一个事实，不该因为我们不会起它就不告诉你——但对它的动作只到「把它自己的
+# 恢复命令显示出来」为止。
+managed_agent_for_provider() {
+    case "$1" in
+        codex) printf 'codex\n' ;;
+        claude-code) printf 'claude\n' ;;
+        *) printf '\n' ;;
+    esac
+}
+
+# 显示用的短 ID 要几位，放进 `short_id_length`。
+#
+# 8 位不够。Codex 的会话 ID 是 UUIDv7，前 8 个十六进制位是**毫秒时间戳**，所以同
+# 一毫秒里起来的会话（并行的 subagent 就是这样）前 8 位完全一样——在一台真机上实
+# 测有四条 `019fd39b`，列表里看起来是同一行出现了四次，而按下去打开的是其中随便
+# 哪一个。
+#
+# 所以取「在这一批里刚好能区分开」的长度，和 git 的短哈希同一个做法：短到好读，
+# 长到不会指错。
+short_id_width() {
+    local candidate id seen_duplicate
+    local -A seen=()
+    short_id_length=8
+    (( $# > 0 )) || return 0
+    # 落在 UUID 的连字符边界上，不在中间截断：`01a02646-8` 读起来像残缺，
+    # `01a02646-8385` 是一段完整的字段。
+    for candidate in 8 13 18 36; do
+        seen=()
+        seen_duplicate=0
+        for id in "$@"; do
+            if [[ -n "${seen[${id:0:$candidate}]:-}" ]]; then
+                seen_duplicate=1
+                break
+            fi
+            seen["${id:0:$candidate}"]=1
+        done
+        short_id_length="$candidate"
+        (( seen_duplicate == 1 )) || return 0
+    done
+    return 0
+}
+
+# 把 workspace 收进一个上限，超出的从**左边**砍。
+#
+# 一个离群值会毁掉整张表：本机有一条 Cursor 会话的 workspace 是它那个数据库的完整
+# 路径（88 字），`column` 于是按 88 给整列定宽，剩下的空间不够 DESCRIPTION 显示，
+# 中间拉出一大片空白——而 DESCRIPTION 才是用来认会话的那一列。
+#
+# 上限跟着终端宽度走，不写死：窄终端下 workspace 让位给描述，宽终端下多给一点。
+# 砍左边不砍右边，因为路径越靠后越能区分（`…/06_WithCao/02_AdaND` 比
+# `/mnt/c/Users/Alg…` 有用）。
+workspace_cell() {
+    local value="$1" width="${2:-0}" cap
+    cap=28
+    if (( width >= 40 )); then
+        cap=$(( width / 5 ))
+        (( cap >= 12 )) || cap=12
+        (( cap <= 28 )) || cap=28
+    fi
+    if (( ${#value} > cap )); then
+        printf '…%s\n' "${value: -$((cap - 1))}"
+    else
+        printf '%s\n' "$value"
+    fi
+}
+
+load_native_session_menu() {
+    local include_archives="${1:-0}" for_menu="${2:-1}" table_width
+    local provider session_id when workspace title path
+    table_width="$(terminal_width)"
+    local checkpoint_id agent saved_date description selector args
+    local marker kind label_id archive_agent
+    local -a rows=() rendered=()
+    terminal_menu_ids=()
+    terminal_menu_labels=()
+    terminal_menu_args=()
+    terminal_menu_details=()
+    terminal_menu_agents=()
+    terminal_menu_header=
+
+    # 先把整批读进来：短号要一次性发完（一次写，不是几十次），而每行显示什么也
+    # 要等这一批都在手里才定得下来。
+    local -a live_provider=() live_id=() live_when=() live_workspace=() live_title=()
+    local -a live_path=() live_key=()
+    while IFS=$'\t' read -r provider session_id when workspace title path; do
+        [[ -n "$provider" && -n "$session_id" ]] || continue
+        live_provider+=("$provider")
+        live_id+=("$session_id")
+        live_when+=("$when")
+        live_workspace+=("$workspace")
+        live_title+=("$title")
+        live_path+=("$path")
+        live_key+=("$provider/$session_id")
+    done < <(native_session_rows)
+    load_session_ordinals
+    (( ${#live_key[@]} == 0 )) || assign_session_ordinals "${live_key[@]}"
+
+    local index ordinal
+    for index in "${!live_id[@]}"; do
+        provider="${live_provider[$index]}"
+        session_id="${live_id[$index]}"
+        when="${live_when[$index]}"
+        workspace="${live_workspace[$index]}"
+        title="${live_title[$index]}"
+        read_session_annotation "$provider" "$session_id"
+        marker=' '
+        (( annotation_pinned == 0 )) || marker='*'
+        ordinal="$(jq -r --arg key "${live_key[$index]}" '.ids[$key] // ""' \
+            <<< "$session_ordinals_json" 2>/dev/null)" || ordinal=
+        [[ -n "$ordinal" ]] || ordinal='-'
+        terminal_menu_ids+=("live:$provider/$session_id")
+        terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
+        terminal_menu_args+=("$annotation_args")
+        terminal_menu_details+=("$(format_launch_args "$annotation_args")")
+        # 人写的 > 模型总结的 > Agent 自己起的名字或第一句话。模型不该有机会盖掉
+        # 人亲手起的名字，而 `title` 是原话的第一行、不是概括，所以排在最后。
+        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${annotation_summary:-$title}}")
+    done
+
+    if (( include_archives == 1 )); then
+        while IFS=$'\t' read -r checkpoint_id agent saved_date description selector args; do
+            [[ -n "$selector" ]] || continue
+            [[ -n "$args" ]] || args='[]'
+            archive_agent="${selector%%/*}"
+            terminal_menu_ids+=("saved:$selector")
+            terminal_menu_agents+=("$archive_agent")
+            terminal_menu_args+=("$args")
+            terminal_menu_details+=("$(format_launch_args "$args")")
+            # 存档没有短号：那一列的含义是"敲这个数字能打开它"，而存档要用它自己
+            # 的检查点 ID。ID 挪到工作区那一栏，因为存档本来就不显示工作区。
+            rows+=(" -"$'\t'"saved"$'\t'"$archive_agent"$'\t'"$saved_date"$'\t'"$checkpoint_id"$'\t'"$description")
+        done < <(list_checkpoint_root local "$local_checkpoints" 1)
+    fi
+
+    (( ${#rows[@]} > 0 )) || return 0
+    # 和存档菜单同一个渲染器，理由也一样：描述常是中文，一个汉字两列宽，靠
+    # `printf '%-*s'` 数字节会把高亮条撕开。
+    if (( for_menu == 1 )); then
+        mapfile -t rendered < <(
+            {
+                printf '#\tKIND\tAGENT\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
+                printf '%s\n' "${rows[@]}"
+            } | render_checkpoint_table 2 1 6
+        )
+    else
+        mapfile -t rendered < <(
+            {
+                printf '#\tKIND\tAGENT\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
+                printf '%s\n' "${rows[@]}"
+            } | render_checkpoint_table 0 0 6
+        )
+    fi
+    if (( ${#rendered[@]} == ${#rows[@]} + 1 )); then
+        terminal_menu_header="${rendered[0]}"
+        terminal_menu_labels=("${rendered[@]:1}")
+    else
+        terminal_menu_labels=("${rows[@]//$'\t'/  }")
+    fi
+}
+
+# 接着上次干：直接把恢复交给 Agent 自己。
+#
+# 会话还活着的时候，什么都不用还原。AGS 存档的那条路要解包、要把字节写回 Agent 的
+# home、要留回滚日志，全是因为那份副本是**冻结**的；活会话就在原地，`codex resume`
+# / `claude --resume` 本来就能打开它。
+#
+# 这里仍然做的三件事，都是 AGS 比 Agent 多知道的：会话在哪个目录里干活、上次带的
+# 是什么参数、以及这个会话是不是已经在另一个进程里开着。
+resume_live_session() {
+    local provider="$1" session_id="$2" agent launch_binary session_path workspace
+    local -a client_args=()
+    agent="$(managed_agent_for_provider "$provider")"
+    if [[ -z "$agent" ]]; then
+        show_foreign_resume_command "$provider" "$session_id"
+        return 0
+    fi
+    read_session_annotation "$provider" "$session_id"
+    # `--agent-args` 之后那一段是这次显式给的，**哪怕是空的**——`ags resume … --`
+    # 的意思是"这次不要参数"，和"没说"必须分得开，否则会被记下来的参数覆盖回去。
+    # 这和存档那条路的 `client_args_explicit` 是同一条规矩。
+    if [[ "${3:-}" == --agent-args ]]; then
+        shift 3
+        client_args=("$@")
+    else
+        decode_launch_args "$annotation_args" ||
+            die "saved Agent arguments are unreadable; resume with -- ARGS"
+        client_args=(${launch_args_decoded[@]+"${launch_args_decoded[@]}"})
+    fi
+    # 和存档恢复同一条规矩，理由也一样：AGS 马上就要自己拼出 `resume <id>` /
+    # `--resume <id>`，记录里再带一个选择，两个客户端都让**后面**那个赢，于是打开
+    # 的是另一个会话。菜单里手敲进去的参数也走这里。
+    strip_session_selection_args "$agent" "${client_args[@]}"
+    if (( ${#client_args[@]} != ${#stripped_launch_args[@]} )); then
+        client_args=("${stripped_launch_args[@]}")
+        log "dropped native session selection from $agent arguments"
+    fi
+    if [[ "$agent" == codex ]]; then
+        validate_codex_context_args "${client_args[@]}"
+    else
+        validate_claude_context_args "${client_args[@]}"
+    fi
+    session_path="$(find_session_file "$agent" "$session_id")"
+    workspace="$(native_session_workspace "$provider" "$session_id")"
+    resolve_resume_cwd "${ags_cwd_option:-}" "${workspace:-unknown}"
+    cd -- "$resolved_resume_cwd"
+    if [[ "$agent" == codex ]]; then
+        assert_native_session_inactive "$agent" "$codex_home" "$session_id"
+    else
+        assert_native_session_inactive "$agent" "$claude_home" "$session_id"
+    fi
+    launch_binary="$(resolve_agent_binary "$agent")"
+    export_launch_args "${client_args[@]}"
+    launch_terminal_title_mode=resume
+    launch_terminal_title="${session_id:0:8}"
+    case "$agent" in
+        codex)
+            launch_managed_agent "$launch_binary" "$agent" \
+                resume "$session_id" ${client_args[@]+"${client_args[@]}"}
+            ;;
+        claude)
+            launch_managed_agent "$launch_binary" "$agent" \
+                --resume "$session_id" ${client_args[@]+"${client_args[@]}"}
+            ;;
+    esac
+}
+
+# 这个会话的工作目录。
+#
+# 从 casr 现读一次而不是在列表里带着走：列表那行是给人看的（可能只有仓库名），
+# 而 `cd` 需要的是完整路径。
+native_session_workspace() {
+    local provider="$1" session_id="$2" binary
+    binary="$(resolve_ags_converter_binary)"
+    "$binary" --json list --all-workspaces --sort date \
+        --limit "$(native_session_limit)" 2>/dev/null |
+        jq -r --arg provider "$provider" --arg id "$session_id" '
+            (.items // [])
+            | map(select(.provider == $provider and .session_id == $id))
+            | (.[0].workspace // "") | tostring' 2>/dev/null
+}
+
+# AGS 不负责启动的 Agent：把它自己的恢复命令说出来，不代跑。
+#
+# 代跑要么 `eval` 一个字符串，要么在这里替十几个 Agent 各写一遍它们的命令行规则。
+# 前者是这个文件到处在躲的东西，后者是把 casr 已经知道的事再抄一份。
+show_foreign_resume_command() {
+    local provider="$1" session_id="$2" binary command
+    binary="$(resolve_ags_converter_binary)"
+    command="$("$binary" --json info "$session_id" 2>/dev/null |
+        jq -r '.resume_command // ""' 2>/dev/null)"
+    if [[ -n "$command" ]]; then
+        log "$provider 会话要用它自己的命令打开："
+        printf '  %s\n' "$command"
+    else
+        log "AGS 不启动 ${provider}；用它自己的客户端打开 $session_id"
+    fi
+}
+
+# 把这个原生会话导出成一份存档。
+#
+# `ags save` 一直做的就是「把这个会话的全部数据抄一份压缩存起来」，改的只是它接受
+# 谁：以前只认自己起的、正在跑的那个会话（从环境变量里读），现在从列表里挑一个就
+# 行——列表里的会话多半早就结束了，也多半不是 AGS 起的。
+save_live_session() {
+    local provider="$1" session_id="$2" description="${3:-}" agent archive_id native_home
+    agent="$(managed_agent_for_provider "$provider")"
+    [[ -n "$agent" ]] ||
+        die "AGS 只导出 Codex 和 Claude 的会话；${provider} 不在其中"
+    if [[ -z "$description" ]]; then
+        read_session_annotation "$provider" "$session_id"
+        description="${annotation_description:-$session_id}"
+    fi
+    # 存档 ID 带上时刻。同一个会话在两个时间点各存一份是这个功能存在的理由——
+    # 「回到我按过 save 的那些点」——所以拿会话 ID 本身当存档 ID 会让第二次保存被
+    # `checkpoint ID already exists` 顶回去，把唯一的用法挡在门外。
+    archive_id="${session_id:0:8}-$(date +%y%m%d-%H%M%S)"
+    if [[ "$agent" == codex ]]; then native_home="$codex_home"; else native_home="$claude_home"; fi
+    # 会话还开着的时候不能立刻抄。
+    #
+    # 归档抄的是原生字节本身，而一个正在跑的会话此刻可能正写到一行 JSONL 的一半；
+    # 抄下来的那份就带着半行，恢复时才发现。`queue_checkpoint` 存在就是为了这个：
+    # 记一条待办，等 Agent 的 Stop 钩子落地后再真正写归档。
+    #
+    # 会话已经结束的（列表里绝大多数都是）没有这个问题，也没有任何钩子会来替它
+    # 落地——所以那条路必须是立刻写完，否则「按了 s 却什么都没出现」。
+    if active_native_session_pid "$agent" "$native_home" "$session_id" >/dev/null; then
+        queue_checkpoint local "$agent" "$session_id" "$archive_id" "$description"
+        log "会话正在运行；归档已排队，等它这一轮结束后落地"
+    else
+        save_checkpoint local "$agent" "$session_id" "$archive_id" "$description"
+    fi
+}
+
+# 删掉一个原生会话。
+#
+# 删的是 **Agent 自己 home 里的文件**，所以规矩比删存档严：
+#
+# - pin 住的不删。pin 的意思就是「别动它」，而这是唯一一个不可逆的动作。
+# - Claude 的会话不只是那个 `.jsonl`：`file-history/<id>`、`tasks/<id>`、
+#   `session-env/<id>` 三棵子树也是它的。删主文件不删它们，留下的是一堆没有会话
+#   指向的孤儿目录。这里删的范围和 `ags save` 抄的范围**是同一份清单**，两边不能
+#   各写各的。
+# - 存档不受影响：那是另一个目录里的另一份字节。先 `s` 导出再删，就是安全的删法。
+delete_live_session() {
+    local provider="$1" session_id="$2" agent session_path session_tree
+    agent="$(managed_agent_for_provider "$provider")"
+    [[ -n "$agent" ]] ||
+        die "AGS 只删 Codex 和 Claude 的会话；${provider} 的会话请用它自己的客户端删"
+    read_session_annotation "$provider" "$session_id"
+    (( annotation_pinned == 0 )) ||
+        die "会话 ${session_id} 被 pin 住了；先取消 pin 再删"
+    assert_native_session_inactive "$agent" \
+        "$( [[ "$agent" == codex ]] && printf '%s' "$codex_home" || printf '%s' "$claude_home" )" \
+        "$session_id"
+    session_path="$(find_session_file "$agent" "$session_id")"
+    rm -f -- "$session_path"
+    if [[ "$agent" == claude ]]; then
+        session_tree="${session_path%.jsonl}"
+        rm -rf -- "$session_tree" \
+            "$claude_home/file-history/$session_id" \
+            "$claude_home/tasks/$session_id" \
+            "$claude_home/session-env/$session_id"
+    fi
+    rm -f -- "$(session_annotation_file "$provider" "$session_id" || true)"
+    printf 'status=deleted\nprovider=%s\nsession_id=%s\npath=%s\n' \
+        "$provider" "$session_id" "$session_path"
+}
+
+toggle_session_pin() {
+    local provider="$1" session_id="$2"
+    read_session_annotation "$provider" "$session_id"
+    if (( annotation_pinned == 1 )); then
+        write_session_annotation "$provider" "$session_id" \
+            "$annotation_description" "$annotation_args" 0
+        printf 'unpinned\n'
+    else
+        write_session_annotation "$provider" "$session_id" \
+            "$annotation_description" "$annotation_args" 1
+        printf 'pinned\n'
+    fi
+}
+
+split_live_selector() {
+    local body="${1#live:}"
+    selected_provider="${body%%/*}"
+    selected_session_id="${body#*/}"
+    [[ -n "$selected_provider" && -n "$selected_session_id" &&
+       "$selected_provider" != "$body" ]] ||
+        die "unreadable session selector: $1"
+}
+
+# 把缺总结的会话补齐。
+#
+# 单独一个动作而不是 `ls` 顺手做掉：每条要调一次模型，几十条就是几十次往返，
+# 而 `ls` 是这个工具里最该秒回的命令。列表平时用缓存里的总结，缓存里没有就退回
+# 标题——那已经比十六进制 ID 好认得多。
+#
+# 一条失败不影响别条：模型超时、这条会话人一句话没说、`codex` 太老，都只是这一行
+# 继续用标题而已。
+summarize_native_sessions() {
+    local force="${1:-0}"
+    local provider session_id when workspace title path
+    local made=0 kept=0 failed=0 native_name
+    local -a queue_provider=() queue_id=() queue_path=() queue_title=()
+    need jq
+    while IFS=$'\t' read -r provider session_id when workspace title path; do
+        [[ -n "$provider" && -n "$session_id" ]] || continue
+        queue_provider+=("$provider")
+        queue_id+=("$session_id")
+        queue_path+=("$path")
+        queue_title+=("$title")
+    done < <(native_session_rows)
+    (( ${#queue_id[@]} > 0 )) || { log "没有会话"; return 0; }
+    log "总结 ${#queue_id[@]} 条会话（已有的跳过）…"
+    local index
+    for index in "${!queue_id[@]}"; do
+        provider="${queue_provider[$index]}"
+        session_id="${queue_id[$index]}"
+        # Agent 自己起过名字的不必再花一次模型调用。`native_session_rows` 已经把
+        # `native_name` 和 `title` 合成一列了，所以这里单独问一次 casr。
+        native_name="$(native_session_name "$provider" "$session_id" "${queue_path[$index]}")"
+        read_session_annotation "$provider" "$session_id"
+        if [[ -n "$annotation_description" ]] ||
+           { (( force == 0 )) && [[ -n "$native_name" ]]; }; then
+            kept=$((kept + 1)); continue
+        fi
+        if [[ -n "$annotation_summary" ]] && (( force == 0 )) &&
+           [[ "$annotation_summary_stamp" == "$(session_content_stamp "${queue_path[$index]}")" ]]; then
+            kept=$((kept + 1)); continue
+        fi
+        if ensure_session_summary "$provider" "$session_id" \
+               "${queue_path[$index]}" "$native_name" "$force"; then
+            read_session_annotation "$provider" "$session_id"
+            made=$((made + 1))
+            log "  ${provider}/${session_id:0:8} → ${annotation_summary}"
+        else
+            failed=$((failed + 1))
+        fi
+    done
+    log "总结完成：新增 ${made}，跳过 ${kept}，没算出来 ${failed}"
+    push_pool_descriptions || true
+}
+
+# 把算好的描述推给凭据池，让后台的会话列表也能看懂。
+#
+# neburst 那一页显示的是 `cwd` 或者 `device_id`——一个说不出这条会话在干什么，另一
+# 个是 `Algorithm-fd30aaf8…` 这样的哈希。这里推上去的就是本地列表里那一列。
+#
+# **怎么把本地的 rollout 和服务端那一行对上。** 问服务端要这把密钥自己的活会话，
+# 它连 `device_id`、`ags_id`、`cwd`、`started_at` 一起发回来，然后两条规则依次试：
+#
+#   1. **`ags_id` 恰好就是 rollout ID。** 实测七条里有五条是这样（会话从
+#      `ags resume <id>` 起来，名字就是那个 ID）。这一条是精确匹配，没有猜的成分。
+#   2. **同一个目录、几乎同一个时刻。** 另外两条的名字是自动生成的
+#      `<目录>-<年.月.日>-<时.分.秒>`，和 rollout ID 无关。ags 上报完立刻 `exec`
+#      成 codex，所以那条 rollout 的开始时刻就落在上报之后的几秒内。
+#
+# 两条都对不上就不推。宁可后台少一句描述，也不能把 A 会话的描述挂到 B 会话上——
+# 那比没有描述糟得多，因为它看起来是对的。
+#
+# 之前这里是靠 ags 自己在启动时留一份本地记录来配对的。不需要了：服务端本来就
+# 存着 cwd 和起始时刻，问它要比自己记一份更准，也少一份会过期的状态。
+#
+# 全程不报错：这是一件锦上添花的事，没有理由让它拦住任何东西。
+push_pool_descriptions() {
+    local config url key remote local_rows pairs
+    local device_id session_id description pushed=0 skipped=0
+    command -v jq >/dev/null 2>&1 || return 0
+    command -v curl >/dev/null 2>&1 || return 0
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+
+    remote="$(curl -sS $codex_pool_curl_redirect --connect-timeout 6 --max-time 15 -X POST \
+        -H "X-Codex-Pool-Token: $key" "$url$codex_pool_prefix/sessions" 2>/dev/null |
+        jq -c '[(.data.sessions // [])[] | select((.device_id // "") != "")]' 2>/dev/null)" || return 0
+    [[ -n "$remote" && "$remote" != "[]" ]] || return 0
+
+    local_rows="$("$(resolve_ags_converter_binary)" --json list --all-workspaces \
+        --sort date --limit "$(native_session_limit)" 2>/dev/null |
+        jq -c '[(.items // [])[]
+               | select(.provider == "codex")
+               | {session_id, workspace: (.workspace // ""),
+                  started_at: (((.started_at // 0) / 1000) | floor)}]' 2>/dev/null)" || return 0
+    [[ -n "$local_rows" ]] || return 0
+
+    # 服务端发的是北京时间的裸字符串（见 CodexSession.timestamp），本地是 epoch。
+    # 补上 +08:00 再转，这样两边比的是同一条时间轴上的秒数。
+    pairs="$(jq -rn --argjson remote "$remote" --argjson local "$local_rows" '
+        def window: 180;
+        def epoch($text): ($text + "+08:00")
+            | try (strptime("%Y-%m-%d %H:%M:%S%z") | mktime) catch null;
+        $remote[]
+        | . as $row
+        | ((($local | map(select(.session_id == $row.ags_id)) | .[0])
+            // (epoch($row.started_at // "") as $started
+                | if $started == null then null
+                  else ($local
+                        | map(select(.workspace == ($row.cwd // "")
+                                     and .started_at >= ($started - 5)
+                                     and .started_at <= ($started + window)))
+                        | sort_by(.started_at) | .[0])
+                  end))) as $match
+        | select($match != null)
+        | [$row.device_id, $match.session_id] | @tsv
+    ' 2>/dev/null)" || return 0
+    [[ -n "$pairs" ]] || { log "凭据池里的会话没有一条能和本地对上，没推描述"; return 0; }
+
+    while IFS=$'\t' read -r device_id session_id; do
+        [[ -n "$device_id" && -n "$session_id" ]] || continue
+        read_session_annotation codex "$session_id"
+        description="${annotation_description:-${annotation_summary:-}}"
+        if [[ -z "$description" ]]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if curl -sS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
+            -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg d "$device_id" --arg t "$description" \
+                  '{device_id: $d, description: $t}')" \
+            "$url$codex_pool_prefix/session/description" >/dev/null 2>&1; then
+            pushed=$((pushed + 1))
+        fi
+    done <<< "$pairs"
+    (( pushed == 0 && skipped == 0 )) ||
+        log "描述已同步到凭据池：推了 ${pushed} 条，${skipped} 条还没有描述"
+    return 0
+}
+
+# Agent 自己给这条会话起的名字，没有就是空串。
+native_session_name() {
+    local provider="$1" session_id="$2" path="$3" binary
+    binary="$(resolve_ags_converter_binary)"
+    "$binary" --json info "$session_id" --from "$provider" \
+        ${path:+--source "$path"} 2>/dev/null |
+        jq -r '.native_name // ""' 2>/dev/null
+}
+
+list_native_sessions() {
+    local include_archives=0 menu_status selector action_output summarize=0
+    local selected_provider selected_session_id
+    while (( $# > 0 )); do
+        case "$1" in
+            -a|--all) include_archives=1; shift ;;
+            -s|--summarize) summarize=1; shift ;;
+            *) die "usage: ags ls [-a] [--summarize]" ;;
+        esac
+    done
+    need column; need jq
+    (( summarize == 0 )) || summarize_native_sessions
+    if (( include_archives == 1 )); then
+        load_local_storage
+        need age; need tar
+        load_encryption_identity
+    fi
+
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        load_native_session_menu "$include_archives" 0
+        (( ${#terminal_menu_labels[@]} > 0 )) || return 0
+        printf '%s\n' "$terminal_menu_header" "${terminal_menu_labels[@]}"
+        return 0
+    fi
+
+    terminal_menu_notice=
+    load_native_session_menu "$include_archives" 1
+    if (( ${#terminal_menu_ids[@]} == 0 )); then
+        log "no sessions"
+        return 0
+    fi
+    while (( ${#terminal_menu_ids[@]} > 0 )); do
+        if terminal_menu "Sessions" 1 1; then
+            selector="$terminal_menu_selected"
+            decode_launch_args "$terminal_menu_selected_args" ||
+                die "saved Agent arguments are unreadable; resume with -- ARGS"
+            case "$selector" in
+                live:*)
+                    split_live_selector "$selector"
+                    # 菜单里改过的参数在这里落盘。改完直接回车走人是最常见的用法，
+                    # 不写就等于没改。
+                    read_session_annotation "$selected_provider" "$selected_session_id"
+                    write_session_annotation "$selected_provider" "$selected_session_id" \
+                        "$annotation_description" "$terminal_menu_selected_args" \
+                        "$annotation_pinned"
+                    resume_live_session "$selected_provider" "$selected_session_id" \
+                        --agent-args ${launch_args_decoded[@]+"${launch_args_decoded[@]}"}
+                    ;;
+                saved:*)
+                    resume_checkpoint local "${selector#saved:}" \
+                        -- ${launch_args_decoded[@]+"${launch_args_decoded[@]}"}
+                    ;;
+                *) die "unreadable session selector: $selector" ;;
+            esac
+            return
+        else
+            menu_status=$?
+        fi
+        case "$menu_status" in
+            1) return 0 ;;
+            2)
+                selector="$terminal_menu_selected"
+                case "$selector" in
+                    live:*)
+                        split_live_selector "$selector"
+                        if action_output="$(
+                            delete_live_session "$selected_provider" "$selected_session_id"
+                        )"; then
+                            terminal_menu_notice="Deleted ${selected_session_id:0:8}; any archive of it is untouched."
+                        else
+                            terminal_menu_notice="Not deleted: $(printf '%s' "$action_output" | tail -n 1)"
+                        fi
+                        ;;
+                    saved:*)
+                        if action_output="$(
+                            delete_local_checkpoint "${selector#saved:}"
+                        )" && grep -Fqx 'status=deleted' <<< "$action_output"; then
+                            terminal_menu_notice="Deleted ${selector#saved:}; it remains recoverable."
+                        else
+                            terminal_menu_notice="Not deleted."
+                        fi
+                        ;;
+                esac
+                ;;
+            3)
+                selector="$terminal_menu_selected"
+                case "$selector" in
+                    live:*)
+                        split_live_selector "$selector"
+                        terminal_menu_notice="$(
+                            toggle_session_pin "$selected_provider" "$selected_session_id"
+                        ) ${selected_session_id:0:8}"
+                        ;;
+                    *) terminal_menu_notice='Only a live session can be pinned.' ;;
+                esac
+                ;;
+            4)
+                selector="$terminal_menu_selected"
+                case "$selector" in
+                    live:*)
+                        split_live_selector "$selector"
+                        if save_live_session "$selected_provider" "$selected_session_id" \
+                            >/dev/null 2>&1; then
+                            terminal_menu_notice="Saved ${selected_session_id:0:8}."
+                        else
+                            terminal_menu_notice="Could not save ${selected_session_id:0:8}."
+                        fi
+                        ;;
+                    *) terminal_menu_notice='That one is already an archive.' ;;
+                esac
+                ;;
+            *) die "session selector failed" ;;
+        esac
+        load_native_session_menu "$include_archives" 1
+        if (( ${#terminal_menu_ids[@]} == 0 )); then
+            printf '%s\n' "$terminal_menu_notice"
+            return 0
+        fi
+    done
+    return 0
+}
+
+
+# ---------------------------------------------------------------------------
+# 保留期
+# ---------------------------------------------------------------------------
+#
+# 两个 Agent 在这件事上**不对称**，所以 AGS 对它们做的事也不一样：
+#
+# - **Claude Code 自己会删。** 它有 `cleanupPeriodDays`，到期就把会话文件删掉。
+#   AGS 因此**不自己删 Claude 的会话**，只把统一的期限写进它自己的设置，让它按这个
+#   数字清。两套 GC 同时删同一批文件，出了问题没人能查清是谁删的。
+# - **Codex 没有任何清理。** 它的 rollout 会一直堆下去（写这段时本机 2769 个、
+#   13.7 GB）。这一半由 AGS 接管，真删。
+#
+# 三条硬规矩，写在这里而不是散在下面：
+#
+# 1. **没配置就不删。** 「保留期」这个概念以前在这套工具里不存在，任何默认值都会
+#    在某个人的机器上删掉他没打算删的东西。
+# 2. **默认只说不做。** `ags gc` 是 dry-run，真删要 `--yes`。而且不挂任何自动触发
+#    ——没有钩子、没有定时器。删别人 home 里的文件这件事必须是有人按下去的。
+# 3. **三类永不删**：pin 住的、已经导出过存档的、以及 AGS 认不出来的。「认不出来
+#    就不动」是底线：这里动的是 Agent 自己的数据。
+retention_config="$state/retention.json"
+
+read_retention_days() {
+    local agent="$1"
+    [[ -s "$retention_config" ]] || return 1
+    jq -er --arg agent "$agent" '
+        .[$agent] | select(type == "number" and . >= 1 and . <= 3650) | floor
+    ' "$retention_config" 2>/dev/null
+}
+
+write_retention_days() {
+    local agent="$1" days="$2" temporary existing='{}'
+    [[ -s "$retention_config" ]] &&
+        existing="$(jq -c 'if type == "object" then . else {} end' \
+            "$retention_config" 2>/dev/null || printf '{}')"
+    mkdir -p "$(dirname "$retention_config")"
+    temporary="$(mktemp "$retention_config.XXXXXX")"
+    jq -c --arg agent "$agent" --argjson days "$days" '.[$agent] = $days' \
+        <<< "$existing" > "$temporary" ||
+        { rm -f -- "$temporary"; die "cannot record the retention period"; }
+    chmod 600 "$temporary"
+    mv -- "$temporary" "$retention_config"
+}
+
+# 把期限交给 Claude 自己。
+#
+# 只改 `cleanupPeriodDays` 一个键，其余原样保留：这是**别人的**配置文件，里面还有
+# 权限、钩子、MCP 服务器。整份重写会把它们一起赌上。
+apply_claude_retention() {
+    local days="$1" settings="$claude_home/settings.json" temporary existing='{}'
+    mkdir -p "$claude_home"
+    if [[ -s "$settings" ]]; then
+        existing="$(jq -c . "$settings" 2>/dev/null)" ||
+            die "Claude 的 settings.json 不是合法 JSON，先修好它再设保留期：$settings"
+    fi
+    temporary="$(mktemp "$settings.XXXXXX")"
+    jq --argjson days "$days" '.cleanupPeriodDays = $days' <<< "$existing" \
+        > "$temporary" ||
+        { rm -f -- "$temporary"; die "cannot write $settings"; }
+    # 权限跟随原文件，新建的走 600：这个文件里可能有别的东西。
+    if [[ -f "$settings" ]]; then
+        chmod --reference="$settings" "$temporary" 2>/dev/null || chmod 600 "$temporary"
+    else
+        chmod 600 "$temporary"
+    fi
+    mv -- "$temporary" "$settings"
+}
+
+configure_retention() {
+    local agent= days= current
+    while (( $# > 0 )); do
+        case "$1" in
+            --agent)
+                (( $# >= 2 )) || die "--agent 需要 codex 或 claude"
+                agent="$2"
+                shift 2
+                ;;
+            *)
+                [[ -z "$days" ]] || die "usage: ags set retention [--agent codex|claude] DAYS"
+                days="$1"
+                shift
+                ;;
+        esac
+    done
+    if [[ -z "$days" ]]; then
+        for agent in codex claude; do
+            if current="$(read_retention_days "$agent")"; then
+                printf '%s=%s\n' "$agent" "$current"
+            else
+                printf '%s=unset\n' "$agent"
+            fi
+        done
+        return 0
+    fi
+    [[ "$days" =~ ^[1-9][0-9]{0,3}$ ]] && (( days <= 3650 )) ||
+        die "保留期要是 1 到 3650 之间的天数"
+    if [[ -n "$agent" ]]; then
+        [[ "$agent" == codex || "$agent" == claude ]] ||
+            die "--agent 只接受 codex 或 claude"
+        set -- "$agent"
+    else
+        set -- codex claude
+    fi
+    for agent in "$@"; do
+        write_retention_days "$agent" "$days"
+        if [[ "$agent" == claude ]]; then
+            apply_claude_retention "$days"
+            printf 'claude=%s (written to %s as cleanupPeriodDays)\n' \
+                "$days" "$claude_home/settings.json"
+        else
+            printf 'codex=%s (ags gc deletes; nothing is automatic)\n' "$days"
+        fi
+    done
+}
+
+# 已经导出过存档的会话 ID。
+#
+# 从存档本身读，不靠任何簿记：簿记会漏——在别处 `ags save` 过的、从别的机器同步
+# 过来的，都不会在本机留下记号。存档是唯一权威的「这份数据我另外留了一份」。
+saved_session_ids() {
+    local file manifest
+    [[ -d "${local_checkpoints:-}" ]] || return 0
+    while IFS= read -r -d '' file; do
+        if manifest="$(age_decrypt "$file" 2>/dev/null | tar -xzOf - manifest 2>/dev/null)"; then
+            sed -n 's/^session_id=//p' <<< "$manifest"
+        fi
+    done < <(find "$local_checkpoints" -mindepth 2 -maxdepth 2 -type f \
+        -name '*.checkpoint.tar.gz.age' -print0)
+}
+
+# 比这个时刻更早的都算过期。
+retention_cutoff_millis() {
+    local days="$1" now
+    now="$(date +%s)"
+    printf '%s\n' "$(( (now - days * 86400) * 1000 ))"
+}
+
+ags_gc() {
+    local agent_filter= assume_yes=0 days agent cutoff
+    local provider session_id when_ms workspace title path
+    local pinned_skipped=0 saved_skipped=0 removed=0 candidates=0 bytes=0
+    local binary size
+    local -a plan=()
+    local -A saved=()
+    while (( $# > 0 )); do
+        case "$1" in
+            --agent)
+                (( $# >= 2 )) || die "--agent 需要 codex 或 claude"
+                agent_filter="$2"
+                [[ "$agent_filter" == codex || "$agent_filter" == claude ]] ||
+                    die "--agent 只接受 codex 或 claude"
+                shift 2
+                ;;
+            --yes) assume_yes=1; shift ;;
+            --dry-run) shift ;;
+            *) die "usage: ags gc [--agent codex|claude] [--yes]" ;;
+        esac
+    done
+    need jq
+    # 先看有没有配置过保留期。没配置就什么都不做，而且**不该**在这之前去要求存储
+    # 配置好——一台刚装完、还没 `ags set` 的机器上，`ags gc` 应该说"没配置保留期"，
+    # 而不是报一个和保留期无关的存储错误。
+    if ! read_retention_days codex >/dev/null && ! read_retention_days claude >/dev/null; then
+        printf 'codex: 没有配置保留期，什么都不做（ags set retention --agent codex DAYS）\n'
+        printf 'claude: 没有配置保留期，什么都不做（ags set retention --agent claude DAYS）\n'
+        return 0
+    fi
+    load_local_storage
+    need age; need tar
+    load_encryption_identity
+    binary="$(resolve_ags_converter_binary)"
+
+    while IFS= read -r session_id; do
+        [[ -n "$session_id" ]] || continue
+        saved["$session_id"]=1
+    done < <(saved_session_ids)
+
+    for agent in codex claude; do
+        [[ -z "$agent_filter" || "$agent_filter" == "$agent" ]] || continue
+        if ! days="$(read_retention_days "$agent")"; then
+            printf '%s: 没有配置保留期，什么都不做（ags set retention --agent %s DAYS）\n' \
+                "$agent" "$agent"
+            continue
+        fi
+        if [[ "$agent" == claude ]]; then
+            # Claude 自己删。这里只核对一遍设置真的写进去了，然后把它会删掉什么
+            # 报出来——**一个都不动**。
+            printf 'claude: %s 天，由 Claude Code 自己按 cleanupPeriodDays 清理\n' "$days"
+            printf 'claude: 当前设置 cleanupPeriodDays=%s\n' \
+                "$(jq -r '.cleanupPeriodDays // "unset"' "$claude_home/settings.json" 2>/dev/null || printf 'unset')"
+            continue
+        fi
+        cutoff="$(retention_cutoff_millis "$days")"
+        printf 'codex: %s 天，早于这个时间的会话会被删\n' "$days"
+        while IFS=$'\t' read -r provider session_id when_ms workspace title path; do
+            [[ "$provider" == codex && -n "$session_id" && -n "$path" ]] || continue
+            (( when_ms < cutoff )) || continue
+            candidates=$((candidates + 1))
+            read_session_annotation "$provider" "$session_id"
+            if (( annotation_pinned == 1 )); then
+                pinned_skipped=$((pinned_skipped + 1))
+                continue
+            fi
+            if [[ -n "${saved[$session_id]:-}" ]]; then
+                saved_skipped=$((saved_skipped + 1))
+                continue
+            fi
+            [[ -f "$path" ]] || continue
+            size="$(stat -c %s -- "$path" 2>/dev/null || printf 0)"
+            bytes=$((bytes + size))
+            plan+=("$session_id"$'\t'"$path")
+        done < <(gc_candidate_rows "$binary")
+    done
+
+    printf '过期 %s 个；pin 跳过 %s，已存档跳过 %s；可删 %s，合计 %s MiB\n' \
+        "$candidates" "$pinned_skipped" "$saved_skipped" "${#plan[@]}" \
+        "$(( bytes / 1048576 ))"
+    (( ${#plan[@]} > 0 )) || return 0
+    if (( assume_yes == 0 )); then
+        printf '%s\n' "${plan[@]}" | cut -f2
+        printf '这是 dry-run，什么都没删。真要删：ags gc --yes（想留哪个先 ags ls 里按 p，或按 s 存一份）\n'
+        return 0
+    fi
+    local entry
+    for entry in "${plan[@]}"; do
+        session_id="${entry%%$'\t'*}"
+        path="${entry#*$'\t'}"
+        # 删之前再核一遍：dry-run 和真删之间可能过了很久，会话可能又活了。
+        if active_native_session_pid codex "$codex_home" "$session_id" >/dev/null; then
+            log "跳过 ${session_id}：它现在正在运行"
+            continue
+        fi
+        read_session_annotation codex "$session_id"
+        (( annotation_pinned == 0 )) || { log "跳过 ${session_id}：已 pin"; continue; }
+        [[ -z "${saved[$session_id]:-}" ]] || { log "跳过 ${session_id}：已存档"; continue; }
+        rm -f -- "$path" || { log "删不掉：$path"; continue; }
+        rm -f -- "$(session_annotation_file codex "$session_id" || true)"
+        removed=$((removed + 1))
+        printf 'deleted=%s\n' "$path"
+    done
+    printf '删了 %s 个\n' "$removed"
+}
+
+# gc 用的会话清单。
+#
+# 和 `ags ls` 不一样：这里要的是**全部**，不是最近的一屏。`--limit` 给到上限，
+# 因为过期的那些按定义就在列表的尾巴上，取前 50 条永远看不到它们。
+gc_candidate_rows() {
+    local binary="$1"
+    "$binary" --json list --all-workspaces --sort date --limit 9999 2>/dev/null |
+        jq -r '
+            (.items // [])
+            | .[]
+            | [ .provider,
+                .session_id,
+                (((.last_active_at // .started_at // 0) | floor) | tostring),
+                ((.workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
+                (((.native_name // .title) // "") | tostring | gsub("[\t\r\n]"; " ")),
+                ((.path // "") | tostring)
+              ]
+            | @tsv' 2>/dev/null
 }
 
 list_local_checkpoints() {
@@ -7719,6 +9158,45 @@ resolve_resume_cwd() {
 resume_checkpoint() {
     local target="$1"
     shift
+    # `live:<provider>/<id>` 走活会话那条路。
+    #
+    # 这个前缀就是 `ags ls` 内部用的选择器，原样接受它有两个理由：菜单里能干的事
+    # 命令行也要能干（否则接着上次干这件事只有一条交互路径，脚本和测试都够不着），
+    # 以及它和存档 ID 不会撞——存档的选择器是 `<agent>/<record_id>`，没有前缀。
+    # 纯数字是 `ags ls` 里那一列短号。人看完列表要接着干的时候，敲的是他刚在屏幕
+    # 上看到的那个数字，而不是一串十六进制。
+    #
+    # 只在本地这条路上认：短号是这台机器发的，云端存档没有这个概念。数字认不出来
+    # 就报错而不是当成检查点 ID 继续——一个叫 `42` 的检查点确实可能存在，但把"短号
+    # 没找到"悄悄变成"去找一个叫 42 的存档"会让人打开完全不相干的东西。
+    if [[ "$target" == local && "${1:-}" =~ ^[0-9]{1,9}$ ]]; then
+        local ordinal_selector
+        if selector_for_ordinal "$1"; then
+            shift
+            set -- "$ordinal_selector" "$@"
+        else
+            die "没有第 ${1} 号会话；先跑 ags ls 看看现在有哪些"
+        fi
+    fi
+    if [[ "${1:-}" == live:* ]]; then
+        local selected_provider selected_session_id
+        local -a live_client_args=()
+        split_live_selector "$1"
+        shift
+        (( $# == 0 )) ||
+            die "ags resume 只接受一个会话标识：$1（给 Agent 的参数写在 -- 之后）"
+        # 给 Agent 的参数在顶层就被 `--` 摘进 `ags_agent_args` 了，不会以位置参数
+        # 的形式走到这里。和存档那条路取的是同一个来源，两条入口才不会一个认
+        # `--model o3`、另一个不认。
+        if (( ${ags_agent_args_given:-0} == 1 )); then
+            live_client_args=(${ags_agent_args[@]+"${ags_agent_args[@]}"})
+            resume_live_session "$selected_provider" "$selected_session_id" \
+                --agent-args ${live_client_args[@]+"${live_client_args[@]}"}
+        else
+            resume_live_session "$selected_provider" "$selected_session_id"
+        fi
+        return
+    fi
     local checkpoint_id="${1:-}" launch_binary resume_cwd= resume_target_agent=
     local profile= agent_profile= effective_profile=
     local runtime_manifest runtime_checkpoint_id runtime_source_agent runtime_record_id
@@ -10738,14 +12216,32 @@ case "${1:-}" in
         (( $# == 0 )) || die "usage: ags codex-name"
         reconcile_codex_binary_name install
         ;;
-    set) shift; configure_local_storage "$@" ;;
+    set)
+        shift
+        # `ags set retention …` 和 `ags set ABSOLUTE_DIR` 是两件事，第一个词分开。
+        if [[ "${1:-}" == retention ]]; then
+            shift
+            configure_retention "$@"
+        else
+            configure_local_storage "$@"
+        fi
+        ;;
+    gc) shift; ags_gc "$@" ;;
     cloud) shift; cloud_command "$@" ;;
     remote) shift; remote_command "$@" ;;
     storage) shift; storage_command "$@" ;;
     # `ls` 是 `list` 的别名。这是手上敲得最多的一个，而 `ls` 是所有人肌肉记忆里
     # "列出来"的那个词。只给这一个加别名：别名不减少复杂度，它增加表面积，只有
     # 高频那一个才划算。
-    list|ls) shift; list_local_checkpoints "$@" ;;
+    list|ls) shift; list_native_sessions "$@" ;;
+    summarize) shift
+        # `--force` 重算已经有的：换了模型、或者一条会话后来长出了完全不同的内容。
+        case "${1:-}" in
+            ''|--force) summarize_native_sessions "$( [[ "${1:-}" == --force ]] && printf 1 || printf 0 )" ;;
+            *) die "usage: ags summarize [--force]" ;;
+        esac
+        ;;
+    archives) shift; list_local_checkpoints "$@" ;;
     show) shift; show_local_checkpoint "$@" ;;
     save) shift; save_active_checkpoint local "$@" ;;
     resume) shift; resume_checkpoint local "$@" ;;
