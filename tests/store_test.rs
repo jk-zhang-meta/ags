@@ -10,7 +10,7 @@
 //! here. Every store these tests create lives in a fresh `tempfile` root.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use casr::ir::{
     Block, Body, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, IR_VERSION, Loss, LossKind,
@@ -130,12 +130,31 @@ fn index_rows(root: &Path) -> Vec<(String, String, String)> {
 }
 
 /// The largest `.jsonl` under `root`, or `None` when the corpus is absent.
+/// The largest corpus session that is not being written to right now.
+///
+/// The quiescence filter is not fussiness. On a machine that uses Codex the
+/// largest rollout is routinely the *live* one — the session doing the work
+/// that is running this test — and it grows between the scan and every
+/// measurement afterwards. A caller that snapshots it then asks whether it
+/// changed gets `rehashed: true`, which is the correct answer about a file
+/// that did change and a useless one about the property being measured. One
+/// minute is far longer than the gap between an agent's writes and far shorter
+/// than the age of anything else in a corpus.
 fn largest_under(root: &Path) -> Option<(PathBuf, u64)> {
+    let quiescent_for = std::time::Duration::from_secs(60);
+    let now = SystemTime::now();
     walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file() && e.path().extension().is_some_and(|x| x == "jsonl"))
-        .filter_map(|e| e.metadata().ok().map(|m| (e.path().to_path_buf(), m.len())))
+        .filter_map(|e| e.metadata().ok().map(|m| (e.path().to_path_buf(), m)))
+        .filter(|(_, meta)| {
+            meta.modified()
+                .ok()
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= quiescent_for)
+        })
+        .map(|(path, meta)| (path, meta.len()))
         .max_by_key(|(_, size)| *size)
 }
 
@@ -1446,7 +1465,18 @@ fn origin_lookup_on_the_largest_corpus_rollout_is_a_stat_not_a_hash() {
     let started = Instant::now();
     let snapshot = OriginSnapshot::of(&path).expect("snapshot");
     let ingest = started.elapsed();
-    assert_eq!(snapshot.size, size);
+    // `>=`, not `==`. The largest rollout on a machine that uses Codex is
+    // routinely the *live* one, and it grows between `largest_under`'s stat and
+    // this snapshot's — 1,024,951,233 bytes then 1,024,954,809 on the run that
+    // found this, three and a half kilobytes of one turn apart. An equality here
+    // fails on exactly the corpus the test was written to measure, and says
+    // nothing about the thing being measured. Rollouts are append-only, so the
+    // invariant that holds is that it never shrank.
+    assert!(
+        snapshot.size >= size,
+        "the largest rollout shrank between the scan and the snapshot: {size} -> {}",
+        snapshot.size
+    );
 
     // The lookup a conversion actually performs: unchanged file, one stat.
     let mut fast = std::time::Duration::MAX;

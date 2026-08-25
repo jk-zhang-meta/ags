@@ -53,6 +53,12 @@ pub struct SourceSelection {
     pub named: SessionKey,
     /// Every incarnation the store ranked for this target, best first.
     pub choice: SourceChoice,
+    /// Whether the caller pinned the source to [`SourceSelection::named`].
+    ///
+    /// Set by `--exact-source`. The ranking still runs — the record, and what
+    /// else is in it, is worth knowing and worth recording — but its answer is
+    /// not acted on.
+    pub pinned: bool,
 }
 
 impl SourceSelection {
@@ -63,7 +69,15 @@ impl SourceSelection {
     /// which is what `--no-store` would have delivered — instead of the head of a
     /// ranking that has no way to prefer one side of a divergence.
     pub fn chosen(&self) -> Option<&SourceCandidate> {
-        self.choice.resolve(Some(&self.named))
+        let resolved = self.choice.resolve(Some(&self.named))?;
+        // Pinned means the bytes that were read are the ones that were named,
+        // so that is what the record has to say they were. Reporting the head
+        // of a ranking nobody acted on would write a lineage that never
+        // happened — and the next conversion would trust it.
+        if self.pinned && resolved.key != self.named {
+            return self.choice.find(&self.named);
+        }
+        Some(resolved)
     }
 
     /// Whether the store read a session the user did not name.
@@ -89,6 +103,16 @@ pub struct ConvertOptions {
     pub verbose: bool,
     pub enrich: bool,
     pub source_hint: Option<String>,
+    /// Convert the session that was named and no other.
+    ///
+    /// The store's whole job is to notice that a better incarnation of this
+    /// conversation exists and read *that* instead. A caller that means one
+    /// specific set of bytes — restoring a checkpoint is the case this was
+    /// added for — has to be able to turn that off without also turning off the
+    /// record, which is what `--no-store` does and why it was the wrong flag
+    /// for it: a conversion that records nothing leaves the *next* one unable
+    /// to find a better source, which is the loss the store exists to prevent.
+    pub exact_source: bool,
     /// How much of the session the caller allowed across, applied only to
     /// cross-provider conversions.
     ///
@@ -112,6 +136,7 @@ impl Default for ConvertOptions {
             verbose: false,
             enrich: false,
             source_hint: None,
+            exact_source: false,
             // Trimming is something the caller asks for. A conversion nobody
             // constrained carries the whole session.
             budget: crate::budget::ContextBudget::UNLIMITED,
@@ -1070,6 +1095,26 @@ but resume may fail until the CLI is installed.",
                 record_id: record.id,
                 named,
                 choice,
+                pinned: opts.exact_source,
+            });
+        }
+
+        // `--exact-source` stops here: the record is known, the ranking has run,
+        // and neither is allowed to change which bytes get converted. Not a
+        // warning — the caller asked for this, and a line telling them the store
+        // knows better on every single run is noise they cannot act on.
+        if opts.exact_source {
+            debug!(
+                record = %record.id,
+                %named,
+                offered = %chosen.key,
+                "exact source: the store offers another incarnation and is not taking it"
+            );
+            return Some(SourceSelection {
+                record_id: record.id,
+                named,
+                choice,
+                pinned: true,
             });
         }
 
@@ -1105,6 +1150,7 @@ but resume may fail until the CLI is installed.",
             record_id: record.id,
             named,
             choice,
+            pinned: false,
         })
     }
 

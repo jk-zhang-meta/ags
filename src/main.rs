@@ -209,6 +209,21 @@ enum Command {
         #[arg(long)]
         no_store: bool,
 
+        /// Convert the session named here and no other, but still record it.
+        ///
+        /// The half of `--no-store` a caller usually wants. `--no-store` turns
+        /// off two things at once — reading a better incarnation, and writing
+        /// down what this conversion produced — and only the first of those is
+        /// what "convert exactly this file" asks for. Turning off the second as
+        /// well is self-defeating: the record is how a *later* conversion back
+        /// to the source provider finds the original instead of a degraded copy
+        /// of it, which is the loss the store exists to prevent.
+        ///
+        /// Use it when the bytes are the point: restoring a checkpoint means
+        /// that archive, not whatever else the store has learned since.
+        #[arg(long, conflicts_with = "no_store")]
+        exact_source: bool,
+
         /// Flags for the target agent, appended after the resume arguments.
         ///
         /// Refused if one of them is a flag the resume command already sets,
@@ -450,6 +465,7 @@ fn main() -> ExitCode {
             account,
             pick_account,
             no_store,
+            exact_source,
             agent_args,
         } => cmd_resume(
             &target,
@@ -462,6 +478,7 @@ fn main() -> ExitCode {
             max_tool_output,
             drop_reasoning,
             no_store,
+            exact_source,
             cli.json,
             LaunchRequest {
                 launch,
@@ -690,6 +707,7 @@ fn cmd_resume(
     max_tool_output: Option<usize>,
     drop_reasoning: bool,
     no_store: bool,
+    exact_source: bool,
     json_mode: bool,
     launch: LaunchRequest,
 ) -> anyhow::Result<ExitCode> {
@@ -709,6 +727,7 @@ fn cmd_resume(
         verbose: false,
         enrich,
         source_hint: source,
+        exact_source,
         // Absent flags mean an absent budget. A converter graded on fidelity
         // does not trim a session nobody asked it to trim.
         budget: ContextBudget::requested(max_context_tokens, max_tool_output, drop_reasoning),
