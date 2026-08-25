@@ -1488,6 +1488,25 @@ impl Codex {
                                             line = line_num,
                                             "skipping duplicate user event_msg"
                                         );
+                                        // Same words, better provenance. Codex
+                                        // writes a typed message twice — once
+                                        // into the model input as a
+                                        // `response_item`, once as its own
+                                        // `event_msg` record of what the user
+                                        // typed — and the two are identical, so
+                                        // only one belongs in the conversation.
+                                        // Keeping the first one is right;
+                                        // keeping the *first one's envelope* is
+                                        // not, because that is the only thing
+                                        // that says which of the two this was,
+                                        // and everything downstream that wants
+                                        // to tell a typed message from an
+                                        // assembled one reads it. Handing the
+                                        // survivor the event's envelope changes
+                                        // no content and no order.
+                                        if let Some(previous) = messages.last_mut() {
+                                            previous.extra = next_message.extra;
+                                        }
                                         continue;
                                     }
 
@@ -1711,10 +1730,67 @@ impl Codex {
             }
         });
 
+        // The title is what the *user* typed, and Codex records that separately
+        // from what was assembled and sent to the model.
+        //
+        // A turn's model input is a `response_item` whose content the harness
+        // has already prepended context to — a repository's AGENTS.md, a plugin
+        // list, an environment block — so the first `role == User` message in
+        // file order is routinely all harness and no user. Titling from it gives
+        // a store where every session reads `# AGENTS.md instructions for …`, or
+        // `<recommended_plugins>`: measured on one machine's corpus, eleven of
+        // eleven Codex sessions listed identically, and the listing could not be
+        // used to find anything.
+        //
+        // `event_msg` / `user_message` is Codex's own record of the typed text.
+        // Preferring it is a rule about which record answers the question, not a
+        // guess about which words look like a person — and where a rollout has
+        // none (a `codex exec` run, an older format), the first user message is
+        // still the answer.
+        fn is_typed_by_the_user(message: &CanonicalMessage) -> bool {
+            message.extra.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+                && message
+                    .extra
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("user_message")
+        }
+        // Move to the *next* message when this one is all harness.
+        //
+        // Preferring `event_msg` is not enough on its own. Codex records a
+        // turn's typed text there, but the harness also injects whole turns of
+        // its own — a repository's AGENTS.md arrives as a user message — so the
+        // first typed message is routinely nothing but injected material. Titling
+        // from it and falling back *within* it lands on the injected heading:
+        // eight of fourteen Codex sessions on one machine read `# AGENTS.md
+        // instructions for /mnt/c/…`, three of them character for character.
+        //
+        // `human_headline` returning `None` says "this message has no prose",
+        // which is the signal to look at the next one rather than to give up.
+        fn headline(message: &CanonicalMessage) -> Option<String> {
+            crate::model::human_headline(&message.content)
+                .map(|line| truncate_title(&line, 100))
+                .filter(|title| !title.is_empty())
+        }
         let title = messages
             .iter()
-            .find(|m| m.role == MessageRole::User)
-            .map(|m| truncate_title(&m.content, 100));
+            .filter(|m| m.role == MessageRole::User && is_typed_by_the_user(m))
+            .find_map(headline)
+            .or_else(|| {
+                messages
+                    .iter()
+                    .filter(|m| m.role == MessageRole::User)
+                    .find_map(headline)
+            })
+            // Every user message was injected material. The raw first line still
+            // beats an empty column.
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| truncate_title(&m.content, 100))
+            });
 
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -2322,6 +2398,75 @@ mod tests {
         provider
             .read_legacy_json(Path::new("/tmp/test-legacy.json"), content)
             .unwrap_or_else(|e| panic!("read_legacy_json failed: {e}"))
+    }
+
+    /// The real shape: the typed message appears twice, and the copy that
+    /// identifies it as typed is the one that gets deduplicated away.
+    #[test]
+    fn title_prefers_the_user_message_when_it_is_a_duplicate_of_the_model_input() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir
+            .path()
+            .join("rollout-2026-08-06T04-26-19-019fd39b-0397-79b1-bd21-6feae813b834.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","timestamp":1700000000.0,"payload":{"id":"019fd39b-0397-79b1-bd21-6feae813b834","cwd":"/work"}}"#,
+                "
+",
+                r##"{"type":"response_item","timestamp":1700000001.0,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>
+use drawio
+</recommended_plugins>
+
+# AGENTS.md instructions for /work"}]}}"##,
+                "
+",
+                r#"{"type":"response_item","timestamp":1700000002.0,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Delegate to the reviewer."}]}}"#,
+                "
+",
+                r#"{"type":"event_msg","timestamp":1700000002.0,"payload":{"type":"user_message","message":"Delegate to the reviewer."}}"#,
+                "
+",
+            ),
+        )
+        .expect("write");
+        let session = Codex.read_session(&path).expect("read");
+        assert_eq!(session.title.as_deref(), Some("Delegate to the reviewer."));
+        // The duplicate is still only counted once.
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|m| m.content == "Delegate to the reviewer.")
+                .count(),
+            1
+        );
+    }
+
+    /// The title comes from what the user typed, not from the context the
+    /// harness prepended to the model input.
+    #[test]
+    fn title_prefers_the_user_message_over_injected_context() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir
+            .path()
+            .join("rollout-2026-08-06T04-26-19-019fd39b-0397-79b1-bd21-6feae813b833.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session_meta","timestamp":1700000000.0,"payload":{"id":"019fd39b-0397-79b1-bd21-6feae813b833","cwd":"/work"}}"#,
+                "\n",
+                // `r##` because the injected text contains `"#`, which would
+                // close an `r#` string in the middle of the JSON.
+                r##"{"type":"response_item","timestamp":1700000001.0,"payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /work\n\nalways be brief\n\nDelegate to the reviewer."}]}}"##,
+                "\n",
+                r#"{"type":"event_msg","timestamp":1700000002.0,"payload":{"type":"user_message","message":"Delegate to the reviewer."}}"#,
+                "\n",
+            ),
+        )
+        .expect("write");
+        let session = Codex.read_session(&path).expect("read");
+        assert_eq!(session.title.as_deref(), Some("Delegate to the reviewer."));
     }
 
     #[test]

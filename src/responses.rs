@@ -452,6 +452,14 @@ pub struct InfoResponse {
     /// Tail of the transcript (last few turns), present only with `--peek`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transcript_tail: Option<Vec<crate::model::TranscriptTurn>>,
+    /// The few things the user actually typed, head and tail. `--digest` only.
+    ///
+    /// What a summariser needs and nothing else: injected wrapper blocks and
+    /// client-injected headings are gone, and only user turns are kept. Absent
+    /// rather than empty when not asked for, so a consumer can tell "not
+    /// requested" from "this session has no user prose".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1233,7 @@ mod tests {
             workspace_name_source: Some("none".to_string()),
             repo_name: None,
             transcript_tail: None,
+            digest: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["schema_version"], 6);
@@ -1440,6 +1449,7 @@ mod tests {
             workspace_name_source: Some("none".to_string()),
             repo_name: None,
             transcript_tail: None,
+            digest: None,
         };
         let json = serde_json::to_value(&info).unwrap();
         assert!(

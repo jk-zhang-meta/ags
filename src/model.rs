@@ -255,16 +255,37 @@ pub fn reindex_messages(messages: &mut [CanonicalMessage]) {
     }
 }
 
-/// Extract a title from message content: first line, truncated to `max_len`.
+/// Extract a title from message content: first line of substance, truncated to
+/// `max_len`.
 ///
 /// Returns an empty string for empty or whitespace-only input.
+///
+/// # Why "of substance" and not simply "first"
+///
+/// The first line of a first user message is very often not the user's. Agent
+/// harnesses prepend context to it — a plugin list, a repository's instructions
+/// file, an environment block — and they open that context with a markup line.
+/// Taking the first line literally then titles every session in a store with
+/// the same wrapper: on one real machine eleven of eleven Codex sessions listed
+/// as `<recommended_plugins>`, which is a listing that cannot be used to find a
+/// session, and the only thing it says is which harness wrote them.
+///
+/// So leading lines that carry no prose are skipped: blank ones, and ones that
+/// are nothing but a markup tag. Nothing is invented and nothing is rewritten —
+/// if every line is skipped, the original first line is still the answer,
+/// because a title that reads badly beats no title at all.
 pub fn truncate_title(text: &str, max_len: usize) -> String {
-    let first_line = text.lines().next().unwrap_or("").trim();
+    // Falling back to the raw first line is deliberate: a title that reads badly
+    // beats no title at all. Callers that can look at *another* message instead
+    // should call `human_headline` and move on when it is `None`.
+    let first_line = human_headline(text)
+        .or_else(|| text.lines().next().map(|line| line.trim().to_string()))
+        .unwrap_or_default();
     if first_line.is_empty() {
         return String::new();
     }
     if first_line.len() <= max_len {
-        first_line.to_string()
+        first_line
     } else {
         // Truncate at char boundary.
         let mut end = max_len;
@@ -363,6 +384,160 @@ pub fn message_snippet(message: &CanonicalMessage, max_len: usize) -> String {
     let keep = max_len.saturating_sub(1);
     let truncated: String = text.chars().take(keep).collect();
     format!("{truncated}…")
+}
+
+/// Truncate to `max_len` *characters*, marking the cut with an ellipsis.
+///
+/// Characters, not bytes: these strings are routinely Chinese, where a byte
+/// bound both cuts three times too early and can land mid-codepoint. `0` means
+/// no limit.
+#[must_use]
+pub fn truncate_chars(text: &str, max_len: usize) -> String {
+    if max_len == 0 || text.chars().count() <= max_len {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max_len.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+/// A line that is one markup tag and nothing else: `<recommended_plugins>`,
+/// `</user_instructions>`.
+///
+/// Deliberately narrow. A line that merely *starts* with `<` can be prose
+/// ("<3 this"), a comparison, or a diff, and skipping those would drop the text
+/// the user actually typed — the failure this is meant to prevent, sign flipped.
+fn is_markup_only(line: &str) -> bool {
+    line.starts_with('<')
+        && line.ends_with('>')
+        && line.len() > 2
+        && !line[1..line.len() - 1].contains(['<', '>'])
+}
+
+/// The tag name of a line that is one markup tag, if it is one.
+fn tag_name(line: &str) -> Option<&str> {
+    is_markup_only(line).then(|| line[1..line.len() - 1].trim_start_matches('/'))
+}
+
+/// A markdown heading a client injects ahead of the first user turn.
+///
+/// `# AGENTS.md instructions for /path/to/repo`, `# Claude.md instructions`.
+/// Narrower than "any heading": a heading the *user* typed is prose worth
+/// keeping, and the two are told apart by this shape rather than by guessing.
+fn is_injected_heading(line: &str) -> bool {
+    let rest = line.trim_start_matches('#');
+    if rest.len() == line.len() || !rest.starts_with(' ') {
+        return false;
+    }
+    let rest = rest.trim_start();
+    let Some(word) = rest.split_whitespace().next() else {
+        return false;
+    };
+    // `<name> instructions …` — the name is a file or product, never a sentence.
+    rest[word.len()..].trim_start().starts_with("instructions")
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// The part of a message a person actually wrote.
+///
+/// Clients inject a great deal ahead of the first user turn — plugin catalogues,
+/// `AGENTS.md`, workspace instructions — and it is *identical on every session*,
+/// so a summary built from it describes the client rather than the work. Whole
+/// `<tag> … </tag>` regions and injected headings are dropped; everything else
+/// is kept verbatim, because deciding what counts as important inside real prose
+/// is the summariser's job, not this function's.
+///
+/// Returns an empty string when nothing survives — the caller decides whether to
+/// fall back, and to what.
+#[must_use]
+pub fn human_prose(text: &str) -> String {
+    human_lines(text).join(" ")
+}
+
+/// The first line a person wrote, if any.
+///
+/// `None` when the text is nothing but injected material — which is a real
+/// answer, not a failure: it means *this message* cannot title a session and
+/// the caller should look at the next one.
+#[must_use]
+pub fn human_headline(text: &str) -> Option<String> {
+    human_lines(text).first().map(|line| (*line).to_string())
+}
+
+/// Every line of `text` that survives the injected-material rules.
+///
+/// One implementation for both the headline and the prose: two copies of a
+/// skip rule drift, and the drift is silent — the list would title a session
+/// from one line while the summariser read a different one.
+fn human_lines(text: &str) -> Vec<&str> {
+    let mut lines = text.lines().map(str::trim);
+    let mut kept: Vec<&str> = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = tag_name(line) {
+            if !line.starts_with("</") {
+                // Skip to the matching close. An opening tag that never closes
+                // swallows the rest, which is the right reading: an unterminated
+                // injected block has no prose after it to find.
+                let closing = format!("</{name}>");
+                for inner in lines.by_ref() {
+                    if inner.trim() == closing {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if is_injected_heading(line) {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept
+}
+
+/// The few things a person actually typed, head and tail.
+///
+/// Enough to say what a session was about, small enough to hand to a model. The
+/// head carries the task ("在 EgressFerry 上实现 wifip2p"), the tail carries where
+/// it ended up — and everything between them is overwhelmingly tool traffic that
+/// costs tokens without changing the answer.
+///
+/// User turns only, for the same reason: the assistant's text restates the task
+/// at ten times the length. Overlapping head and tail on a short session yields
+/// each turn once, in order.
+#[must_use]
+pub fn session_digest(
+    messages: &[CanonicalMessage],
+    head: usize,
+    tail: usize,
+    max_len: usize,
+) -> Vec<String> {
+    let typed: Vec<String> = messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .map(|message| human_prose(&message.content))
+        .filter(|prose| !prose.is_empty())
+        .collect();
+    if head == 0 && tail == 0 {
+        return Vec::new();
+    }
+    let picked: Vec<&String> = if typed.len() <= head + tail {
+        typed.iter().collect()
+    } else {
+        typed
+            .iter()
+            .take(head)
+            .chain(typed.iter().skip(typed.len() - tail))
+            .collect()
+    };
+    picked
+        .into_iter()
+        .map(|prose| truncate_chars(prose, max_len))
+        .collect()
 }
 
 /// Extract the last `count` turns of a session as compact snapshots.
@@ -656,6 +831,62 @@ mod tests {
         );
     }
 
+    /// The wrapper an agent harness prepends is not the session's title.
+    #[test]
+    fn truncate_title_skips_a_leading_markup_wrapper() {
+        let text = "<recommended_plugins>\nHere is a list of plugins.\n</recommended_plugins>\n\n看一下本地的 ags";
+        assert_eq!(truncate_title(text, 80), "看一下本地的 ags");
+    }
+
+    /// A message that is *only* a wrapper still gets the title it has. Skipping
+    /// every line would leave the row blank, which says less than the wrapper.
+    #[test]
+    fn truncate_title_falls_back_when_every_line_is_markup() {
+        assert_eq!(
+            truncate_title("<recommended_plugins>", 80),
+            "<recommended_plugins>"
+        );
+        assert_eq!(
+            truncate_title("<wrapper>\nonly this\n</wrapper>", 80),
+            "<wrapper>"
+        );
+    }
+
+    /// Two wrappers in a row, which is what a harness that injects several
+    /// kinds of context produces.
+    #[test]
+    fn truncate_title_skips_more_than_one_wrapper() {
+        let text = "<user_instructions>\nbe brief\n</user_instructions>\n                    <environment>\ncwd=/tmp\n</environment>\nthe actual question";
+        assert_eq!(truncate_title(text, 80), "the actual question");
+    }
+
+    /// Prose that happens to start with `<` is prose.
+    #[test]
+    fn truncate_title_keeps_a_line_that_only_looks_like_markup() {
+        assert_eq!(truncate_title("<3 this idea", 80), "<3 this idea");
+        assert_eq!(truncate_title("<a> vs <b>", 80), "<a> vs <b>");
+    }
+
+    /// A leading blank line used to produce an empty title.
+    #[test]
+    fn truncate_title_skips_leading_blank_lines() {
+        assert_eq!(truncate_title("\n\n  real title\n", 80), "real title");
+    }
+
+    #[test]
+    fn truncate_title_skips_an_injected_instructions_heading() {
+        // Measured on one machine: eight of fourteen Codex sessions were titled
+        // `# AGENTS.md instructions for /mnt/c/…`, so the list could not be used
+        // to tell them apart.
+        let text = "# AGENTS.md instructions for /mnt/c/Users/A/work\n\n重启 explorer";
+        assert_eq!(truncate_title(text, 80), "重启 explorer");
+    }
+
+    #[test]
+    fn truncate_title_keeps_a_heading_the_user_typed() {
+        assert_eq!(truncate_title("# 设计\n细节", 80), "# 设计");
+    }
+
     #[test]
     fn truncate_title_empty_returns_empty() {
         assert_eq!(truncate_title("", 100), "");
@@ -664,6 +895,151 @@ mod tests {
     #[test]
     fn truncate_title_whitespace_only_returns_empty() {
         assert_eq!(truncate_title("   \n   ", 100), "");
+    }
+
+    // -----------------------------------------------------------------------
+    // human_prose / session_digest
+    // -----------------------------------------------------------------------
+
+    fn user(idx: usize, content: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            idx,
+            role: MessageRole::User,
+            content: content.to_string(),
+            timestamp: None,
+            author: None,
+            tool_calls: vec![],
+            tool_results: vec![],
+            extra: serde_json::Value::Null,
+        }
+    }
+
+    fn assistant(idx: usize, content: &str) -> CanonicalMessage {
+        CanonicalMessage {
+            role: MessageRole::Assistant,
+            ..user(idx, content)
+        }
+    }
+
+    #[test]
+    fn human_prose_keeps_every_line_the_user_wrote() {
+        assert_eq!(
+            human_prose("第一行\n\n第二行"),
+            "第一行 第二行",
+            "prose is the summariser's input, so nothing inside it is dropped"
+        );
+    }
+
+    #[test]
+    fn human_prose_drops_a_whole_injected_block_not_just_its_tags() {
+        // The text inside a wrapper belongs to the harness, not the user, and
+        // is identical on every session — a summary built from it describes the
+        // client rather than the work.
+        let text =
+            "<recommended_plugins>\nHere is a list of plugins\n</recommended_plugins>\n真正的问题";
+        assert_eq!(human_prose(text), "真正的问题");
+    }
+
+    #[test]
+    fn human_prose_drops_the_injected_agents_heading() {
+        // The observed failure: eight of fourteen Codex sessions on one machine
+        // were titled `# AGENTS.md instructions for /mnt/c/…`, so the list could
+        // not be used to tell them apart.
+        let text = "# AGENTS.md instructions for /mnt/c/Users/A/work\n\n重启 explorer";
+        assert_eq!(human_prose(text), "重启 explorer");
+        assert_eq!(human_prose("# Claude.md instructions\n干活"), "干活");
+    }
+
+    #[test]
+    fn human_prose_keeps_a_heading_the_user_typed() {
+        // Narrower than "any heading" on purpose: the sign-flipped failure is
+        // dropping the one line the user actually wrote.
+        assert_eq!(human_prose("# 设计"), "# 设计");
+        assert_eq!(
+            human_prose("# 关于 instructions 的问题"),
+            "# 关于 instructions 的问题"
+        );
+        assert_eq!(human_prose("#notaheading"), "#notaheading");
+    }
+
+    #[test]
+    fn human_prose_returns_empty_when_the_message_is_all_injection() {
+        assert_eq!(
+            human_prose("<user_instructions>\nfoo\n</user_instructions>"),
+            ""
+        );
+        assert_eq!(human_prose("   \n  "), "");
+    }
+
+    #[test]
+    fn human_prose_swallows_the_rest_after_an_unterminated_tag() {
+        // An opening tag that never closes has no prose after it to find, and
+        // guessing where it ends would be worse than saying nothing.
+        assert_eq!(human_prose("<open>\n里面的话"), "");
+    }
+
+    #[test]
+    fn session_digest_takes_the_head_and_the_tail_of_what_was_typed() {
+        let messages: Vec<CanonicalMessage> = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    user(i, &format!("u{i}"))
+                } else {
+                    assistant(i, &format!("a{i}"))
+                }
+            })
+            .collect();
+        // User turns are u0 u2 u4 u6 u8; head 2 + tail 1 keeps the ends.
+        assert_eq!(session_digest(&messages, 2, 1, 100), ["u0", "u2", "u8"]);
+    }
+
+    #[test]
+    fn session_digest_never_repeats_a_turn_on_a_short_session() {
+        let messages = vec![user(0, "只有一条")];
+        assert_eq!(session_digest(&messages, 3, 2, 100), ["只有一条"]);
+    }
+
+    #[test]
+    fn session_digest_ignores_everything_that_is_not_a_user_turn() {
+        let messages = vec![
+            assistant(0, "模型说的"),
+            user(1, "人说的"),
+            CanonicalMessage {
+                role: MessageRole::System,
+                ..user(2, "系统注入的")
+            },
+        ];
+        assert_eq!(session_digest(&messages, 3, 2, 100), ["人说的"]);
+    }
+
+    #[test]
+    fn session_digest_skips_turns_that_are_pure_injection() {
+        // Otherwise the whole budget goes to the wrapper block that opens every
+        // Codex session and the real question never makes it into the digest.
+        let messages = vec![
+            user(0, "<recommended_plugins>\nlist\n</recommended_plugins>"),
+            user(1, "真正的问题"),
+        ];
+        assert_eq!(session_digest(&messages, 1, 0, 100), ["真正的问题"]);
+    }
+
+    #[test]
+    fn session_digest_truncates_by_characters_not_bytes() {
+        let messages = vec![user(0, "一二三四五")];
+        assert_eq!(session_digest(&messages, 1, 0, 3), ["一二…"]);
+    }
+
+    #[test]
+    fn session_digest_of_nothing_is_empty() {
+        assert!(session_digest(&[], 3, 2, 100).is_empty());
+        assert!(session_digest(&[user(0, "x")], 0, 0, 100).is_empty());
+    }
+
+    #[test]
+    fn truncate_chars_counts_characters() {
+        assert_eq!(truncate_chars("一二三", 10), "一二三");
+        assert_eq!(truncate_chars("一二三四", 3), "一二…");
+        assert_eq!(truncate_chars("一二三四", 0), "一二三四");
     }
 
     // -----------------------------------------------------------------------

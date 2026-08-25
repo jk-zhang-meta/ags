@@ -306,6 +306,15 @@ enum Command {
         /// Number of trailing turns to show (implies `--peek`; default 5).
         #[arg(long)]
         peek_lines: Option<usize>,
+
+        /// Emit the few things the user actually typed, head and tail.
+        ///
+        /// Purpose-built to be handed to a model for summarising: injected
+        /// wrapper blocks and client-injected headings are dropped, and only
+        /// user turns are kept. `--peek` answers "what happened last"; this
+        /// answers "what was this session about" at a fraction of the tokens.
+        #[arg(long)]
+        digest: bool,
     },
 
     /// List detected providers and their installation status.
@@ -513,8 +522,18 @@ fn main() -> ExitCode {
             from,
             peek,
             peek_lines,
+            digest,
         } => cmd_info(
-            &session, cli.json, enrich_fs, source, from, peek, peek_lines,
+            &session,
+            cli.json,
+            enrich_fs,
+            source,
+            from,
+            &TranscriptRequest {
+                peek,
+                peek_lines,
+                digest,
+            },
         )
         .map(|()| ExitCode::SUCCESS),
         Command::Providers => cmd_providers(cli.json).map(|()| ExitCode::SUCCESS),
@@ -2727,15 +2746,33 @@ fn cmd_list(
     Ok(())
 }
 
+/// What `info` should say about the conversation itself, beyond the counts.
+///
+/// One struct rather than three more parameters: they arrive together from one
+/// command, they are only ever read together, and threading them separately is
+/// what pushed this function past what a reader can hold at once.
+struct TranscriptRequest {
+    /// Show the last few turns (`--peek`).
+    peek: bool,
+    /// How many trailing turns; implies `peek`.
+    peek_lines: Option<usize>,
+    /// Emit the user's own turns, head and tail (`--digest`).
+    digest: bool,
+}
+
 fn cmd_info(
     argument: &str,
     json_mode: bool,
     enrich_fs: bool,
     source: Option<String>,
     from: Option<String>,
-    peek: bool,
-    peek_lines: Option<usize>,
+    transcript: &TranscriptRequest,
 ) -> anyhow::Result<()> {
+    let TranscriptRequest {
+        peek,
+        peek_lines,
+        digest,
+    } = *transcript;
     let registry = ProviderRegistry::default_registry();
 
     // A path and an ID are told apart by the filesystem, as the help states: an
@@ -2827,6 +2864,21 @@ fn cmd_info(
         let n = peek_lines.unwrap_or(DEFAULT_PEEK_LINES);
         casr::model::transcript_tail(&session.messages, n, PEEK_SNIPPET_MAX_CHARS)
     });
+    // Head and tail of what the user typed. Three opening turns are enough to
+    // say what the session is for — the first is often a one-line "look at X"
+    // and the substance lands in the next two — and two closing turns say where
+    // it ended up. Everything between is overwhelmingly tool traffic.
+    const DIGEST_HEAD_TURNS: usize = 3;
+    const DIGEST_TAIL_TURNS: usize = 2;
+    const DIGEST_TURN_MAX_CHARS: usize = 600;
+    let digest = digest.then(|| {
+        casr::model::session_digest(
+            &session.messages,
+            DIGEST_HEAD_TURNS,
+            DIGEST_TAIL_TURNS,
+            DIGEST_TURN_MAX_CHARS,
+        )
+    });
 
     if json_mode {
         let (workspace_name, workspace_name_source) =
@@ -2859,6 +2911,7 @@ fn cmd_info(
             workspace_name_source,
             repo_name,
             transcript_tail,
+            digest,
         };
         println!("{}", serde_json::to_string_pretty(&response)?);
     } else {
