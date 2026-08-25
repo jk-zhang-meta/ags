@@ -20,6 +20,7 @@ use casr::budget::ContextBudget;
 use casr::discovery::ProviderRegistry;
 use casr::ir::Fidelity;
 use casr::launch::{LaunchSpec, SessionTargeting};
+use casr::listing_cache::{LoadedRows, Stamp};
 use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
 use casr::providers::{Provider, SessionListing, read_dir_reporting, walk_entry_reporting};
 use casr::responses::{
@@ -226,6 +227,16 @@ enum Command {
         /// Filter by workspace path.
         #[arg(long)]
         workspace: Option<String>,
+
+        /// List every workspace, not just the one this ran in.
+        ///
+        /// Without it, and without `--workspace`, the listing is scoped to the
+        /// working directory — a default scope rather than a claim, which is
+        /// why a session whose workspace cannot be determined is kept. This
+        /// asks the other question: everything this machine has, newest first,
+        /// wherever it was worked in.
+        #[arg(long, conflicts_with = "workspace")]
+        all_workspaces: bool,
 
         /// Maximum sessions to show per provider.
         #[arg(long, default_value = "10")]
@@ -464,12 +475,14 @@ fn main() -> ExitCode {
         Command::List {
             provider,
             workspace,
+            all_workspaces,
             limit,
             sort,
             enrich_fs,
         } => cmd_list(
             provider.as_deref(),
             workspace.as_deref(),
+            all_workspaces,
             limit,
             &sort,
             cli.json,
@@ -1333,6 +1346,7 @@ fn launch_agent(spec: &LaunchSpec) -> anyhow::Result<ExitCode> {
 fn cmd_list(
     provider_filter: Option<&str>,
     workspace_filter: Option<&str>,
+    all_workspaces: bool,
     limit: usize,
     sort: &str,
     json_mode: bool,
@@ -1344,7 +1358,15 @@ fn cmd_list(
         .and_then(|filter| registry.find_by_alias(filter).map(|p| p.slug().to_string()))
         .or_else(|| provider_filter.map(|filter| filter.to_ascii_lowercase()));
 
-    #[derive(Debug)]
+    /// The shape [`casr::listing_cache`] stores, from its point of view.
+    ///
+    /// Bump on any change to `SessionSummary` that changes what a field *means*
+    /// as well as any change to which fields exist — the cache holds an opaque
+    /// string and cannot see either. Rows written under another number are
+    /// dropped rather than read.
+    const LIST_ROW_VERSION: u32 = 7;
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
     struct SessionSummary {
         session_id: String,
         provider: String,
@@ -1360,6 +1382,18 @@ fn cmd_list(
         /// `None` where nothing could count them; see `ListItem::tool_uses`.
         tool_uses: Option<usize>,
         path: PathBuf,
+    }
+
+    /// Where a row came from, so a run writes back only what it read.
+    enum RowSource {
+        /// Answered from the cache. Its file was not opened.
+        Cached,
+        /// Read from the file, which did not change while it was being read.
+        Read(Stamp),
+        /// Read from the file, with nothing to bind a cached row to: the file
+        /// carried no stamp, or it changed underneath the read. Caching it
+        /// would key this row to bytes it does not describe.
+        Uncacheable,
     }
 
     impl SessionSummary {
@@ -2066,15 +2100,27 @@ fn cmd_list(
     }
 
     let workspace_filter_explicit = workspace_filter.is_some();
-    let workspace_filter = workspace_filter
-        .map(expand_tilde_path)
-        .or_else(|| std::env::current_dir().ok());
+    // `--all-workspaces` is the one way to reach an unfiltered listing. The
+    // fallback below is what makes the working directory a *default* scope;
+    // asking for every workspace has to skip it, not pass it a path that
+    // happens to be a prefix of everything — `--workspace /` would also mark
+    // the filter explicit, and an explicit filter drops the sessions whose
+    // workspace could not be determined, which is the opposite of "everything".
+    let workspace_filter = if all_workspaces {
+        None
+    } else {
+        workspace_filter
+            .map(expand_tilde_path)
+            .or_else(|| std::env::current_dir().ok())
+    };
     let workspace_scope = workspace_filter
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "all workspaces".to_string());
     let workspace_scope_label = if workspace_filter_explicit {
         "workspace project (--workspace)"
+    } else if all_workspaces {
+        "every workspace (--all-workspaces)"
     } else {
         "current working-directory project"
     };
@@ -2105,7 +2151,7 @@ fn cmd_list(
     /// so a failure is carried out as a value rather than raised.
     enum Candidate {
         /// Read, and belongs in the listing.
-        Row(SessionSummary),
+        Row(SessionSummary, RowSource),
         /// Excluded on purpose: this provider's layout places it elsewhere.
         Elsewhere,
         /// Found, claimed as a session, and unreadable.
@@ -2118,19 +2164,102 @@ fn cmd_list(
         provider_slug: &str,
         path: PathBuf,
         workspace_filter: Option<&PathBuf>,
+        cached: &LoadedRows,
     ) -> Candidate {
         // Only a positive mismatch skips the parse. `Unknown` is not evidence,
         // so it must not act like one.
         if workspace_path_hint(provider_slug, &path, workspace_filter) == WorkspaceHint::Differs {
             return Candidate::Elsewhere;
         }
+        // Taken before the read, and again after it. A row is bound to the
+        // bytes it was derived from, so a file appended to *while* it was being
+        // parsed has no stamp this row may be stored under: the pre-read stamp
+        // names bytes the row already went past, and the post-read one names
+        // bytes it never saw.
+        let before = Stamp::of(&path);
+        if let Some(stamp) = before
+            && let Some(row) = cached.get(&path, stamp)
+        {
+            match serde_json::from_str::<SessionSummary>(row) {
+                Ok(summary) => return Candidate::Row(summary, RowSource::Cached),
+                Err(error) => {
+                    // The row does not decide what is listed, so a row this
+                    // build cannot read costs one parse and nothing else.
+                    tracing::debug!(path = %path.display(), %error, "unreadable cached listing row");
+                }
+            }
+        }
         match provider.read_session(&path) {
-            Ok(session) => Candidate::Row(build_summary(provider_slug, path, session)),
+            Ok(session) => {
+                let after = Stamp::of(&path);
+                let source = match (before, after) {
+                    (Some(before), Some(after)) if before == after => RowSource::Read(before),
+                    _ => RowSource::Uncacheable,
+                };
+                Candidate::Row(build_summary(provider_slug, path, session), source)
+            }
             Err(error) => Candidate::Unreadable(SkippedSession {
                 provider: provider_slug.to_string(),
                 path: path.display().to_string(),
                 error: format!("{error}"),
             }),
+        }
+    }
+
+    // Opened before the scan and written after it, because the parses it
+    // replaces run in parallel and a `Connection` does not. A cache that will
+    // not open is not a failure: `cached` stays empty, nothing is written back,
+    // and every candidate is read — which is what this command did before the
+    // cache existed.
+    let mut cache = match casr::listing_cache::ListingCache::open(LIST_ROW_VERSION) {
+        Ok(cache) => Some(cache),
+        Err(error) => {
+            tracing::debug!(%error, "listing cache unavailable; reading every session");
+            None
+        }
+    };
+    let cached = cache
+        .as_ref()
+        .and_then(|cache| match cache.load() {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                tracing::debug!(%error, "cannot read the listing cache");
+                None
+            }
+        })
+        .unwrap_or_default();
+    tracing::debug!(rows = cached.len(), "listing cache loaded");
+    let mut fresh_rows: Vec<(PathBuf, Stamp, String)> = Vec::new();
+    let mut reused_rows: Vec<PathBuf> = Vec::new();
+
+    /// Route one classified candidate to the listing and to the cache.
+    ///
+    /// A closure would have to borrow four of this function's locals mutably at
+    /// once; a fn taking them is the same code without that argument.
+    fn accept(
+        candidate: Candidate,
+        sessions: &mut Vec<SessionSummary>,
+        skipped: &mut Vec<SkippedSession>,
+        fresh_rows: &mut Vec<(PathBuf, Stamp, String)>,
+        reused_rows: &mut Vec<PathBuf>,
+    ) {
+        match candidate {
+            Candidate::Row(summary, source) => {
+                match source {
+                    RowSource::Cached => reused_rows.push(summary.path.clone()),
+                    RowSource::Read(stamp) => match serde_json::to_string(&summary) {
+                        Ok(row) => fresh_rows.push((summary.path.clone(), stamp, row)),
+                        Err(error) => {
+                            // Not cacheable is not not-listable.
+                            tracing::debug!(%error, "listing row could not be cached");
+                        }
+                    },
+                    RowSource::Uncacheable => {}
+                }
+                sessions.push(summary);
+            }
+            Candidate::Elsewhere => {}
+            Candidate::Unreadable(skip) => skipped.push(skip),
         }
     }
 
@@ -2169,7 +2298,13 @@ fn cmd_list(
 
             let provider_slug = provider.slug().to_string();
             let classify = |path: PathBuf| {
-                classify_candidate(*provider, &provider_slug, path, workspace_filter.as_ref())
+                classify_candidate(
+                    *provider,
+                    &provider_slug,
+                    path,
+                    workspace_filter.as_ref(),
+                    &cached,
+                )
             };
             let parsed: Vec<Candidate> = if listed.len() < LIST_PARSE_PARALLEL_THRESHOLD {
                 listed
@@ -2183,11 +2318,13 @@ fn cmd_list(
                     .collect()
             };
             for candidate in parsed {
-                match candidate {
-                    Candidate::Row(summary) => sessions.push(summary),
-                    Candidate::Elsewhere => {}
-                    Candidate::Unreadable(skip) => skipped.push(skip),
-                }
+                accept(
+                    candidate,
+                    &mut sessions,
+                    &mut skipped,
+                    &mut fresh_rows,
+                    &mut reused_rows,
+                );
             }
             continue;
         }
@@ -2242,7 +2379,13 @@ fn cmd_list(
 
         let provider_slug = provider.slug().to_string();
         let classify = |path: PathBuf| {
-            classify_candidate(*provider, &provider_slug, path, workspace_filter.as_ref())
+            classify_candidate(
+                *provider,
+                &provider_slug,
+                path,
+                workspace_filter.as_ref(),
+                &cached,
+            )
         };
         let parsed: Vec<Candidate> = if candidate_paths.len() < LIST_PARSE_PARALLEL_THRESHOLD {
             candidate_paths.into_iter().map(classify).collect()
@@ -2250,13 +2393,32 @@ fn cmd_list(
             candidate_paths.into_par_iter().map(classify).collect()
         };
         for candidate in parsed {
-            match candidate {
-                Candidate::Row(summary) => sessions.push(summary),
-                Candidate::Elsewhere => {}
-                Candidate::Unreadable(skip) => skipped.push(skip),
-            }
+            accept(
+                candidate,
+                &mut sessions,
+                &mut skipped,
+                &mut fresh_rows,
+                &mut reused_rows,
+            );
         }
     }
+
+    // After the scan, and never in its way. Everything below this point renders
+    // rows that are already in hand, so a cache that refuses to be written
+    // costs the next listing a re-read and costs this one nothing.
+    if let Some(cache) = cache.as_mut() {
+        if let Err(error) = cache.store(&fresh_rows) {
+            tracing::debug!(%error, rows = fresh_rows.len(), "cannot write the listing cache");
+        }
+        if let Err(error) = cache.touch(&reused_rows) {
+            tracing::debug!(%error, rows = reused_rows.len(), "cannot refresh the listing cache");
+        }
+    }
+    tracing::debug!(
+        read = fresh_rows.len(),
+        reused = reused_rows.len(),
+        "listing cache accounting"
+    );
 
     // Sessions no source could place in *any* workspace, counted per provider.
     //

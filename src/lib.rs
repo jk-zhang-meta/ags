@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod error;
 pub mod ir;
 pub mod launch;
+pub mod listing_cache;
 pub mod model;
 pub mod pipeline;
 pub mod providers;

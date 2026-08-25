@@ -1941,12 +1941,40 @@ fn codex_parse_arguments_value(value: &serde_json::Value) -> serde_json::Value {
 /// callers must not read "unknown" as "no" — [`Codex::list_sessions`] lists a
 /// rollout it could not classify rather than dropping it.
 fn session_meta_payload(path: &Path) -> Option<serde_json::Value> {
+    /// Just the discriminator, so a line can be ruled out without building a
+    /// [`serde_json::Value`] for it.
+    ///
+    /// Everything this function reads is on the one line that *is* the
+    /// `session_meta`; the other 63 are looked at only to reject them. Building
+    /// a full `Value` to reject a line allocates the whole tree first, and a
+    /// Codex rollout line carrying a tool result can be large. Deserializing
+    /// into this struct instead lexes the line and discards every other field
+    /// through serde's `IgnoredAny`, allocating one short string.
+    ///
+    /// Measured on 2,767 local rollouts: `casr list --provider codex` spent
+    /// 10.8s, against 1.4s for the file reads themselves.
+    /// [`Codex::list_sessions`] calls this once per rollout before any limit is
+    /// applied, so that cost lands on every listing.
+    ///
+    /// The answer is unchanged. Each of the three inputs the old `Value` path
+    /// treated as "not this line" — unparseable, not an object, `type` not a
+    /// string — fails this deserialize too, and leaves by the same `continue`.
+    #[derive(serde::Deserialize)]
+    struct EnvelopeKind {
+        #[serde(rename = "type", default)]
+        kind: Option<String>,
+    }
+
     let file = std::fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().map_while(Result::ok).take(64) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
+        }
+        match serde_json::from_str::<EnvelopeKind>(trimmed) {
+            Ok(envelope) if envelope.kind.as_deref() == Some("session_meta") => {}
+            _ => continue,
         }
         let envelope: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
