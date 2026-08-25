@@ -2216,10 +2216,24 @@ fn cmd_list(
         // bytes it never saw.
         let before = Stamp::of(&path);
         if let Some(stamp) = before
-            && let Some(row) = cached.get(&path, stamp)
+            && let Some((cached_stamp, row)) = cached.get_stale(&path)
         {
             match serde_json::from_str::<SessionSummary>(row) {
-                Ok(summary) => return Candidate::Row(summary, RowSource::Cached),
+                Ok(mut summary) => {
+                    if cached_stamp == stamp {
+                        return Candidate::Row(summary, RowSource::Cached);
+                    }
+                    // The file only grew, and not by much. Everything the
+                    // listing identifies a session by was fixed when it was
+                    // written; only the activity time moved, and the stamp
+                    // already carries it. See `reusable_after_growth` for what
+                    // this trades away and how far.
+                    if casr::listing_cache::reusable_after_growth(cached_stamp, stamp) {
+                        summary.last_active_at = Some(stamp.mtime_millis);
+                        summary.file_size_bytes = stamp.size;
+                        return Candidate::Row(summary, RowSource::Cached);
+                    }
+                }
                 Err(error) => {
                     // The row does not decide what is listed, so a row this
                     // build cannot read costs one parse and nothing else.

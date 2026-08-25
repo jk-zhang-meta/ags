@@ -95,6 +95,33 @@ impl Stamp {
     }
 }
 
+/// Whether a row derived from `cached` may still describe a file now stamped
+/// `current`, given only that the file grew.
+///
+/// Appending to a session file cannot change what the listing shows to identify
+/// it: the title is the first thing the user typed, the workspace is recorded in
+/// the header, and the start time is the start time. What appending *does*
+/// change is the activity time and the per-message counts — and the activity
+/// time is exactly the stamp's own mtime, so it costs nothing to refresh.
+///
+/// That leaves the counts, which go stale. They are bounded rather than exact:
+/// once the file has grown by more than a fifth, the row is re-derived from the
+/// bytes. The bound is proportional on purpose — a fifth of a 1.16 GiB rollout
+/// is a rare event, a fifth of a 200 KiB one is cheap to honour — so the work
+/// scales with the file instead of with how often anyone runs `list`.
+#[must_use]
+pub fn reusable_after_growth(cached: Stamp, current: Stamp) -> bool {
+    // Shrunk or rewritten: nothing about the old row can be trusted.
+    if current.size < cached.size {
+        return false;
+    }
+    // A row derived from nothing has no counts worth keeping.
+    if cached.size == 0 {
+        return false;
+    }
+    current.size - cached.size <= cached.size / 5
+}
+
 /// Rows read from the cache at the start of a listing, keyed by path.
 ///
 /// Loaded in one query and consulted from many threads, because the parses it
@@ -109,6 +136,22 @@ impl LoadedRows {
     pub fn get(&self, path: &Path, stamp: Stamp) -> Option<&str> {
         let (cached, row) = self.rows.get(path)?;
         (*cached == stamp).then_some(row.as_str())
+    }
+
+    /// The row cached for `path` and the stamp it was derived from, whatever
+    /// that stamp is.
+    ///
+    /// For a file that is still being appended to — an agent session that is
+    /// open right now — a stamp keyed on `(size, mtime)` can never match, so
+    /// [`get`](Self::get) returns `None` on every run and the file is parsed
+    /// again every time. Measured on one machine: 301 of 315 rows hit, and the
+    /// 14 that missed were the live sessions, together 1.65 GiB re-parsed per
+    /// listing, one of them 1.16 GiB on its own.
+    ///
+    /// The caller decides what a near-miss is worth; see `reusable_after_growth`.
+    pub fn get_stale(&self, path: &Path) -> Option<(Stamp, &str)> {
+        let (cached, row) = self.rows.get(path)?;
+        Some((*cached, row.as_str()))
     }
 
     pub fn len(&self) -> usize {
@@ -294,5 +337,56 @@ mod tests {
     fn a_missing_file_has_no_stamp() {
         let dir = tempfile::tempdir().expect("tmpdir");
         assert!(Stamp::of(&dir.path().join("absent.jsonl")).is_none());
+    }
+
+    fn stamp(size: u64) -> Stamp {
+        Stamp {
+            size,
+            mtime_millis: 0,
+        }
+    }
+
+    #[test]
+    fn a_file_that_only_grew_a_little_keeps_its_row() {
+        // The case this exists for: a session that is open right now. Its stamp
+        // can never match, so without this every listing re-parses it — measured
+        // at 1.65 GiB per run on one machine.
+        assert!(reusable_after_growth(stamp(1_000), stamp(1_100)));
+        assert!(reusable_after_growth(stamp(1_000), stamp(1_000)));
+    }
+
+    #[test]
+    fn growth_past_a_fifth_earns_a_fresh_parse() {
+        // The bound is what keeps the counts from drifting without limit.
+        assert!(!reusable_after_growth(stamp(1_000), stamp(1_201)));
+        assert!(reusable_after_growth(stamp(1_000), stamp(1_200)));
+    }
+
+    #[test]
+    fn the_bound_is_proportional_not_absolute() {
+        // A fifth of a 1.16 GiB rollout is a rare event; a fifth of a small one
+        // is cheap to honour. Scaling with the file is the point — an absolute
+        // byte bound would re-parse the giant file constantly and the small one
+        // never.
+        let giant = 1_160_000_000;
+        assert!(reusable_after_growth(
+            stamp(giant),
+            stamp(giant + 200_000_000)
+        ));
+        assert!(!reusable_after_growth(
+            stamp(giant),
+            stamp(giant + 300_000_000)
+        ));
+    }
+
+    #[test]
+    fn a_file_that_shrank_was_rewritten_and_keeps_nothing() {
+        assert!(!reusable_after_growth(stamp(1_000), stamp(999)));
+    }
+
+    #[test]
+    fn a_row_derived_from_an_empty_file_is_never_reused() {
+        // Nothing was counted, so there is nothing worth carrying forward.
+        assert!(!reusable_after_growth(stamp(0), stamp(10)));
     }
 }
