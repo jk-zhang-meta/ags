@@ -206,7 +206,8 @@ usage() {
   ags codex [--id 名字]        起一个 Codex 会话
   ags claude [--id 名字]       起一个 Claude 会话
   ags ls [-a]                  列出会话，挑一个接着干（-a 连存档一起列）
-  ags summarize                调模型给会话起名，列表里才认得出来（--force 重算）
+  ags summarize                调模型给会话起名（--force 重算）；ags ls 也会在后台顺手做
+                               关掉：AGS_AUTO_SUMMARY=0
   ags save "描述"              把这个会话导出成一份存档
   ags resume N|ID              接着第 N 号会话干，或者打开一份存档
   ags update                   更新到最新版
@@ -243,7 +244,7 @@ Usage:
                                        (Up/Down or j/k, Enter open, a edit the
                                        Agent arguments, p pin, s save, Del
                                        delete, Esc quit)
-  ags summarize [--force]              Have a model name each session in one
+  ags summarize [--force|--settled]    Have a model name each session in one
                                        line, so the list can be read. Claude
                                        Code names its own sessions and those are
                                        left alone; Codex names none, which is
@@ -253,6 +254,15 @@ Usage:
                                        changed; --force recomputes everything.
                                        Set AGS_SUMMARY_CMD to use something
                                        other than `codex exec`.
+                                       `ags ls` also starts this in the
+                                       background when rows are unnamed: at most
+                                       once every AGS_AUTO_SUMMARY_INTERVAL
+                                       (900s), never re-naming a session it
+                                       named within AGS_SUMMARY_REFRESH_SECONDS
+                                       (3600s), and not at all when
+                                       AGS_AUTO_SUMMARY=0. `--settled` restricts
+                                       a run to sessions nothing has written to
+                                       for AGS_SUMMARY_IDLE_SECONDS (600s).
   ags archives                         List only the saved archives
   ags set retention [--agent codex|claude] DAYS
                                        One retention period for both Agents.
