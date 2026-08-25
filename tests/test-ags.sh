@@ -6,14 +6,19 @@ set -Eeuo pipefail
 # 断言失败时说清楚是哪一条。
 #
 # 这个套件大量使用裸断言（`[[ -e "$x" ]]`、`cmp …`），配上 `set -e` 的结果是：
-# 失败时**一个字都不打**，只留一个退出码 1。在自己机器上还能靠"跑到哪一行停了"
-# 猜，在 CI 上只有一行 `Process completed with exit code 1`，而它前面几百行全是
-# 正常输出——等于知道它坏了，但不知道坏在哪。
+# 失败时**一个字都不打**，只留一个退出码 1。在 CI 上看到的就是一行
+# `Process completed with exit code 1`，前面几百行全是正常输出——等于知道它坏了，
+# 但不知道坏在哪，只能靠反复推送去二分。
 #
-# `$LINENO` 在 ERR trap 里就是失败那一行，`$BASH_COMMAND` 是那条命令的原文。
-# 被 `||`、`if`、`!` 接住的非零不触发 ERR，所以那些"故意失败"的用例不受影响。
-trap 'ags_suite_status=$?; printf "\nags suite: 第 %s 行失败（退出码 %s）：%s\n" \
-    "$LINENO" "$ags_suite_status" "$BASH_COMMAND" >&2' ERR
+# **记录，不当场打印。** 套件里有一批用例故意让命令失败（`ags_sidpool_run` 里那句
+# "被拒的那次退出码非 0"就是），当场打印会让一次全绿的运行里冒出几条看着像失败的
+# 行——那比不打印更糟。所以 ERR 只往文件里记一行，最后真的死了才由 EXIT 打出来。
+#
+# 用文件而不是变量：这些断言很多在子 shell 里，子 shell 改不到父进程的变量。
+# 后写的覆盖先写的，所以留下的是**最后一次**、也就是把套件带死的那一次。
+ags_suite_errfile="$(mktemp "${TMPDIR:-/tmp}/ags-suite-err.XXXXXX")"
+trap 'printf "第 %s 行（退出码 %s）：%s\n" "$LINENO" "$?" "$BASH_COMMAND" \
+    > "$ags_suite_errfile" 2>/dev/null || true' ERR
 
 tool="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/plugins/ags/scripts/ags}"
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -776,7 +781,12 @@ cc "$project_root/tests/ags-agent-holder.c" -o "$tmp/codex"
 cp -- "$tmp/codex" "$tmp/claude"
 
 cleanup() {
-    local pid
+    local pid status=$?
+    # 真的失败了才把上面记下的那一行说出来。
+    if (( status != 0 )) && [[ -s "${ags_suite_errfile:-}" ]]; then
+        printf '\nags suite: %s' "$(cat "$ags_suite_errfile")" >&2
+    fi
+    rm -f -- "${ags_suite_errfile:-}"
     for pid in "${!test_child_pids[@]}"; do
         kill "$pid" 2>/dev/null || true
     done

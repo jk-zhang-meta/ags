@@ -400,6 +400,12 @@ jobs:
         with:
           node-version: "22"
 
+      # `ags init` 真的会去调 `age-keygen` 生成身份，而 runner 镜像里没有 age。
+      # 少了它，套件跑到 init 那组就死，报出来却是一句没有上下文的 exit 1——
+      # 而在开发者机器上（装了 age）永远是绿的。
+      - name: Install age
+        run: sudo apt-get update && sudo apt-get install -y age
+
       # test-ags-install-smoke.sh needs the debug binary; test-ags.sh drives the
       # Bash runtime directly and does not.
       - name: Build debug binary
