@@ -7750,8 +7750,13 @@ list_native_sessions() {
                         --agent-args ${launch_args_decoded[@]+"${launch_args_decoded[@]}"}
                     ;;
                 saved:*)
-                    resume_checkpoint local "${selector#saved:}" \
-                        -- ${launch_args_decoded[@]+"${launch_args_decoded[@]}"}
+                    # 菜单里的参数就是这次的决定，哪怕它是空的。走和命令行
+                    # `--` 同一个开关，别再传一个位置参数——`--` 现在是 ags 自己
+                    # 的参数区，`resume_checkpoint` 会把它当成第二个检查点标识
+                    # 拒掉（`ags resume 只接受一个检查点标识：--`）。
+                    ags_agent_args_given=1
+                    ags_agent_args=(${launch_args_decoded[@]+"${launch_args_decoded[@]}"})
+                    resume_checkpoint local "${selector#saved:}"
                     ;;
                 *) die "unreadable session selector: $selector" ;;
             esac
@@ -8103,13 +8108,21 @@ list_local_checkpoints() {
         while (( ${#terminal_menu_ids[@]} > 0 )); do
             if terminal_menu "Saved AGS sessions" 1; then
                 # Always explicit, including when the menu holds no arguments:
-                # `--` is what tells resume the caller decided, so clearing the
-                # arguments in the menu is honoured instead of being refilled
+                # the flag is what tells resume the caller decided, so clearing
+                # the arguments in the menu is honoured instead of being refilled
                 # from the checkpoint.
+                #
+                # It travels as `ags_agent_args_given`, not as a positional
+                # `--`: `--` is ags's own argument section now, so resume reads
+                # a trailing one as a second checkpoint id and refuses the whole
+                # launch. Opening an archive from this menu died that way —
+                # invisibly, because the only test that drives it runs under a
+                # pseudo-terminal and the failure was a bare exit code.
                 decode_launch_args "$terminal_menu_selected_args" ||
                     die "saved Agent arguments are unreadable; resume with -- ARGS"
-                resume_checkpoint local "$terminal_menu_selected" \
-                    -- "${launch_args_decoded[@]}"
+                ags_agent_args_given=1
+                ags_agent_args=(${launch_args_decoded[@]+"${launch_args_decoded[@]}"})
+                resume_checkpoint local "$terminal_menu_selected"
                 return
             else
                 menu_status=$?
