@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# `-E` 让 ERR trap 也能在函数和子 shell 里生效——没有它，下面那个 trap 只覆盖顶层
+# 命令，而这个套件的断言绝大多数在函数里。
+set -Eeuo pipefail
+
+# 断言失败时说清楚是哪一条。
+#
+# 这个套件大量使用裸断言（`[[ -e "$x" ]]`、`cmp …`），配上 `set -e` 的结果是：
+# 失败时**一个字都不打**，只留一个退出码 1。在自己机器上还能靠"跑到哪一行停了"
+# 猜，在 CI 上只有一行 `Process completed with exit code 1`，而它前面几百行全是
+# 正常输出——等于知道它坏了，但不知道坏在哪。
+#
+# `$LINENO` 在 ERR trap 里就是失败那一行，`$BASH_COMMAND` 是那条命令的原文。
+# 被 `||`、`if`、`!` 接住的非零不触发 ERR，所以那些"故意失败"的用例不受影响。
+trap 'ags_suite_status=$?; printf "\nags suite: 第 %s 行失败（退出码 %s）：%s\n" \
+    "$LINENO" "$ags_suite_status" "$BASH_COMMAND" >&2' ERR
 
 tool="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/plugins/ags/scripts/ags}"
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
