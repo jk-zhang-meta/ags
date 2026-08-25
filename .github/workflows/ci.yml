@@ -81,7 +81,7 @@ jobs:
             --format json \
             --report-time \
             --show-output \
-            | grep -E '^[[:space:]]*\\{' \
+            | grep -E '^[[:space:]]*\{' \
             | tee test-report.jsonl
         env:
           NO_COLOR: "1"
