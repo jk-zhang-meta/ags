@@ -502,16 +502,26 @@ setup_openclaw_fixture() {
 
 # Stage an Antigravity (agy) conversation under the shared GEMINI_HOME.
 # agy and gmi share the ~/.gemini parent: agy lives under antigravity-cli/.
-# Copies the conversations/<uuid>.db + brain/<uuid>/.../transcript.jsonl tree
-# from the fixture corpus. Echoes the conversation uuid (== session id).
+# Echoes the conversation uuid (== session id).
+#
+# The transcript is *assembled* here rather than copied from a pre-built tree,
+# because a pre-built one is not in the corpus: this used to `cp -R` a
+# `brain/<uuid>` directory that was never committed, so the copy failed, the
+# conversion saw a database and no messages, and three tests failed with
+# "Session has no messages" — a missing fixture wearing the mask of a parser bug.
+#
+# `tests/fixtures_test.rs` builds the same tree the same way from the same file.
+# One copy of the transcript, two consumers: duplicating it would let the shell
+# corpus and the Rust corpus drift apart without anything failing.
 setup_agy_fixture() {
     local uuid="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    local src="$FIXTURES_DIR/antigravity/antigravity-cli"
+    local src="$FIXTURES_DIR/antigravity"
     local dst="$GEMINI_HOME/antigravity-cli"
+    local logs="$dst/brain/$uuid/.system_generated/logs"
 
-    mkdir -p "$dst/conversations" "$dst/brain"
-    cp "$src/conversations/${uuid}.db" "$dst/conversations/${uuid}.db"
-    cp -R "$src/brain/${uuid}" "$dst/brain/${uuid}"
+    mkdir -p "$dst/conversations" "$logs"
+    cp "$src/antigravity-cli/conversations/${uuid}.db" "$dst/conversations/${uuid}.db"
+    cp "$src/transcripts/agy_simple.jsonl" "$logs/transcript.jsonl"
     echo "$uuid"
 }
 
