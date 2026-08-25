@@ -4230,11 +4230,14 @@ terminal_menu_edit_args() {
 # 自己贴上去的话，第一次翻会看起来只滚了一行：光标从第 0 行跳到第 10 行，而窗口
 # 只需要挪 1 行就能把它露出来。人按的是"翻页"，看到的却是"滚了一行"。
 menu_turn_page() {
-    local direction="$1"
-    index=$((index + direction * visible))
+    local direction="$1" page
+    # 落到相邻那一页的**第一行**，而不是"当前光标加减一页"。后者在半页位置上翻
+    # 会落到下一页的中间，人按翻页却看不出边界在哪。
+    page=$(( index / visible + direction ))
+    (( page >= 0 )) || page=0
+    index=$(( page * visible ))
+    (( index < total )) || index=$(( (total - 1) / visible * visible ))
     (( index >= 0 )) || index=0
-    (( index < total )) || index=$((total - 1))
-    first=$index
 }
 
 terminal_menu() {
@@ -4270,9 +4273,15 @@ terminal_menu() {
         # 一次翻多远，永远是同一个数。
         (( visible <= menu_page_rows )) || visible=$menu_page_rows
         (( total > visible )) || visible=$total
-        (( index >= first )) || first=$index
-        (( index < first + visible )) || first=$((index - visible + 1))
-        (( first + visible <= total )) || first=$((total - visible))
+        # 窗口按**整页**对齐，不跟着光标一行一行地滑。
+        #
+        # 滑动式的窗口在一百多条会话里读起来很累：↓ 到底之后每按一次就整屏重画、
+        # 内容只挪一行，眼睛得重新找位置。按页对齐之后，↓ 到最后一行再按一次就是
+        # 干净的翻页，光标落到下一页第一行；↑ 同理往回翻。
+        #
+        # 最后一页可能不满（102 条、一页 10 行，最后一页只有 2 条），所以下面画行
+        # 的循环必须同时以 `total` 收口，否则会去读数组越界的下标。
+        first=$(( (index / visible) * visible ))
         (( first >= 0 )) || first=0
         pad=$((body - ${#title} - ${#count}))
         (( pad >= 1 )) || pad=1
@@ -4287,7 +4296,7 @@ terminal_menu() {
         (( first == 0 )) ||
             printf '  %s%s %d more above%s\n' \
                 "$style_dim" "$style_more" "$first" "$style_reset"
-        for ((row = first; row < first + visible; row++)); do
+        for ((row = first; row < first + visible && row < total; row++)); do
             if (( row == index )); then
                 printf '%s%s%s%s\n' "$style_pointer" "$style_select" \
                     "${terminal_menu_labels[$row]}" "$style_reset"
