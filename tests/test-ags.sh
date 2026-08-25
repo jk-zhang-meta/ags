@@ -785,6 +785,18 @@ cleanup() {
     # 真的失败了才把上面记下的那一行说出来。
     if (( status != 0 )) && [[ -s "${ags_suite_errfile:-}" ]]; then
         printf '\nags suite: %s' "$(cat "$ags_suite_errfile")" >&2
+        # 伪终端那组用例失败时，把最后画出来的那一帧也贴出来。断言全是
+        # `grep -Fq … <<< "$frame"`，没有这一段就只知道"没匹配上"，不知道
+        # 实际画的是什么——而这些用例在 CI 上跑，重现一次要推一个提交。
+        if [[ -s "${ags_suite_last_pty_out:-}" ]]; then
+            printf 'ags suite: 最后一帧（输入 %q）：\n' \
+                "${ags_suite_last_pty_input:-}" >&2
+            # 这里把 sed 写开而不是调 `strip_terminal_control`：那个函数定义在
+            # 文件很靠后的地方，而失败可能发生在它之前，cleanup 里就会变成
+            # "command not found" 盖掉真正的报错。
+            sed -e 's/\x1b\[[?0-9;]*[a-zA-Z]//g' -e 's/\r//g' -e 's/\x1b//g' \
+                -e 's/^/    /' "$ags_suite_last_pty_out" >&2
+        fi
     fi
     rm -f -- "${ags_suite_errfile:-}"
     for pid in "${!test_child_pids[@]}"; do
@@ -2549,6 +2561,10 @@ EOF
     run_checkpoint_pty() {
         local input="$1" output="$2" checkpoint_root="$3" pty_command
         shift 3
+        # 记下最后一次画的那一帧。这一组用例都是拿它去 `grep -Fq`，而 grep 失败
+        # 时只有一个退出码——看不到实际画出来的是什么，就只能靠反复推送去猜。
+        ags_suite_last_pty_out="$output"
+        ags_suite_last_pty_input="$input"
         printf -v pty_command '%q ' \
             env "${source_env[@]}" \
             AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
