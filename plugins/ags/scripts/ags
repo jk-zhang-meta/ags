@@ -6869,6 +6869,7 @@ read_session_annotation() {
     annotation_pinned=0
     annotation_summary=
     annotation_summary_stamp=
+    annotation_summary_at=0
     file="$(session_annotation_file "$provider" "$session_id")" || return 0
     [[ -f "$file" ]] || return 0
     payload="$(jq -c . "$file" 2>/dev/null)" || return 0
@@ -6878,6 +6879,8 @@ read_session_annotation() {
     [[ "$(jq -r '.pinned // false' <<< "$payload" 2>/dev/null)" == true ]] && annotation_pinned=1
     annotation_summary="$(jq -r '.summary // "" | gsub("[\t\r\n]"; " ")' <<< "$payload" 2>/dev/null || printf '')"
     annotation_summary_stamp="$(jq -r '.summary_stamp // ""' <<< "$payload" 2>/dev/null || printf '')"
+    annotation_summary_at="$(jq -r '.summary_at // 0' <<< "$payload" 2>/dev/null || printf 0)"
+    [[ "$annotation_summary_at" =~ ^[0-9]+$ ]] || annotation_summary_at=0
     return 0
 }
 
@@ -6893,8 +6896,9 @@ write_session_annotation() {
         die "cannot record notes for $provider/$session_id"
     mkdir -p "$(dirname "$file")"
     if [[ -f "$file" ]]; then
-        kept="$(jq -c '{summary: (.summary // ""), summary_stamp: (.summary_stamp // "")}
-                       | with_entries(select(.value != ""))' "$file" 2>/dev/null)" || kept='{}'
+        kept="$(jq -c '{summary: (.summary // ""), summary_stamp: (.summary_stamp // ""),
+                        summary_at: (.summary_at // 0)}
+                       | with_entries(select(.value != "" and .value != 0))' "$file" 2>/dev/null)" || kept='{}'
         [[ -n "$kept" ]] || kept='{}'
     fi
     temporary="$(mktemp "$file.XXXXXX")"
@@ -6925,7 +6929,9 @@ write_session_summary() {
     fi
     temporary="$(mktemp "$file.XXXXXX")" || return 1
     if jq -nc --arg summary "$summary" --arg stamp "$stamp" --argjson kept "$kept" \
-        '$kept + {summary: $summary, summary_stamp: $stamp}' > "$temporary" 2>/dev/null; then
+        --argjson at "$(date +%s)" \
+        '$kept + {summary: $summary, summary_stamp: $stamp, summary_at: $at}' \
+        > "$temporary" 2>/dev/null; then
         chmod 600 "$temporary"
         mv -- "$temporary" "$file"
     else
@@ -7078,12 +7084,32 @@ ensure_session_summary() {
     [[ -z "$annotation_description" ]] || return 0
     (( force == 1 )) || [[ -z "$native_name" ]] || return 0
     stamp="$(session_content_stamp "$path")"
-    if (( force == 0 )) && [[ -n "$annotation_summary" && -n "$stamp" &&
-          "$annotation_summary_stamp" == "$stamp" ]]; then
+    # 判据是**指纹**，不是"有没有总结"。有些会话根本没有可总结的东西（整段都是
+    # 客户端注入的上下文，人一个字没打），它算出来必然是空的——而按"有没有总结"
+    # 判的话，这种会话每一轮都会被重算一次，为一个注定的空结果反复解析整个文件。
+    # 有些文件是一 GiB 级的。
+    if (( force == 0 )) && [[ -n "$stamp" && "$annotation_summary_stamp" == "$stamp" ]]; then
+        return 0
+    fi
+    # 内容变了，但刚算过就先别重算。
+    #
+    # 一条**还在跑**的会话每一分钟内容都在变，按指纹判的话每一轮都要重算一次——
+    # 而它恰恰是列表最上面、你最想认出来的那几条。全跳过（只补已经结束的）是另一
+    # 个极端：正在干的活永远没有名字。折中就是这一条：照常补，但一小时内不重复。
+    local refresh
+    refresh="${AGS_SUMMARY_REFRESH_SECONDS:-3600}"
+    [[ "$refresh" =~ ^[0-9]{1,7}$ ]] || refresh=3600
+    if (( force == 0 && annotation_summary_at > 0 )) &&
+       (( $(date +%s) - annotation_summary_at < refresh )); then
         return 0
     fi
     digest="$(session_digest_text "$provider" "$session_id" "$path")"
-    [[ -n "${digest//[[:space:]]/}" ]] || return 1
+    if [[ -z "${digest//[[:space:]]/}" ]]; then
+        # 记下"这份内容看过了，没什么可说的"，别下一轮再来一次。模型调用失败是另
+        # 一回事（网络、超时），那种不记，因为它下次可能就成了。
+        write_session_summary "$provider" "$session_id" "" "$stamp" || true
+        return 1
+    fi
     limit="$(ags_summary_max_chars)"
     answer="$(run_summary_model "$(summary_prompt "$limit" "$digest")")" || return 1
     # 只在模型答了一整段时兜底截一刀，**不按显示宽度砍**——存下来的东西要能在更宽
@@ -7188,7 +7214,7 @@ native_session_limit() {
 # 描述那列显示成了标题、标题列显示成了路径，而且不报任何错。`\x1f` 不是 IFS 空白
 # 字符，空字段照样保留。
 #
-# 输出：provider · session_id · 时间 · 工作区 · Agent 自己起的名字 · 标题 · 路径
+# 输出：provider · session_id · 时间 · 时间(epoch 秒) · 工作区 · Agent 自己起的名字 · 标题 · 路径
 #
 # 排序在 jq 里做而不是交给 `sort`：`casr list` 是按 provider 分组各自截断的，跨
 # provider 的先后只有把两边合起来看才成立。
@@ -7234,6 +7260,7 @@ native_session_rows() {
             | [ .provider,
                 .session_id,
                 (if ._when > 0 then (._when / 1000 | floor | strflocaltime("%m-%d %H:%M")) else "" end),
+                ((._when / 1000) | floor | tostring),
                 ((.workspace // .workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
                 ((.native_name // "") | tostring | gsub("[\t\r\n]"; " ")),
                 ((.title // "") | display_line),
@@ -7313,7 +7340,8 @@ workspace_cell() {
 
 load_native_session_menu() {
     local include_archives="${1:-0}" for_menu="${2:-1}" table_width
-    local provider session_id when workspace native_name title path
+    local provider session_id when when_epoch workspace native_name title path
+    local now
     table_width="$(terminal_width)"
     local checkpoint_id agent saved_date description selector args
     local marker kind label_id archive_agent
@@ -7324,14 +7352,19 @@ load_native_session_menu() {
     terminal_menu_details=()
     terminal_menu_agents=()
     terminal_menu_header=
+    # 这一屏里有多少条只能显示"原话第一行"——也就是还没有任何像样的名字。自动补
+    # 描述看的就是这个数，为零就不起后台进程。
+    native_menu_missing=0
 
     # 先把整批读进来：短号要一次性发完（一次写，不是几十次），而每行显示什么也
     # 要等这一批都在手里才定得下来。
     local -a live_provider=() live_id=() live_when=() live_workspace=() live_title=()
-    local -a live_path=() live_key=() live_native=()
-    while IFS=$'\x1f' read -r provider session_id when workspace native_name title path; do
+    local -a live_path=() live_key=() live_native=() live_when_epoch=()
+    while IFS=$'\x1f' read -r provider session_id when when_epoch workspace \
+                              native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
         live_provider+=("$provider")
+        live_when_epoch+=("$when_epoch")
         live_id+=("$session_id")
         live_when+=("$when")
         live_workspace+=("$workspace")
@@ -7341,6 +7374,7 @@ load_native_session_menu() {
         live_key+=("$provider/$session_id")
     done < <(native_session_rows)
     load_session_ordinals
+    now="$(date +%s)"
     (( ${#live_key[@]} == 0 )) || assign_session_ordinals "${live_key[@]}"
 
     local index ordinal
@@ -7367,6 +7401,11 @@ load_native_session_menu() {
         # 通常更准，而且不花钱。顺序反过来的话，`ags summarize --force` 会给一条
         # 本来就有好名字的 Claude 会话生成一份总结，然后**永久压住**那个好名字。
         # `title` 是原话的第一行、不是概括，所以垫底。
+        if [[ -z "$annotation_description" && -z "$native_name" &&
+              -z "$annotation_summary" ]] &&
+           [[ -z "$annotation_summary_stamp" ]]; then
+            native_menu_missing=$((native_menu_missing + 1))
+        fi
         rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${native_name:-${annotation_summary:-$title}}}")
     done
 
@@ -7602,6 +7641,89 @@ split_live_selector() {
         die "unreadable session selector: $1"
 }
 
+# 这条会话是不是已经不写了。
+#
+# 判据就是文件多久没被动过。没有比这更准的信号：ags 启动 Agent 是 `exec` 过去的，
+# 进程被顶掉、再也回不来，所以"会话结束了"这件事 ags 根本收不到通知。
+#
+# 为什么要这个判据：总结的缓存按 `(大小, mtime)` 失效，而**一条还在写的会话每次都
+# 会重算**——文件一直在长，指纹一直在变。自动补描述如果不挡住活会话，就会对着同
+# 几条会话反复付钱，而且算出来的东西下一分钟就过期。
+session_is_settled() {
+    local last="$1" now="$2" idle
+    idle="${AGS_SUMMARY_IDLE_SECONDS:-600}"
+    [[ "$idle" =~ ^[0-9]{1,6}$ ]] || idle=600
+    [[ "$last" =~ ^[0-9]+$ ]] || return 1
+    (( last > 0 )) || return 1
+    (( now - last >= idle ))
+}
+
+# 该不该在这次 `ags ls` 之后顺手补一轮描述。
+#
+# 三道闸，缺一不可：
+#
+#   - `AGS_AUTO_SUMMARY=0` 直接关掉。这件事要花钱，必须留一个不用读文档就能想到
+#     的开关。
+#   - 有节流。`ls` 是随手就敲的命令，每次都起一轮后台任务等于给自己开了个循环。
+#   - 真的有活要干。没有缺描述的会话就不起进程——起一个只为了发现无事可做，是
+#     纯粹的浪费。
+auto_summary_should_run() {
+    local stamp interval now last
+    [[ "${AGS_AUTO_SUMMARY:-1}" != 0 ]] || return 1
+    interval="${AGS_AUTO_SUMMARY_INTERVAL:-900}"
+    [[ "$interval" =~ ^[0-9]{1,7}$ ]] || interval=900
+    now="$(date +%s 2>/dev/null)" || return 1
+    stamp="$state/auto-summary.stamp"
+    if [[ -f "$stamp" ]]; then
+        last="$(cat "$stamp" 2>/dev/null || printf 0)"
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+        (( now - last >= interval )) || return 1
+    fi
+    mkdir -p "$state" 2>/dev/null || true
+    printf '%s\n' "$now" > "$stamp" 2>/dev/null || true
+    return 0
+}
+
+# 看完列表之后，顺手把没名字的补上——如果值得。
+#
+# 为什么挂在 `ls` 上而不是定时任务：ags 没有常驻进程，装一个 cron/systemd timer
+# 意味着一套新的安装、卸载、状态查询接口，而"看列表"本来就是唯一会在意名字好不好
+# 认的时刻。看得越勤，补得越勤；不看就不花钱。
+maybe_start_background_summary() {
+    (( ${native_menu_missing:-0} > 0 )) || return 0
+    auto_summary_should_run || return 0
+    log "后台补 ${native_menu_missing} 条描述（AGS_AUTO_SUMMARY=0 关掉）"
+    start_background_summary
+}
+
+# 起一轮后台补描述。
+#
+# 后台而不是当场做：一条会话一次模型调用，几十条就是几十次往返，而 `ls` 应该是
+# 秒回的。输出全部丢进日志文件——交互菜单此刻正占着终端，往 stderr 写一行就会把
+# 画面撕开。
+start_background_summary() {
+    local log="$state/auto-summary.log"
+    mkdir -p "$state" 2>/dev/null || true
+    # `setsid` 而不是一个裸 `&`：裸 `&` 起的活儿和 `ags ls` 在同一个进程组里，
+    # `ls` 一退出它就跟着没了——实测只写下第一行日志就断了。补描述要跑几十秒，
+    # 必须活得比起它的那条命令长，所以单独开一个会话组。
+    #
+    # 走 `casr checkpoint` 这个入口而不是在本进程里起子 shell：那样新进程有自己
+    # 干净的一份状态，不会因为父进程正占着终端而互相干扰。
+    local binary
+    binary="$(resolve_ags_converter_binary 2>/dev/null)" || return 0
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$binary" checkpoint summarize \
+            >"$log" 2>&1 </dev/null &
+    else
+        # 没有 setsid（部分 macOS）就退回本进程后台，并挡住挂断信号。
+        ( trap '' HUP INT; summarize_native_sessions 0 0 ) \
+            >"$log" 2>&1 </dev/null &
+    fi
+    disown 2>/dev/null || true
+    return 0
+}
+
 # 把缺总结的会话补齐。
 #
 # 单独一个动作而不是 `ls` 顺手做掉：每条要调一次模型，几十条就是几十次往返，
@@ -7611,13 +7733,16 @@ split_live_selector() {
 # 一条失败不影响别条：模型超时、这条会话人一句话没说、`codex` 太老，都只是这一行
 # 继续用标题而已。
 summarize_native_sessions() {
-    local force="${1:-0}"
-    local provider session_id when workspace native_name title path
-    local made=0 kept=0 failed=0
+    local force="${1:-0}" settled_only="${2:-0}"
+    local provider session_id when when_epoch workspace native_name title path
+    local made=0 kept=0 failed=0 busy=0 now
     local -a queue_provider=() queue_id=() queue_path=() queue_title=() queue_native=()
+    local -a queue_when=()
     need jq
-    while IFS=$'\x1f' read -r provider session_id when workspace native_name title path; do
+    while IFS=$'\x1f' read -r provider session_id when when_epoch workspace \
+                              native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
+        queue_when+=("$when_epoch")
         queue_provider+=("$provider")
         queue_id+=("$session_id")
         queue_path+=("$path")
@@ -7625,6 +7750,7 @@ summarize_native_sessions() {
         queue_native+=("$native_name")
     done < <(native_session_rows)
     (( ${#queue_id[@]} > 0 )) || { log "没有会话"; return 0; }
+    now="$(date +%s)"
     log "总结 ${#queue_id[@]} 条会话（已有的跳过）…"
     local index
     for index in "${!queue_id[@]}"; do
@@ -7633,13 +7759,22 @@ summarize_native_sessions() {
         # 名字直接从行里取。以前这里为每条会话单独跑一次 `casr info`——上百条会话
         # 就是上百次进程启动，而这个值列表本来就已经拿到了。
         native_name="${queue_native[$index]}"
+        # 还在写的会话跳过：它的总结下一分钟就过期，而缓存指纹一定不命中，等于
+        # 每一轮都为同一条会话再付一次钱。
+        if (( settled_only == 1 )) && ! session_is_settled "${queue_when[$index]}" "$now"; then
+            busy=$((busy + 1)); continue
+        fi
         read_session_annotation "$provider" "$session_id"
         if [[ -n "$annotation_description" ]] ||
            { (( force == 0 )) && [[ -n "$native_name" ]]; }; then
             kept=$((kept + 1)); continue
         fi
-        if [[ -n "$annotation_summary" ]] && (( force == 0 )) &&
+        if (( force == 0 )) && [[ -n "$annotation_summary_stamp" ]] &&
            [[ "$annotation_summary_stamp" == "$(session_content_stamp "${queue_path[$index]}")" ]]; then
+            kept=$((kept + 1)); continue
+        fi
+        if (( force == 0 && annotation_summary_at > 0 )) &&
+           (( now - annotation_summary_at < ${AGS_SUMMARY_REFRESH_SECONDS:-3600} )); then
             kept=$((kept + 1)); continue
         fi
         if ensure_session_summary "$provider" "$session_id" \
@@ -7651,7 +7786,11 @@ summarize_native_sessions() {
             failed=$((failed + 1))
         fi
     done
-    log "总结完成：新增 ${made}，跳过 ${kept}，没算出来 ${failed}"
+    if (( busy > 0 )); then
+        log "总结完成：新增 ${made}，跳过 ${kept}，还在写的 ${busy}，没算出来 ${failed}"
+    else
+        log "总结完成：新增 ${made}，跳过 ${kept}，没算出来 ${failed}"
+    fi
     push_pool_descriptions || true
 }
 
@@ -7773,11 +7912,13 @@ list_native_sessions() {
         load_native_session_menu "$include_archives" 0
         (( ${#terminal_menu_labels[@]} > 0 )) || return 0
         printf '%s\n' "$terminal_menu_header" "${terminal_menu_labels[@]}"
+        maybe_start_background_summary
         return 0
     fi
 
     terminal_menu_notice=
     load_native_session_menu "$include_archives" 1
+    maybe_start_background_summary
     if (( ${#terminal_menu_ids[@]} == 0 )); then
         log "no sessions"
         return 0
@@ -12300,8 +12441,11 @@ case "${1:-}" in
     summarize) shift
         # `--force` 重算已经有的：换了模型、或者一条会话后来长出了完全不同的内容。
         case "${1:-}" in
-            ''|--force) summarize_native_sessions "$( [[ "${1:-}" == --force ]] && printf 1 || printf 0 )" ;;
-            *) die "usage: ags summarize [--force]" ;;
+            '') summarize_native_sessions 0 0 ;;
+            --force) summarize_native_sessions 1 0 ;;
+            # 只补已经不写的会话。`ags ls` 在后台起的就是这一条。
+            --settled) summarize_native_sessions 0 1 ;;
+            *) die "usage: ags summarize [--force|--settled]" ;;
         esac
         ;;
     archives) shift; list_local_checkpoints "$@" ;;
