@@ -96,7 +96,7 @@ ags_zone_launch() {
         AGENT_SESSION_STORAGE_MODE=local \
         AGENT_SESSION_LOCAL_DIR="$ags_zone_home/store" \
         AGENT_SESSION_STATE_DIR="$ags_zone_home/state" \
-        AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>&1 || return $?
+        AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>"$ags_zone_home/err" || return $?
     cat "$out"
 }
 
@@ -104,16 +104,33 @@ ags_zone_field() {
     sed -n "s/^$1=//p" <<< "$2"
 }
 
+# 断言失败时**把 ags 自己说的话打出来**。
+#
+# 之前这里把 stderr 丢进 `/dev/null`，于是一条"启动前被拒绝"的用例报出来的是
+# `ARGS 是空的，想要 --model o3`——一个关于参数归属的断言，而真正的原因可能是存储
+# 没配、池子连不上、或者别的任何东西。这个套件的注释反复说"报出来的和原因离得很
+# 远"，而这一行正是制造那种距离的地方。
+#
+# 在**开发者自己的机器上永远看不出来**：那里什么都配好了，全绿。只有干净的 runner
+# 会红，而红的时候唯一的线索恰恰被扔掉了。
+ags_zone_diagnose() {
+    [[ -s "$ags_zone_home/err" ]] || return 0
+    printf 'ags zone: ags 自己的输出:\n' >&2
+    sed 's/^/    /' "$ags_zone_home/err" >&2
+}
+
 ags_zone_expect() {
     local label="$1" field="$2" want="$3" got
     shift 3
     got="$(ags_zone_field "$field" "$(ags_zone_launch "$@")")" || {
         printf 'ags zone: %s: launch failed\n' "$label" >&2
+        ags_zone_diagnose
         exit 1
     }
     [[ "$got" == "$want" ]] || {
         printf 'ags zone: %s: %s was %q, wanted %q\n' \
             "$label" "$field" "$got" "$want" >&2
+        ags_zone_diagnose
         exit 1
     }
 }
