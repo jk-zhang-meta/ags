@@ -4224,12 +4224,28 @@ terminal_menu_edit_args() {
     printf '\033[?25l'
 }
 
+# 整页翻。`$1` 是方向（1 往后、-1 往前）。
+#
+# 光标落到**新一页的第一行**，窗口跟着整页移动。只把光标 `index` 加减一页而让窗口
+# 自己贴上去的话，第一次翻会看起来只滚了一行：光标从第 0 行跳到第 10 行，而窗口
+# 只需要挪 1 行就能把它露出来。人按的是"翻页"，看到的却是"滚了一行"。
+menu_turn_page() {
+    local direction="$1"
+    index=$((index + direction * visible))
+    (( index >= 0 )) || index=0
+    (( index < total )) || index=$((total - 1))
+    first=$index
+}
+
 terminal_menu() {
-    local title="$1" allow_delete="$2" allow_actions="${3:-0}" key second third fourth confirm
+    local title="$1" allow_delete="$2" allow_actions="${3:-0}" key second third fourth
+    local menu_page_rows confirm
     local index=0 row width height body count hint pad
     local total chrome visible first=0
     (( ${#terminal_menu_ids[@]} > 0 )) || return 1
     init_terminal_style
+    menu_page_rows="${AGS_PAGE_ROWS:-10}"
+    [[ "$menu_page_rows" =~ ^[1-9][0-9]{0,2}$ ]] || menu_page_rows=10
     width="$(terminal_width)"
     (( width > 0 )) || width=80
     height="$(terminal_height)"
@@ -4248,9 +4264,12 @@ terminal_menu() {
         if (( total > visible )); then
             visible=$((visible - 2))
             (( visible >= 3 )) || visible=3
-        else
-            visible=$total
         fi
+        # 一页固定这么多行。窗口比它还小的时候以窗口为准——画不下的行不是"一页"，
+        # 是被截掉。翻页的步长用的就是这个数（见方向键那一段），所以窗口多大、
+        # 一次翻多远，永远是同一个数。
+        (( visible <= menu_page_rows )) || visible=$menu_page_rows
+        (( total > visible )) || visible=$total
         (( index >= first )) || first=$index
         (( index < first + visible )) || first=$((index - visible + 1))
         (( first + visible <= total )) || first=$((total - visible))
@@ -4352,21 +4371,21 @@ terminal_menu() {
             #
             # 步长用的是这一屏**实际画了几行**（`visible`），不是一个写死的数字：
             # 窗口多高就翻多少，翻完光标停的位置和眼睛看的位置才对得上。
-            C) index=$((index + visible)); (( index < total )) || index=$((total - 1)) ;;
-            D) index=$((index - visible)); (( index >= 0 )) || index=0 ;;
+            C) menu_turn_page 1 ;;
+            D) menu_turn_page -1 ;;
             H) index=0 ;;
             F) index=$((total - 1)) ;;
             5)
                 [[ "$second" == '[' ]] || continue
                 IFS= read -rsn1 -t 0.05 fourth || continue
                 [[ "$fourth" == '~' ]] || continue
-                index=$((index - visible)); (( index >= 0 )) || index=0
+                menu_turn_page -1
                 ;;
             6)
                 [[ "$second" == '[' ]] || continue
                 IFS= read -rsn1 -t 0.05 fourth || continue
                 [[ "$fourth" == '~' ]] || continue
-                index=$((index + visible)); (( index < total )) || index=$((total - 1))
+                menu_turn_page 1
                 ;;
             1|7)
                 [[ "$second" == '[' ]] || continue
