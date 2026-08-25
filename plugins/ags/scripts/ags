@@ -7205,6 +7205,68 @@ selector_for_ordinal() {
     return 0
 }
 
+# 一次把所有注解读进内存，别一行起一次 jq。
+#
+# 渲染一屏列表原来要为每条会话调 4~5 次 jq（描述、参数、置顶、总结、短号），一百
+# 条会话就是五百多次进程启动——实测 `ags ls` 里 casr 只占 0.85 秒，剩下 1.85 秒
+# 全花在这上面。这里一次 jq 读完全部注解文件。
+#
+# 一个文件坏了 jq 会整批失败，所以失败时返回非零、调用方退回逐条读。批量是优化，
+# 不该变成一个新的失败点。
+load_all_annotations() {
+    local root="$state/annotations" key rest
+    annotation_map=()
+    [[ -d "$root" ]] || return 0
+    while IFS=$'\x1f' read -r key rest; do
+        [[ -n "$key" ]] || continue
+        annotation_map["$key"]="$rest"
+    done < <(
+        find "$root" -mindepth 2 -maxdepth 2 -type f -name '*.json' -print0 2>/dev/null |
+            xargs -0 -r jq -r '
+                (input_filename | split("/") | .[-2:]
+                 | .[1] |= sub("\\.json$"; "") | join("/")) as $key
+                | [ $key,
+                    ((.description // "") | tostring | gsub("[\t\r\n]"; " ")),
+                    (if (.args | type) == "array" then (.args | tojson) else "[]" end),
+                    (if (.pinned // false) then "1" else "0" end),
+                    ((.summary // "") | tostring | gsub("[\t\r\n]"; " ")),
+                    ((.summary_stamp // "") | tostring),
+                    ((.summary_at // 0) | tostring)
+                  ] | join("\u001f")' 2>/dev/null
+    )
+    # `done < <(...)` 里那条管道的退出码传不出来，所以判据是结果本身：注解目录
+    # 存在、却一条都没读到，就是这批读失败了（某个文件坏了会让 jq 整批放弃）。
+    # 这时候返回非零，调用方退回逐条读。
+    if [[ -d "$root" ]] && (( ${#annotation_map[@]} == 0 )) &&
+       [[ -n "$(find "$root" -mindepth 2 -maxdepth 2 -type f -name '*.json' -print -quit 2>/dev/null)" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# 从批量结果里取一条，填进和 `read_session_annotation` 同一组变量。
+#
+# 取不到就是"这条会话没有注解"——那是最常见的情况（绝大多数会话是直接用 Agent 起
+# 的，AGS 从没见过它们），所以填默认值，不报错。
+annotation_from_map() {
+    local key="$1" packed
+    annotation_description=
+    annotation_args='[]'
+    annotation_pinned=0
+    annotation_summary=
+    annotation_summary_stamp=
+    annotation_summary_at=0
+    packed="${annotation_map[$key]:-}"
+    [[ -n "$packed" ]] || return 0
+    IFS=$'\x1f' read -r annotation_description annotation_args annotation_pinned \
+        annotation_summary annotation_summary_stamp annotation_summary_at \
+        <<< "$packed"
+    [[ "$annotation_pinned" == 1 ]] || annotation_pinned=0
+    [[ "$annotation_summary_at" =~ ^[0-9]+$ ]] || annotation_summary_at=0
+    [[ -n "$annotation_args" ]] || annotation_args='[]'
+    return 0
+}
+
 # 每个 Agent 最多取多少条。
 #
 # casr 的 `--limit` 是**按 provider** 算的，这里取完之后再全局按时间排一次，所以
@@ -7370,6 +7432,8 @@ load_native_session_menu() {
     # 要等这一批都在手里才定得下来。
     local -a live_provider=() live_id=() live_when=() live_workspace=() live_title=()
     local -a live_path=() live_key=() live_native=() live_when_epoch=()
+    local -A annotation_map=() ordinal_map=()
+    local annotations_batched=1
     while IFS=$'\x1f' read -r provider session_id when when_epoch workspace \
                               native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
@@ -7386,6 +7450,14 @@ load_native_session_menu() {
     load_session_ordinals
     now="$(date +%s)"
     (( ${#live_key[@]} == 0 )) || assign_session_ordinals "${live_key[@]}"
+    # 一次读完，别一行起一次 jq。读不动就退回逐条，批量只是优化。
+    load_all_annotations || annotations_batched=0
+    local ordinal_key ordinal_value
+    while IFS=$'\t' read -r ordinal_key ordinal_value; do
+        [[ -n "$ordinal_key" ]] || continue
+        ordinal_map["$ordinal_key"]="$ordinal_value"
+    done < <(jq -r '.ids | to_entries[] | "\(.key)\t\(.value)"' \
+        <<< "$session_ordinals_json" 2>/dev/null || true)
 
     local index ordinal
     for index in "${!live_id[@]}"; do
@@ -7395,11 +7467,14 @@ load_native_session_menu() {
         workspace="${live_workspace[$index]}"
         native_name="${live_native[$index]}"
         title="${live_title[$index]}"
-        read_session_annotation "$provider" "$session_id"
+        if (( annotations_batched == 1 )); then
+            annotation_from_map "${live_key[$index]}"
+        else
+            read_session_annotation "$provider" "$session_id"
+        fi
         marker=' '
         (( annotation_pinned == 0 )) || marker='*'
-        ordinal="$(jq -r --arg key "${live_key[$index]}" '.ids[$key] // ""' \
-            <<< "$session_ordinals_json" 2>/dev/null)" || ordinal=
+        ordinal="${ordinal_map[${live_key[$index]}]:--}"
         [[ -n "$ordinal" ]] || ordinal='-'
         terminal_menu_ids+=("live:$provider/$session_id")
         terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
