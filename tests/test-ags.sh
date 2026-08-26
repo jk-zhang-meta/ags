@@ -2620,15 +2620,68 @@ EOF
     #
     # `trap '' PIPE`：菜单可能在键喂完之前就退出（收到 Esc 就走），那时管道读端已经
     # 关了，写端会吃到 SIGPIPE 以 141 退出——那不是失败，是它已经达到目的了。
+    # 等被测程序把这一帧画完、真的停在等下一个键那一步。
+    #
+    # 原来是每个键之间固定 sleep 0.04。在开发机上够，在 GitHub 跑步机上不够：`a`
+    # 打开参数编辑器要先从菜单的 raw 读切到 readline，紧跟其后的 Ctrl-U 会落在切换
+    # 完成之前，于是清不掉预填的参数——帧里出现
+    # `--yolo --model 'o3 mini'--model o3`，断言失败，而本地永远是绿的。
+    #
+    # 改成盯输出文件：每个键都会引发重画，输出停止增长就说明它在等下一个键了。
+    # 上限 6 秒，卡住也不会把套件挂死。
+    pty_settle() {
+        local out="$1" floor="$2" stamp stable=0 spin
+        sleep "$floor"
+        [[ -n "$out" ]] || return 0
+        # 比时间戳，不比大小：`[[ a -nt b ]]` 是 bash 内建，而 `$(wc -c < …)` 每轮
+        # 都要 fork 一次。整套跑下来是几千次 fork，在 WSL 上把套件从 45 秒拖到
+        # 近 5 分钟。
+        stamp="$tmp/.pty-settle-stamp"
+        for (( spin = 0; spin < 100; spin++ )); do
+            : > "$stamp"
+            sleep 0.05
+            if [[ "$out" -nt "$stamp" ]]; then
+                stable=0
+            else
+                stable=$(( stable + 1 ))
+                (( stable >= 2 )) && return 0
+            fi
+        done
+    }
+
     feed_keys() {
-        local input="$1" i ch
+        local input="$1" out="${2:-}" i=0 ch key byte n
+        # `n` 单独一行赋值：`local a="$1" n=${#a}` 里 bash 先把所有名字
+        # 声明成未设置再逐个赋值，`${#a}` 取到的是那个还没赋值的局部变量，
+        # `set -u` 下当场 unbound variable——函数死在这里，一个键都不会送
+        # 出去，被测程序就那么等着，表现是套件挂起而不是断言失败。
+        n=${#input}
         trap '' PIPE
         # 先让被测程序把第一帧画出来、进到等键那一步。
-        sleep 0.4
-        for (( i = 0; i < ${#input}; i++ )); do
+        pty_settle "$out" 0.4
+        while (( i < n )); do
             ch="${input:i:1}"
-            printf '%s' "$ch" 2>/dev/null || return 0
-            sleep 0.04
+            key="$ch"
+            # `i=$(( i + 1 ))` 而不是 `(( i++ ))`：后者在 i=0 时求值为 0，
+            # `(( ))` 于是返回退出码 1，`set -e` 当场把 feed_keys 杀掉——一个键都
+            # 送不出去，被测程序等在那里，表现是套件挂起而不是断言失败。
+            i=$(( i + 1 ))
+            # 一条 CSI 序列（ESC [ … 终止字节）必须整条一次送出去。应用是靠
+            # "ESC 之后紧接着还有没有字节"来区分「按了 Esc」和「按了 Delete」的，
+            # 逐字节喂会让 `\E[3~` 被当成一个孤立的 Esc——菜单当场退出，删除确认
+            # 那一帧根本不会出现。要按"键"喂，不是按字节。
+            if [[ "$ch" == $'\033' && "${input:i:1}" == '[' ]]; then
+                key+='['
+                i=$(( i + 1 ))
+                while (( i < n )); do
+                    byte="${input:i:1}"
+                    key+="$byte"
+                    i=$(( i + 1 ))
+                    [[ "$byte" == [@-~] ]] && break
+                done
+            fi
+            printf '%s' "$key" 2>/dev/null || return 0
+            pty_settle "$out" 0.04
         done
     }
 
@@ -2651,7 +2704,7 @@ EOF
             TERM=xterm-256color \
             AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
             "$tmp/stty-guard" "$tool" archives
-        feed_keys "$input" | \
+        feed_keys "$input" "$output" | \
             SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
                 > "$output" 2>&1
     }
@@ -2689,7 +2742,7 @@ EOF
             "$tmp/stty-guard" "$tool" "$@"
         (
             cd "$launch_dir"
-            feed_keys "$input" | \
+            feed_keys "$input" "$output" | \
                 SHELL=/bin/bash /usr/bin/script -q -e -f \
                     -c "$pty_command" /dev/null > "$output" 2>&1
         )

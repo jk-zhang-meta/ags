@@ -469,6 +469,13 @@ fn main() -> ExitCode {
             let mut rebuilt = Vec::with_capacity(raw.len().saturating_sub(1));
             rebuilt.extend(raw[..at].iter().cloned());
             rebuilt.extend(raw[at + 1..].iter().cloned());
+            // clap builds its `Usage:` line from argv[0]. With `convert` merely
+            // removed it would print `Usage: ags resume …`, and anyone copying
+            // that lands in the runtime's `resume` instead — a different command
+            // that takes a saved-session name, not a provider.
+            if !rebuilt.is_empty() {
+                rebuilt[0] = std::ffi::OsString::from("ags convert");
+            }
             // The `-cc <id>` shorthand belongs to conversion, so it is only
             // rewritten once we know that is where we are.
             rewrite_shorthand_resume_args(rebuilt)

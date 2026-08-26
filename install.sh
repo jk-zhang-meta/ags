@@ -462,7 +462,7 @@ ags convert -gmi <session-id>  # open in Gemini
 ```bash
 ags convert providers
 ags convert list --workspace "$(pwd)" --sort date --limit 20
-ags convert cod resume <session-id> --source cc
+ags convert resume cod <session-id> --source cc
 ags convert info <session-id> --json
 ```
 

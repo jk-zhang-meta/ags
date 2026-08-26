@@ -28,7 +28,7 @@ That installer is the primary distribution path. It handles platform detection, 
 
 | Feature | What It Does |
 |---|---|
-| Cross-provider resume | `ags convert cc resume <codex-session-id>` and similar conversions in one command |
+| Cross-provider resume | `ags convert resume cc <codex-session-id>` and similar conversions in one command |
 | Canonical IR | Normalizes provider formats into a common model, then exports back to native format |
 | Native-format writers | Produces plausible provider-native session files, not intermediate-only exports |
 | Safety-first writes | Atomic temp-then-rename writes, conflict detection, optional `.bak` backup with `--force` |
@@ -51,7 +51,7 @@ ags convert list --limit 20 --sort date
 ags convert info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
 # 4) Convert that session to Claude Code format
-ags convert cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+ags convert resume cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
 # ergonomic shorthand (auto-detects source provider from the session ID)
 ags convert -cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # open in Claude Code
@@ -535,14 +535,14 @@ Global flags:
 Convert a source session into target provider format and print the target resume command.
 
 ```bash
-ags convert cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+ags convert resume cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 ags claude resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # standard name fallback
-ags convert cod resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
+ags convert resume cod 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
 ags codex resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
-ags convert gmi resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
+ags convert resume gmi 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
 ags gemini resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
-ags convert cc resume <session-id> --force
-ags convert cc resume <session-id> --json
+ags convert resume cc <session-id> --force
+ags convert resume cc <session-id> --json
 ```
 
 **Context budget (opt-in).** By default nothing is trimmed: the whole session
@@ -1123,7 +1123,7 @@ Test suite coverage includes:
 ```bash
 ags convert list
 ags convert info <session-id>
-ags convert cc resume <session-id> --source cod
+ags convert resume cc <session-id> --source cod
 ```
 
 ### "Target provider not installed"
@@ -1141,7 +1141,7 @@ Install the missing provider, then retry.
 Use force mode to back up and overwrite:
 
 ```bash
-ags convert cc resume <session-id> --force
+ags convert resume cc <session-id> --force
 ```
 
 ### "Write verification failed"
@@ -1149,7 +1149,7 @@ ags convert cc resume <session-id> --force
 Run in trace mode and inspect JSON diagnostics:
 
 ```bash
-ags convert cc resume <session-id> --trace --json
+ags convert resume cc <session-id> --trace --json
 ```
 
 ### "Wrong source provider was detected"
@@ -1157,8 +1157,8 @@ ags convert cc resume <session-id> --trace --json
 Pin source provider or session path explicitly:
 
 ```bash
-ags convert cc resume <session-id> --source cod
-ags convert cc resume <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.jsonl
+ags convert resume cc <session-id> --source cod
+ags convert resume cc <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.jsonl
 ```
 
 ## Limitations

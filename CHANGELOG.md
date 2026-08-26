@@ -10,6 +10,30 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
 
 > Commits on `main` since the v0.1.1 tag (`be1ce19`, 2026-03-03). No GitHub Release yet.
 
+### Renamed to `ags` (breaking, v0.5.0)
+
+- **The binary is now `ags`; `casr` is gone.** It used to be a `casr` binary with
+  a four-line `ags` wrapper beside it. The wrapper is gone and the binary itself
+  is `ags`, so the two names no longer coexist.
+
+- **The bare namespace belongs to the session runtime; conversion moved under
+  `ags convert`.** Both halves wanted the names `list` and `resume`, so:
+
+  | Before | Now |
+  |---|---|
+  | `casr list` | `ags convert list` |
+  | `casr resume cc <id>` | `ags convert resume cc <id>` |
+  | `casr info` / `providers` / `completions` | `ags convert info` / … |
+  | *(the runtime, previously the `ags` wrapper)* | `ags ls` / `resume` / `save` / `summarize` / `gc` / `update` |
+
+  Routing happens before argument parsing, so `ags --json convert list` works too.
+  `--version` stays at the top level, and `checkpoint` is kept for old wrappers.
+
+- **Upgrading needs no action.** The installer overwrites the old `ags` wrapper
+  with the real binary and removes the leftover `casr` next to it; `ags update`
+  fetches its `install.sh` from the tag it is installing, so an old install is
+  never locked out.
+
 ### AGS Runtime
 
 - **The launcher menu detects an Agent the same way it launches one**: the menu
