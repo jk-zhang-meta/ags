@@ -230,7 +230,7 @@ find "$vault/codex" -maxdepth 1 -type f \
 
 identity_sha="$(sha256sum "$identity" | cut -d' ' -f1)"
 custom_vault="$tmp/custom-vault"
-"${runtime_env[@]}" "$bin_dir/ags" set "$custom_vault" >/dev/null
+"${runtime_env[@]}" "$bin_dir/ags" store add local "$custom_vault" >/dev/null
 if ! run_installer > "$tmp/second.out" 2> "$tmp/second.err"; then
     printf 'repeat offline installer run failed:\n' >&2
     cat "$tmp/second.err" >&2

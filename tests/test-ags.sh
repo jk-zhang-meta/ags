@@ -707,11 +707,32 @@ ags_upd_run() {
 
 # `ls` 和 `list` 是同一个命令：列 Agent 自己的会话。存档是另一个命令
 # （`ags archives`），两者列的是不同的东西，所以这里只比 `ls` 和 `list`。
-"$tool" ls --help >/dev/null 2>&1 || true
-[[ "$("$tool" ls 2>&1 | head -1)" == "$("$tool" list 2>&1 | head -1)" ]] || {
+#
+# 要带沙箱跑。裸调 `$tool` 的话，`ags ls` 列的是**开发者自己**的会话（这台机器上
+# 2977 条），还会照常起后台补描述——对着真实会话调模型。而在跑步机上一条都没有，
+# 于是两边行为完全不同，本地这条断言的绿是假的。
+ags_alias_home="$tmp/alias-home"
+mkdir -p "$ags_alias_home/codex" "$ags_alias_home/claude" "$tmp/alias-state"
+ags_alias_env=(
+    env
+    HOME="$ags_alias_home"
+    CODEX_HOME="$ags_alias_home/codex"
+    CLAUDE_CONFIG_DIR="$ags_alias_home/claude"
+    XDG_CONFIG_HOME="$ags_alias_home/.config"
+    XDG_DATA_HOME="$ags_alias_home/.local/share"
+    XDG_STATE_HOME="$ags_alias_home/.local/state"
+    AGENT_SESSION_STATE_DIR="$tmp/alias-state"
+    AGS_AUTO_SUMMARY=0
+    AGS_AUTO_GC=0
+    AGS_UPDATE_CHECK=0
+)
+"${ags_alias_env[@]}" "$tool" ls --help >/dev/null 2>&1 || true
+[[ "$("${ags_alias_env[@]}" "$tool" ls 2>&1 | head -1)" == \
+   "$("${ags_alias_env[@]}" "$tool" list 2>&1 | head -1)" ]] || {
     printf 'ags ls: must behave like ags list\n' >&2
     exit 1
 }
+unset ags_alias_home
 
 # 帮助分两层：默认只印常用的，`ags help all` 印全部。一条都不能少——分层是为了好读，
 # 不是为了藏起来。
@@ -747,11 +768,6 @@ for ags_help_verb in remote storage cloud summarize archives legacy rehome-claud
         exit 1
     }
 done
-# 但它们必须还能用——帮助里撤掉不等于删掉。
-"$tool" storage list >/dev/null 2>&1 || {
-    printf 'ags help: `ags storage list` stopped working\n' >&2
-    exit 1
-}
 unset ags_help_verb ags_help_short ags_help_all
 
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
@@ -5899,8 +5915,15 @@ store_rc=0
 "${store_env[@]}" "$tool" store bogus >/dev/null 2>&1 || store_rc=$?
 [[ "$store_rc" == 2 ]]
 
-# 老名字还认，提示改名，而且提示**只在 stderr**——`ags storage list` 的输出有脚本
-# 在解析，一行提示混进 stdout 会把它们弄坏。
+# 老名字还认——帮助里撤掉不等于删掉，老脚本和后台任务还靠着它们。
+#
+# 这条断言必须带着 store_env 跑。之前它裸调 `$tool`，于是在开发机上读的是**开发者
+# 自己**的 `~/.local/state/ags/storage.json`（那里配好了，所以过），在跑步机上没有
+# 配置就死——本地绿、CI 红，而红的原因和被测的东西毫无关系。
+"${store_env[@]}" "$tool" storage list >/dev/null
+"${store_env[@]}" "$tool" remote list >/dev/null
+
+# 提示改名，而且提示**只在 stderr**——这些命令的 stdout 有脚本在解析。
 grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" storage list 2>&1 >/dev/null)"
 grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" remote list 2>&1 >/dev/null)"
 grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" set "$tmp/store-vault3" 2>&1 >/dev/null)"
