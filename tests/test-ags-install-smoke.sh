@@ -145,6 +145,15 @@ if grep -Fq 'AGE-SECRET-KEY-' "$tmp/first.out" "$tmp/first.err"; then
 fi
 [[ ! -e "$offline_network_marker" ]]
 
+# 依赖不齐时安装器只 warn 一句就跳过 init，然后正常返回 0。少了这一条，症状是
+# 几十行之后 `[[ -f "$identity" … ]]` 失败，而真正的原因（缺 rclone）躺在一个
+# 从来没人打印的 first.err 里。
+if grep -Fq 'Checkpoint runtime not initialized; missing:' "$tmp/first.err"; then
+    printf 'installer skipped init: %s\n' \
+        "$(grep -F 'missing:' "$tmp/first.err" | head -1)" >&2
+    exit 1
+fi
+
 identity="$home/.config/ags/identity.agekey"
 config="$home/.local/state/ags/storage.json"
 vault="$home/.local/share/ags/checkpoints"

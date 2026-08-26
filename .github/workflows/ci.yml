@@ -403,8 +403,13 @@ jobs:
       # `ags init` 真的会去调 `age-keygen` 生成身份，而 runner 镜像里没有 age。
       # 少了它，套件跑到 init 那组就死，报出来却是一句没有上下文的 exit 1——
       # 而在开发者机器上（装了 age）永远是绿的。
-      - name: Install age
-        run: sudo apt-get update && sudo apt-get install -y age
+      #
+      # rclone 同理，但它的表现更阴：安装器的 `checkpoint_dependencies_ready` 列了
+      # age age-keygen column flock git jq rclone rsync ssh ssh-keygen tar zstd，
+      # 少任何一个都只是 warn 一句然后**静默跳过 init**，安装器照样返回成功。装完
+      # 没有 identity/storage.json/vault，失败的却是几十行之后的断言。
+      - name: Install checkpoint runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y age rclone zstd
 
       # test-ags-install-smoke.sh needs the debug binary; test-ags.sh drives the
       # Bash runtime directly and does not.

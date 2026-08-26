@@ -143,6 +143,20 @@ err() {
   fi
 }
 
+# 一句 `--quiet` 也压不住的警告，写 stderr。
+#
+# `warn` 在 `--quiet` 下直接 return，而且写的是 stdout。用它报"检查点没初始化"的
+# 后果是：一次 `--quiet` 安装会**完全无声地**跳过整个检查点功能——装完没有身份、
+# 没有 storage.json、没有保险库，退出码却是 0。`--quiet` 该压的是絮叨，不是
+# "你装的东西有一半不能用"。
+notice() {
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+    gum style --foreground 214 "⚠ $*" >&2
+  else
+    echo -e "\033[1;33m⚠\033[0m $*" >&2
+  fi
+}
+
 run_with_spinner() {
   local title="$1"
   shift
@@ -778,7 +792,7 @@ checkpoint_dependencies_ready() {
     missing+=("bash>=4")
   fi
   if [ "${#missing[@]}" -gt 0 ]; then
-    warn "Checkpoint runtime not initialized; missing: ${missing[*]}"
+    notice "Checkpoint runtime not initialized; missing: ${missing[*]}"
     return 1
   fi
   return 0
