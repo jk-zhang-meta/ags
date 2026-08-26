@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+
+# 失败时说出是哪一行。
+#
+# 这个套件全是裸断言（`[[ -x … ]]`、`grep -Fq …`），配上 `set -e` 的结果是失败时
+# **一个字都不打**：CI 上只有一行 `Process completed with exit code 1`，安装器本身
+# 又是 `--quiet` 的，等于什么线索都没有。`-E` 不能少，否则 trap 进不了函数和子 shell。
+#
+# 记录到文件、真死了才由 EXIT 打出来：套件里有故意失败的用例（离线守卫那几处），
+# 当场打印会让一次全绿的运行里冒出看着像失败的行。文件而不是变量，是因为不少断言
+# 在子 shell 里，改不到父进程的变量。后写覆盖先写，留下的是最后一次。
+smoke_errfile="$(mktemp "${TMPDIR:-/tmp}/ags-smoke-err.XXXXXX")"
+trap 'printf "第 %s 行（退出码 %s）：%s\n" "$LINENO" "$?" "$BASH_COMMAND" \
+    > "$smoke_errfile" 2>/dev/null || true' ERR
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_target="${CARGO_TARGET_DIR:-$project_root/target}"
@@ -28,9 +41,17 @@ test_tmp_root=/tmp
 [[ "$platform" != Darwin ]] || test_tmp_root=/private/tmp
 tmp="$(mktemp -d "$test_tmp_root/ags-install-smoke.XXXXXX")"
 export FAKE_REAL_NODE_BINARY="$(command -v node)"
-[[ -x "$FAKE_REAL_NODE_BINARY" ]]
+[[ -x "$FAKE_REAL_NODE_BINARY" ]] || {
+    printf 'node is required (the offline guard shadows it with a stub)\n' >&2
+    exit 1
+}
 
 cleanup() {
+    local status=$?
+    if (( status != 0 )) && [[ -s "${smoke_errfile:-}" ]]; then
+        printf 'ags install smoke: %s' "$(cat "$smoke_errfile")" >&2
+    fi
+    rm -f "${smoke_errfile:-}"
     case "$tmp" in
         /tmp/ags-install-smoke.*|/private/tmp/ags-install-smoke.*) rm -rf -- "$tmp" ;;
     esac
@@ -154,13 +175,22 @@ jq -e --arg command "$hook_command" '
     any(.hooks.SessionStart[]?.hooks[]?; .command == $command)
 ' "$home/.claude/settings.json" >/dev/null
 
+# 假的 codex：`ags save` 会先把 Agent 解析出来，解析不到就
+# `cannot find an executable codex binary`。跑步机上没装 Codex，所以这一段本来
+# **只在装了 Codex 的开发机上是绿的**——这个套件排在运行时套件后面、那个一直红，
+# 所以从来没人看见。套件要自带被依赖的东西，不能指望宿主有。
+agent_stub_bin="$tmp/agent-stub-bin"
+mkdir -p "$agent_stub_bin"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$agent_stub_bin/codex"
+chmod 0755 "$agent_stub_bin/codex"
+
 runtime_env=(
     env
     HOME="$home"
     XDG_CONFIG_HOME="$home/.config"
     XDG_DATA_HOME="$home/.local/share"
     XDG_STATE_HOME="$home/.local/state"
-    PATH="$bin_dir:$PATH"
+    PATH="$bin_dir:$agent_stub_bin:$PATH"
 )
 # 裸命名空间归运行时，`convert` 下面才是转换 CLI，两边各验一句。
 "${runtime_env[@]}" "$bin_dir/ags" --help | grep -Fq '用法:'
