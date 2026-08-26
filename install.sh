@@ -644,6 +644,7 @@ retire_legacy_casr_binary() {
   # 旧的 `casr` 留在那儿不会坏事，但它是 6 MiB 的死重量，而且 PATH 里多一个叫
   # 这个名字的东西会让人以为它还有用。
   local legacy="$DEST/casr"
+  local stale_skill
 
   if [ "$NO_CONFIGURE" -eq 1 ]; then
     AGS_WRAPPER_STATUS="skipped (--no-configure)"
@@ -664,6 +665,22 @@ retire_legacy_casr_binary() {
   else
     AGS_WRAPPER_STATUS="could not remove $(status_path "$legacy")"
   fi
+}
+
+# 转换那份 skill 以前叫 `casr`，现在叫 `ags-convert`。装了新的就把旧的收走——两份
+# 同时摆在 skills 目录里，Agent 会把它们当成两个不同的能力，而它们说的是同一件事。
+retire_legacy_casr_skill() {
+  local root stale
+  for root in "$CODEX_CONFIG_ROOT/skills" "$CLAUDE_CONFIG_ROOT/skills"; do
+    stale="$root/casr"
+    # 只删我们自己写的那份：里面得有我们生成的 SKILL.md，而且不能是符号链接。
+    [ -d "$stale" ] || continue
+    [ ! -L "$stale" ] || continue
+    [ -f "$stale/SKILL.md" ] || continue
+    grep -Fq 'ags convert' "$stale/SKILL.md" 2>/dev/null ||
+      grep -Fq 'casr' "$stale/SKILL.md" 2>/dev/null || continue
+    rm -rf -- "$stale"
+  done
 }
 
 install_checkpoint_skill() {
@@ -815,6 +832,7 @@ configure_checkpoints() {
   fi
 
   retire_legacy_casr_binary
+  retire_legacy_casr_skill
   install_checkpoint_skill "$CODEX_CONFIG_ROOT/skills" AGS_CODEX_SKILL_STATUS
   install_checkpoint_skill "$CLAUDE_CONFIG_ROOT/skills" AGS_CLAUDE_SKILL_STATUS
   if write_checkpoint_hooks "$CODEX_CONFIG_ROOT/hooks.json" codex &&
@@ -1001,7 +1019,7 @@ check_existing_install() {
     local current
     current=$("$DEST/$BINARY_NAME" --version 2>/dev/null | head -1 || echo "")
     if [ -n "$current" ]; then
-      info "Existing casr detected: $current"
+      info "Existing ags detected: $current"
     fi
   fi
 }
@@ -1328,7 +1346,7 @@ recover_pending_install_transaction() {
 
   if [[ -n "$current_sha" && "$current_sha" == "$candidate_sha" ]]; then
     # Keep the binary journal active and rejoin the ordinary post-install path,
-    # which commits the casr binary.
+    # which commits the ags binary.
     INSTALL_TRANSACTION_ACTIVE=1
     info "Resuming the interrupted ags installation"
     return 0
@@ -1357,7 +1375,7 @@ recover_pending_install_transaction() {
   warn "Discarded an interrupted install before binary activation"
 }
 
-install_casr_binary() {
+install_ags_binary() {
   local source="$1"
   local candidate_sha
   [ -x "$source" ] || {
@@ -1552,7 +1570,7 @@ ensure_rust() {
       case "$ans" in y|Y) :;; *) warn "Skipping rustup install"; return 0;; esac
     fi
   fi
-  info "Installing rustup (nightly) — casr requires Rust nightly (edition 2024)"
+  info "Installing rustup (nightly) — ags requires Rust nightly (edition 2024)"
   curl --proto '=https' --tlsv1.2 -sSf "${PROXY_ARGS[@]}" https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain nightly --profile minimal
   if [[ -f "$HOME/.cargo/env" ]]; then
@@ -1581,12 +1599,12 @@ maybe_add_path() {
           fi
         done
         if [ "$UPDATED" -eq 1 ]; then
-          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use casr"
+          warn "PATH updated in ~/.zshrc/.bashrc; restart shell to use ags"
         else
-          warn "Add $DEST to PATH to use casr"
+          warn "Add $DEST to PATH to use ags"
         fi
       else
-        warn "Add $DEST to PATH to use casr"
+        warn "Add $DEST to PATH to use ags"
       fi
     ;;
   esac
@@ -1610,7 +1628,7 @@ install_completions_for_shell() {
   local shell="$1"
   local bin="$DEST/$BINARY_NAME"
   if [ ! -x "$bin" ]; then
-    warn "casr binary not found at $bin; skipping completions"
+    warn "ags binary not found at $bin; skipping completions"
     return 1
   fi
 
@@ -1623,13 +1641,13 @@ install_completions_for_shell() {
   local target=""
   case "$shell" in
     bash)
-      target="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/casr"
+      target="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/ags"
       ;;
     zsh)
-      target="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_casr"
+      target="${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions/_ags"
       ;;
     fish)
-      target="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/casr.fish"
+      target="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/ags.fish"
       ;;
     *)
       return 1
@@ -1847,7 +1865,7 @@ else
     fi
   fi
   if [ "$LOCKED" -eq 0 ]; then
-    err "Another casr installer is running (lock $LOCK_DIR)"
+    err "Another ags installer is running (lock $LOCK_DIR)"
     exit 1
   fi
 fi
@@ -1874,7 +1892,7 @@ trap cleanup EXIT
 
 recover_pending_install_transaction || exit 1
 if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
-  # The installed casr is already the exact journaled candidate. Finish Context
+  # The installed ags is already the exact journaled candidate. Finish Context
   # Mode and commit that transaction without requiring the original artifact or
   # any network access.
   RESUME_CORE_ONLY=1
@@ -1888,12 +1906,12 @@ if [ "$QUIET" -eq 0 ]; then
       --border-foreground 39 \
       --padding "0 1" \
       --margin "1 0" \
-      "$(gum style --foreground 42 --bold 'casr installer')" \
+      "$(gum style --foreground 42 --bold 'ags installer')" \
       "$(gum style --foreground 245 'Cross Agent Session Resumer')" \
       "$(gum style --foreground 245 'Resume AI coding sessions across providers')"
   else
     echo ""
-    echo -e "\033[1;32mcasr installer\033[0m"
+    echo -e "\033[1;32mags installer\033[0m"
     echo -e "\033[0;90mCross Agent Session Resumer\033[0m"
     echo -e "\033[0;90mResume AI coding sessions across providers\033[0m"
     echo ""
@@ -1928,7 +1946,7 @@ preflight_checks
 INSTALLED_CASR_VERSION=""
 if [ "$RESUME_CORE_ONLY" -eq 0 ] && [ "$FORCE_INSTALL" -eq 0 ] &&
    check_installed_version "$VERSION"; then
-  ok "casr $INSTALLED_CASR_VERSION is already installed at $DEST/$BINARY_NAME (target $VERSION)"
+  ok "ags $INSTALLED_CASR_VERSION is already installed at $DEST/$BINARY_NAME (target $VERSION)"
   info "Use --force to reinstall"
   INSTALL_SOURCE="already installed ($INSTALLED_CASR_VERSION)"
 fi
@@ -1977,11 +1995,11 @@ if [ -n "$OFFLINE_TARBALL" ] && [ "$RESUME_CORE_ONLY" -eq 0 ]; then
     else
       VERSION="v$artifact_version"
     fi
-    install_casr_binary "$BIN"
+    install_ags_binary "$BIN"
     ok "Installed to $DEST/$BINARY_NAME (offline)"
     INSTALL_SOURCE="offline tarball"
   else
-    info "Keeping the exact casr candidate from the recovered transaction"
+    info "Keeping the exact ags candidate from the recovered transaction"
   fi
 fi
 
@@ -1992,7 +2010,7 @@ fi
 if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$URL" ]; then
   info "Downloading $URL"
   DOWNLOAD_OK=0
-  if run_with_spinner "Downloading casr..." \
+  if run_with_spinner "Downloading ags..." \
     curl -fsSL "${PROXY_ARGS[@]}" "$URL" -o "$TMP/$TAR"; then
     DOWNLOAD_OK=1
   fi
@@ -2032,7 +2050,7 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 1 ]; then
       _ "$TMP/src" "$BUILD_TARGET_DIR" "$BINARY_NAME"
   BIN="$BUILD_TARGET_DIR/release/$BINARY_NAME"
   [ -x "$BIN" ] || { err "Build failed: binary not found at $BIN"; exit 1; }
-  install_casr_binary "$BIN"
+  install_ags_binary "$BIN"
   ok "Installed to $DEST/$BINARY_NAME (source build)"
   INSTALL_SOURCE="built from source (Rust nightly)"
 fi
@@ -2093,7 +2111,7 @@ if [ -z "$INSTALL_SOURCE" ]; then
   fi
   [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
-  install_casr_binary "$BIN"
+  install_ags_binary "$BIN"
   ok "Installed to $DEST/$BINARY_NAME"
   INSTALL_SOURCE="prebuilt binary ($VERSION)"
 fi
@@ -2161,8 +2179,8 @@ summary_lines=(
   "codext:           $CODEXT_STATUS"
   ""
   "Get started:"
-  "  casr providers"
-  "  casr list"
+  "  ags convert providers"
+  "  ags convert list"
   "  ags convert -cc <session-id>"
   "  ags convert -cod <session-id>"
   "  ags convert -gmi <session-id>"
@@ -2172,7 +2190,7 @@ summary_lines=(
   "Managed paths:"
   "  binary:   $(status_path "$DEST/$BINARY_NAME")"
   "  wrappers: $(status_path "$DEST")/{cc,cod,gmi,ags}"
-  "  skills:   ~/.claude/skills/{casr,ags} and ~/.codex/skills/{casr,ags}"
+  "  skills:   ~/.claude/skills/{ags,ags-convert} and ~/.codex/skills/{ags,ags-convert}"
 )
 
 echo ""
@@ -2180,7 +2198,7 @@ echo ""
 if [ "$QUIET" -eq 0 ]; then
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     {
-      gum style --foreground 42 --bold 'casr installed successfully!'
+      gum style --foreground 42 --bold 'ags installed successfully!'
       echo ""
       for line in "${summary_lines[@]}"; do
         if [ -z "$line" ]; then
@@ -2189,7 +2207,7 @@ if [ "$QUIET" -eq 0 ]; then
         fi
         if [[ "$line" == "Get started:" ]] || [[ "$line" == "Managed paths:" ]]; then
           gum style --foreground 245 "$line"
-        elif [[ "$line" == "  casr "* ]]; then
+        elif [[ "$line" == "  ags "* ]]; then
           gum style --foreground 39 "$line"
         else
           gum style --foreground 245 "$line"
@@ -2197,7 +2215,7 @@ if [ "$QUIET" -eq 0 ]; then
       done
     } | gum style --border normal --border-foreground 42 --padding "1 2"
   else
-    box_lines=("\033[1;32mcasr installed successfully!\033[0m" "")
+    box_lines=("\033[1;32mags installed successfully!\033[0m" "")
     for line in "${summary_lines[@]}"; do
       box_lines+=("$line")
     done
