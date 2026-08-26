@@ -1,8 +1,8 @@
 # Changelog
 
-All notable changes to [ags](https://github.com/Dicklesworthstone/cross_agent_session_resumer) (Cross Agent Session Resumer) are documented here.
+All notable changes to [ags](https://github.com/jk-zhang-meta/ags) (Cross Agent Session Resumer) are documented here.
 
-Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cross_agent_session_resumer/releases) unless marked **Unreleased**. Both releases have accompanying git tags; the distinction between "tag" and "release" is noted per version. Where a GitHub Issue motivated a change, it is linked inline.
+Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/releases) unless marked **Unreleased**. Both releases have accompanying git tags; the distinction between "tag" and "release" is noted per version. Where a GitHub Issue motivated a change, it is linked inline.
 
 ---
 
@@ -341,7 +341,7 @@ Issues that drove notable changes, linked to the versions where they were addres
 |---|---|---|
 | [#2](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/2) | Codex-to-CC read-back verification role mismatch on `developer` messages | v0.1.0 |
 | [#3](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/3) | Installer quirk as of `08b4091` | v0.1.1 |
-| [#4](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/4) | `ags convert resume cod` produces JSONL that Codex CLI 0.107.0 cannot parse | v0.1.0 |
+| [#4](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/4) | `casr resume cod` produces JSONL that Codex CLI 0.107.0 cannot parse | v0.1.0 |
 | [#5](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/5) | Workspace-aware metadata enrichment (proposal) | Unreleased |
 | [#6](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/6) | Versioned JSON envelope for `list --json` (proposal) | Unreleased |
 | [#7](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/7) | Move repo discovery out of model layer (proposal) | Unreleased |
