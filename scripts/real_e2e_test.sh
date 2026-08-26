@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/real_e2e_test.sh — Real end-to-end integration test harness for casr.
+# scripts/real_e2e_test.sh — Real end-to-end integration test harness for ags.
 #
 # Discovers REAL sessions from installed providers (Claude Code, Codex, Gemini),
 # copies them into isolated sandboxes, runs the full 6-path conversion matrix,
@@ -13,8 +13,8 @@
 #
 # Optional:
 #   bash scripts/real_e2e_test.sh --verbose
-#   CASR_BIN=/path/to/casr bash scripts/real_e2e_test.sh
-#   E2E_ARTIFACTS_DIR=/tmp/casr-e2e bash scripts/real_e2e_test.sh
+#   AGS_BIN=/path/to/ags bash scripts/real_e2e_test.sh
+#   E2E_ARTIFACTS_DIR=/tmp/ags-e2e bash scripts/real_e2e_test.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,9 +22,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CARGO_TARGET="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
 # 二进制改名成 `ags` 之后，跨 Agent 转换那套收在 `ags convert` 底下——`list` 和
 # `resume` 两边都要用，而日常敲的是会话运行时那边。所以这里是个数组，每次调用都
-# 带上前缀；下面所有 `"${CASR[@]}"` 就是原来的 `"$CASR"`。
-CASR_PATH="${CASR_BIN:-$CARGO_TARGET/debug/ags}"
-CASR=("$CASR_PATH" convert)
+# 带上前缀；下面所有 `"${AGS[@]}"` 就是原来的 `"$AGS"`。
+AGS_PATH="${AGS_BIN:-$CARGO_TARGET/debug/ags}"
+AGS=("$AGS_PATH" convert)
 VERBOSE="${VERBOSE:-0}"
 
 # ---------------------------------------------------------------------------
@@ -33,9 +33,9 @@ VERBOSE="${VERBOSE:-0}"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --verbose) VERBOSE=1; shift ;;
-        --casr-bin)
-            [[ $# -lt 2 ]] && { echo "ERROR: --casr-bin requires a path" >&2; exit 2; }
-            CASR_PATH="$2"; CASR=("$CASR_PATH" convert); shift 2 ;;
+        --ags-bin)
+            [[ $# -lt 2 ]] && { echo "ERROR: --ags-bin requires a path" >&2; exit 2; }
+            AGS_PATH="$2"; AGS=("$AGS_PATH" convert); shift 2 ;;
         --artifacts-dir)
             [[ $# -lt 2 ]] && { echo "ERROR: --artifacts-dir requires a path" >&2; exit 2; }
             E2E_ARTIFACTS_DIR="$2"; shift 2 ;;
@@ -129,18 +129,18 @@ status_skip() {
     log_to_file "SKIP: $1"
 }
 
-# Run casr with full artifact capture. Sets LAST_EXIT, LAST_STDOUT_FILE, LAST_STDERR_FILE, LAST_DURATION_MS.
-run_casr() {
+# Run ags with full artifact capture. Sets LAST_EXIT, LAST_STDOUT_FILE, LAST_STDERR_FILE, LAST_DURATION_MS.
+run_ags() {
     local prefix="$1"; shift
     local stdout_file="${prefix}.stdout.json"
     local stderr_file="${prefix}.stderr.txt"
 
-    log_to_file "CMD: $CASR $*"
+    log_to_file "CMD: $AGS $*"
     local start_ms
     start_ms=$(ts_ms)
 
     set +e
-    "${CASR[@]}" "$@" > "$stdout_file" 2> "$stderr_file"
+    "${AGS[@]}" "$@" > "$stdout_file" 2> "$stderr_file"
     LAST_EXIT=$?
     set -e
 
@@ -150,7 +150,7 @@ run_casr() {
     LAST_STDOUT_FILE="$stdout_file"
     LAST_STDERR_FILE="$stderr_file"
 
-    log_to_file "EXIT($LAST_EXIT) ${LAST_DURATION_MS}ms: $CASR $*"
+    log_to_file "EXIT($LAST_EXIT) ${LAST_DURATION_MS}ms: $AGS $*"
 
     if [[ "$VERBOSE" == "1" ]]; then
         [[ -s "$stdout_file" ]] && echo "    stdout: $(head -3 "$stdout_file")"
@@ -198,9 +198,9 @@ phase_prereqs() {
     fi
     log_step "sha256sum: available"
 
-    # Build casr
-    if [[ ! -x "$CASR_PATH" ]]; then
-        log_step "Building casr..."
+    # Build ags
+    if [[ ! -x "$AGS_PATH" ]]; then
+        log_step "Building ags..."
         if command -v rch > /dev/null 2>&1; then
             rch exec cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" 2>&1 | tail -3
         else
@@ -208,18 +208,18 @@ phase_prereqs() {
         fi
     fi
 
-    if [[ ! -x "$CASR_PATH" ]]; then
-        echo "ERROR: ags binary not found at $CASR_PATH" >&2
+    if [[ ! -x "$AGS_PATH" ]]; then
+        echo "ERROR: ags binary not found at $AGS_PATH" >&2
         exit 1
     fi
 
     local version
-    version=$("${CASR[@]}" --version 2>&1 || true)
-    log_step "casr: $version ($CASR)"
+    version=$("${AGS[@]}" --version 2>&1 || true)
+    log_step "ags: $version ($AGS)"
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2: Discover Real Sessions (direct filesystem, bypasses slow casr list)
+# Phase 2: Discover Real Sessions (direct filesystem, bypasses slow ags convert list)
 # ---------------------------------------------------------------------------
 
 # Discover a CC session: find recent .jsonl files under ~/.claude/projects/
@@ -546,7 +546,7 @@ validate_gemini_json() {
 }
 
 # ---------------------------------------------------------------------------
-# Fidelity check via casr info readback
+# Fidelity check via ags convert info readback
 # ---------------------------------------------------------------------------
 check_fidelity() {
     local target_alias="$1"
@@ -559,18 +559,18 @@ check_fidelity() {
     local info_stdout="${artifact_prefix}_target_info.json"
     local info_stderr="${artifact_prefix}_target_info.stderr.txt"
 
-    # Run casr info on the target session, using sandbox env vars
+    # Run ags convert info on the target session, using sandbox env vars
     set +e
     env \
         CLAUDE_HOME="$sandbox_dir/claude" \
         CODEX_HOME="$sandbox_dir/codex" \
         GEMINI_HOME="$sandbox_dir/gemini" \
-        "${CASR[@]}" --json info "$target_session_id" > "$info_stdout" 2> "$info_stderr"
+        "${AGS[@]}" --json info "$target_session_id" > "$info_stdout" 2> "$info_stderr"
     local info_exit=$?
     set -e
 
     if [[ "$info_exit" -ne 0 ]]; then
-        echo "FAIL:casr info exit=$info_exit"
+        echo "FAIL:ags convert info exit=$info_exit"
         return 1
     fi
 
@@ -583,7 +583,7 @@ check_fidelity() {
         return 1
     fi
 
-    # Both counts come from casr's canonical readers. Provider files also contain
+    # Both counts come from ags's canonical readers. Provider files also contain
     # metadata, reasoning and lifecycle events, so raw JSONL line counts are not
     # a meaningful cross-provider fidelity oracle.
     if [[ "$source_msg_count" -gt 0 ]]; then
@@ -632,7 +632,7 @@ run_conversion_pair() {
 
     # --- Step A: Create isolated sandbox ---
     local sandbox
-    sandbox=$(mktemp -d "${TMPDIR:-/tmp}/casr-e2e-${pair_safe}-XXXXXX")
+    sandbox=$(mktemp -d "${TMPDIR:-/tmp}/ags-e2e-${pair_safe}-XXXXXX")
     mkdir -p "$sandbox/claude" "$sandbox/codex" "$sandbox/gemini"
 
     log_step "Sandbox: $sandbox"
@@ -654,7 +654,7 @@ run_conversion_pair() {
 
     log_step "Seeded: $seeded_path"
 
-    # Establish the fidelity baseline with casr's source reader, not the raw
+    # Establish the fidelity baseline with ags's source reader, not the raw
     # provider file's line/message approximation used only for discovery.
     local source_canonical_info="$pair_dir/source_canonical_info.json"
     local source_canonical_stderr="$pair_dir/source_canonical_info.stderr.txt"
@@ -663,7 +663,7 @@ run_conversion_pair() {
         CLAUDE_HOME="$sandbox/claude" \
         CODEX_HOME="$sandbox/codex" \
         GEMINI_HOME="$sandbox/gemini" \
-        "${CASR[@]}" --json info "$source_session_id" --source "$src" \
+        "${AGS[@]}" --json info "$source_session_id" --source "$src" \
         > "$source_canonical_info" 2> "$source_canonical_stderr"
     local source_info_exit=$?
     set -e
@@ -703,14 +703,14 @@ run_conversion_pair() {
     local convert_stdout="$pair_dir/convert.stdout.json"
     local convert_stderr="$pair_dir/convert.stderr.txt"
 
-    log_step "Running: casr --json resume $tgt $source_session_id --source $src --force"
+    log_step "Running: ags --json resume $tgt $source_session_id --source $src --force"
 
     set +e
     env \
         CLAUDE_HOME="$sandbox/claude" \
         CODEX_HOME="$sandbox/codex" \
         GEMINI_HOME="$sandbox/gemini" \
-        "${CASR[@]}" --json resume "$tgt" "$source_session_id" --source "$src" --force \
+        "${AGS[@]}" --json resume "$tgt" "$source_session_id" --source "$src" --force \
         > "$convert_stdout" 2> "$convert_stderr"
     local convert_exit=$?
     set -e
@@ -795,7 +795,7 @@ run_conversion_pair() {
         verify_notes="${verify_notes:+$verify_notes; }struct: ${struct_result#FAIL:}"
     fi
 
-    # Stage 4: Content fidelity via casr info readback
+    # Stage 4: Content fidelity via ags convert info readback
     local fidelity_result=""
     set +e
     fidelity_result=$(check_fidelity "$tgt" "$target_session_id" "$source_msg_count" "$source_workspace" "$sandbox" "$pair_dir/fidelity" 2>/dev/null)
@@ -927,8 +927,8 @@ trap cleanup EXIT
 # Main
 # ---------------------------------------------------------------------------
 main() {
-    echo -e "${BOLD}casr real E2E integration test${RESET}"
-    echo "Binary: $CASR_PATH"
+    echo -e "${BOLD}ags real E2E integration test${RESET}"
+    echo "Binary: $AGS_PATH"
     echo "Artifacts: $ARTIFACTS_DIR"
     echo ""
 

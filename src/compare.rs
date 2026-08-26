@@ -60,7 +60,7 @@
 //! The comparison is *conservation*, not equality. Every source event and every
 //! source capsule must be accounted for; a target that holds something extra is
 //! counted in [`Comparison::added_events`] and reported, but not failed. One
-//! writer is deliberately louder than its source — the `[converted by casr]`
+//! writer is deliberately louder than its source — the `[converted by ags]`
 //! marker that stands where a dropped sealed compaction used to be — and a hole
 //! that announces itself is the behaviour the corpus tests demand.
 //!
@@ -150,7 +150,7 @@ pub struct Comparison {
     /// Target events built entirely out of content the source never had.
     ///
     /// Reported, not failed. A writer is allowed to be louder than its source
-    /// and one is: the `[converted by casr]` marker that stands where a dropped
+    /// and one is: the `[converted by ags]` marker that stands where a dropped
     /// sealed compaction used to be, which the corpus tests require to be
     /// visible rather than silent. A writer that starts inventing conversation
     /// shows up here rather than nowhere.
@@ -426,7 +426,7 @@ pub fn compare_replays(src: &[&Event], tgt: &[&Event], target_vendor: &str) -> C
     // Pass three: what the target says that the source never did. Whatever is
     // left in `texts` was claimed by no source event, so an event built
     // entirely out of it is the target's own invention — the
-    // `[converted by casr]` marker, or a writer that has started making things
+    // `[converted by ags]` marker, or a writer that has started making things
     // up. Counting leftover *shapes* instead would have counted every reshaped
     // event, which is 19,400 of them crossing the corpus and tells nobody
     // anything.
@@ -1187,7 +1187,7 @@ mod tests {
                 message(
                     "m",
                     Role::Assistant,
-                    "[converted by casr] history was sealed",
+                    "[converted by ags] history was sealed",
                 ),
             ],
         );

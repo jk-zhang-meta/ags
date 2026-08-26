@@ -592,13 +592,13 @@ mod cc_golden {
     }
 
     #[test]
-    fn golden_cc_version_is_casr() {
+    fn golden_cc_version_is_ags() {
         let (_, content) = write_cc_session(&simple_session());
         for (i, line) in content.lines().enumerate() {
             let entry: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(
-                entry["version"], "casr",
-                "CC entry {i} version should be 'casr'"
+                entry["version"], "ags",
+                "CC entry {i} version should be 'ags'"
             );
         }
     }

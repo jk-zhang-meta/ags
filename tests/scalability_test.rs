@@ -11,7 +11,7 @@ use std::{
 
 use ags::{
     discovery::{DetectionResult, ProviderRegistry},
-    error::CasrError,
+    error::AgsError,
     model::CanonicalSession,
     model::MessageRole,
     providers::{
@@ -370,7 +370,7 @@ fn discovery_and_reader_scalability_regression() {
     let missing = registry.resolve_session("perf-missing-session-id", None);
     let miss_ms = start_miss.elapsed().as_millis();
     assert!(
-        matches!(missing, Err(CasrError::SessionNotFound { .. })),
+        matches!(missing, Err(AgsError::SessionNotFound { .. })),
         "missing session should produce SessionNotFound"
     );
     assert!(
@@ -415,7 +415,7 @@ fn discovery_and_reader_scalability_regression() {
         "readers": reader_metrics,
     });
 
-    if let Ok(path) = std::env::var("CASR_PERF_METRICS_FILE") {
+    if let Ok(path) = std::env::var("AGS_PERF_METRICS_FILE") {
         fs::write(
             PathBuf::from(path),
             serde_json::to_vec_pretty(&metrics).expect("serialize perf metrics"),

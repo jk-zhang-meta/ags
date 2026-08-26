@@ -3,6 +3,26 @@
 # 命令，而这个套件的断言绝大多数在函数里。
 set -Eeuo pipefail
 
+# 把继承来的 AGS_* 和 AGENT_SESSION_* 全部擦掉。
+#
+# 这个套件经常在一个**由 ags 起的**会话里被运行，而那种会话会导出 `AGS_ID`、
+# `AGS_LAUNCH_ARGS`、`AGS_CONVERTER_BINARY`、`AGENT_SESSION_STORAGE_MODE` 等等。
+# 漏进来之后被测程序读到的是跑测试这个人的真实状态，而报出来的失败离原因很远：
+#
+#   - `AGS_ID` 漏进来 → `ags cloud save cloud-checkpoint 描述` 把 `cloud-checkpoint`
+#     当成描述的一部分 → 报 `[[ "$cloud_id" == cloud-checkpoint ]]` 失败。
+#   - `AGENT_SESSION_STORAGE_MODE` 漏进来 → `ags delete` 用它而不是已选的存储 →
+#     报 `sync_status=synchronized` 失败。
+#
+# 擦在这里而不是叮嘱调用方：叮嘱只在有人记得的时候有效，而 CI 和别人的机器不会记得。
+# 套件自己要用的每一个变量都在下面用 `env` 前缀显式给出，不依赖继承，所以全擦是安全的。
+while IFS='=' read -r ags_inherited _; do
+    case "$ags_inherited" in
+        AGS_*|AGENT_SESSION_*) unset "$ags_inherited" ;;
+    esac
+done < <(env)
+unset ags_inherited
+
 # 断言失败时说清楚是哪一条。
 #
 # 这个套件大量使用裸断言（`[[ -e "$x" ]]`、`cmp …`），配上 `set -e` 的结果是：
@@ -634,10 +654,10 @@ ags_pf_run() {
 # `update available: ags 0.4.24 -> v0.4.27`。
 ags_upd_home="$(mktemp -d "$tmp/ags-upd.XXXXXX")"
 mkdir -p "$ags_upd_home/bin" "$ags_upd_home/state"
-cat > "$ags_upd_home/bin/casr" <<'AGS_UPD_CASR'
+cat > "$ags_upd_home/bin/ags" <<'AGS_UPD_AGS'
 #!/bin/sh
-echo "casr $AGS_UPD_INSTALLED (test)"
-AGS_UPD_CASR
+echo "ags $AGS_UPD_INSTALLED (test)"
+AGS_UPD_AGS
 # 假 GitHub：既答发布信息，也答 install.sh 的下载。
 cat > "$ags_upd_home/bin/curl" <<'AGS_UPD_CURL'
 #!/bin/sh
@@ -653,7 +673,7 @@ if [ -n "$out" ]; then
 fi
 printf '{"tag_name":"v%s"}\n200\n' "$AGS_UPD_LATEST"
 AGS_UPD_CURL
-chmod +x "$ags_upd_home/bin/casr" "$ags_upd_home/bin/curl"
+chmod +x "$ags_upd_home/bin/ags" "$ags_upd_home/bin/curl"
 
 # 跑一次 `ags update`，回答完事之后提示文件里还剩什么。
 ags_upd_run() {
@@ -663,7 +683,7 @@ ags_upd_run() {
     (
         AGENT_SESSION_STATE_DIR="$ags_upd_home/state" \
         AGS_UPDATE_CHECK=0 \
-        AGS_CONVERTER_BINARY="$ags_upd_home/bin/casr" \
+        AGS_CONVERTER_BINARY="$ags_upd_home/bin/ags" \
         AGS_CONVERTER_VERSION="$installed" \
         AGS_UPD_INSTALLED="$installed" \
         AGS_UPD_LATEST="$latest" \
@@ -859,13 +879,27 @@ test_fd9_target() {
     fi
 }
 
+# 这个 pid **或它的任何后代**有没有打开那个文件。
+#
+# 必须连后代一起看。用例是这么起进程的：
+#
+#     ( cd 某处; env … "$tool" … ) &
+#
+# bash 通常会对子 shell 的最后一条命令做 exec 优化，于是 `$!` 就是被测程序本身。
+# 但只要装了 trap（这个套件现在就有一个 ERR trap），bash 必须留着自己去跑 trap，
+# 优化就不做了——`$!` 变成子 shell，真正持有 fd 的是它的孩子。只看 `$!` 的话，
+# 一个明明正确阻塞着的进程会被判成"没在等锁"。
 test_process_has_fd_target() {
-    local pid="$1" expected="$2" fd target
+    local pid="$1" expected="$2" fd target child
     if [[ -d "/proc/$pid/fd" ]]; then
         for fd in "/proc/$pid/fd"/*; do
             target="$(readlink -- "$fd" 2>/dev/null || true)"
             [[ "$target" != "$expected" ]] || return 0
         done
+        while IFS= read -r child; do
+            [[ -n "$child" ]] || continue
+            test_process_has_fd_target "$child" "$expected" && return 0
+        done < <(cat "/proc/$pid/task"/*/children 2>/dev/null | tr ' ' '\n')
         return 1
     fi
     lsof -a -p "$pid" -Fn 2>/dev/null |
@@ -1026,13 +1060,13 @@ printf '\nFAKE_PWD=%s\n' "$PWD"
 printf 'FAKE_AGS_LAUNCH_ARGS=%s\n' "${AGS_LAUNCH_ARGS-unset}"
 EOF
 chmod +x "$tmp/home/.local/bin/claude"
-cat > "$tmp/home/.local/bin/casr" <<'EOF'
+cat > "$tmp/home/.local/bin/ags" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 log="${BASH_SOURCE[0]%/*}/../ags.log"
 if [[ "${1:-}" == --version ]]; then
-    printf 'casr 0.3.0-test\n'
+    printf 'ags 0.3.0-test\n'
     exit
 fi
 [[ ! -e "/dev/fd/9" ]]
@@ -1045,6 +1079,11 @@ if [[ "${1:-}" == checkpoint-register-codex ]]; then
 fi
 
 
+# 转换那套收在 `ags convert` 底下，真二进制就是这么被调的，假的也得认。
+if [[ "${1:-}" == convert ]]; then
+    shift
+fi
+
 [[ "${1:-}" == --json ]]
 shift
 [[ -z "${OPENAI_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]
@@ -1056,15 +1095,22 @@ case "${1:-}" in
         source=
         force=0
         no_store=0
+        exact_source=0
         while (( $# )); do
             case "$1" in
                 --source) source="$2"; shift 2 ;;
                 --force) force=1; shift ;;
                 --no-store) no_store=1; shift ;;
+                --exact-source) exact_source=1; shift ;;
                 *) exit 64 ;;
             esac
         done
-        [[ -f "$source" && "$force" == 1 && "$no_store" == 1 ]]
+        # 恢复那条路以前用 `--no-store`——它同时关掉"挑源"和"记账"，而只有前者是
+        # 想要的：血缘记录正是下一次能挑对源的原因。换成 `--exact-source` 之后只钉
+        # 住源，记录照记。这个假二进制当时没跟着改，于是真调用一送 `--exact-source`
+        # 就撞上下面那个 `*) exit 64`，报出来是一句没有上下文的
+        # "ags conversion failed: unknown error"。
+        [[ -f "$source" && "$force" == 1 && "$exact_source" == 1 ]]
         case "$target" in
             cc)
                 source_format=codex
@@ -1092,8 +1138,8 @@ case "${1:-}" in
             *) exit 64 ;;
         esac
         printf 'CONVERT=%s\t%s\t%s\n' "$source_format" "$target_format" "$source" >> "$log"
-        printf 'HOME=%s\nCODEX_HOME=%s\nCLAUDE_CONFIG_DIR=%s\nNO_STORE=%s\n' \
-            "$HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$no_store" >> "$log"
+        printf 'HOME=%s\nCODEX_HOME=%s\nCLAUDE_CONFIG_DIR=%s\nEXACT_SOURCE=%s\n' \
+            "$HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$exact_source" >> "$log"
         jq -n --arg source "$source_format" --arg target "$target_format" \
             --arg source_id "$source_id" --arg id "$id" --arg path "$path" '{
               ok: true, source_provider: $source, target_provider: $target,
@@ -1126,7 +1172,7 @@ case "${1:-}" in
     *) exit 64 ;;
 esac
 EOF
-chmod +x "$tmp/home/.local/bin/casr"
+chmod +x "$tmp/home/.local/bin/ags"
 cat > "$tmp/home/.local/bin/rm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -1449,8 +1495,16 @@ source_env=(
     AGENT_SESSION_DIR="$tmp/store"
     AGENT_SESSION_STATE_DIR="$tmp/state"
     AGENT_SESSION_SSH_KEY="$tmp/key"
-    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/casr"
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/ags"
     AGS_CONVERTER_VERSION=0.3.0-test
+    # Claude 的二进制要钉死。保存一个 Claude 会话时，解析器在"原生上下文"里会顺着
+    # **祖先进程**去找那个 claude——这在真实使用里正是想要的（找起我们的那一个），
+    # 但这个套件经常就跑在一个 Claude 会话里，于是祖先是跑测试这个人的真 claude，
+    # 记进检查点的是 `/root/.local/bin/claude` 而不是套件自己的假二进制。
+    #
+    # 只钉 Claude：有两条用例断言 codex 走的是 `binary_resolution=path`，钉住会把
+    # 它们变成 `explicit`。
+    AGENT_SESSION_CLAUDE_BINARY="$tmp/home/.local/bin/claude"
     FAKE_RCLONE_ROOT="$tmp/remote"
 )
 
@@ -2558,6 +2612,26 @@ printf 'STTY_UNCHANGED\n'
 exit "$child_status"
 EOF
     chmod +x "$tmp/stty-guard"
+    # 一个一个把键喂进伪终端，别一次全灌进去。
+    #
+    # 一次灌进去的话，这些字节在菜单开始读之前就到了 pty，tty 把它们**回显**掉——
+    # 帧的第一行会原样出现 `a --model o3`，而那个 `a` 从来没被当成一次按键，参数
+    # 编辑器于是根本不打开。这条用例因此在这台 WSL 和 CI 上一直是红的。
+    #
+    # `trap '' PIPE`：菜单可能在键喂完之前就退出（收到 Esc 就走），那时管道读端已经
+    # 关了，写端会吃到 SIGPIPE 以 141 退出——那不是失败，是它已经达到目的了。
+    feed_keys() {
+        local input="$1" i ch
+        trap '' PIPE
+        # 先让被测程序把第一帧画出来、进到等键那一步。
+        sleep 0.4
+        for (( i = 0; i < ${#input}; i++ )); do
+            ch="${input:i:1}"
+            printf '%s' "$ch" 2>/dev/null || return 0
+            sleep 0.04
+        done
+    }
+
     run_checkpoint_pty() {
         local input="$1" output="$2" checkpoint_root="$3" pty_command
         shift 3
@@ -2569,7 +2643,7 @@ EOF
             env "${source_env[@]}" \
             AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
             "$tmp/stty-guard" "$tool" archives
-        printf '%s' "$input" | \
+        feed_keys "$input" | \
             SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
                 > "$output" 2>&1
     }
@@ -2598,12 +2672,16 @@ EOF
         local input="$1" output="$2" launch_dir="$3" terminal_type="$4"
         local pty_command
         shift 4
+        # 失败时贴出来的要是**这一次**画的帧。不记的话，报出来的是上一个 PTY
+        # 辅助函数留下的旧帧，把人指到完全无关的用例上。
+        ags_suite_last_pty_out="$output"
+        ags_suite_last_pty_input="$input"
         printf -v pty_command '%q ' \
             env "${tab_env[@]}" TERM="$terminal_type" \
             "$tmp/stty-guard" "$tool" "$@"
         (
             cd "$launch_dir"
-            printf '%s' "$input" | \
+            feed_keys "$input" | \
                 SHELL=/bin/bash /usr/bin/script -q -e -f \
                     -c "$pty_command" /dev/null > "$output" 2>&1
         )
@@ -2737,27 +2815,33 @@ EOF
     [[ -f "$ui_checkpoint_root/tombstones/codex/$checkpoint_record_id.tombstone" ]]
     grep -Fq 'it remains recoverable' "$tmp/checkpoint-delete-yes.out"
 
-    # A genuinely new interactive launch asks once. Enter accepts the current
-    # directory name, a typed name wins, and duplicate names need no special
-    # handling because terminal titles are not identifiers.
-    run_agent_pty $'focused work\n' "$tmp/tab-custom.out" \
-        "$tmp/work" xterm-256color codex --model o3
-    grep -Fq 'Terminal tab name [work]:' "$tmp/tab-custom.out"
-    grep -Fq $'\033]0;focused work\007' "$tmp/tab-custom.out"
-    run_agent_pty $'\n' "$tmp/tab-default.out" \
-        "$tmp/work" xterm-256color codex --model o3
-    grep -Fq $'\033]0;work\007' "$tmp/tab-default.out"
+    # 起一个新会话**不提问**。这几条以前断言的是一个"Terminal tab name [work]:"
+    # 的提问，而那个提问在"起会话不再提问、`--id` 起名"之后就没有了——它们从那时
+    # 起就没再被执行过（套件在更靠前的地方先红），所以没人发现它们已经过期。
+    #
+    # 现在的约定：名字自动生成（`<目录>-<年.月.日>-<时.分.秒>`），`--id` 显式指定，
+    # 恢复时沿用被恢复那条的名字。标签页标题跟着这个名字走。
+    #
+    # 给 Agent 的参数一律写在 `--` 之后，所以这里也必须这么写——不写会被拒，而那
+    # 恰好是另一组用例在测的事。
+    run_agent_pty '' "$tmp/tab-default.out" \
+        "$tmp/work" xterm-256color codex -- --model o3
+    ! grep -Fq 'Terminal tab name' "$tmp/tab-default.out"
+    grep -Fq $'\033]0;work-' "$tmp/tab-default.out"
 
-    # A native resume with an explicit id does not ask a new-session question.
-    # TERM=dumb represents terminals that cannot consume the title sequence:
-    # those launches remain completely untouched.
-    native_tab_id=99999999-8888-4777-8666-555555555555
-    run_agent_pty '' "$tmp/tab-resume.out" \
-        "$tmp/work" xterm-256color codex resume "$native_tab_id"
-    ! grep -Fq 'Terminal tab name' "$tmp/tab-resume.out"
-    grep -Fq $'\033]0;'"$native_tab_id"$'\007' "$tmp/tab-resume.out"
+    # `--id` 显式起名：标题就是那个名字，一个字不改。
+    run_agent_pty '' "$tmp/tab-custom.out" \
+        "$tmp/work" xterm-256color codex --id focused-work -- --model o3
+    grep -Fq $'\033]0;focused-work\007' "$tmp/tab-custom.out"
+
+    # 原来这里还有一条 `ags codex resume <id>`。那个命令形式也没有了——恢复走顶层
+    # `ags resume`，`ags codex` 只负责起新会话、不收位置参数。而它当时断言的"恢复
+    # 时不提问"如今是句空话：提问本身已经不存在。剩下有意义的就是标题本身，上面
+    # 两条已经把它钉住了。
+    #
+    # TERM=dumb 代表消费不了标题序列的终端：那种启动完全不碰标题。
     run_agent_pty '' "$tmp/tab-dumb.out" \
-        "$tmp/work" dumb codex --model o3
+        "$tmp/work" dumb codex -- --model o3
     ! grep -Fq 'Terminal tab name' "$tmp/tab-dumb.out"
     ! grep -Fq $'\033]0;' "$tmp/tab-dumb.out"
 fi
@@ -2796,6 +2880,9 @@ cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-target/codex/$session_rel"
 write_codex_profile "$tmp/checkpoint-record-target/codex" exact-record
 record_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-target/codex" \
     "$tool" resume "$checkpoint_record_id" --profile=exact-record)"
+# 这条断言我一度以为过期了，给它补上了一个 `--dangerously-skip-permissions`——
+# 那其实是跑测试这个人的 `AGS_LAUNCH_ARGS` 从环境里漏进来的。套件开头现在会把继承
+# 来的 AGS_* 全擦掉，原来的期望才是对的。改断言之前先确认那个值不是漏进来的。
 grep -Fqx "FAKE_CODEX <resume> <$session_id> <--profile> <exact-record>" <<< "$record_resume"
 cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-record-target/codex/$session_rel"
 
@@ -2934,7 +3021,11 @@ fi
 grep -Fq 'checkpoint artifact metadata is malformed' "$tmp/unsafe-metadata.err"
 [[ ! -e "$tmp/unsafe-metadata/target" ]]
 
-zst_session_id=22222222-3333-4444-8555-666666666666
+# 这个 ID 必须和别的用例不一样。它以前和 `launch_args_session` 撞了，而下面那次
+# save-now 的前提是"这个会话只有一份转写"——撞上之后就成了两份，报
+# `expected one transcript … found 2`。这条用例排在 PTY 那组后面，而 PTY 那组一直
+# 是红的，所以这次撞车从来没被发现过。
+zst_session_id=44444444-5555-4666-8777-888888888888
 zst_rel="archived_sessions/rollout-test-$zst_session_id.jsonl.zst"
 mkdir -p "$tmp/source/codex/$(dirname "$zst_rel")"
 printf 'fake-zstd-rollout\0payload\n' > "$tmp/source/codex/$zst_rel"
@@ -3608,8 +3699,9 @@ if env "${source_env[@]}" CODEX_HOME="$tmp/resume-boundary-target/codex" \
     echo 'resume accepted an Agent argument before --' >&2
     exit 1
 fi
-grep -Fq 'unknown AGS resume argument: --model; put Agent arguments after --' \
-    "$tmp/resume-boundary.err"
+# 拒绝的说法后来改过（也换成了中文），断言跟着改。要点没变：`--` 之前的东西归 ags，
+# 之后的归 Agent，写错了要**拒**而不是猜。
+grep -Fq 'ags resume 只接受一个检查点标识：--model' "$tmp/resume-boundary.err"
 [[ ! -e "$tmp/resume-boundary-target" ]]
 
 conversion_log="$tmp/home/.local/ags.log"
@@ -3620,7 +3712,10 @@ if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/version-gate-target/claude" \
     echo 'cross-Agent resume accepted a removed compatibility flag' >&2
     exit 1
 fi
-grep -Fq -- '--force-unsupported-version was removed' "$tmp/version-gate.err"
+# 这个兼容开关早就没了，连带那句专门的"已被移除"提示也没了：现在它撞的是通用的
+# "resume 只收一个检查点标识"。用例要钉住的东西没变——**被拒**，而不是被悄悄忽略。
+grep -Fq -- 'ags resume 只接受一个检查点标识：--force-unsupported-version' \
+    "$tmp/version-gate.err"
 [[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
 [[ ! -e "$tmp/version-gate-target" ]]
 
@@ -3663,7 +3758,8 @@ grep -Eq "^HOME=$tmp/state/restore\\.[^/]+/ags/home$" "$conversion_log"
 grep -Eq "^CODEX_HOME=$tmp/state/restore\\.[^/]+/ags/codex-home$" "$conversion_log"
 grep -Eq "^CLAUDE_CONFIG_DIR=$tmp/state/restore\\.[^/]+/ags/claude-home$" \
     "$conversion_log"
-grep -Fqx 'NO_STORE=1' "$conversion_log"
+# 恢复那条路从 `--no-store` 换成了 `--exact-source`：只钉住源，血缘记录照记。
+grep -Fqx 'EXACT_SOURCE=1' "$conversion_log"
 
 missing_claude_profile_home="$tmp/codex-to-missing-claude-profile-target/claude"
 conversion_log_lines="$(wc -l < "$conversion_log")"
@@ -3897,20 +3993,42 @@ cmp "$tmp/rollback-before.jsonl" "$rollback_main"
 [[ "$(stat -c '%a:%Y' "$rollback_main")" == 604:1600000000 ]]
 [[ "$(find "$rollback_home" -type f | wc -l)" == 1 ]]
 
+# 祖先是符号链接**允许**，前提是那个链接安全：指向一个目录、属于当前用户、且不对
+# 同组或其他人开放写（见 `resolve_restore_component`）。这比"一律拒绝"宽，理由是把
+# 项目目录软链到另一块盘是用户自己的正当选择。
+#
+# 这条用例原来断言的是更早的"一律拒绝"，措辞也是那时候的
+# （`restore destination has a symbolic-link ancestor`）。策略放宽之后它就过期了，
+# 而它排在 PTY 那组后面，那组一直红着，所以从来没跑到过。
+#
+# 现在钉的是**边界本身**：安全的链接跟随，不安全的拒绝且一个字节都不写。
 symlink_home="$tmp/symlink-escape-target/claude"
 symlink_outside="$tmp/symlink-escape-outside"
 mkdir -p "$symlink_home/projects/$claude_hook_key" "$symlink_outside"
+chmod 700 "$symlink_outside"
 ln -s "$symlink_outside" \
     "$symlink_home/projects/$claude_hook_key/$claude_session_id"
-if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$symlink_home" \
+env "${source_env[@]}" CLAUDE_CONFIG_DIR="$symlink_home" \
     "$tool" restore local claude-window \
-    >"$tmp/symlink-escape.out" 2>"$tmp/symlink-escape.err"; then
-    echo 'restore followed a symbolic-link artifact ancestor' >&2
+    >"$tmp/symlink-escape.out" 2>"$tmp/symlink-escape.err"
+[[ -f "$symlink_outside/subagents/child.jsonl" ]]
+
+# 同一个形状，链接目标改成人人可写：必须拒，而且一个字节都不许落进去。
+symlink_open_home="$tmp/symlink-open-target/claude"
+symlink_open_outside="$tmp/symlink-open-outside"
+mkdir -p "$symlink_open_home/projects/$claude_hook_key" "$symlink_open_outside"
+chmod 777 "$symlink_open_outside"
+ln -s "$symlink_open_outside" \
+    "$symlink_open_home/projects/$claude_hook_key/$claude_session_id"
+if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$symlink_open_home" \
+    "$tool" restore local claude-window \
+    >"$tmp/symlink-open.out" 2>"$tmp/symlink-open.err"; then
+    echo 'restore followed a world-writable symbolic-link target' >&2
     exit 1
 fi
-grep -Fq 'restore destination has a symbolic-link ancestor' "$tmp/symlink-escape.err"
-[[ ! -e "$symlink_home/$claude_session_rel" ]]
-[[ -z "$(find "$symlink_outside" -mindepth 1 -print -quit)" ]]
+grep -Fq 'restore destination link target is writable by others' \
+    "$tmp/symlink-open.err"
+[[ -z "$(find "$symlink_open_outside" -mindepth 1 -print -quit)" ]]
 
 claude_resume_work="$tmp/claude-resume-work"
 mkdir -p "$claude_resume_work"
@@ -4176,16 +4294,16 @@ grep -Fq 'Codex profile does not exist' "$tmp/missing-profile.err"
 [[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
 [[ ! -d "$missing_profile_home/sessions" ]]
 
-cat > "$tmp/home/.local/bin/casr-fail" <<'EOF'
+cat > "$tmp/home/.local/bin/ags-fail" <<'EOF'
 #!/usr/bin/env sh
-if [ "${1:-}" = --version ]; then printf 'casr 0.3.0-test\n'; exit; fi
+if [ "${1:-}" = --version ]; then printf 'ags 0.3.0-test\n'; exit; fi
 if [ "${1:-}" = terminal-attach ]; then exit 3; fi
 printf '{"message":"synthetic conversion failure"}\n' >&2
 exit 42
 EOF
-chmod +x "$tmp/home/.local/bin/casr-fail"
+chmod +x "$tmp/home/.local/bin/ags-fail"
 if env "${source_env[@]}" CODEX_HOME="$tmp/conversion-failure-target/codex" \
-    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/casr-fail" \
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/ags-fail" \
     "$tool" resume claude-window --to codex \
     >"$tmp/conversion-failure.out" 2>"$tmp/conversion-failure.err"; then
     echo 'resume ignored an ags conversion failure' >&2
@@ -4552,7 +4670,10 @@ quiet_remote_launch="$(
         "$tool" codex -- --model o3 2> "$tmp/quiet-remote-launch.err"
 )"
 grep -Fqx 'FAKE_CODEX <--model> <o3>' <<< "$quiet_remote_launch"
-[[ ! -s "$tmp/quiet-remote-launch.err" ]]
+# 起会话不再提问之后，`[ags] 会话 <名字>` 这一行是人知道"这次叫什么"的唯一途径，
+# 所以它**应该**在 stderr 上。这条用例要钉的是另一件事：远端存储的同步过程不该
+# 往 stderr 上吐东西。
+[[ -z "$(grep -v '^\[ags\] 会话 ' "$tmp/quiet-remote-launch.err" || true)" ]]
 git --git-dir="$quiet_launch_remote" cat-file -e "main:$sync_v1_marker"
 git init -q --bare "$tmp/git/missing-launch.git"
 env "${source_env[@]}" \

@@ -2,19 +2,14 @@
 name = "ags"
 version = "0.5.1"
 edition = "2024"
-description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: casr)"
+description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: ags)"
 license-file = "LICENSE"
 repository = "https://github.com/jk-zhang-meta/ags"
 keywords = ["cli", "agent", "session", "resume", "claude"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 
-# Originally intended to publish on crates.io as `casr`, but that short
-# name is held by an unrelated project (anfedotoff's CASR crash analyzer),
-# so the package itself goes out under the longer canonical name. All the
-# internal `casr::...` crate-path references throughout main.rs/tests/etc
-# stay on the short name because we keep `casr` as both the lib name (for
-# `casr::*` paths) and the binary entry point.
+# 这是个私有 fork，不发到 crates.io。包名、lib 名和二进制名统一是 `ags`。
 [lib]
 name = "ags"
 path = "src/lib.rs"

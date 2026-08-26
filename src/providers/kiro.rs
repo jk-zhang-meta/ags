@@ -51,7 +51,7 @@
 //!   [`Kiro::ide_home_dir`].
 //!
 //! So `KIRO_HOME=/tmp/x` moves kiro-cli's sessions — *both* its layouts — and
-//! leaves the IDE's where they were. casr therefore scans the bucketed layout
+//! leaves the IDE's where they were. ags therefore scans the bucketed layout
 //! under **both** roots ([`Kiro::kas_roots`]) and the flat layout under the
 //! CLI's root. Pinning the bucketed scan to `~/.kiro` alone, on the theory
 //! that bucketed means IDE, silently drops every kiro-cli session written
@@ -210,7 +210,7 @@ pub struct Kiro;
 impl Kiro {
     /// Root directory for Kiro **CLI** data.
     ///
-    /// This is `kiro-cli`'s own resolver, not a casr convention. From the
+    /// This is `kiro-cli`'s own resolver, not a ags convention. From the
     /// bundled TUI in the shipped `kiro-cli-chat` 2.14.2 binary, verbatim:
     ///
     /// ```js
@@ -250,7 +250,7 @@ impl Kiro {
     /// nothing in the package ever supplies one (`sessionsPath:` occurs zero
     /// times), so the default always wins.
     ///
-    /// Honouring `KIRO_HOME` here would point casr at a directory Kiro IDE
+    /// Honouring `KIRO_HOME` here would point ags at a directory Kiro IDE
     /// never writes to, which is the same defect — reading a path the tool does
     /// not use — that adding this store was meant to fix.
     fn ide_home_dir() -> Option<PathBuf> {
@@ -354,7 +354,7 @@ impl Kiro {
         path.with_extension(ext)
     }
 
-    /// Reduce `session_state` to the only value casr can safely publish.
+    /// Reduce `session_state` to the only value ags can safely publish.
     ///
     /// `conversation_metadata` contains outbound model requests,
     /// `rts_model_state` has an open extension bag, and `permissions` is itself
@@ -443,7 +443,7 @@ impl Provider for Kiro {
         // Every root, not just the IDE's: `ide_root()` alone ignores
         // `KIRO_HOME` by design, so with it set the whole CLI store — flat
         // *and* bucketed — sat under no returned root, and
-        // `casr info $KIRO_HOME/sessions/cli/<id>.json` fell through to the
+        // `ags convert info $KIRO_HOME/sessions/cli/<id>.json` fell through to the
         // best-effort parser and was read as some other agent's format.
         Self::kas_roots()
             .into_iter()
@@ -703,7 +703,7 @@ impl Provider for Kiro {
         // finds no `'/'` gate in either.
         //
         // So `.history` is 100 lines of raw user input, and a key pasted at
-        // the prompt is in it verbatim. `casr info --json` prints the metadata
+        // the prompt is in it verbatim. `ags convert info --json` prints the metadata
         // bag, and users pipe that to a file and paste it into issues. There
         // is no allow-list to apply — the file has no fields, only the user's
         // typing — so the only correct filter is not to carry it.
@@ -896,7 +896,7 @@ impl Provider for Kiro {
     }
 
     /// One flag, two contracts — and the bucketed one has two extra
-    /// preconditions casr used to omit.
+    /// preconditions ags used to omit.
     ///
     /// `kiro-cli --resume-id <id>` is implemented by handing the id to the
     /// internal wire subcommand `chat _ ensure-session`, verbatim from the
@@ -931,7 +931,7 @@ impl Provider for Kiro {
     /// affordance is the palette command `kiroAgent.openChatSession`. So when a
     /// bucketed session has no workspace to `cd` into — `workspacePaths: []`,
     /// which Kiro buckets under the literal `_global` and which no `process.cwd()`
-    /// can ever hash to — there is no command that resumes it, and casr says so
+    /// can ever hash to — there is no command that resumes it, and ags says so
     /// by naming no session at all rather than printing one that cannot work.
     fn resume_command(&self, session_id: &str) -> String {
         match Self::resume_form(session_id) {
@@ -982,7 +982,7 @@ impl Provider for Kiro {
 /// See [`Kiro::resume_command`] for the measurements behind each arm.
 enum ResumeForm {
     /// A flat `sessions/cli/<uuid>` session: `--resume-id` finds it from
-    /// anywhere. Also the form every session casr *writes* takes.
+    /// anywhere. Also the form every session ags *writes* takes.
     Flat,
     /// A bucketed session with a workspace: reachable only from that directory.
     Bucketed(PathBuf),
@@ -1559,7 +1559,7 @@ fn message_to_envelopes(msg: &CanonicalMessage) -> Vec<serde_json::Value> {
         let call_id = tr.call_id.clone().unwrap_or_default();
         let mut content = Vec::new();
         if content_is_structural_result && index == 0 {
-            // Kiro ignores ToolResults.content, but casr uses this bounded copy
+            // Kiro ignores ToolResults.content, but ags uses this bounded copy
             // to restore readers that expose the same observation as both text
             // and a structural result without showing it twice to the model.
             content.push(serde_json::json!({ "kind": "text", "data": msg.content }));
@@ -1764,7 +1764,7 @@ mod tests {
         // The `.history` sidecar is deliberately *not* captured. It is not the
         // slash-command log this reader once took it for: kiro-cli's
         // `addToHistory` appends every submitted line, so the file is raw user
-        // input and `casr info --json` would print it. See the comment at the
+        // input and `ags convert info --json` would print it. See the comment at the
         // read site. The fixture still has one, so this asserts the drop and
         // not merely its absence.
         assert!(

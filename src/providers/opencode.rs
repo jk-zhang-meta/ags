@@ -7,12 +7,12 @@
 //! the layout are independent facts, and a user who installed OpenCode years
 //! ago has an old layout in a path today's OpenCode never writes.
 //!
-//! casr addresses specific OpenCode sessions using a virtual path form:
+//! ags addresses specific OpenCode sessions using a virtual path form:
 //! `<db-path>/<urlencoded-session-id>`
 //! This mirrors the approach used by Cursor and Aider providers.
 //!
 //! Target writes never edit SQLite directly. When the official `opencode` CLI
-//! is available, casr gives its `import` command an export-shaped JSON file,
+//! is available, ags gives its `import` command an export-shaped JSON file,
 //! verifies the imported session through this reader, and uses
 //! `opencode session delete` for rollback.
 use std::collections::{BTreeSet, HashMap};
@@ -39,7 +39,7 @@ const DB_FILENAME: &str = "opencode.db";
 const DATA_DIRNAME: &str = ".opencode";
 const OPENCODE_BIN_ENV: &str = "OPENCODE_BIN";
 const OPENCODE_CLI_REQUIRED: &str = "OpenCode is read/resume-only on this machine: target writes \
-require the official `opencode` CLI in PATH (or OPENCODE_BIN). casr uses the vendor's import and \
+require the official `opencode` CLI in PATH (or OPENCODE_BIN). ags uses the vendor's import and \
 delete commands and will not modify opencode.db directly.";
 
 /// Which physical layout an `opencode.db` uses.
@@ -124,7 +124,7 @@ impl OpenCode {
 
     /// The database the official CLI must import into.
     ///
-    /// casr's `OPENCODE_HOME` and `OPENCODE_DB_PATH` overrides are intentionally
+    /// ags's `OPENCODE_HOME` and `OPENCODE_DB_PATH` overrides are intentionally
     /// understood here even though OpenCode itself does not know them. The child
     /// receives the resolved absolute path through OpenCode's own `OPENCODE_DB`.
     fn write_db_path() -> anyhow::Result<PathBuf> {
@@ -405,10 +405,10 @@ impl OpenCode {
     /// Parse OPENCODE environment overrides into a target DB path.
     ///
     /// In precedence order:
-    /// - `OPENCODE_DB_PATH` — casr's own override, a direct file path.
-    /// - `OPENCODE_HOME` — casr's own override: a directory containing
+    /// - `OPENCODE_DB_PATH` — ags's own override, a direct file path.
+    /// - `OPENCODE_HOME` — ags's own override: a directory containing
     ///   `opencode.db`, or a direct `.db` path. OpenCode has no variable of
-    ///   either name, so these two are casr's alone and win, so that aiming casr
+    ///   either name, so these two are ags's alone and win, so that aiming ags
     ///   at a database never disturbs the OpenCode the rest of the shell uses.
     /// - `OPENCODE_DB` — the variable OpenCode itself honours, resolved the way
     ///   OpenCode resolves it: an absolute path is used verbatim, anything else
@@ -531,7 +531,7 @@ impl OpenCode {
         // OpenCode's real home. `upstream_data_dir` already encodes how OpenCode
         // resolves it, and leaving it out of discovery was why an ordinary
         // install — the only location a current OpenCode ever writes — was
-        // invisible to casr while `~/.opencode` and the cwd ancestors, which
+        // invisible to ags while `~/.opencode` and the cwd ancestors, which
         // current OpenCode never writes, were searched.
         if let Some(data_dir) = Self::upstream_data_dir() {
             candidates.push(data_dir.join(DB_FILENAME));
@@ -1172,7 +1172,7 @@ impl Provider for OpenCode {
         let session_id = format!("ses_{}", uuid::Uuid::new_v4().simple());
         let payload = Self::import_payload(session, &session_id, &workspace);
         let mut import_file = tempfile::Builder::new()
-            .prefix("casr-opencode-import-")
+            .prefix("ags-opencode-import-")
             .suffix(".json")
             .tempfile()
             .context("failed to create temporary OpenCode import file")?;
@@ -1264,7 +1264,7 @@ impl Provider for OpenCode {
     fn list_sessions(&self) -> Option<SessionListing> {
         let mut listing = SessionListing::default();
         // Every database accounts for itself. `find_db_files` returns only
-        // databases that exist, so each of these failures is a store casr found
+        // databases that exist, so each of these failures is a store ags found
         // and could not read — the case `warn!` alone left out of `list`.
         for db_path in &Self::find_db_files() {
             let conn = match Self::open_db(db_path) {

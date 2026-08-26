@@ -375,7 +375,7 @@ fn bash_execution_to_text(msg: &serde_json::Value) -> String {
 /// That is OpenClaw's own compatibility rule for rows written by older
 /// appenders (`parseParentlessCanonicalEntry`: "Treat those rows as a linear
 /// continuation of the current append cursor"), and it is also what keeps
-/// transcripts casr itself wrote before this change readable.
+/// transcripts ags itself wrote before this change readable.
 fn scan(path: &Path, out: &mut Transcript) -> anyhow::Result<(Vec<Entry>, Option<String>)> {
     let file = std::fs::File::open(path)
         .map_err(|e| anyhow::anyhow!("failed to open {}: {e}", path.display()))?;
@@ -1643,9 +1643,9 @@ impl Provider for OpenClaw {
 ///   has nowhere to put one and `buildSessionContext` reads it from nowhere
 ///   else.
 ///
-/// Fields casr cannot know — `usage`, `stopReason`, `api`, `provider` — are left
+/// Fields ags cannot know — `usage`, `stopReason`, `api`, `provider` — are left
 /// absent rather than filled with zeros. A zero token count is a claim, and a
-/// false one; absence is what casr actually knows.
+/// false one; absence is what ags actually knows.
 ///
 /// That is a tolerated deviation, not a sanctioned one: `AssistantMessage`
 /// declares `usage: Usage` and `stopReason: StopReason` as *required*
@@ -1687,9 +1687,9 @@ fn render_session(session_id: &str, session: &CanonicalSession) -> String {
     // OpenClaw itself appends one of these when a session starts and again on
     // every switch, so this is the shape rather than an approximation of it.
     //
-    // `provider` is omitted because casr does not observe it: `model_name` is a
+    // `provider` is omitted because ags does not observe it: `model_name` is a
     // model id, and inferring "anthropic" from a `claude-` prefix would be a
-    // claim casr cannot support. That has a measured cost on
+    // claim ags cannot support. That has a measured cost on
     // `openclaw@2026.7.1-2` and it is the smaller one: OpenClaw's runtime still
     // resolves `modelId` from this entry, but `isSessionEntry` requires a
     // non-empty `provider` string, so `readTranscriptFileState` drops the row
@@ -1879,7 +1879,7 @@ mod tests {
         assert_eq!(text, vec!["kept"]);
     }
 
-    /// Rows with no `parentId` are OpenClaw's legacy shape — and the shape casr
+    /// Rows with no `parentId` are OpenClaw's legacy shape — and the shape ags
     /// itself used to write. They must still read as one linear conversation.
     #[test]
     fn parentless_rows_read_as_a_linear_conversation() {

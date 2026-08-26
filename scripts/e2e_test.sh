@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/e2e_test.sh — End-to-end test script for casr CLI.
+# scripts/e2e_test.sh — End-to-end test script for ags CLI.
 #
 # Exercises the full conversion matrix, error cases, flags, and JSON output.
 # Uses temp directories with env overrides so real provider data is never touched.
@@ -8,9 +8,9 @@
 # Optional:
 #   bash scripts/e2e_test.sh --verbose                  (show all output)
 #   VERBOSE=1 bash scripts/e2e_test.sh                  (show all output)
-#   bash scripts/e2e_test.sh --casr-bin /path/to/casr    (custom binary)
-#   CASR_BIN=/path/to/casr bash scripts/e2e_test.sh      (custom binary)
-#   bash scripts/e2e_test.sh --artifacts-dir /tmp/casr-artifacts
+#   bash scripts/e2e_test.sh --ags-bin /path/to/ags    (custom binary)
+#   AGS_BIN=/path/to/ags bash scripts/e2e_test.sh      (custom binary)
+#   bash scripts/e2e_test.sh --artifacts-dir /tmp/ags-artifacts
 #   bash scripts/e2e_test.sh --slow-threshold-ms 5000
 set -euo pipefail
 
@@ -24,29 +24,29 @@ FIXTURES_DIR="$PROJECT_ROOT/tests/fixtures"
 CARGO_TARGET="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
 # 二进制改名成 `ags` 之后，跨 Agent 转换那套收在 `ags convert` 底下——`list` 和
 # `resume` 两边都要用，而日常敲的是会话运行时那边。所以这里是个数组，每次调用都
-# 带上前缀；下面所有 `"${CASR[@]}"` 就是原来的 `"$CASR"`。
-CASR_PATH="${CASR_BIN:-$CARGO_TARGET/debug/ags}"
-CASR=("$CASR_PATH" convert)
+# 带上前缀；下面所有 `"${AGS[@]}"` 就是原来的 `"$AGS"`。
+AGS_PATH="${AGS_BIN:-$CARGO_TARGET/debug/ags}"
+AGS=("$AGS_PATH" convert)
 VERBOSE="${VERBOSE:-0}"
 SLOW_THRESHOLD_MS="${SLOW_THRESHOLD_MS:-2000}"
 
 usage() {
     cat <<'EOF'
-casr e2e test suite
+ags e2e test suite
 
 Usage:
-  bash scripts/e2e_test.sh [--verbose] [--casr-bin PATH] [--artifacts-dir PATH] [--slow-threshold-ms N]
+  bash scripts/e2e_test.sh [--verbose] [--ags-bin PATH] [--artifacts-dir PATH] [--slow-threshold-ms N]
 
 Flags:
   --verbose                Show stdout/stderr snippets and extra timing diagnostics
-  --casr-bin PATH          Use a specific casr binary (default: target/debug/ags)
+  --ags-bin PATH          Use a specific ags binary (default: target/debug/ags)
   --artifacts-dir PATH     Write per-test artifacts under PATH (default: ./artifacts/e2e/<run-id>/)
-  --slow-threshold-ms N    Warn when a single casr invocation exceeds N ms (default: 2000)
+  --slow-threshold-ms N    Warn when a single ags invocation exceeds N ms (default: 2000)
   -h, --help               Show this help and exit
 
 Environment overrides:
   VERBOSE=1
-  CASR_BIN=/path/to/casr
+  AGS_BIN=/path/to/ags
   ARTIFACTS_DIR=/path/to/artifacts
   SLOW_THRESHOLD_MS=2000
 EOF
@@ -61,12 +61,12 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=1
             shift
             ;;
-        --casr-bin)
+        --ags-bin)
             if [[ $# -lt 2 ]]; then
-                echo "ERROR: --casr-bin requires a path" >&2
+                echo "ERROR: --ags-bin requires a path" >&2
                 exit 2
             fi
-            CASR_PATH="$2"; CASR=("$CASR_PATH" convert)
+            AGS_PATH="$2"; AGS=("$AGS_PATH" convert)
             shift 2
             ;;
         --artifacts-dir)
@@ -121,7 +121,7 @@ fi
 # Temp directory + cleanup
 # ---------------------------------------------------------------------------
 
-TMPDIR_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/casr-e2e-XXXXXX")
+TMPDIR_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ags-e2e-XXXXXX")
 trap 'rm -rf "$TMPDIR_ROOT"' EXIT
 
 export CLAUDE_HOME="$TMPDIR_ROOT/claude"
@@ -138,7 +138,7 @@ export FACTORY_HOME="$TMPDIR_ROOT/factory"
 export OPENCLAW_HOME="$TMPDIR_ROOT/openclaw"
 export PI_AGENT_HOME="$TMPDIR_ROOT/pi-agent"
 export XDG_CONFIG_HOME="$TMPDIR_ROOT/xdg-config"
-# Amp threads live under $XDG_DATA_HOME/amp; casr does not read AMP_HOME.
+# Amp threads live under $XDG_DATA_HOME/amp; ags does not read AMP_HOME.
 export XDG_DATA_HOME="$TMPDIR_ROOT/xdg-data"
 export NO_COLOR=1
 
@@ -203,9 +203,9 @@ record_result() {
     JSON_RESULTS=$(echo "$JSON_RESULTS" | jq --argjson e "$entry" '. + [$e]')
 }
 
-run_casr() {
+run_ags() {
     local desc="$1"; shift
-    local cmd_str="${CASR[*]} $*"
+    local cmd_str="${AGS[*]} $*"
 
     ARTIFACT_SEQ=$((ARTIFACT_SEQ + 1))
     local slug artifact_base stdout_file stderr_file cmd_file stdin_file meta_file
@@ -228,7 +228,7 @@ run_casr() {
     echo -e "  [$(ts_fmt)] ${CYAN}CMD${RESET}: $cmd_str"
 
     local exit_code=0
-    "${CASR[@]}" "$@" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+    "${AGS[@]}" "$@" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
 
     local run_end_ms
     run_end_ms=$(ts_ms)
@@ -540,19 +540,19 @@ reset_env() {
 # Ensure binary exists
 # ---------------------------------------------------------------------------
 
-if [[ ! -x "$CASR_PATH" ]]; then
-    echo "Building casr..."
+if [[ ! -x "$AGS_PATH" ]]; then
+    echo "Building ags..."
     (cd "$PROJECT_ROOT" && cargo build --quiet 2>&1)
 fi
 
-if [[ ! -x "$CASR_PATH" ]]; then
-    echo "ERROR: ags binary not found at $CASR_PATH"
-    echo "Run 'cargo build' first or set CASR_BIN."
+if [[ ! -x "$AGS_PATH" ]]; then
+    echo "ERROR: ags binary not found at $AGS_PATH"
+    echo "Run 'cargo build' first or set AGS_BIN."
     exit 1
 fi
 
-echo -e "${BOLD}casr e2e test suite${RESET}"
-echo "Binary: $CASR_PATH"
+echo -e "${BOLD}ags e2e test suite${RESET}"
+echo "Binary: $AGS_PATH"
 echo "Fixtures: $FIXTURES_DIR"
 echo "Temp: $TMPDIR_ROOT"
 echo "Artifacts: $ARTIFACTS_DIR"
@@ -563,19 +563,19 @@ echo ""
 # ===========================================================================
 
 log "TEST: Version output"
-run_casr "version" --version
+run_ags "version" --version
 assert_exit_ok "ags --version succeeds"
 assert_stdout_contains "version names the binary" "ags"
 
 log "TEST: Help output"
-run_casr "help" --help
-assert_exit_ok "casr --help succeeds"
+run_ags "help" --help
+assert_exit_ok "ags --help succeeds"
 assert_stdout_contains "help mentions resume" "resume"
 assert_stdout_contains "help mentions list" "list"
 
 log "TEST: No args shows error"
-EXPECT_FAIL=1 run_casr "no args" || true
-assert_exit_fail "casr with no args fails"
+EXPECT_FAIL=1 run_ags "no args" || true
+assert_exit_fail "ags with no args fails"
 
 # ===========================================================================
 # TEST: Providers command
@@ -583,8 +583,8 @@ assert_exit_fail "casr with no args fails"
 
 log "TEST: Providers command"
 reset_env
-run_casr "providers" providers
-assert_exit_ok "casr providers succeeds"
+run_ags "providers" providers
+assert_exit_ok "ags convert providers succeeds"
 assert_stdout_contains "providers lists Claude Code" "Claude Code"
 assert_stdout_contains "providers lists Codex" "Codex"
 assert_stdout_contains "providers lists Gemini" "Gemini"
@@ -602,8 +602,8 @@ assert_stdout_contains "providers lists Pi-Agent" "Pi-Agent"
 assert_stdout_contains "providers lists Antigravity" "Antigravity CLI"
 
 log "TEST: Providers --json"
-run_casr "providers json" --json providers
-assert_exit_ok "casr --json providers succeeds"
+run_ags "providers json" --json providers
+assert_exit_ok "ags --json providers succeeds"
 assert_valid_json "providers JSON is valid"
 
 # ===========================================================================
@@ -612,20 +612,20 @@ assert_valid_json "providers JSON is valid"
 
 log "TEST: List with no sessions"
 reset_env
-run_casr "list empty" list
-assert_exit_ok "casr list succeeds when empty"
+run_ags "list empty" list
+assert_exit_ok "ags convert list succeeds when empty"
 assert_stdout_contains "list shows no sessions" "No sessions found"
 
 log "TEST: List with CC session"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "list cc" list --workspace "/data/projects/myapp"
-assert_exit_ok "casr list with CC session succeeds"
+run_ags "list cc" list --workspace "/data/projects/myapp"
+assert_exit_ok "ags convert list with CC session succeeds"
 assert_stdout_contains "list shows CC session" "$cc_sid"
 
 log "TEST: List --json"
-run_casr "list json" --json list --workspace "/data/projects/myapp"
-assert_exit_ok "casr --json list succeeds"
+run_ags "list json" --json list --workspace "/data/projects/myapp"
+assert_exit_ok "ags --json list succeeds"
 assert_valid_json "list JSON is valid"
 
 log "TEST: List --limit"
@@ -633,8 +633,8 @@ cc_project_dir="$CLAUDE_HOME/projects/-data-projects-myapp"
 sed 's/cc-simple-001/cc-simple-002/g' \
     "$FIXTURES_DIR/claude_code/cc_simple.jsonl" \
     > "$cc_project_dir/cc-simple-002.jsonl"
-run_casr "list limit" --json list --workspace "/data/projects/myapp" --limit 1
-assert_exit_ok "casr list --limit 1 succeeds"
+run_ags "list limit" --json list --workspace "/data/projects/myapp" --limit 1
+assert_exit_ok "ags convert list --limit 1 succeeds"
 local_count=$(echo "$LAST_STDOUT" | jq '.items | length')
 if [[ "$local_count" -eq 1 ]]; then
     pass "list --limit 1 returns 1 session"
@@ -649,24 +649,24 @@ fi
 log "TEST: Info command"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "info" info "$cc_sid"
-assert_exit_ok "casr info succeeds"
+run_ags "info" info "$cc_sid"
+assert_exit_ok "ags convert info succeeds"
 assert_stdout_contains "info shows session ID" "$cc_sid"
 assert_stdout_contains "info shows provider" "claude-code"
 assert_stdout_contains "info shows message count" "Messages:"
 
 log "TEST: Info --json"
-run_casr "info json" --json info "$cc_sid"
-assert_exit_ok "casr --json info succeeds"
+run_ags "info json" --json info "$cc_sid"
+assert_exit_ok "ags --json info succeeds"
 assert_valid_json "info JSON is valid"
 
 log "TEST: Info unknown session"
-EXPECT_FAIL=1 run_casr "info bad" info "nonexistent-id" || true
-assert_exit_fail "casr info with bad ID fails"
+EXPECT_FAIL=1 run_ags "info bad" info "nonexistent-id" || true
+assert_exit_fail "ags convert info with bad ID fails"
 
 log "TEST: Info unknown session --json"
-EXPECT_FAIL=1 run_casr "info bad json" --json info "nonexistent-id" || true
-assert_exit_fail "casr --json info with bad ID fails"
+EXPECT_FAIL=1 run_ags "info bad json" --json info "nonexistent-id" || true
+assert_exit_fail "ags --json info with bad ID fails"
 if echo "$LAST_STDERR" | jq -e '.error_type' > /dev/null 2>&1; then
     pass "JSON error has error_type field"
 else
@@ -680,13 +680,13 @@ fi
 log "TEST: Resume CC → Codex (dry-run)"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume dry" resume cod "$cc_sid" --dry-run
+run_ags "resume dry" resume cod "$cc_sid" --dry-run
 assert_exit_ok "CC→Codex dry-run succeeds"
 assert_stdout_contains "dry-run mentions 'Would convert'" "Would convert"
 assert_file_count "dry-run writes no codex files" "$CODEX_HOME/sessions" 0
 
 log "TEST: Resume CC → Codex (write)"
-run_casr "resume write" resume cod "$cc_sid"
+run_ags "resume write" resume cod "$cc_sid"
 assert_exit_ok "CC→Codex write succeeds"
 assert_stdout_contains "resume shows Converted" "Converted"
 assert_stdout_contains "resume shows resume command" "Resume:"
@@ -702,7 +702,7 @@ fi
 log "TEST: Resume CC → Codex --json"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume json" --json resume cod "$cc_sid" --dry-run
+run_ags "resume json" --json resume cod "$cc_sid" --dry-run
 assert_exit_ok "CC→Codex JSON dry-run succeeds"
 assert_valid_json "resume JSON is valid"
 if echo "$LAST_STDOUT" | jq -e '.ok == true' > /dev/null 2>&1; then
@@ -718,7 +718,7 @@ fi
 log "TEST: Resume CC → Gemini"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->gmi" resume gmi "$cc_sid"
+run_ags "resume cc->gmi" resume gmi "$cc_sid"
 assert_exit_ok "CC→Gemini write succeeds"
 assert_stdout_contains "resume shows gemini" "gemini"
 
@@ -736,7 +736,7 @@ fi
 log "TEST: Resume CC → Cursor"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->cur refused" --json resume cur "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "resume cc->cur refused" --json resume cur "$cc_sid" || true
 assert_exit_fail "CC→Cursor write is refused"
 assert_json_error_envelope "CC→Cursor refusal is JSON"
 assert_stderr_contains "CC→Cursor explains the vendor lifecycle boundary" "read/resume-only"
@@ -744,7 +744,7 @@ assert_file_count "CC→Cursor refusal writes no state" "$CURSOR_HOME" 0
 
 log "TEST: Resume Cursor → CC"
 cursor_sid=$(setup_cursor_fixture)
-run_casr "resume cur->cc" resume cc "$cursor_sid" --source cur
+run_ags "resume cur->cc" resume cc "$cursor_sid" --source cur
 assert_exit_ok "Cursor→CC write succeeds"
 assert_stdout_contains "cursor→cc shows claude-code" "claude-code"
 
@@ -755,7 +755,7 @@ assert_stdout_contains "cursor→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → Cline"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->cln refused" --json resume cln "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "resume cc->cln refused" --json resume cln "$cc_sid" || true
 assert_exit_fail "CC→Cline write is refused without the official CLI"
 assert_json_error_envelope "CC→Cline refusal is JSON"
 assert_stderr_contains "CC→Cline explains the vendor API boundary" "read/resume-only"
@@ -763,7 +763,7 @@ assert_file_count "CC→Cline refusal writes no state" "$CLINE_HOME" 0
 
 log "TEST: Resume Cline → CC"
 cline_sid=$(setup_cline_fixture)
-run_casr "resume cln->cc" resume cc "$cline_sid" --source cln
+run_ags "resume cln->cc" resume cc "$cline_sid" --source cln
 assert_exit_ok "Cline→CC write succeeds"
 assert_stdout_contains "cline→cc shows claude-code" "claude-code"
 
@@ -774,7 +774,7 @@ assert_stdout_contains "cline→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → Amp"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->amp" --json resume amp "$cc_sid"
+run_ags "resume cc->amp" --json resume amp "$cc_sid"
 assert_exit_ok "CC→Amp write succeeds"
 assert_valid_json "CC→Amp JSON is valid"
 amp_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
@@ -786,7 +786,7 @@ fi
 assert_file_exists "Amp thread file exists after conversion" "$XDG_DATA_HOME/amp/threads/${amp_sid}.json"
 
 log "TEST: Resume Amp → CC"
-run_casr "resume amp->cc" resume cc "$amp_sid" --source amp
+run_ags "resume amp->cc" resume cc "$amp_sid" --source amp
 assert_exit_ok "Amp→CC write succeeds"
 assert_stdout_contains "amp→cc shows claude-code" "claude-code"
 
@@ -797,7 +797,7 @@ assert_stdout_contains "amp→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → Aider"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->aid" --json resume aid "$cc_sid"
+run_ags "resume cc->aid" --json resume aid "$cc_sid"
 assert_exit_ok "CC→Aider write succeeds"
 assert_valid_json "CC→Aider JSON is valid"
 aid_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
@@ -812,7 +812,7 @@ assert_file_not_exists "Aider conversion does not overwrite the default history"
     "$AIDER_HOME/.aider.chat.history.md"
 
 log "TEST: Resume Aider → CC"
-run_casr "resume aid->cc" resume cc "$aid_sid" --source aid
+run_ags "resume aid->cc" resume cc "$aid_sid" --source aid
 assert_exit_ok "Aider→CC write succeeds"
 assert_stdout_contains "aider→cc shows claude-code" "claude-code"
 
@@ -823,20 +823,20 @@ assert_stdout_contains "aider→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → OpenCode"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->opc refused" --json resume opc "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "resume cc->opc refused" --json resume opc "$cc_sid" || true
 assert_exit_fail "CC→OpenCode write is refused"
 assert_json_error_envelope "CC→OpenCode refusal is JSON"
 assert_stderr_contains "CC→OpenCode explains refusal" "OpenCode is read/resume-only"
 assert_file_count "CC→OpenCode refusal creates no database" "$OPENCODE_HOME" 0
 
-EXPECT_FAIL=1 run_casr "dry-run cc->opc refused" --json resume opc "$cc_sid" --dry-run || true
+EXPECT_FAIL=1 run_ags "dry-run cc->opc refused" --json resume opc "$cc_sid" --dry-run || true
 assert_exit_fail "CC→OpenCode dry-run is also refused"
 assert_json_error_envelope "CC→OpenCode dry-run refusal is JSON"
 assert_file_count "CC→OpenCode dry-run creates no database" "$OPENCODE_HOME" 0
 
 log "TEST: Resume OpenCode → CC"
 opc_sid=$(setup_opencode_fixture)
-run_casr "resume opc->cc" resume cc "$opc_sid" --source opc
+run_ags "resume opc->cc" resume cc "$opc_sid" --source opc
 assert_exit_ok "OpenCode→CC write succeeds"
 assert_stdout_contains "opencode→cc shows claude-code" "claude-code"
 
@@ -847,7 +847,7 @@ assert_stdout_contains "opencode→cc shows claude-code" "claude-code"
 log "TEST: Resume Codex → CC"
 reset_env
 cod_sid=$(setup_codex_fixture "codex_modern" "jsonl")
-run_casr "resume cod->cc" resume cc "$cod_sid"
+run_ags "resume cod->cc" resume cc "$cod_sid"
 assert_exit_ok "Codex→CC write succeeds"
 assert_stdout_contains "codex→cc shows claude-code" "claude-code"
 
@@ -865,7 +865,7 @@ fi
 log "TEST: Resume Codex → Gemini"
 reset_env
 cod_sid=$(setup_codex_fixture "codex_modern" "jsonl")
-run_casr "resume cod->gmi" resume gmi "$cod_sid"
+run_ags "resume cod->gmi" resume gmi "$cod_sid"
 assert_exit_ok "Codex→Gemini write succeeds"
 
 # ===========================================================================
@@ -875,7 +875,7 @@ assert_exit_ok "Codex→Gemini write succeeds"
 log "TEST: Resume Gemini → CC"
 reset_env
 gmi_sid=$(setup_gemini_fixture "gmi_simple")
-run_casr "resume gmi->cc" resume cc "$gmi_sid"
+run_ags "resume gmi->cc" resume cc "$gmi_sid"
 assert_exit_ok "Gemini→CC write succeeds"
 
 # ===========================================================================
@@ -885,7 +885,7 @@ assert_exit_ok "Gemini→CC write succeeds"
 log "TEST: Resume Gemini → Codex"
 reset_env
 gmi_sid=$(setup_gemini_fixture "gmi_simple")
-run_casr "resume gmi->cod" resume cod "$gmi_sid"
+run_ags "resume gmi->cod" resume cod "$gmi_sid"
 assert_exit_ok "Gemini→Codex write succeeds"
 
 # ===========================================================================
@@ -896,15 +896,15 @@ log "TEST: Resume Antigravity → CC"
 reset_env
 agy_sid=$(setup_agy_fixture)
 # agy and gmi share GEMINI_HOME; --source agy disambiguates from the gmi reader.
-run_casr "resume agy->cc" --json resume cc "$agy_sid" --source agy
+run_ags "resume agy->cc" --json resume cc "$agy_sid" --source agy
 assert_exit_ok "Antigravity→CC write succeeds"
 assert_json_field "agy→cc source is antigravity" ".source_provider" "antigravity"
 assert_json_field "agy→cc target is claude-code" ".target_provider" "claude-code"
 
 # An agy conversation reports the antigravity provider and an unknown model:
-# agy transcripts record no model, so casr must report null, not a guess.
+# agy transcripts record no model, so ags must report null, not a guess.
 log "TEST: Antigravity info reports provider + unknown model"
-run_casr "info agy" --json info "$agy_sid" --source agy
+run_ags "info agy" --json info "$agy_sid" --source agy
 assert_exit_ok "info agy conversation succeeds"
 assert_json_field "agy info provider is antigravity" ".provider" "antigravity"
 assert_json_field "agy info model is unknown" ".model_name" "null"
@@ -915,7 +915,7 @@ assert_json_field "agy info model is unknown" ".model_name" "null"
 log "TEST: Resume CC → Antigravity"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->agy" --json resume agy "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "resume cc->agy" --json resume agy "$cc_sid" || true
 if [[ "$LAST_EXIT" -eq 0 ]]; then
     assert_json_field "CC→Antigravity target is antigravity" ".target_provider" "antigravity"
     agy_db=$(echo "$LAST_STDOUT" | jq -r '.written_paths[0] // empty')
@@ -936,7 +936,7 @@ fi
 log "TEST: Resume CC → ChatGPT"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->gpt refused" --json resume gpt "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "resume cc->gpt refused" --json resume gpt "$cc_sid" || true
 assert_exit_fail "CC→ChatGPT write is refused"
 assert_json_error_envelope "CC→ChatGPT refusal is JSON"
 assert_stderr_contains "CC→ChatGPT explains refusal" "no supported session import path"
@@ -944,7 +944,7 @@ assert_file_count "CC→ChatGPT refusal creates no files" "$CHATGPT_HOME" 0
 
 log "TEST: Resume ChatGPT → CC"
 gpt_sid=$(setup_chatgpt_fixture)
-run_casr "resume gpt->cc" resume cc "$gpt_sid" --source gpt
+run_ags "resume gpt->cc" resume cc "$gpt_sid" --source gpt
 assert_exit_ok "ChatGPT→CC write succeeds"
 assert_stdout_contains "chatgpt→cc shows claude-code" "claude-code"
 
@@ -955,7 +955,7 @@ assert_stdout_contains "chatgpt→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → ClawdBot"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->cwb" --json resume cwb "$cc_sid"
+run_ags "resume cc->cwb" --json resume cwb "$cc_sid"
 assert_exit_ok "CC→ClawdBot write succeeds"
 assert_valid_json "CC→ClawdBot JSON is valid"
 cwb_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
@@ -967,7 +967,7 @@ fi
 assert_file_exists "ClawdBot JSONL exists after conversion" "$CLAWDBOT_HOME/${cwb_sid}.jsonl"
 
 log "TEST: Resume ClawdBot → CC"
-run_casr "resume cwb->cc" resume cc "$cwb_sid" --source cwb
+run_ags "resume cwb->cc" resume cc "$cwb_sid" --source cwb
 assert_exit_ok "ClawdBot→CC write succeeds"
 assert_stdout_contains "clawdbot→cc shows claude-code" "claude-code"
 
@@ -978,7 +978,7 @@ assert_stdout_contains "clawdbot→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → Vibe"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->vib" --json resume vib "$cc_sid"
+run_ags "resume cc->vib" --json resume vib "$cc_sid"
 assert_exit_ok "CC→Vibe write succeeds"
 assert_valid_json "CC→Vibe JSON is valid"
 vib_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
@@ -991,7 +991,7 @@ fi
 assert_file_exists "Vibe messages.jsonl exists after conversion" "$vib_path"
 
 log "TEST: Resume Vibe → CC"
-run_casr "resume vib->cc" resume cc "$vib_sid" --source vib
+run_ags "resume vib->cc" resume cc "$vib_sid" --source vib
 assert_exit_ok "Vibe→CC write succeeds"
 assert_stdout_contains "vibe→cc shows claude-code" "claude-code"
 
@@ -1002,7 +1002,7 @@ assert_stdout_contains "vibe→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → Factory"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->fac" --json resume fac "$cc_sid"
+run_ags "resume cc->fac" --json resume fac "$cc_sid"
 assert_exit_ok "CC→Factory write succeeds"
 assert_valid_json "CC→Factory JSON is valid"
 fac_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
@@ -1015,7 +1015,7 @@ factory_path=$(find "$FACTORY_HOME" -type f -name "${fac_sid}.jsonl" 2>/dev/null
 assert_file_exists "Factory JSONL exists after conversion" "$factory_path"
 
 log "TEST: Resume Factory → CC"
-run_casr "resume fac->cc" resume cc "$fac_sid" --source fac
+run_ags "resume fac->cc" resume cc "$fac_sid" --source fac
 assert_exit_ok "Factory→CC write succeeds"
 assert_stdout_contains "factory→cc shows claude-code" "claude-code"
 
@@ -1026,7 +1026,7 @@ assert_stdout_contains "factory→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → OpenClaw"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "resume cc->ocl refused" --json resume ocl "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "resume cc->ocl refused" --json resume ocl "$cc_sid" || true
 assert_exit_fail "CC→OpenClaw write is refused"
 assert_json_error_envelope "CC→OpenClaw refusal is JSON"
 assert_stderr_contains "CC→OpenClaw explains gateway boundary" "Gateway"
@@ -1035,7 +1035,7 @@ assert_file_count "CC→OpenClaw refusal writes no state" "$OPENCLAW_HOME" 0
 log "TEST: Resume OpenClaw → CC"
 reset_env
 ocl_sid=$(setup_openclaw_fixture)
-run_casr "resume ocl->cc" resume cc "$ocl_sid" --source ocl
+run_ags "resume ocl->cc" resume cc "$ocl_sid" --source ocl
 assert_exit_ok "OpenClaw→CC write succeeds"
 assert_stdout_contains "openclaw→cc shows claude-code" "claude-code"
 
@@ -1046,7 +1046,7 @@ assert_stdout_contains "openclaw→cc shows claude-code" "claude-code"
 log "TEST: Resume CC → PiAgent"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "resume cc->pi" --json resume pi "$cc_sid"
+run_ags "resume cc->pi" --json resume pi "$cc_sid"
 assert_exit_ok "CC→PiAgent write succeeds"
 assert_valid_json "CC→PiAgent JSON is valid"
 pi_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
@@ -1059,7 +1059,7 @@ fi
 assert_file_exists "Pi-Agent JSONL exists after conversion" "$pi_path"
 
 log "TEST: Resume PiAgent → CC"
-run_casr "resume pi->cc" resume cc "$pi_sid" --source pi
+run_ags "resume pi->cc" resume cc "$pi_sid" --source pi
 assert_exit_ok "PiAgent→CC write succeeds"
 assert_stdout_contains "piagent→cc shows claude-code" "claude-code"
 
@@ -1070,23 +1070,23 @@ assert_stdout_contains "piagent→cc shows claude-code" "claude-code"
 log "TEST: Resume unknown target"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "bad target" resume nonexistent "$cc_sid" || true
+EXPECT_FAIL=1 run_ags "bad target" resume nonexistent "$cc_sid" || true
 assert_exit_fail "resume with unknown target fails"
 
 log "TEST: Resume unknown session"
 reset_env
-EXPECT_FAIL=1 run_casr "bad session" resume cod "nonexistent-session" || true
+EXPECT_FAIL=1 run_ags "bad session" resume cod "nonexistent-session" || true
 assert_exit_fail "resume with unknown session ID fails"
 
 log "TEST: Malformed Amp session (invalid JSON)"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "seed amp for malformed" --json resume amp "$cc_sid"
+run_ags "seed amp for malformed" --json resume amp "$cc_sid"
 assert_exit_ok "seed amp succeeds"
 amp_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
 assert_file_exists "Amp thread file exists after seed" "$XDG_DATA_HOME/amp/threads/${amp_sid}.json"
 printf '{' > "$XDG_DATA_HOME/amp/threads/${amp_sid}.json"
-EXPECT_FAIL=1 run_casr "malformed amp read" --json resume cc "$amp_sid" --dry-run --source amp || true
+EXPECT_FAIL=1 run_ags "malformed amp read" --json resume cc "$amp_sid" --dry-run --source amp || true
 assert_exit_fail "malformed Amp session fails"
 assert_json_error_envelope "malformed Amp error is JSON"
 
@@ -1096,7 +1096,7 @@ cline_sid=$(setup_cline_fixture)
 cline_api="$CLINE_HOME/tasks/$cline_sid/api_conversation_history.json"
 assert_file_exists "Cline API history fixture exists" "$cline_api"
 printf '{}' > "$cline_api"
-EXPECT_FAIL=1 run_casr "malformed cln read" --json resume cc "$cline_sid" --dry-run --source cln || true
+EXPECT_FAIL=1 run_ags "malformed cln read" --json resume cc "$cline_sid" --dry-run --source cln || true
 assert_exit_fail "malformed Cline session fails"
 assert_json_error_envelope "malformed Cline error is JSON"
 
@@ -1106,7 +1106,7 @@ gpt_sid=$(setup_chatgpt_fixture)
 gpt_file="$CHATGPT_HOME/conversations-fixture/${gpt_sid}.json"
 assert_file_exists "ChatGPT conversation exists after seed" "$gpt_file"
 printf 'not-json\n' > "$gpt_file"
-EXPECT_FAIL=1 run_casr "malformed gpt read" --json resume cc "$gpt_sid" --dry-run --source gpt || true
+EXPECT_FAIL=1 run_ags "malformed gpt read" --json resume cc "$gpt_sid" --dry-run --source gpt || true
 assert_exit_fail "malformed ChatGPT session fails"
 assert_json_error_envelope "malformed ChatGPT error is JSON"
 
@@ -1114,7 +1114,7 @@ log "TEST: Corrupt Cursor DB via --source path"
 reset_env
 mkdir -p "$CURSOR_HOME/User/globalStorage"
 printf 'not a sqlite db' > "$CURSOR_HOME/User/globalStorage/state.vscdb"
-EXPECT_FAIL=1 run_casr "cursor corrupt db" --json resume cc "dummy" --dry-run \
+EXPECT_FAIL=1 run_ags "cursor corrupt db" --json resume cc "dummy" --dry-run \
     --source "$CURSOR_HOME/User/globalStorage/state.vscdb" || true
 assert_exit_fail "corrupt Cursor DB fails"
 assert_json_error_envelope "corrupt Cursor DB error is JSON"
@@ -1123,7 +1123,7 @@ log "TEST: Corrupt OpenCode DB via --source path"
 reset_env
 mkdir -p "$OPENCODE_HOME"
 printf 'not a sqlite db' > "$OPENCODE_HOME/opencode.db"
-EXPECT_FAIL=1 run_casr "opencode corrupt db" --json resume cc "dummy" --dry-run --source "$OPENCODE_HOME/opencode.db" || true
+EXPECT_FAIL=1 run_ags "opencode corrupt db" --json resume cc "dummy" --dry-run --source "$OPENCODE_HOME/opencode.db" || true
 assert_exit_fail "corrupt OpenCode DB fails"
 assert_json_error_envelope "corrupt OpenCode DB error is JSON"
 
@@ -1133,11 +1133,11 @@ assert_json_error_envelope "corrupt OpenCode DB error is JSON"
 
 log "TEST: Verbose flag"
 reset_env
-run_casr "verbose" --verbose providers
+run_ags "verbose" --verbose providers
 assert_exit_ok "--verbose accepted"
 
 log "TEST: Trace flag"
-run_casr "trace" --trace providers
+run_ags "trace" --trace providers
 assert_exit_ok "--trace accepted"
 
 # ===========================================================================
@@ -1151,7 +1151,7 @@ assert_exit_ok "--trace accepted"
 log "TEST: Dry-run JSON content — CC→Codex"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "dry-run json cc->cod" --json resume cod "$cc_sid" --dry-run
+run_ags "dry-run json cc->cod" --json resume cod "$cc_sid" --dry-run
 assert_exit_ok "CC→Codex dry-run JSON succeeds"
 assert_valid_json "dry-run JSON is valid"
 assert_json_field "dry-run ok=true" ".ok" "true"
@@ -1164,7 +1164,7 @@ assert_file_count "dry-run writes no codex files" "$CODEX_HOME/sessions" 0
 log "TEST: Dry-run JSON content — CC→Gemini"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "dry-run json cc->gmi" --json resume gmi "$cc_sid" --dry-run
+run_ags "dry-run json cc->gmi" --json resume gmi "$cc_sid" --dry-run
 assert_exit_ok "CC→Gemini dry-run JSON succeeds"
 assert_valid_json "dry-run Gemini JSON is valid"
 assert_json_field "dry-run Gemini ok=true" ".ok" "true"
@@ -1173,7 +1173,7 @@ assert_json_field "dry-run Gemini target_provider" ".target_provider" "gemini"
 log "TEST: Dry-run JSON content — CC→Cursor"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "dry-run json cc->cur refused" \
+EXPECT_FAIL=1 run_ags "dry-run json cc->cur refused" \
     --json resume cur "$cc_sid" --dry-run || true
 assert_exit_fail "CC→Cursor dry-run is refused"
 assert_json_error_envelope "CC→Cursor dry-run refusal is JSON"
@@ -1183,7 +1183,7 @@ assert_file_count "CC→Cursor dry-run writes no files" "$CURSOR_HOME" 0
 log "TEST: Dry-run JSON content — CC→ChatGPT"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "dry-run json cc->gpt refused" --json resume gpt "$cc_sid" --dry-run || true
+EXPECT_FAIL=1 run_ags "dry-run json cc->gpt refused" --json resume gpt "$cc_sid" --dry-run || true
 assert_exit_fail "CC→ChatGPT dry-run is refused"
 assert_json_error_envelope "CC→ChatGPT dry-run refusal is JSON"
 assert_stderr_contains "CC→ChatGPT dry-run explains refusal" "no supported session import path"
@@ -1192,7 +1192,7 @@ assert_file_count "CC→ChatGPT dry-run writes no files" "$CHATGPT_HOME" 0
 log "TEST: Dry-run JSON content — Codex→CC"
 reset_env
 cod_sid=$(setup_codex_fixture "codex_modern" "jsonl")
-run_casr "dry-run json cod->cc" --json resume cc "$cod_sid" --dry-run
+run_ags "dry-run json cod->cc" --json resume cc "$cod_sid" --dry-run
 assert_exit_ok "Codex→CC dry-run JSON succeeds"
 assert_valid_json "dry-run Codex→CC JSON is valid"
 assert_json_field "dry-run Codex→CC ok=true" ".ok" "true"
@@ -1210,20 +1210,20 @@ assert_json_field "dry-run Codex→CC source" ".source_provider" "codex"
 log "TEST: --force accepted — CC→Codex"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "force cod: write" resume cod "$cc_sid" --force
+run_ags "force cod: write" resume cod "$cc_sid" --force
 assert_exit_ok "CC→Codex --force accepted"
 assert_stdout_contains "--force codex shows resume" "Resume:"
 
 log "TEST: --force accepted — CC→Gemini"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "force gmi: write" resume gmi "$cc_sid" --force
+run_ags "force gmi: write" resume gmi "$cc_sid" --force
 assert_exit_ok "CC→Gemini --force accepted"
 
 log "TEST: --force cannot bypass Cursor refusal"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "force cur: refused" --json resume cur "$cc_sid" --force || true
+EXPECT_FAIL=1 run_ags "force cur: refused" --json resume cur "$cc_sid" --force || true
 assert_exit_fail "CC→Cursor --force is refused"
 assert_json_error_envelope "CC→Cursor --force refusal is JSON"
 assert_file_count "CC→Cursor --force writes no files" "$CURSOR_HOME" 0
@@ -1231,13 +1231,13 @@ assert_file_count "CC→Cursor --force writes no files" "$CURSOR_HOME" 0
 log "TEST: --force accepted — CC→ClawdBot"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "force cwb: write" resume cwb "$cc_sid" --force
+run_ags "force cwb: write" resume cwb "$cc_sid" --force
 assert_exit_ok "CC→ClawdBot --force accepted"
 
 log "TEST: --force cannot bypass ChatGPT refusal"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-EXPECT_FAIL=1 run_casr "force gpt: refused" --json resume gpt "$cc_sid" --force || true
+EXPECT_FAIL=1 run_ags "force gpt: refused" --json resume gpt "$cc_sid" --force || true
 assert_exit_fail "CC→ChatGPT --force is refused"
 assert_json_error_envelope "CC→ChatGPT --force refusal is JSON"
 assert_file_count "CC→ChatGPT --force writes no files" "$CHATGPT_HOME" 0
@@ -1245,7 +1245,7 @@ assert_file_count "CC→ChatGPT --force writes no files" "$CHATGPT_HOME" 0
 log "TEST: --force accepted — CC→PiAgent"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "force pi: write" resume pi "$cc_sid" --force
+run_ags "force pi: write" resume pi "$cc_sid" --force
 assert_exit_ok "CC→PiAgent --force accepted"
 
 log "TEST: --force double write — CC→Codex"
@@ -1253,10 +1253,10 @@ reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
 # Bypass the conversion store so this measures the writer, not the store's
 # intentional reuse of the best existing Codex incarnation.
-run_casr "force double: first" --json resume cod "$cc_sid" --force --no-store
+run_ags "force double: first" --json resume cod "$cc_sid" --force --no-store
 assert_exit_ok "CC→Codex --force first write"
 first_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
-run_casr "force double: second" --json resume cod "$cc_sid" --force --no-store
+run_ags "force double: second" --json resume cod "$cc_sid" --force --no-store
 assert_exit_ok "CC→Codex --force second write"
 second_sid=$(echo "$LAST_STDOUT" | jq -r '.target_session_id // empty')
 if [[ "$first_sid" != "$second_sid" && -n "$first_sid" && -n "$second_sid" ]]; then
@@ -1272,7 +1272,7 @@ fi
 log "TEST: Enrich — CC→Codex"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "enrich cc->cod" --json resume cod "$cc_sid" --enrich
+run_ags "enrich cc->cod" --json resume cod "$cc_sid" --enrich
 assert_exit_ok "CC→Codex --enrich succeeds"
 assert_valid_json "enrich JSON output is valid"
 # Read written file and verify enrichment messages are prepended.
@@ -1295,7 +1295,7 @@ fi
 log "TEST: Enrich — CC→Gemini"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "enrich cc->gmi" resume gmi "$cc_sid" --enrich
+run_ags "enrich cc->gmi" resume gmi "$cc_sid" --enrich
 assert_exit_ok "CC→Gemini --enrich succeeds"
 gemini_file=$(find "$GEMINI_HOME/tmp" -type f -name '*.json' 2>/dev/null | head -1)
 if [[ -n "$gemini_file" ]]; then
@@ -1308,7 +1308,7 @@ fi
 log "TEST: Enrich + dry-run — CC→Codex"
 reset_env
 cc_sid=$(setup_cc_fixture "cc_simple")
-run_casr "enrich+dryrun cc->cod" --json resume cod "$cc_sid" --enrich --dry-run
+run_ags "enrich+dryrun cc->cod" --json resume cod "$cc_sid" --enrich --dry-run
 assert_exit_ok "CC→Codex --enrich --dry-run succeeds"
 assert_valid_json "enrich dry-run JSON is valid"
 assert_json_field "enrich dry-run ok=true" ".ok" "true"
@@ -1343,7 +1343,7 @@ setup_source_session() {
             # Seed: set up CC fixture, convert CC→source, return target sid.
             local _cc_sid _json_out _target_sid
             _cc_sid=$(setup_cc_fixture "cc_simple")
-            _json_out=$("${CASR[@]}" --json resume "$source_alias" "$_cc_sid" 2>/dev/null) || true
+            _json_out=$("${AGS[@]}" --json resume "$source_alias" "$_cc_sid" 2>/dev/null) || true
             _target_sid=$(echo "$_json_out" | jq -r '.target_session_id // empty' 2>/dev/null)
             echo "$_target_sid"
             ;;
@@ -1390,7 +1390,7 @@ for source in "${ALL_ALIASES[@]}"; do
                 refusal_home="$OPENCLAW_HOME"
             fi
 
-            EXPECT_FAIL=1 run_casr "matrix:${local_pair}:refused" \
+            EXPECT_FAIL=1 run_ags "matrix:${local_pair}:refused" \
                 --json resume "$target" "$source_sid" --source "$source" || true
             refusal_files=0
             if [[ -d "$refusal_home" ]]; then
@@ -1409,7 +1409,7 @@ for source in "${ALL_ALIASES[@]}"; do
             continue
         fi
 
-        run_casr "matrix:${local_pair}" --json resume "$target" "$source_sid" --source "$source"
+        run_ags "matrix:${local_pair}" --json resume "$target" "$source_sid" --source "$source"
 
         if [[ "$LAST_EXIT" -eq 0 ]]; then
             ok_val=$(echo "$LAST_STDOUT" | jq -r '.ok // "false"' 2>/dev/null)
@@ -1432,16 +1432,16 @@ echo -e "  ${BOLD}Matrix summary:${RESET} ${GREEN}${MATRIX_OK}/${MATRIX_PAIRS} b
 # ===========================================================================
 
 log "TEST: Completions bash"
-run_casr "completions" completions bash
+run_ags "completions" completions bash
 assert_exit_ok "completions bash succeeds"
 assert_stdout_contains "completions name the binary" "ags"
 
 log "TEST: Completions zsh"
-run_casr "completions zsh" completions zsh
+run_ags "completions zsh" completions zsh
 assert_exit_ok "completions zsh succeeds"
 
 log "TEST: Completions fish"
-run_casr "completions fish" completions fish
+run_ags "completions fish" completions fish
 assert_exit_ok "completions fish succeeds"
 
 # ===========================================================================

@@ -1,4 +1,4 @@
-# UBS ignore globs for casr.
+# UBS ignore globs for ags.
 #
 # UBS is most valuable on production Rust sources. Our test suite intentionally
 # uses `panic!`, `unwrap()`, and other patterns that are noise for UBS.

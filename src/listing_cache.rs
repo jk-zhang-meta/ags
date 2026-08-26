@@ -5,7 +5,7 @@
 //! A listing row carries counts only a full read can produce — messages,
 //! unique user messages, average agent response length, tool uses. On one real
 //! machine the thirty most recent Codex rollouts are 1.45 GiB, so rendering
-//! *two* rows of `casr list` parsed 1.45 GiB, and did it again on the next
+//! *two* rows of `ags convert list` parsed 1.45 GiB, and did it again on the next
 //! invocation. Rollouts are append-only and most of them are finished, so
 //! nearly every one of those parses reproduced the previous run's answer.
 //!

@@ -5,7 +5,7 @@ design record, not a tutorial: it says what the store is for, what is
 authoritative inside it, and which decisions were deliberate so that a later
 change can tell a constraint from an accident.
 
-`casr` converts and forgets. Its output is a file in the target provider's
+`ags` converts and forgets. Its output is a file in the target provider's
 directory and a line of text on stdout. That is the right shape for a
 one-shot converter and the wrong shape for the tool we are building, for one
 concrete reason that the corpus can put a number on.
@@ -214,8 +214,8 @@ change is not durable until the directory itself is synced. Nothing synced it. A
 syscall trace of one conversion showed the asymmetry plainly:
 
 ```
-fsync  records/<id>/.casr-tmp-…          # the staging file's contents
-rename .casr-tmp-…  -> record.json.ags-new-…
+fsync  records/<id>/.ags-tmp-…          # the staging file's contents
+rename .ags-tmp-…  -> record.json.ags-new-…
 rename record.json.ags-new-… -> record.json     # publication: not durable
 fsync  index.sqlite-wal                  # SQLite's COMMIT: durable
 ```

@@ -190,14 +190,14 @@ fn write_session_is_refused_without_official_cli() {
     );
 }
 
-/// CLI smoke test: `casr list --provider grok` finds the seeded session.
+/// CLI smoke test: `ags convert list --provider grok` finds the seeded session.
 #[test]
 fn cli_list_finds_seeded_grok_session() {
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     seed_grok_home(tmp.path());
 
-    // `casr list` defaults to scoping by the current working-directory
+    // `ags convert list` defaults to scoping by the current working-directory
     // project; the fixture's workspace is a synthetic path, so pass it
     // explicitly via `--workspace` to take it out of cwd scope.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
@@ -213,13 +213,13 @@ fn cli_list_finds_seeded_grok_session() {
         ])
         .env("GROK_HOME", tmp.path())
         .output()
-        .expect("run casr list");
+        .expect("run ags convert list");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "casr list failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        "ags convert list failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
     assert!(
@@ -228,7 +228,7 @@ fn cli_list_finds_seeded_grok_session() {
     );
 }
 
-/// CLI smoke test: `casr info <id> --source grk` reports the session details.
+/// CLI smoke test: `ags convert info <id> --source grk` reports the session details.
 #[test]
 fn cli_info_reports_seeded_grok_session() {
     let _lock = GROK_ENV.lock().unwrap();
@@ -239,13 +239,13 @@ fn cli_info_reports_seeded_grok_session() {
         .args(["convert", "info", FIXTURE_ID, "--source", "grk"])
         .env("GROK_HOME", tmp.path())
         .output()
-        .expect("run casr info");
+        .expect("run ags convert info");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "casr info failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        "ags convert info failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
     assert!(
@@ -289,7 +289,7 @@ fn cli_convert_into_grok_is_refused_without_official_cli() {
         // `tempfile` directory that is about to be deleted.
         .env("AGS_STORE", tmp.path().join("ags-store"))
         .output()
-        .expect("run casr resume grok");
+        .expect("run ags convert resume grok");
 
     assert!(
         !output.status.success(),

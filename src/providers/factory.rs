@@ -3,8 +3,8 @@
 //! Session files: `~/.factory/sessions/{workspace-slug}/{uuid}.jsonl`, or
 //! `~/.factory/sessions/{uuid}.jsonl` for a session started with no project
 //! cwd. Those two levels are the whole store; droid never recurses past them.
-//! casr reads both forms and writes the flat form, which droid explicitly
-//! enumerates without requiring casr to reproduce its workspace slugger.
+//! ags reads both forms and writes the flat form, which droid explicitly
+//! enumerates without requiring ags to reproduce its workspace slugger.
 //! Settings file: `~/.factory/sessions/{workspace-slug}/{uuid}.settings.json`
 //! Override root: `FACTORY_HOME` env var
 //!
@@ -45,9 +45,9 @@ impl Factory {
 
     /// Root directory for Factory session storage, in precedence order:
     ///
-    /// 1. `FACTORY_HOME` — casr's own override, naming the sessions directory
+    /// 1. `FACTORY_HOME` — ags's own override, naming the sessions directory
     ///    itself. `droid` has no variable with those semantics, so this one is
-    ///    casr's alone; it wins so that aiming casr at a tree never disturbs the
+    ///    ags's alone; it wins so that aiming ags at a tree never disturbs the
     ///    `droid` the rest of the shell talks to.
     /// 2. `FACTORY_HOME_OVERRIDE` — the variable `droid` itself honours. It
     ///    replaces the *home directory*, so `.factory/sessions` is joined onto
@@ -318,7 +318,7 @@ impl Provider for Factory {
     /// return []` and `.filter(E => !E.isBtwFork)` — while still resolving one
     /// by id, because `findSessionFile` probes
     /// `join(getBtwSessionsDirectory(), `${id}.jsonl`)` after the cwd project
-    /// and the root. casr matches on both counts: this predicate is consulted
+    /// and the root. ags matches on both counts: this predicate is consulted
     /// only when listing (`main.rs`), and `owns_session` walks the whole tree
     /// by filename and so still resolves a btw session by id.
     fn is_session_path(&self, path: &Path) -> bool {
@@ -528,7 +528,7 @@ impl Provider for Factory {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let session_id = if session.session_id.is_empty() {
-            format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
+            format!("ags-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
         } else {
             session.session_id.clone()
         };
@@ -562,7 +562,7 @@ impl Provider for Factory {
             "type": "session_start",
             "id": session_id,
             "title": title,
-            "owner": "casr",
+            "owner": "ags",
         });
         if let Some(cwd) = cwd {
             header["cwd"] = serde_json::Value::String(cwd);

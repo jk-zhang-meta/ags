@@ -9,7 +9,7 @@
 //! Support/com.openai.chat` on macOS and to nothing at all on every other
 //! platform, so off macOS this provider reads only what `CHATGPT_HOME` is
 //! explicitly pointed at. There is no Windows or Linux path here to be wrong
-//! about, and `CHATGPT_HOME` is casr's own override — the desktop app honours
+//! about, and `CHATGPT_HOME` is ags's own override — the desktop app honours
 //! no such variable.
 //!
 //! ## Storage generations
@@ -52,7 +52,7 @@
 //! *visibility* marker — `isVisuallyHiddenFromConversation` and
 //! `isUserSystemMessage`, stored properties of `ConversationMessageMetadata`
 //! (byte 85387904/85387936, snake-cased on the wire by
-//! `JSONDecoder.convertFromSnakeCase`) — and casr does not need to consult it.
+//! `JSONDecoder.convertFromSnakeCase`) — and ags does not need to consult it.
 //! Across six real exported conversations, every one of the eight `system`
 //! nodes carried `content: {"content_type":"text","parts":[""]}` and
 //! `is_visually_hidden_from_conversation: true`, and **none** carried words:
@@ -92,7 +92,7 @@ use crate::providers::{
 };
 
 const CHATGPT_WRITE_REFUSAL: &str = "ChatGPT has no supported session import path: exported or \
-casr-generated conversation JSON cannot be added to ChatGPT history. Use ChatGPT as a conversion \
+ags-generated conversation JSON cannot be added to ChatGPT history. Use ChatGPT as a conversion \
 source, not a target.";
 
 /// ChatGPT desktop app provider implementation.
@@ -151,7 +151,7 @@ impl ChatGpt {
 
     /// Root directory for ChatGPT app data.
     ///
-    /// `CHATGPT_HOME` is casr's own override — the desktop app honours no such
+    /// `CHATGPT_HOME` is ags's own override — the desktop app honours no such
     /// variable — and off macOS it is the only way to reach a store at all.
     fn home_dir() -> Option<PathBuf> {
         if let Ok(home) = std::env::var("CHATGPT_HOME") {
@@ -171,7 +171,7 @@ impl ChatGpt {
     /// Find conversation directories under a base path.
     ///
     /// Returns `(path, is_encrypted)` pairs, where `is_encrypted` means "the
-    /// app wrote this and casr cannot read it", not "casr found no files".
+    /// app wrote this and ags cannot read it", not "ags found no files".
     ///
     /// Both separators are deliberate. The shipped app names its store with a
     /// version token joined to the account id, and it changed separator between
@@ -181,7 +181,7 @@ impl ChatGpt {
     /// store invisible: not read, and not reported as refused either, so `list`
     /// said "no sessions" about a directory that was full of them. Anything
     /// carrying a version token is the app's own encrypted store; the plain
-    /// `conversations-<id>` form is the one casr writes itself, and an id is
+    /// `conversations-<id>` form is the one ags writes itself, and an id is
     /// hex, so it can never begin with `v`.
     fn find_conversation_dirs_reporting(
         base: &Path,
@@ -292,7 +292,7 @@ impl Provider for ChatGpt {
                 // applies.
                 listing.unreadable.push(UnreadableSource {
                     path: dir,
-                    error: "encrypted conversation store (v2/v3); casr cannot read it".to_string(),
+                    error: "encrypted conversation store (v2/v3); ags cannot read it".to_string(),
                 });
                 continue;
             }

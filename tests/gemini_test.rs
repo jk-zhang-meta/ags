@@ -107,7 +107,7 @@ fn message(id: &str, kind: &str, content: &str) -> serde_json::Value {
 ///
 /// A directory holding one of each used to yield exactly one session — the
 /// legacy `.json` — because discovery required `.ends_with(".json")`. That is
-/// not "casr reads the old format": it is casr showing whichever sessions
+/// not "ags reads the old format": it is ags showing whichever sessions
 /// nobody has resumed lately, cut off at an arbitrary date.
 #[test]
 fn list_sessions_finds_both_formats() {

@@ -1,4 +1,4 @@
-//! Pins which ChatGPT directories casr reads, which it refuses out loud, and
+//! Pins which ChatGPT directories ags reads, which it refuses out loud, and
 //! which files inside a readable one count as sessions.
 //!
 //! Verified against `ChatGPT.app` (`ChatGPT.dmg`, sha256 `49b33cad…`). Its
@@ -57,7 +57,7 @@ impl Drop for EnvGuard {
     }
 }
 
-/// A conversation casr's own writer would produce: `<id>.json`, flat.
+/// A conversation ags's own writer would produce: `<id>.json`, flat.
 fn write_conversation(dir: &Path, id: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let body = format!(
@@ -72,14 +72,14 @@ fn write_conversation(dir: &Path, id: &str) {
     std::fs::write(dir.join(format!("{id}.json")), body).unwrap();
 }
 
-/// Every store shape the artifact attests to, plus the one casr writes.
+/// Every store shape the artifact attests to, plus the one ags writes.
 fn seed_chatgpt_home(home: &Path) {
-    // Readable: the shape casr's own `write_session` produces.
+    // Readable: the shape ags's own `write_session` produces.
     write_conversation(
         &home.join("conversations-13df5255-83ed-4749-921b-4565e9c12a7d"),
         "13df5255-83ed-4749-921b-4565e9c12a7d",
     );
-    // The app's own stores. All encrypted; casr must refuse them by name.
+    // The app's own stores. All encrypted; ags must refuse them by name.
     for encrypted in [
         "conversations-v3-acct_ABC123",
         "conversations_v2_acct_ABC123",
@@ -135,9 +135,9 @@ fn the_underscore_v2_store_is_refused_out_loud_not_silently_ignored() {
 }
 
 /// The version token is what marks the app's store, and an id is hex, so the
-/// plain form casr writes can never be mistaken for one.
+/// plain form ags writes can never be mistaken for one.
 #[test]
-fn only_the_unversioned_store_casr_writes_is_read() {
+fn only_the_unversioned_store_ags_writes_is_read() {
     let _lock = CHATGPT_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("CHATGPT_HOME", tmp.path());
@@ -156,10 +156,10 @@ fn only_the_unversioned_store_casr_writes_is_read() {
 /// what stops `is_session_path` being "corrected" to the artifact's
 /// extension-less naming: that naming belongs to the app's `ObjectLoader`
 /// module, whose directories are all refused above, while this tree is the one
-/// casr's own `write_session` creates and the ten `*_to_chatgpt` roundtrip
+/// ags's own `write_session` creates and the ten `*_to_chatgpt` roundtrip
 /// tests depend on.
 #[test]
-fn a_conversation_casr_wrote_is_listed() {
+fn a_conversation_ags_wrote_is_listed() {
     let _lock = CHATGPT_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("CHATGPT_HOME", tmp.path());
@@ -171,10 +171,10 @@ fn a_conversation_casr_wrote_is_listed() {
     assert_eq!(
         ids,
         vec!["13df5255-83ed-4749-921b-4565e9c12a7d"],
-        "a conversation casr wrote must keep appearing in `list`"
+        "a conversation ags wrote must keep appearing in `list`"
     );
     assert!(
         ChatGpt.is_session_path(Path::new("/store/conversations-x/abc.json")),
-        "`<id>.json` is the shape casr writes"
+        "`<id>.json` is the shape ags writes"
     );
 }

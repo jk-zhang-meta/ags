@@ -12,7 +12,7 @@ use std::{
 use tracing::{debug, info, warn};
 
 use crate::discovery::{ProviderRegistry, ResolvedSession, SourceHint};
-use crate::error::CasrError;
+use crate::error::AgsError;
 use crate::ir::{Body, Fidelity, Loss, LossKind, SessionIr};
 use crate::model::{CanonicalMessage, CanonicalSession, MessageRole, reindex_messages};
 use crate::providers::{Provider, StructuredWrite, WriteOptions, WrittenSession};
@@ -336,9 +336,9 @@ fn prepend_enrichment_messages(
     let summary_timestamp = notice_timestamp.map(|ts| ts.saturating_add(1));
 
     let mut notice_lines = vec![
-        "[casr synthetic context]".to_string(),
+        "[ags synthetic context]".to_string(),
         format!(
-            "This session was originally created in {source_provider} and converted to {target_provider} format by casr."
+            "This session was originally created in {source_provider} and converted to {target_provider} format by ags."
         ),
         format!("Original session ID: {source_session_id}."),
         "Some provider-specific context may have been lost in conversion.".to_string(),
@@ -350,7 +350,7 @@ fn prepend_enrichment_messages(
 
     let (summary_count, summary_lines) = build_recent_summary(session, 4, 180);
     let summary_body = format!(
-        "[casr synthetic context]\nRecent conversation snapshot (last {summary_count} message(s)):\n{summary_lines}"
+        "[ags synthetic context]\nRecent conversation snapshot (last {summary_count} message(s)):\n{summary_lines}"
     );
 
     let notice = CanonicalMessage {
@@ -358,11 +358,11 @@ fn prepend_enrichment_messages(
         role: MessageRole::System,
         content: notice_lines.join("\n"),
         timestamp: notice_timestamp,
-        author: Some("casr-enrichment".to_string()),
+        author: Some("ags-enrichment".to_string()),
         tool_calls: Vec::new(),
         tool_results: Vec::new(),
         extra: serde_json::json!({
-            "casr_enrichment": true,
+            "ags_enrichment": true,
             "synthetic": true,
             "enrichment_type": "conversion_notice",
             "source_provider": source_provider,
@@ -376,11 +376,11 @@ fn prepend_enrichment_messages(
         role: MessageRole::System,
         content: summary_body,
         timestamp: summary_timestamp,
-        author: Some("casr-enrichment".to_string()),
+        author: Some("ags-enrichment".to_string()),
         tool_calls: Vec::new(),
         tool_results: Vec::new(),
         extra: serde_json::json!({
-            "casr_enrichment": true,
+            "ags_enrichment": true,
             "synthetic": true,
             "enrichment_type": "recent_summary",
             "source_provider": source_provider,
@@ -465,7 +465,7 @@ impl ConversionPipeline {
     ) -> anyhow::Result<ConversionResult> {
         // 1. Resolve target provider.
         let target_provider = self.registry.find_by_alias(target_alias).ok_or_else(|| {
-            CasrError::UnknownProviderAlias {
+            AgsError::UnknownProviderAlias {
                 alias: target_alias.to_string(),
                 known_aliases: self.registry.known_aliases(),
             }
@@ -548,7 +548,7 @@ but resume may fail until the CLI is installed.",
         all_warnings.extend(validation.warnings.clone());
 
         if validation.has_errors() {
-            return Err(CasrError::ValidationError {
+            return Err(AgsError::ValidationError {
                 errors: validation.errors,
                 warnings: validation.warnings,
                 info: validation.info,
@@ -569,7 +569,7 @@ but resume may fail until the CLI is installed.",
                 target_provider.slug(),
                 &source_session_id,
             );
-            info!(inserted, "applied casr enrichment");
+            info!(inserted, "applied ags enrichment");
             all_warnings.push(format!(
                 "Added {inserted} synthetic context message(s) via --enrich."
             ));
@@ -739,7 +739,7 @@ but resume may fail until the CLI is installed.",
                                         format!("rollback failed: {rollback_error}")
                                     }
                                 };
-                            return Err(CasrError::VerifyFailed {
+                            return Err(AgsError::VerifyFailed {
                                 provider: target_provider.slug().to_string(),
                                 written_paths: written.paths.clone(),
                                 detail: format!("{detail}; {rollback_detail}"),
@@ -854,7 +854,7 @@ but resume may fail until the CLI is installed.",
         // *Which targets.* The old gate was `slug != "claude-code"`, which
         // named the one target known to round-trip `tool_use` blocks. Six more
         // do: see [`writer_carries_tool_calls`]. Rendering into those wrote a
-        // `[Tool: grep]` placeholder *beside* the real call — casr minting the
+        // `[Tool: grep]` placeholder *beside* the real call — ags minting the
         // very duplicate its OpenClaw reader was fixed for not minting, on the
         // 22,553 tool-call-only assistant turns in the corpus.
         //
@@ -952,7 +952,7 @@ but resume may fail until the CLI is installed.",
                                     format!("rollback failed: {rollback_error}")
                                 }
                             };
-                        return Err(CasrError::VerifyFailed {
+                        return Err(AgsError::VerifyFailed {
                             provider: target_provider.slug().to_string(),
                             written_paths: written.paths.clone(),
                             detail: format!("{detail}; {rollback_detail}"),
@@ -969,7 +969,7 @@ but resume may fail until the CLI is installed.",
                             format!("rollback failed: {rollback_error}")
                         }
                     };
-                    return Err(CasrError::VerifyFailed {
+                    return Err(AgsError::VerifyFailed {
                         provider: target_provider.slug().to_string(),
                         written_paths: written.paths.clone(),
                         detail: format!("unable to read written session: {e}; {rollback_detail}"),
@@ -1278,9 +1278,9 @@ fn read_source_ir(provider: &dyn Provider, path: &Path) -> Result<Option<Session
 ///
 /// - **Damage** — content missing that [`crate::ir::Capsule::fits`] did not
 ///   predict, or sealed bytes it forbade that crossed anyway. The written file
-///   is rolled back and the conversion fails with [`CasrError::VerifyFailed`],
+///   is rolled back and the conversion fails with [`AgsError::VerifyFailed`],
 ///   exactly as the flat track behaves. That error already says "this is a bug
-///   in casr", which is what it is: the file on disk is not the session, and a
+///   in ags", which is what it is: the file on disk is not the session, and a
 ///   resume from it would hand the model an incomplete history with nothing to
 ///   show that anything was missing. Returning it as a *success* with a worse
 ///   grade would bury a writer bug inside the vocabulary reserved for honest
@@ -1406,7 +1406,7 @@ fn verify_structured_write(
     if report.added_events > 0 {
         warnings.push(format!(
             "The written session holds {} model-visible event(s) the source did not, such as \
-             the markers casr writes where a sealed history could not be carried.",
+             the markers ags writes where a sealed history could not be carried.",
             report.added_events
         ));
     }
@@ -1510,7 +1510,7 @@ fn flat_grade(
 /// A dry run must report the grade the real run will produce, and a dry run
 /// stops at 7a3 without writing anything. Reading the answer back out of the
 /// written file would be both later than the dry run and, per the read-back's
-/// own caveat, a measurement of casr's reader rather than of the file.
+/// own caveat, a measurement of ags's reader rather than of the file.
 fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> Vec<Loss> {
     let mut losses = Vec::new();
 
@@ -1689,10 +1689,10 @@ fn target_projection_losses(canonical: &CanonicalSession, target_slug: &str) -> 
 /// # The oracle is the written file
 ///
 /// Every row below was read out of the artifact each writer produces for a
-/// session holding one message of each role, not out of casr reading its own
+/// session holding one message of each role, not out of ags reading its own
 /// output back. The distinction matters in both directions. Gemini, ClawdBot,
 /// Factory, Pi-Agent, ChatGPT and Codex write an unrecognised source role
-/// through under its own name, and casr's own `model::normalize_role` then maps
+/// through under its own name, and ags's own `model::normalize_role` then maps
 /// `"developer"` back onto [`MessageRole::System`] — so a read-back would report
 /// a fold those files did not perform. Kiro has no third journal variant to
 /// send a system turn to — `LogEntryV1` is `{Prompt, AssistantMessage,
@@ -1928,7 +1928,7 @@ pub(crate) fn elide_middle(s: &str, max: usize) -> Option<String> {
     let omitted = chars.len() - head_len - tail_len;
     let head: String = chars[..head_len].iter().collect();
     let tail: String = chars[chars.len() - tail_len..].iter().collect();
-    Some(format!("{head}\n…[casr: {omitted} chars elided]…\n{tail}"))
+    Some(format!("{head}\n…[ags: {omitted} chars elided]…\n{tail}"))
 }
 
 /// The tool ids that are already unpaired in `session`.
@@ -2378,8 +2378,8 @@ fn maybe_inject_atomic_write_failure(stage: AtomicWriteFailStage) -> std::io::Re
 /// fully written and fsynced. Never leaves partial writes.
 ///
 /// Returns `AtomicWriteOutcome` on success, or:
-/// - [`CasrError::SessionConflict`] if target exists and `force` is false.
-/// - [`CasrError::SessionWriteError`] on I/O failures.
+/// - [`AgsError::SessionConflict`] if target exists and `force` is false.
+/// - [`AgsError::SessionWriteError`] on I/O failures.
 ///
 /// # Why the original is never unlinked
 ///
@@ -2409,12 +2409,12 @@ pub fn atomic_write(
     content: &[u8],
     force: bool,
     provider_slug: &str,
-) -> Result<AtomicWriteOutcome, CasrError> {
+) -> Result<AtomicWriteOutcome, AgsError> {
     use std::io::Write;
 
     // 1. Create parent directories.
     if let Some(parent) = target_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| CasrError::SessionWriteError {
+        std::fs::create_dir_all(parent).map_err(|e| AgsError::SessionWriteError {
             path: target_path.to_path_buf(),
             provider: provider_slug.to_string(),
             detail: format!("failed to create parent directories: {e}"),
@@ -2425,14 +2425,14 @@ pub fn atomic_write(
     //    check is a check, and the file stays where the agent can read it.
     let displaces_existing = target_path.exists();
     if displaces_existing && !force {
-        return Err(CasrError::SessionConflict {
+        return Err(AgsError::SessionConflict {
             session_id: String::new(),
             existing_path: target_path.to_path_buf(),
         });
     }
 
     // 3. Write to temp file in the same directory.
-    let temp_name = format!(".casr-tmp-{}", uuid::Uuid::new_v4().as_hyphenated());
+    let temp_name = format!(".ags-tmp-{}", uuid::Uuid::new_v4().as_hyphenated());
     let temp_path = target_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -2458,7 +2458,7 @@ pub fn atomic_write(
         // The target was never touched, so cleaning up the temp file is the
         // whole of the recovery.
         let _ = std::fs::remove_file(&temp_path);
-        return Err(CasrError::SessionWriteError {
+        return Err(AgsError::SessionWriteError {
             path: target_path.to_path_buf(),
             provider: provider_slug.to_string(),
             detail: format!("failed to write temp file: {e}"),
@@ -2485,7 +2485,7 @@ pub fn atomic_write(
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&temp_path);
-                return Err(CasrError::SessionWriteError {
+                return Err(AgsError::SessionWriteError {
                     path: target_path.to_path_buf(),
                     provider: provider_slug.to_string(),
                     detail: format!("failed to create backup: {e}"),
@@ -2512,7 +2512,7 @@ pub fn atomic_write(
         if let Some(ref bak) = backup_path {
             let _ = std::fs::remove_file(bak);
         }
-        return Err(CasrError::SessionWriteError {
+        return Err(AgsError::SessionWriteError {
             path: target_path.to_path_buf(),
             provider: provider_slug.to_string(),
             detail: format!("failed to rename temp file to target: {e}"),
@@ -2538,7 +2538,7 @@ pub fn atomic_write(
 /// Restore a backup after a verification failure.
 ///
 /// Removes the broken target and renames the backup back into place.
-pub fn restore_backup(outcome: &AtomicWriteOutcome, provider_slug: &str) -> Result<(), CasrError> {
+pub fn restore_backup(outcome: &AtomicWriteOutcome, provider_slug: &str) -> Result<(), AgsError> {
     if let Some(ref bak) = outcome.backup_path {
         warn!(
             backup = %bak.display(),
@@ -2546,7 +2546,7 @@ pub fn restore_backup(outcome: &AtomicWriteOutcome, provider_slug: &str) -> Resu
             "restoring backup after verification failure"
         );
         let _ = std::fs::remove_file(&outcome.target_path);
-        std::fs::rename(bak, &outcome.target_path).map_err(|e| CasrError::SessionWriteError {
+        std::fs::rename(bak, &outcome.target_path).map_err(|e| AgsError::SessionWriteError {
             path: outcome.target_path.clone(),
             provider: provider_slug.to_string(),
             detail: format!("failed to restore backup: {e}"),
@@ -2703,7 +2703,7 @@ mod tests {
         assert!(
             session.messages[0]
                 .content
-                .contains("[casr synthetic context]")
+                .contains("[ags synthetic context]")
         );
         assert!(
             session.messages[1]
@@ -2713,7 +2713,7 @@ mod tests {
         assert_eq!(
             session.messages[0]
                 .extra
-                .get("casr_enrichment")
+                .get("ags_enrichment")
                 .and_then(|v| v.as_bool()),
             Some(true)
         );
@@ -2763,12 +2763,7 @@ mod tests {
         fs::read_dir(dir)
             .expect("read temp dir")
             .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".casr-tmp-")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".ags-tmp-"))
             .count()
     }
 
@@ -2801,7 +2796,7 @@ mod tests {
 
         let err =
             atomic_write(&target, b"new content", false, "test").expect_err("should conflict");
-        assert!(matches!(err, CasrError::SessionConflict { .. }));
+        assert!(matches!(err, AgsError::SessionConflict { .. }));
         assert_eq!(
             fs::read_to_string(&target).expect("target should remain"),
             "existing"
@@ -2825,7 +2820,7 @@ mod tests {
             let err =
                 atomic_write(&target, b"new content", true, "test").expect_err("expected failure");
             assert!(
-                matches!(err, CasrError::SessionWriteError { .. }),
+                matches!(err, AgsError::SessionWriteError { .. }),
                 "expected SessionWriteError for stage {stage:?}, got {err:?}"
             );
 
@@ -2855,7 +2850,7 @@ mod tests {
         let _reset = with_fail_stage(AtomicWriteFailStage::BackupRename);
         let err =
             atomic_write(&target, b"new content", true, "test").expect_err("expected failure");
-        let CasrError::SessionWriteError { detail, .. } = err else {
+        let AgsError::SessionWriteError { detail, .. } = err else {
             panic!("expected SessionWriteError, got {err:?}");
         };
         assert!(

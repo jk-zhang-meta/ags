@@ -14,14 +14,14 @@
 //!
 //! ## Session ID scheme
 //!
-//! Aider has no native session IDs. casr derives a deterministic ID from the
-//! session start timestamp: `YYYY-MM-DDThh-mm-ss`. Histories written by casr
+//! Aider has no native session IDs. ags derives a deterministic ID from the
+//! session start timestamp: `YYYY-MM-DDThh-mm-ss`. Histories written by ags
 //! carry an ignored metadata comment with a unique `ags-<uuid>` ID.
 //!
 //! ## Multi-session files
 //!
 //! A single `.aider.chat.history.md` may contain many sessions (append-only).
-//! casr uses a virtual path scheme `<history-file>/<session-id>` (like Cursor)
+//! ags uses a virtual path scheme `<history-file>/<session-id>` (like Cursor)
 //! to address individual sessions within a multi-session file.
 //!
 //! ## Where the history file lives
@@ -41,12 +41,12 @@
 //!   `AIDER_CHAT_HISTORY_FILE` an alias for `--chat-history-file`.
 //!
 //! [`Aider::find_history_files`] reproduces that rule instead of approximating
-//! it, so running casr from anywhere inside a repository finds the same file
+//! it, so running ags from anywhere inside a repository finds the same file
 //! aider would append to.
 //!
 //! ## Writing
 //!
-//! casr never appends to Aider's shared history. Each conversion gets a
+//! ags never appends to Aider's shared history. Each conversion gets a
 //! dedicated `.aider.chat.history.ags-<uuid>.md`, and the launch specification
 //! passes that exact path through `--chat-history-file` together with
 //! `--restore-chat-history`.
@@ -89,12 +89,12 @@ struct ParsedSession {
 }
 
 impl Aider {
-    /// Tree casr scans for history files, from `AIDER_HOME`.
+    /// Tree ags scans for history files, from `AIDER_HOME`.
     ///
-    /// `AIDER_HOME` is **casr's own** override (the README's "casr's own
+    /// `AIDER_HOME` is **ags's own** override (the README's "ags's own
     /// override" column), not one of aider's: the aider 0.86.2 sdist contains
     /// no occurrence of the name, and aider has no `--home` argument for its
-    /// `auto_env_var_prefix="AIDER_"` parser to derive it from. It aims casr at
+    /// `auto_env_var_prefix="AIDER_"` parser to derive it from. It aims ags at
     /// a tree of checkouts without touching aider. Aider's *own* variable,
     /// `AIDER_CHAT_HISTORY_FILE`, is honoured separately in
     /// [`Self::find_history_files`].
@@ -105,7 +105,7 @@ impl Aider {
         None
     }
 
-    /// Find every `.aider.chat.history.md` casr can account for.
+    /// Find every `.aider.chat.history.md` ags can account for.
     ///
     /// Steps 2 and 3 reproduce aider's own resolution of the history path (see
     /// the module docs for the exact sdist references): the file lives at the
@@ -146,7 +146,7 @@ impl Aider {
     ) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = Vec::new();
 
-        // 1. casr's own override: scan the tree it points at.
+        // 1. ags's own override: scan the tree it points at.
         if let Some(home) = Self::home_dir() {
             Self::scan_for_history_files(&home, &mut files, unreadable, 4);
         }
@@ -1367,7 +1367,7 @@ Hi!
 
         // aider writes at the git work-tree root and finds it from anywhere
         // inside the repo (`aider/main.py:462` → `search_parent_directories`).
-        // casr must resolve the same file, not just the one in the CWD.
+        // ags must resolve the same file, not just the one in the CWD.
         let found = Aider::history_files_from(Some(&nested), &mut Vec::new());
         assert!(
             found.contains(&history),

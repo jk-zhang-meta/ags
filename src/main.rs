@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! casr — Cross Agent Session Resumer.
+//! ags — Cross Agent Session Resumer.
 //!
 //! CLI entry point: parses arguments, dispatches subcommands, renders output.
 
@@ -148,7 +148,7 @@ enum Command {
         /// a command to paste.
         ///
         /// On Unix this process is replaced by the agent, so it inherits the
-        /// terminal and there is no casr left waiting behind it.
+        /// terminal and there is no ags left waiting behind it.
         ///
         /// Aider and Cursor have no way to be pointed at a specific session.
         /// For those the agent is started plain, with a notice naming the file
@@ -373,13 +373,13 @@ fn init_tracing(cli: &Cli) {
 /// Rewrite ergonomic shorthand target flags into canonical resume commands.
 ///
 /// Supports:
-/// - `casr -cc <session-id> ...`
-/// - `casr -cod <session-id> ...`
-/// - `casr -gmi <session-id> ...`
-/// - `casr -agy <session-id> ...`
+/// - `ags -cc <session-id> ...`
+/// - `ags -cod <session-id> ...`
+/// - `ags -gmi <session-id> ...`
+/// - `ags -agy <session-id> ...`
 ///
 /// Rewritten form:
-/// `casr [global-options] resume <target> <session-id> ...`
+/// `ags [global-options] resume <target> <session-id> ...`
 fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
     if args.len() < 2 {
         return args;
@@ -389,7 +389,7 @@ fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
     let mut target_alias: Option<&'static str> = None;
 
     // Only scan option-like tokens before the first positional token.
-    // This preserves regular subcommand behavior (e.g., `casr list`).
+    // This preserves regular subcommand behavior (e.g., `ags convert list`).
     for (idx, arg) in args.iter().enumerate().skip(1) {
         let raw = arg.to_string_lossy();
         if raw == "--" {
@@ -436,7 +436,23 @@ fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
 
 fn main() -> ExitCode {
     let raw: Vec<OsString> = std::env::args_os().collect();
-    let first = raw.get(1).map(|arg| arg.to_string_lossy().into_owned());
+    // The word that decides which half this is, skipping the flags that belong
+    // to both. `--json`, `--verbose` and `--trace` are global, so `ags --json
+    // convert list` has to reach conversion — reading it as a runtime command
+    // instead printed the runtime's usage and exited 0, which is the worst
+    // possible answer: it looks like it worked.
+    let selector = raw
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, arg)| {
+            !matches!(
+                arg.to_string_lossy().as_ref(),
+                "--json" | "--verbose" | "--trace"
+            )
+        })
+        .map(|(index, arg)| (index, arg.to_string_lossy().into_owned()));
+    let first = selector.as_ref().map(|(_, word)| word.clone());
     // What people type is the session runtime — `ags ls`, `ags resume 7`,
     // `ags save`. Cross-provider conversion is the occasional errand, so it
     // lives under `ags convert` and the runtime owns the bare namespace.
@@ -448,9 +464,11 @@ fn main() -> ExitCode {
     // one of them is the only way both keep their names.
     let argv = match first.as_deref() {
         Some("convert") => {
+            // Drop just the `convert` word; the global flags around it stay.
+            let at = selector.as_ref().map_or(1, |(index, _)| *index);
             let mut rebuilt = Vec::with_capacity(raw.len().saturating_sub(1));
-            rebuilt.push(raw[0].clone());
-            rebuilt.extend(raw[2..].iter().cloned());
+            rebuilt.extend(raw[..at].iter().cloned());
+            rebuilt.extend(raw[at + 1..].iter().cloned());
             // The `-cc <id>` shorthand belongs to conversion, so it is only
             // rewritten once we know that is where we are.
             rewrite_shorthand_resume_args(rebuilt)
@@ -603,17 +621,17 @@ fn cmd_checkpoint(args: &[OsString]) -> ExitCode {
 
 /// Extract a short error type name for JSON output.
 fn error_type_name(e: &anyhow::Error) -> &'static str {
-    if let Some(casr_err) = e.downcast_ref::<ags::error::CasrError>() {
-        match casr_err {
-            ags::error::CasrError::SessionNotFound { .. } => "SessionNotFound",
-            ags::error::CasrError::AmbiguousSessionId { .. } => "AmbiguousSessionId",
-            ags::error::CasrError::UnknownProviderAlias { .. } => "UnknownProviderAlias",
-            ags::error::CasrError::ProviderUnavailable { .. } => "ProviderUnavailable",
-            ags::error::CasrError::SessionReadError { .. } => "SessionReadError",
-            ags::error::CasrError::SessionWriteError { .. } => "SessionWriteError",
-            ags::error::CasrError::SessionConflict { .. } => "SessionConflict",
-            ags::error::CasrError::ValidationError { .. } => "ValidationError",
-            ags::error::CasrError::VerifyFailed { .. } => "VerifyFailed",
+    if let Some(ags_err) = e.downcast_ref::<ags::error::AgsError>() {
+        match ags_err {
+            ags::error::AgsError::SessionNotFound { .. } => "SessionNotFound",
+            ags::error::AgsError::AmbiguousSessionId { .. } => "AmbiguousSessionId",
+            ags::error::AgsError::UnknownProviderAlias { .. } => "UnknownProviderAlias",
+            ags::error::AgsError::ProviderUnavailable { .. } => "ProviderUnavailable",
+            ags::error::AgsError::SessionReadError { .. } => "SessionReadError",
+            ags::error::AgsError::SessionWriteError { .. } => "SessionWriteError",
+            ags::error::AgsError::SessionConflict { .. } => "SessionConflict",
+            ags::error::AgsError::ValidationError { .. } => "ValidationError",
+            ags::error::AgsError::VerifyFailed { .. } => "VerifyFailed",
         }
     } else {
         "InternalError"
@@ -2598,7 +2616,7 @@ fn cmd_list(
         }
         if skipped.len() > SKIPPED_EXAMPLES {
             eprintln!(
-                "  … and {} more; `casr list --json` reports every one.",
+                "  … and {} more; `ags convert list --json` reports every one.",
                 skipped.len() - SKIPPED_EXAMPLES
             );
         }
@@ -2659,7 +2677,7 @@ fn cmd_list(
                 "No sessions found for {} {}. Run {} to check provider status.",
                 workspace_scope_label.cyan(),
                 workspace_scope.cyan(),
-                "casr providers".cyan(),
+                "ags convert providers".cyan(),
             );
             return Ok(());
         }
@@ -2782,7 +2800,7 @@ fn cmd_list(
 
             console.print_renderable(&table);
         }
-        console.print("[dim]Tip:[/] run [bold]casr info <session-id>[/] for full metadata.");
+        console.print("[dim]Tip:[/] run [bold]ags convert info <session-id>[/] for full metadata.");
     }
 
     Ok(())
@@ -2838,7 +2856,7 @@ fn cmd_info(
         .as_deref()
         .map(|alias| {
             registry.find_by_alias(alias).ok_or_else(|| {
-                ags::error::CasrError::UnknownProviderAlias {
+                ags::error::AgsError::UnknownProviderAlias {
                     alias: alias.to_string(),
                     known_aliases: registry.known_aliases(),
                 }

@@ -1,4 +1,4 @@
-//! `casr list` must tell the truth about what it found.
+//! `ags convert list` must tell the truth about what it found.
 //!
 //! Three failures of that, all of which look identical to the user — a short
 //! listing:
@@ -20,12 +20,12 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-/// A `casr` invocation whose every provider home points inside `tmp`.
+/// A `ags` invocation whose every provider home points inside `tmp`.
 ///
-/// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* casr's own
+/// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* ags's own
 /// session store, so leaving it unset would have these tests create
 /// `~/.local/share/ags` on the machine running them.
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -57,12 +57,12 @@ fn casr_cmd(tmp: &TempDir) -> Command {
     cmd
 }
 
-/// Run `casr list --json` and return the parsed envelope.
+/// Run `ags convert list --json` and return the parsed envelope.
 fn list_json(tmp: &TempDir) -> serde_json::Value {
-    let output = casr_cmd(tmp)
+    let output = ags_cmd(tmp)
         .args(["list", "--json"])
         .output()
-        .expect("casr list should run");
+        .expect("ags convert list should run");
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -262,7 +262,7 @@ fn every_registered_provider_narrows_the_default_session_file_rule() {
 /// `list` reads `~/.claude/projects`, and neither of those implies it. Without
 /// this the user gets `✓ Claude Code — /root/.claude exists` from one command
 /// and an empty listing from the other, and nothing anywhere distinguishes
-/// "no sessions yet" from "casr is reading a directory that does not exist".
+/// "no sessions yet" from "ags is reading a directory that does not exist".
 ///
 /// The evidence is checked, not `installed`: narrowing `detect` to require the
 /// store would report `✗` for a CLI the user can run right now, which is a
@@ -273,10 +273,10 @@ fn detection_names_the_store_list_reads_when_it_is_absent() {
     fs::create_dir_all(tmp.path().join("claude")).expect("mkdir claude home");
     let projects = tmp.path().join("claude").join("projects");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["providers", "--json"])
         .output()
-        .expect("casr providers should run");
+        .expect("ags convert providers should run");
     let providers: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("providers --json is an array");
     let claude = providers
@@ -311,10 +311,10 @@ fn detection_distinguishes_a_store_that_exists_from_one_that_does_not() {
     fs::create_dir_all(without_store.path().join("claude")).expect("mkdir");
 
     let evidence_for = |tmp: &TempDir| -> String {
-        let output = casr_cmd(tmp)
+        let output = ags_cmd(tmp)
             .args(["providers", "--json"])
             .output()
-            .expect("casr providers should run");
+            .expect("ags convert providers should run");
         let providers: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("providers --json is an array");
         providers
@@ -487,7 +487,7 @@ fn vibe_metadata_sidecar_is_not_rendered_as_a_session() {
   "git_commit": null,
   "git_branch": null,
   "environment": {"working_directory": null},
-  "username": "casr",
+  "username": "ags",
   "total_messages": 1
 }
 "#,

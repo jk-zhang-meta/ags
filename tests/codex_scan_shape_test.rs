@@ -1,10 +1,10 @@
-//! What Codex 0.145.0 will offer, and what casr's listing may therefore claim.
+//! What Codex 0.145.0 will offer, and what ags's listing may therefore claim.
 //!
 //! Every expectation here was measured against the shipped `@openai/codex`
 //! 0.145.0 binary, by driving its own `codex app-server` over stdio with
 //! `thread/list` while real rollouts sat at chosen paths under a throwaway
 //! `CODEX_HOME`. `src/providers/codex.rs` records the full matrix; these tests
-//! hold casr to it from the outside.
+//! hold ags to it from the outside.
 //!
 //! The line each test is drawing is the same one: a listing is an answer to
 //! "what is there", and it is wrong in two directions. Claiming a file Codex
@@ -183,7 +183,7 @@ fn listing_is_exactly_what_codex_would_offer() {
         COMPRESSED_ROLLOUT,
     );
     // The three components are integers, not a date: `thread/list` returns a
-    // rollout under `2026/255/18` and casr must not be stricter than the tool.
+    // rollout under `2026/255/18` and ags must not be stricter than the tool.
     plant(
         home,
         "sessions/2026/255/18/rollout-2026-07-28T03-00-00-oddday.jsonl",
@@ -246,7 +246,7 @@ fn listing_is_exactly_what_codex_would_offer() {
 /// read it is the honest answer; leaving it out of the listing is not.
 ///
 /// `cmd_list` turns this `Err` into a `skipped` row carrying the path and the
-/// message, which is the only channel that can distinguish "casr cannot read
+/// message, which is the only channel that can distinguish "ags cannot read
 /// this one" from "there is nothing there".
 #[test]
 fn compressed_rollout_is_reported_rather_than_silently_dropped() {
@@ -272,7 +272,7 @@ fn compressed_rollout_is_reported_rather_than_silently_dropped() {
         ("read_session_ir", Codex.read_session_ir(&path).err()),
     ] {
         let error = error.unwrap_or_else(|| {
-            panic!("{label} claimed to have decoded a zstd frame casr cannot decompress")
+            panic!("{label} claimed to have decoded a zstd frame ags cannot decompress")
         });
         let text = format!("{error}");
         assert!(
@@ -286,7 +286,7 @@ fn compressed_rollout_is_reported_rather_than_silently_dropped() {
 ///
 /// Codex withholds an archived thread from a plain `thread/list` and a subagent
 /// thread from the default `sourceKinds`, and it still resumes either one when
-/// named. A user who asks casr to convert a session by id has named it, so the
+/// named. A user who asks ags to convert a session by id has named it, so the
 /// exclusions above must not reach [`Provider::owns_session`].
 #[test]
 fn withheld_rollouts_are_still_resolvable_by_id() {
@@ -364,7 +364,7 @@ fn withheld_rollouts_are_still_resolvable_by_id() {
 /// corpus proves it fires on the shape Codex actually emits, and the margin is
 /// not small: on the store this was measured against, 576 of 660 rollouts are
 /// subagent threads. A regression here does not lose a corner case, it turns
-/// `casr list` for Codex into 87% noise.
+/// `ags convert list` for Codex into 87% noise.
 ///
 /// The cross-check is the point. `Codex::list_sessions` keys on
 /// `session_meta.payload.source`, the field `thread/list` derives its
@@ -495,7 +495,7 @@ fn rollout_layout_is_three_integer_levels_under_a_named_root() {
     ] {
         assert!(
             Codex.is_session_path(&base.join(dirs).join(name)),
-            "0.145.0 lists a rollout under {dirs}, so casr must claim it"
+            "0.145.0 lists a rollout under {dirs}, so ags must claim it"
         );
     }
 
@@ -526,7 +526,7 @@ fn rollout_layout_is_three_integer_levels_under_a_named_root() {
     ] {
         assert!(
             !Codex.is_session_path(&base.join(dirs).join(name)),
-            "0.145.0 does not list a rollout under {dirs}, so casr must not invent one"
+            "0.145.0 does not list a rollout under {dirs}, so ags must not invent one"
         );
     }
 

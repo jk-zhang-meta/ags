@@ -1,12 +1,12 @@
 # CASS Independence Policy
 
-casr **must not** depend on `coding_agent_session_search` (CASS) at runtime. This is a hard architectural constraint, not a suggestion.
+ags **must not** depend on `coding_agent_session_search` (CASS) at runtime. This is a hard architectural constraint, not a suggestion.
 
 ## Rules
 
 1. **No Cargo dependency.** `Cargo.toml` must never contain a `path`, `git`, or `crates.io` reference to `coding_agent_session_search`. CI enforces this with a grep guardrail.
 
-2. **Vendored code is self-contained.** Any logic adapted from CASS must compile and run solely within the casr crate. No `extern crate`, no `use coding_agent_session_search::*`.
+2. **Vendored code is self-contained.** Any logic adapted from CASS must compile and run solely within the ags crate. No `extern crate`, no `use coding_agent_session_search::*`.
 
 3. **New provider adaptations follow the same policy.** If CASS adds a new connector that we want to port, we vendor-adapt the relevant parsing/writing logic into `src/providers/`.
 
@@ -14,9 +14,9 @@ casr **must not** depend on `coding_agent_session_search` (CASS) at runtime. Thi
 
 ## Rationale
 
-- **Different concerns.** CASS indexes sessions for search; casr converts them for resumption. The dependency trees diverge (CASS pulls SQLite, tantivy, etc.).
-- **Binary size.** casr ships as a lean static binary (<5 MB target). A CASS dependency would balloon this.
-- **Release independence.** Breaking changes in CASS model types should not force casr releases.
+- **Different concerns.** CASS indexes sessions for search; ags converts them for resumption. The dependency trees diverge (CASS pulls SQLite, tantivy, etc.).
+- **Binary size.** ags ships as a lean static binary (<5 MB target). A CASS dependency would balloon this.
+- **Release independence.** Breaking changes in CASS model types should not force ags releases.
 
 ## Enforcement
 
@@ -25,4 +25,4 @@ casr **must not** depend on `coding_agent_session_search` (CASS) at runtime. Thi
 
 ## See Also
 
-- [CASS Porting Notes](./cass-porting-notes.md) — maps CASS source files to their casr adaptations.
+- [CASS Porting Notes](./cass-porting-notes.md) — maps CASS source files to their ags adaptations.

@@ -2,7 +2,7 @@
 //!
 //! The Bash program owns checkpoint encryption, synchronization, and restore
 //! transactions. Rust only selects a supported Bash and exposes the current
-//! `casr` executable for cross-provider conversion.
+//! `ags` executable for cross-provider conversion.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -25,7 +25,7 @@ pub fn run(args: &[OsString]) -> Result<ExitStatus> {
 
 fn runtime_command(args: &[OsString]) -> Result<(tempfile::NamedTempFile, Command)> {
     let (bash, homebrew_prefix) = runtime_bash()?;
-    let current_exe = std::env::current_exe().context("cannot locate the casr executable")?;
+    let current_exe = std::env::current_exe().context("cannot locate the ags executable")?;
     let mut script = tempfile::Builder::new()
         .prefix("ags-checkpoint-")
         .suffix(".sh")
@@ -54,7 +54,7 @@ fn runtime_command(args: &[OsString]) -> Result<(tempfile::NamedTempFile, Comman
     Ok((script, command))
 }
 
-/// Return an installer asset carried by the verified casr binary.
+/// Return an installer asset carried by the verified ags binary.
 pub fn asset(name: &str) -> Option<&'static str> {
     match name {
         "skill" => Some(AGS_SKILL),

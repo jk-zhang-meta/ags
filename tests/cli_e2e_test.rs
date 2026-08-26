@@ -1,4 +1,4 @@
-//! End-to-end CLI integration tests for casr.
+//! End-to-end CLI integration tests for ags.
 //!
 //! Uses `assert_cmd` to invoke the compiled binary and validate output.
 //! All tests use temp directories with env overrides (`CLAUDE_HOME`,
@@ -19,11 +19,11 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Build a `Command` for the casr binary with isolated provider homes.
+/// Build a `Command` for the ags binary with isolated provider homes.
 ///
 /// Sets provider home overrides to subdirs of the provided temp dir so the
 /// CLI never touches real provider data.
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     cmd.env("CLAUDE_HOME", tmp.path().join("claude"))
@@ -288,7 +288,7 @@ fn setup_vibe_fixture(tmp: &TempDir, session_id: &str) -> String {
             "git_commit": null,
             "git_branch": null,
             "environment": {"working_directory": null},
-            "username": "casr",
+            "username": "ags",
             "total_messages": total_messages,
         }))
         .expect("serialize Vibe metadata"),
@@ -304,7 +304,7 @@ fn setup_vibe_fixture(tmp: &TempDir, session_id: &str) -> String {
 #[test]
 fn cli_version_outputs_metadata() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .arg("--version")
         .assert()
         .success()
@@ -314,7 +314,7 @@ fn cli_version_outputs_metadata() {
 #[test]
 fn cli_help_outputs_usage() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .arg("--help")
         .assert()
         .success()
@@ -328,7 +328,7 @@ fn cli_help_outputs_usage() {
 #[test]
 fn cli_no_args_shows_error() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .assert()
         .failure()
         .stderr(predicate::str::contains("Usage"));
@@ -337,7 +337,7 @@ fn cli_no_args_shows_error() {
 #[test]
 fn cli_invalid_subcommand_fails() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp).arg("nonexistent").assert().failure();
+    ags_cmd(&tmp).arg("nonexistent").assert().failure();
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +347,7 @@ fn cli_invalid_subcommand_fails() {
 #[test]
 fn cli_providers_succeeds() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .arg("providers")
         .assert()
         .success()
@@ -364,7 +364,7 @@ fn cli_providers_succeeds() {
 #[test]
 fn cli_providers_json_is_valid() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "providers"])
         .output()
         .expect("providers should run");
@@ -383,7 +383,7 @@ fn cli_providers_json_is_valid() {
 #[test]
 fn cli_list_empty_shows_helpful_message() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .arg("list")
         .assert()
         .success()
@@ -394,7 +394,7 @@ fn cli_list_empty_shows_helpful_message() {
 fn cli_list_finds_cc_sessions() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["list", "--workspace", "/data/projects/myapp"])
         .assert()
         .success()
@@ -414,7 +414,7 @@ fn cli_list_shows_full_session_id_and_last_active_for_current_project_scope() {
         Some("366bd160-20b3-4e69-b0be-5a559ef5ffec"),
     );
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .current_dir(&workspace)
         .arg("list")
         .assert()
@@ -435,7 +435,7 @@ fn cli_list_shows_full_session_id_and_last_active_for_current_project_scope() {
 fn cli_list_json_is_valid_array() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
         .expect("list should run");
@@ -466,7 +466,7 @@ fn cli_list_limit_respects_bound() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
     setup_cc_fixture_custom(&tmp, "cc_malformed", Some("/data/projects/myapp"), None);
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
@@ -489,7 +489,7 @@ fn cli_list_limit_applies_per_provider() {
     setup_cc_fixture_custom(&tmp, "cc_simple", Some("/data/projects/backend"), None);
     setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
@@ -536,7 +536,7 @@ fn cli_list_workspace_filter_filters_sessions() {
     let myapp_id = setup_cc_fixture(&tmp, "cc_simple"); // /data/projects/myapp
     let webapp_id = setup_cc_fixture(&tmp, "cc_complex"); // /data/projects/webapp
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
         .expect("list should run");
@@ -580,7 +580,7 @@ fn cli_list_without_workspace_filter_includes_workspace_less_provider() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_vibe_fixture(&tmp, "vibe-unplaced-0001");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["--json", "list", "--provider", "vibe"])
         .output()
@@ -611,7 +611,7 @@ fn cli_list_without_workspace_filter_says_which_sessions_are_unplaced() {
     let tmp = TempDir::new().unwrap();
     setup_vibe_fixture(&tmp, "vibe-unplaced-0002");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["list", "--provider", "vibe"])
         .assert()
@@ -628,7 +628,7 @@ fn cli_list_explicit_workspace_filter_hides_unplaceable_sessions_and_says_so() {
     let tmp = TempDir::new().unwrap();
     let vibe_id = setup_vibe_fixture(&tmp, "vibe-unplaced-0003");
 
-    let assert = casr_cmd(&tmp)
+    let assert = ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args([
             "--json",
@@ -665,7 +665,7 @@ fn cli_list_explicit_workspace_filter_still_selects_among_reporting_providers() 
     let webapp_id = setup_cc_fixture(&tmp, "cc_complex"); // /data/projects/webapp
     setup_vibe_fixture(&tmp, "vibe-unplaced-0004");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
@@ -702,7 +702,7 @@ fn cli_list_explicit_workspace_filter_still_selects_among_reporting_providers() 
 // file the reader rejected left the listing through the same door as a file
 // that was never a session: no error, no warning, no count. The listing was
 // short, and nothing anywhere said short of what. The same file read through
-// `casr info` fails loudly and exits non-zero, which is what makes the silence
+// `ags convert info` fails loudly and exits non-zero, which is what makes the silence
 // a defect rather than a policy.
 
 /// One bad file among good ones: the good ones still list, and the bad one is
@@ -714,7 +714,7 @@ fn cli_list_names_the_session_file_it_could_not_read() {
     write_good_gemini_session(&tmp, "gmi-readable-0002");
     let corrupt = write_corrupt_gemini_session(&tmp, "gmi-corrupt-0003");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["list", "--provider", "gemini"])
         .assert()
@@ -737,7 +737,7 @@ fn cli_list_json_carries_the_session_files_it_could_not_read() {
     write_good_gemini_session(&tmp, "gmi-readable-0011");
     let corrupt = write_corrupt_gemini_session(&tmp, "gmi-corrupt-0012");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["--json", "list", "--provider", "gemini"])
         .output()
@@ -779,7 +779,7 @@ fn cli_list_says_so_when_a_whole_directory_will_not_parse() {
     write_corrupt_gemini_session(&tmp, "gmi-corrupt-0022");
     write_corrupt_gemini_session(&tmp, "gmi-corrupt-0023");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["list", "--provider", "gemini"])
         .output()
@@ -822,7 +822,7 @@ fn cli_list_is_quiet_when_nothing_was_skipped() {
     )
     .unwrap();
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .current_dir(tmp.path())
         .args(["--json", "list", "--provider", "gemini"])
         .output()
@@ -855,7 +855,7 @@ fn cli_list_sort_messages_orders_descending() {
     let complex_id =
         setup_cc_fixture_custom(&tmp, "cc_complex", Some("/data/projects/myapp"), None);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
@@ -892,7 +892,7 @@ fn cli_list_sort_messages_orders_descending() {
 fn cli_info_shows_session_details() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["info", &session_id])
         .assert()
         .success()
@@ -905,7 +905,7 @@ fn cli_info_shows_session_details() {
 fn cli_info_json_is_valid() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &session_id])
         .output()
         .expect("info should run");
@@ -921,7 +921,7 @@ fn cli_info_json_is_valid() {
 #[test]
 fn cli_info_unknown_session_fails() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["info", "nonexistent-session-id"])
         .assert()
         .failure()
@@ -931,7 +931,7 @@ fn cli_info_unknown_session_fails() {
 #[test]
 fn cli_info_unknown_session_json_error() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "nonexistent-session-id"])
         .output()
         .expect("info should run");
@@ -954,7 +954,7 @@ fn cli_resume_dry_run_does_not_write() {
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
     // Resume CC→Codex with dry run.
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cod", &session_id, "--dry-run"])
         .assert()
         .success()
@@ -982,7 +982,7 @@ fn cli_resume_writes_target_session() {
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
     // Resume CC→Codex (actual write).
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cod", &session_id])
         .assert()
         .success()
@@ -1014,7 +1014,7 @@ fn cli_resume_json_output_is_valid() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id, "--dry-run"])
         .output()
         .expect("resume should run");
@@ -1034,7 +1034,7 @@ fn cli_resume_unknown_target_fails() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "nonexistent", &session_id])
         .assert()
         .failure()
@@ -1044,7 +1044,7 @@ fn cli_resume_unknown_target_fails() {
 #[test]
 fn cli_resume_unknown_session_fails() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cod", "nonexistent-session"])
         .assert()
         .failure()
@@ -1056,7 +1056,7 @@ fn cli_resume_cc_to_gemini_works() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "gmi", &session_id])
         .assert()
         .success()
@@ -1085,7 +1085,7 @@ fn cli_resume_shorthand_cod_flag_works() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["-cod", &session_id, "--dry-run"])
         .assert()
         .success()
@@ -1098,7 +1098,7 @@ fn cli_resume_shorthand_cc_flag_works() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["-cc", &session_id, "--dry-run"])
         .assert()
         .success()
@@ -1111,7 +1111,7 @@ fn cli_resume_shorthand_gmi_flag_works_in_json_mode() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "-gmi", &session_id, "--dry-run"])
         .output()
         .expect("shorthand -gmi should run");
@@ -1131,7 +1131,7 @@ fn cli_resume_standard_name_claude_target_works() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "claude", &session_id, "--dry-run"])
         .assert()
         .success()
@@ -1144,7 +1144,7 @@ fn cli_resume_source_standard_name_claude_works() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args([
             "resume",
             "codex",
@@ -1177,12 +1177,12 @@ fn cli_list_defaults_to_current_workspace_and_top_10() {
     setup_cc_fixture_custom(
         &tmp,
         "cc_simple",
-        Some("/tmp/not-current-casr-workspace"),
+        Some("/tmp/not-current-ags-workspace"),
         Some(out_of_scope_sid),
     );
 
     // Default list: current workspace + top 10 recent.
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list"])
         .output()
         .expect("list should run");
@@ -1213,12 +1213,12 @@ fn cli_list_defaults_to_current_workspace_and_top_10() {
     }
 
     // Explicit workspace override should include the out-of-scope session.
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
             "--workspace",
-            "/tmp/not-current-casr-workspace",
+            "/tmp/not-current-ags-workspace",
         ])
         .output()
         .expect("list --workspace should run");
@@ -1241,7 +1241,7 @@ fn cli_list_provider_filter_accepts_claude_standard_name() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
@@ -1278,7 +1278,7 @@ fn cli_resume_cc_to_cursor_refuses_real_and_dry_run_without_state() {
         if dry_run {
             args.push("--dry-run");
         }
-        let output = casr_cmd(&tmp)
+        let output = ags_cmd(&tmp)
             .env("CLINE_BIN", tmp.path().join("missing-cline"))
             .args(args)
             .output()
@@ -1306,7 +1306,7 @@ fn cli_resume_cursor_to_cc_works_with_source_hint() {
     std::fs::create_dir_all(cursor_db.parent().unwrap()).unwrap();
     std::fs::copy(fixtures_dir().join("cursor/state.vscdb"), &cursor_db).unwrap();
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", "cur-composer-001", "--source", "cur"])
         .assert()
         .success()
@@ -1325,7 +1325,7 @@ fn cli_resume_cc_to_cline_refuses_real_and_dry_run_without_state() {
         if dry_run {
             args.push("--dry-run");
         }
-        let output = casr_cmd(&tmp)
+        let output = ags_cmd(&tmp)
             .env("OPENCLAW_BIN", tmp.path().join("missing-openclaw"))
             .args(args)
             .output()
@@ -1351,7 +1351,7 @@ fn cli_resume_cline_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let cline_session_id = setup_cline_fixture(&tmp);
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", cline_session_id, "--source", "cln"])
         .assert()
         .success()
@@ -1365,7 +1365,7 @@ fn cli_resume_cc_to_amp_works_and_is_discoverable() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "amp", &session_id])
         .output()
         .expect("resume should run");
@@ -1388,7 +1388,7 @@ fn cli_resume_cc_to_amp_works_and_is_discoverable() {
         "Amp thread file should exist after CC→Amp conversion"
     );
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args([
             "--json",
             "resume",
@@ -1407,7 +1407,7 @@ fn cli_resume_amp_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let source_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let amp_result = casr_cmd(&tmp)
+    let amp_result = ags_cmd(&tmp)
         .args(["--json", "resume", "amp", &source_id])
         .output()
         .expect("CC→Amp seed conversion should run");
@@ -1418,7 +1418,7 @@ fn cli_resume_amp_to_cc_works_with_source_hint() {
         .as_str()
         .expect("amp target_session_id should be present");
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", amp_session_id, "--source", "amp"])
         .assert()
         .success()
@@ -1432,7 +1432,7 @@ fn cli_resume_cc_to_aider_writes_only_an_independent_history() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let dry_run = casr_cmd(&tmp)
+    let dry_run = ags_cmd(&tmp)
         .args(["--json", "resume", "aid", &session_id, "--dry-run"])
         .output()
         .expect("dry run should run");
@@ -1442,7 +1442,7 @@ fn cli_resume_cc_to_aider_writes_only_an_independent_history() {
         "Aider dry run created provider state"
     );
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "aid", &session_id])
         .output()
         .expect("resume should run");
@@ -1482,7 +1482,7 @@ fn cli_resume_aider_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let aider_session_id = setup_aider_fixture(&tmp);
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", &aider_session_id, "--source", "aid"])
         .assert()
         .success()
@@ -1501,7 +1501,7 @@ fn cli_resume_cc_to_opencode_requires_the_official_cli_for_real_and_dry_run() {
         if dry_run {
             args.push("--dry-run");
         }
-        let output = casr_cmd(&tmp)
+        let output = ags_cmd(&tmp)
             .args(args)
             .output()
             .expect("resume should run");
@@ -1526,7 +1526,7 @@ fn cli_resume_opencode_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let opencode_session_id = setup_opencode_fixture(&tmp);
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", opencode_session_id, "--source", "opc"])
         .assert()
         .success()
@@ -1549,7 +1549,7 @@ fn cli_resume_cc_to_chatgpt_refuses_real_and_dry_run_without_files() {
         if dry_run {
             args.push("--dry-run");
         }
-        let output = casr_cmd(&tmp)
+        let output = ags_cmd(&tmp)
             .args(args)
             .output()
             .expect("resume should run");
@@ -1574,7 +1574,7 @@ fn cli_resume_chatgpt_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let gpt_session_id = setup_chatgpt_fixture(&tmp);
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", gpt_session_id, "--source", "gpt"])
         .assert()
         .success()
@@ -1592,7 +1592,7 @@ fn cli_resume_cc_to_clawdbot_works_and_is_discoverable() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cwb", &session_id])
         .output()
         .expect("resume should run");
@@ -1619,7 +1619,7 @@ fn cli_resume_clawdbot_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let source_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let cwb_result = casr_cmd(&tmp)
+    let cwb_result = ags_cmd(&tmp)
         .args(["--json", "resume", "cwb", &source_id])
         .output()
         .expect("CC→ClawdBot seed conversion should run");
@@ -1631,7 +1631,7 @@ fn cli_resume_clawdbot_to_cc_works_with_source_hint() {
         .expect("clawdbot target_session_id should be present");
 
     // Use --force since the session ID may match the source CC session.
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["resume", "cc", cwb_session_id, "--source", "cwb", "--force"])
         .assert()
         .success()
@@ -1649,7 +1649,7 @@ fn cli_resume_cc_to_vibe_works_and_is_discoverable() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "vib", &session_id])
         .output()
         .expect("resume should run");
@@ -1673,7 +1673,7 @@ fn cli_resume_vibe_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let source_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let vibe_result = casr_cmd(&tmp)
+    let vibe_result = ags_cmd(&tmp)
         .args(["--json", "resume", "vib", &source_id])
         .output()
         .expect("CC→Vibe seed conversion should run");
@@ -1685,7 +1685,7 @@ fn cli_resume_vibe_to_cc_works_with_source_hint() {
         .expect("vibe target_session_id should be present");
 
     // Use --force since the session ID may match the source CC session.
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -1710,7 +1710,7 @@ fn cli_resume_cc_to_factory_works_and_is_discoverable() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "fac", &session_id])
         .output()
         .expect("resume should run");
@@ -1737,7 +1737,7 @@ fn cli_resume_factory_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let source_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let factory_result = casr_cmd(&tmp)
+    let factory_result = ags_cmd(&tmp)
         .args(["--json", "resume", "fac", &source_id])
         .output()
         .expect("CC→Factory seed conversion should run");
@@ -1749,7 +1749,7 @@ fn cli_resume_factory_to_cc_works_with_source_hint() {
         .expect("factory target_session_id should be present");
 
     // Use --force since the session ID may match the source CC session.
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -1779,7 +1779,7 @@ fn cli_resume_cc_to_openclaw_refuses_without_official_cli() {
         if dry_run {
             args.push("--dry-run");
         }
-        let output = casr_cmd(&tmp)
+        let output = ags_cmd(&tmp)
             .args(args)
             .output()
             .expect("resume should run");
@@ -1804,7 +1804,7 @@ fn cli_resume_openclaw_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let openclaw_session_id = setup_openclaw_fixture(&tmp);
 
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -1829,7 +1829,7 @@ fn cli_resume_cc_to_piagent_works_and_is_discoverable() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "pi", &session_id])
         .output()
         .expect("resume should run");
@@ -1856,7 +1856,7 @@ fn cli_resume_piagent_to_cc_works_with_source_hint() {
     let tmp = TempDir::new().unwrap();
     let source_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let piagent_result = casr_cmd(&tmp)
+    let piagent_result = ags_cmd(&tmp)
         .args(["--json", "resume", "pi", &source_id])
         .output()
         .expect("CC→PiAgent seed conversion should run");
@@ -1868,7 +1868,7 @@ fn cli_resume_piagent_to_cc_works_with_source_hint() {
         .expect("piagent target_session_id should be present");
 
     // Use --force since the session ID may match the source CC session.
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -1975,7 +1975,7 @@ fn cli_launch_dry_run_prints_a_command_that_parses_back_to_the_spec() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["resume", "cod", &session_id, "--launch-dry-run"])
         .output()
         .expect("launch dry run should run");
@@ -2005,7 +2005,7 @@ fn cli_launch_dry_run_appends_passthrough_flags() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "resume",
             "cod",
@@ -2038,7 +2038,7 @@ fn cli_launch_refuses_a_passthrough_flag_that_would_retarget_the_session() {
     // The real `--launch` path, not the dry run: the claim is that the conflict
     // is caught *before* anything is started. `PATH` is empty so a regression
     // that got as far as spawning would fail on the program instead.
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .env("PATH", empty_path(&tmp))
         .args([
             "resume",
@@ -2072,7 +2072,7 @@ fn cli_launch_refuses_a_conversion_that_lost_part_of_the_conversation() {
     let tmp = TempDir::new().unwrap();
     let session_id = write_codex_rollout(&tmp, "codex-compacted-001", CODEX_COMPACTED_ROLLOUT);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -2102,7 +2102,7 @@ fn cli_launch_refuses_a_conversion_that_lost_part_of_the_conversation() {
     );
 
     // And the override is an override, not a suggestion.
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -2132,7 +2132,7 @@ fn cli_launch_refusal_keeps_the_json_envelope_parseable() {
     let tmp = TempDir::new().unwrap();
     let session_id = write_codex_rollout(&tmp, "codex-compacted-002", CODEX_COMPACTED_ROLLOUT);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "resume",
@@ -2199,7 +2199,7 @@ fn cli_launch_dry_run_targets_the_independent_aider_history() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["resume", "aid", &session_id, "--launch-dry-run"])
         .output()
         .expect("launch dry run should run");
@@ -2230,7 +2230,7 @@ fn cli_launch_reports_a_missing_agent_as_missing_rather_than_as_a_failed_convers
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .env("PATH", empty_path(&tmp))
         .args(["resume", "cod", &session_id, "--launch"])
         .output()
@@ -2261,7 +2261,7 @@ fn json_interactive_launch_is_refused_before_starting_the_agent() {
         "#!/bin/sh\ntouch \"$AGENT_LAUNCH_MARKER\"\nexit 97\n",
     );
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .env("PATH", &bin)
         .env("AGENT_LAUNCH_MARKER", &marker)
         .args(["--json", "resume", "cod", &session_id, "--launch"])
@@ -2297,7 +2297,7 @@ fn cli_launch_flags_are_refused_where_they_would_do_nothing() {
         vec!["--launch", "--launch-dry-run"],
         vec!["--launch", "--dry-run"],
     ] {
-        let mut cmd = casr_cmd(&tmp);
+        let mut cmd = ags_cmd(&tmp);
         cmd.args(["resume", "cod", &session_id]).args(&extra);
         cmd.assert()
             .failure()
@@ -2312,7 +2312,7 @@ fn cli_launch_flags_are_refused_where_they_would_do_nothing() {
 #[test]
 fn cli_completions_bash() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["completions", "bash"])
         .assert()
         .success()
@@ -2322,7 +2322,7 @@ fn cli_completions_bash() {
 #[test]
 fn cli_completions_invalid_shell() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["completions", "ksh"])
         .assert()
         .failure();
@@ -2335,7 +2335,7 @@ fn cli_completions_invalid_shell() {
 #[test]
 fn cli_verbose_flag_accepted() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["--verbose", "providers"])
         .assert()
         .success();
@@ -2344,7 +2344,7 @@ fn cli_verbose_flag_accepted() {
 #[test]
 fn cli_trace_flag_accepted() {
     let tmp = TempDir::new().unwrap();
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["--trace", "providers"])
         .assert()
         .success();
@@ -2354,7 +2354,7 @@ fn cli_trace_flag_accepted() {
 fn cli_verbose_emits_debug_logs() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["--verbose", "resume", "cod", &session_id, "--dry-run"])
         .assert()
         .success()
@@ -2368,7 +2368,7 @@ fn cli_verbose_emits_debug_logs() {
 fn cli_trace_emits_trace_logs() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
-    casr_cmd(&tmp)
+    ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .assert()
         .success()
@@ -2394,7 +2394,7 @@ fn cli_resume_structured_track_honours_the_context_budget() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_complex");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "resume",
@@ -2455,7 +2455,7 @@ fn cli_resume_structured_track_without_flags_carries_everything() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_complex");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id])
         .output()
         .expect("resume should run");
@@ -2496,7 +2496,7 @@ fn cli_resume_flat_track_budget_is_opt_in() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_complex");
 
-    let plain = casr_cmd(&tmp)
+    let plain = ags_cmd(&tmp)
         .args(["--json", "resume", "gmi", &session_id, "--no-store"])
         .output()
         .expect("resume should run");
@@ -2522,7 +2522,7 @@ fn cli_resume_flat_track_budget_is_opt_in() {
         plain["warnings"]
     );
 
-    let asked = casr_cmd(&tmp)
+    let asked = ags_cmd(&tmp)
         .args([
             "--json",
             "resume",
@@ -2562,7 +2562,7 @@ fn cli_resume_flat_track_budget_is_opt_in() {
 /// *absent*, which is the same defect one flag over. The inverted sense had to
 /// go with it: an absent `--keep-reasoning` cannot mean "delete".
 ///
-/// `--keep-reasoning` stays accepted so that an existing casr command line does
+/// `--keep-reasoning` stays accepted so that an existing ags command line does
 /// not start erroring, and it now names the default. Passing both is a genuine
 /// contradiction and is refused rather than resolved by picking one.
 #[test]
@@ -2573,7 +2573,7 @@ fn cli_resume_reasoning_is_kept_unless_dropping_is_asked_for() {
         let session_id = setup_codex_fixture(&tmp, "codex_reasoning", "jsonl");
         let mut argv: Vec<String> = vec!["--json".into(), "resume".into(), "cc".into(), session_id];
         argv.extend(args.iter().map(|a| (*a).to_string()));
-        let output = casr_cmd(&tmp)
+        let output = ags_cmd(&tmp)
             .args(&argv)
             .output()
             .expect("resume should run");
@@ -2622,7 +2622,7 @@ fn cli_resume_reasoning_is_kept_unless_dropping_is_asked_for() {
     // Contradictory, so refused — clap's own usage error, exit code 2.
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_reasoning", "jsonl");
-    let both = casr_cmd(&tmp)
+    let both = ags_cmd(&tmp)
         .args([
             "resume",
             "cc",
@@ -2657,7 +2657,7 @@ fn cli_json_launch_preparation_failure_is_one_coherent_object() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .env("PATH", empty_path(&tmp))
         .args([
             "--json",
@@ -2702,7 +2702,7 @@ fn cli_json_launch_dry_run_still_reports_success() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cc", &session_id, "--launch-dry-run"])
         .output()
         .expect("launch dry run should run");
@@ -2733,7 +2733,7 @@ fn cli_resume_by_record_id_says_which_session_it_converted() {
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
     // First conversion, with the store on, files this conversation as a record.
-    let first = casr_cmd(&tmp)
+    let first = ags_cmd(&tmp)
         .args(["--json", "resume", "cc", &session_id])
         .output()
         .expect("first conversion");
@@ -2755,7 +2755,7 @@ fn cli_resume_by_record_id_says_which_session_it_converted() {
         "the record id is ours and is not any provider's session id"
     );
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &record_id])
         .output()
         .expect("resume by record id");

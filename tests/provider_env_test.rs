@@ -100,19 +100,19 @@ fn claude_code_follows_claude_config_dir() {
 #[test]
 fn claude_home_wins_over_claude_config_dir() {
     let _lock = PROVIDER_ENV.lock().unwrap();
-    let casr_home = tempfile::tempdir().unwrap();
+    let ags_home = tempfile::tempdir().unwrap();
     let agent_home = tempfile::tempdir().unwrap();
-    let _home = EnvGuard::set("CLAUDE_HOME", casr_home.path());
+    let _home = EnvGuard::set("CLAUDE_HOME", ags_home.path());
     let _config = EnvGuard::set("CLAUDE_CONFIG_DIR", agent_home.path());
 
-    let expected = seed_claude_home(casr_home.path(), PROJECT_KEY, SESSION_ID);
+    let expected = seed_claude_home(ags_home.path(), PROJECT_KEY, SESSION_ID);
     let decoy = seed_claude_home(agent_home.path(), PROJECT_KEY, SESSION_ID);
 
-    // `CLAUDE_HOME` is casr's own override: it aims casr at one tree without
+    // `CLAUDE_HOME` is ags's own override: it aims ags at one tree without
     // disturbing the Claude Code the rest of the shell talks to.
     assert_eq!(
         ClaudeCode.session_roots(),
-        vec![casr_home.path().join("projects")]
+        vec![ags_home.path().join("projects")]
     );
     let owned = ClaudeCode.owns_session(SESSION_ID).unwrap();
     assert_eq!(owned, expected);
@@ -147,13 +147,13 @@ fn gemini_joins_dot_gemini_onto_gemini_cli_home() {
 #[test]
 fn gemini_home_wins_over_gemini_cli_home() {
     let _lock = PROVIDER_ENV.lock().unwrap();
-    let casr_home = tempfile::tempdir().unwrap();
+    let ags_home = tempfile::tempdir().unwrap();
     let agent_home = tempfile::tempdir().unwrap();
-    let _home = EnvGuard::set("GEMINI_HOME", casr_home.path());
+    let _home = EnvGuard::set("GEMINI_HOME", ags_home.path());
     let _cli_home = EnvGuard::set("GEMINI_CLI_HOME", agent_home.path());
 
-    // `GEMINI_HOME` is casr's own override and names the `.gemini` dir directly.
-    assert_eq!(Gemini::home_dir(), Some(casr_home.path().to_path_buf()));
+    // `GEMINI_HOME` is ags's own override and names the `.gemini` dir directly.
+    assert_eq!(Gemini::home_dir(), Some(ags_home.path().to_path_buf()));
 }
 
 #[test]
@@ -195,7 +195,7 @@ fn cline_finds_the_sdk_store_via_cline_data_dir() {
     let expected = seed_cline_task(tmp.path(), "1700000000000");
 
     // Cline's own `resolveDataDir()` reads `CLINE_DATA_DIR` first. Its SDK/CLI
-    // store is a second task tree that casr used to miss entirely.
+    // store is a second task tree that ags used to miss entirely.
     assert_eq!(Cline.owns_session("1700000000000"), Some(expected));
 }
 
@@ -232,20 +232,20 @@ fn cline_data_dir_wins_over_cline_dir() {
 #[test]
 fn cline_home_is_used_alone() {
     let _lock = PROVIDER_ENV.lock().unwrap();
-    let casr_home = tempfile::tempdir().unwrap();
+    let ags_home = tempfile::tempdir().unwrap();
     let agent_data = tempfile::tempdir().unwrap();
-    let _home = EnvGuard::set("CLINE_HOME", casr_home.path());
+    let _home = EnvGuard::set("CLINE_HOME", ags_home.path());
     let _data = EnvGuard::set("CLINE_DATA_DIR", agent_data.path());
-    let expected = seed_cline_task(casr_home.path(), "1700000000003");
+    let expected = seed_cline_task(ags_home.path(), "1700000000003");
     seed_cline_task(agent_data.path(), "1700000000003");
 
-    // `CLINE_HOME` is casr's own override and is exclusive. Both the legacy
+    // `CLINE_HOME` is ags's own override and is exclusive. Both the legacy
     // extension store and the current CLI store remain under that one root.
     assert_eq!(
         Cline.session_roots(),
         vec![
-            casr_home.path().join("tasks"),
-            casr_home.path().join("sessions")
+            ags_home.path().join("tasks"),
+            ags_home.path().join("sessions")
         ]
     );
     assert_eq!(Cline.owns_session("1700000000003"), Some(expected));
@@ -268,17 +268,14 @@ fn factory_joins_dot_factory_sessions_onto_factory_home_override() {
 #[test]
 fn factory_home_wins_over_factory_home_override() {
     let _lock = PROVIDER_ENV.lock().unwrap();
-    let casr_home = tempfile::tempdir().unwrap();
+    let ags_home = tempfile::tempdir().unwrap();
     let agent_home = tempfile::tempdir().unwrap();
-    let _home = EnvGuard::set("FACTORY_HOME", casr_home.path());
+    let _home = EnvGuard::set("FACTORY_HOME", ags_home.path());
     let _override = EnvGuard::set("FACTORY_HOME_OVERRIDE", agent_home.path());
     std::fs::create_dir_all(agent_home.path().join(".factory").join("sessions")).unwrap();
 
-    // `FACTORY_HOME` is casr's own override and names the sessions dir directly.
-    assert_eq!(
-        Factory.session_roots(),
-        vec![casr_home.path().to_path_buf()]
-    );
+    // `FACTORY_HOME` is ags's own override and names the sessions dir directly.
+    assert_eq!(Factory.session_roots(), vec![ags_home.path().to_path_buf()]);
 }
 
 #[test]
@@ -290,7 +287,7 @@ fn pi_agent_follows_pi_coding_agent_dir() {
     let sessions = tmp.path().join("sessions");
     std::fs::create_dir_all(&sessions).unwrap();
 
-    // `PI_CODING_AGENT_DIR` names the agent dir, the same thing casr's own
+    // `PI_CODING_AGENT_DIR` names the agent dir, the same thing ags's own
     // `PI_AGENT_HOME` names, and `pi` puts sessions in `<dir>/sessions`.
     assert_eq!(PiAgent.session_roots(), vec![sessions]);
 }
@@ -298,11 +295,11 @@ fn pi_agent_follows_pi_coding_agent_dir() {
 #[test]
 fn pi_agent_home_wins_over_pi_coding_agent_dir() {
     let _lock = PROVIDER_ENV.lock().unwrap();
-    let casr_home = tempfile::tempdir().unwrap();
+    let ags_home = tempfile::tempdir().unwrap();
     let agent_dir = tempfile::tempdir().unwrap();
-    let _home = EnvGuard::set("PI_AGENT_HOME", casr_home.path());
+    let _home = EnvGuard::set("PI_AGENT_HOME", ags_home.path());
     let _agent_dir = EnvGuard::set("PI_CODING_AGENT_DIR", agent_dir.path());
-    let expected = casr_home.path().join("sessions");
+    let expected = ags_home.path().join("sessions");
     std::fs::create_dir_all(&expected).unwrap();
     std::fs::create_dir_all(agent_dir.path().join("sessions")).unwrap();
 
@@ -475,7 +472,7 @@ fn vibe_joins_logs_session_onto_vibe_home() {
             "git_commit": null,
             "git_branch": null,
             "environment": {"working_directory": null},
-            "username": "casr",
+            "username": "ags",
             "total_messages": 1,
         }))
         .unwrap(),
@@ -494,7 +491,7 @@ fn amp_follows_xdg_data_home_and_ignores_amp_home() {
     let install = tempfile::tempdir().unwrap();
     let _xdg_env = EnvGuard::set("XDG_DATA_HOME", xdg.path());
     // A user who set `AMP_HOME` correctly for Amp points it at the *install*
-    // tree. casr must not mistake that for the data directory.
+    // tree. ags must not mistake that for the data directory.
     let _amp_home = EnvGuard::set("AMP_HOME", install.path());
     let threads = xdg.path().join("amp").join("threads");
     std::fs::create_dir_all(&threads).unwrap();
@@ -516,15 +513,15 @@ fn amp_follows_xdg_data_home_and_ignores_amp_home() {
 #[test]
 fn clawdbot_home_wins_over_clawdbot_state_dir() {
     let _lock = PROVIDER_ENV.lock().unwrap();
-    let casr_home = tempfile::tempdir().unwrap();
+    let ags_home = tempfile::tempdir().unwrap();
     let agent_state = tempfile::tempdir().unwrap();
-    let _home = EnvGuard::set("CLAWDBOT_HOME", casr_home.path());
+    let _home = EnvGuard::set("CLAWDBOT_HOME", ags_home.path());
     let _state = EnvGuard::set("CLAWDBOT_STATE_DIR", agent_state.path());
     std::fs::create_dir_all(agent_state.path().join("sessions")).unwrap();
 
-    // `CLAWDBOT_HOME` is casr's own override and names the sessions dir directly.
+    // `CLAWDBOT_HOME` is ags's own override and names the sessions dir directly.
     assert_eq!(
         ClawdBot.session_roots(),
-        vec![casr_home.path().to_path_buf()]
+        vec![ags_home.path().to_path_buf()]
     );
 }

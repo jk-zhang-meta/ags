@@ -24,7 +24,7 @@ use std::{
 use ags::{
     budget::ContextBudget,
     discovery::{DetectionResult, ProviderRegistry},
-    error::CasrError,
+    error::AgsError,
     ir::{
         Body, Branch, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, LossKind, SessionIr,
         SourceRef, Visibility,
@@ -822,7 +822,7 @@ fn pipeline_fails_a_structured_write_that_lost_the_conversation() {
         .convert("tgt", "sid-damaged", options(false, None))
         .expect_err("a written file that is missing conversation must not pass");
 
-    let Some(CasrError::VerifyFailed { detail, .. }) = error.downcast_ref::<CasrError>() else {
+    let Some(AgsError::VerifyFailed { detail, .. }) = error.downcast_ref::<AgsError>() else {
         panic!("expected VerifyFailed, got {error:?}");
     };
     assert!(
@@ -1048,8 +1048,8 @@ fn pipeline_unknown_target_alias_errors() {
         .expect_err("unknown target alias should error");
 
     assert!(matches!(
-        err.downcast_ref::<CasrError>(),
-        Some(CasrError::UnknownProviderAlias { .. })
+        err.downcast_ref::<AgsError>(),
+        Some(AgsError::UnknownProviderAlias { .. })
     ));
 }
 
@@ -1077,8 +1077,8 @@ fn pipeline_session_not_found_errors() {
         .expect_err("missing session should error");
 
     assert!(matches!(
-        err.downcast_ref::<CasrError>(),
-        Some(CasrError::SessionNotFound { .. })
+        err.downcast_ref::<AgsError>(),
+        Some(AgsError::SessionNotFound { .. })
     ));
 }
 
@@ -1101,8 +1101,8 @@ fn pipeline_ambiguous_session_errors() {
         .expect_err("ambiguous session id should error");
 
     assert!(matches!(
-        err.downcast_ref::<CasrError>(),
-        Some(CasrError::AmbiguousSessionId { .. })
+        err.downcast_ref::<AgsError>(),
+        Some(AgsError::AmbiguousSessionId { .. })
     ));
 }
 
@@ -1258,8 +1258,8 @@ fn pipeline_readback_mismatch_fails_and_removes_unverified_output() {
         .convert("tgt", "sid-readback-mismatch", options(false, None))
         .expect_err("readback mismatch should fail conversion");
 
-    match err.downcast_ref::<CasrError>() {
-        Some(CasrError::VerifyFailed { detail, .. }) => {
+    match err.downcast_ref::<AgsError>() {
+        Some(AgsError::VerifyFailed { detail, .. }) => {
             assert!(
                 detail.contains("message count mismatch"),
                 "unexpected verify detail: {detail}"
@@ -1310,8 +1310,8 @@ fn pipeline_rejects_undeclared_tool_to_assistant_fold() {
         .convert("oth", "sid-other-tool-fold", options(false, None))
         .expect_err("an undeclared Tool-to-Assistant fold must fail verification");
 
-    match err.downcast_ref::<CasrError>() {
-        Some(CasrError::VerifyFailed { detail, .. }) => {
+    match err.downcast_ref::<AgsError>() {
+        Some(AgsError::VerifyFailed { detail, .. }) => {
             assert!(
                 detail.contains("message role mismatch at idx 2"),
                 "unexpected verify detail: {detail}"
@@ -1495,8 +1495,8 @@ fn pipeline_readback_content_mismatch_fails_and_removes_unverified_output() {
         .convert("tgt", "sid-readback-content-mismatch", options(false, None))
         .expect_err("readback content mismatch should fail conversion");
 
-    match err.downcast_ref::<CasrError>() {
-        Some(CasrError::VerifyFailed { detail, .. }) => {
+    match err.downcast_ref::<AgsError>() {
+        Some(AgsError::VerifyFailed { detail, .. }) => {
             assert!(
                 detail.contains("content mismatch"),
                 "unexpected verify detail: {detail}"
@@ -1549,8 +1549,8 @@ fn pipeline_readback_error_restores_backup_and_returns_verify_failed() {
         .convert("tgt", "sid-readback-error", options(false, None))
         .expect_err("readback error should fail conversion");
 
-    match err.downcast_ref::<CasrError>() {
-        Some(CasrError::VerifyFailed { detail, .. }) => {
+    match err.downcast_ref::<AgsError>() {
+        Some(AgsError::VerifyFailed { detail, .. }) => {
             assert!(
                 detail.contains("rollback succeeded"),
                 "expected rollback detail, got: {detail}"
@@ -1949,8 +1949,8 @@ fn pipeline_real_session_not_found() {
         .expect_err("real not-found should error");
 
     assert!(matches!(
-        err.downcast_ref::<CasrError>(),
-        Some(CasrError::SessionNotFound { .. })
+        err.downcast_ref::<AgsError>(),
+        Some(AgsError::SessionNotFound { .. })
     ));
 }
 
@@ -1977,8 +1977,8 @@ fn pipeline_real_unknown_target_alias() {
         .expect_err("unknown alias should error");
 
     assert!(matches!(
-        err.downcast_ref::<CasrError>(),
-        Some(CasrError::UnknownProviderAlias { .. })
+        err.downcast_ref::<AgsError>(),
+        Some(AgsError::UnknownProviderAlias { .. })
     ));
 }
 
@@ -2585,7 +2585,7 @@ fn enrichment_reaches_the_file_the_output_claims_it_reached() {
         written
             .messages
             .iter()
-            .any(|m| m.content.contains("[casr synthetic context]")),
+            .any(|m| m.content.contains("[ags synthetic context]")),
         "the file must hold what the run said was added to it"
     );
     assert!(

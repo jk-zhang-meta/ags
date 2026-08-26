@@ -1,7 +1,7 @@
 //! Pi-Agent provider — reads/writes JSONL sessions with typed entries and content blocks.
 //!
 //! Session files: `~/.pi/agent/sessions/<safe-path>/<timestamp>_<uuid>.jsonl`
-//! Override root: `PI_AGENT_HOME` env var (casr's own), `PI_CODING_AGENT_DIR`
+//! Override root: `PI_AGENT_HOME` env var (ags's own), `PI_CODING_AGENT_DIR`
 //! and `PI_CODING_AGENT_SESSION_DIR` (`pi`'s own)
 //!
 //! ## JSONL format
@@ -49,11 +49,11 @@ pub struct PiAgent;
 impl PiAgent {
     /// Root directory for Pi-Agent session storage, in precedence order:
     ///
-    /// 1. `PI_AGENT_HOME` — casr's own override. `pi` has no variable of that
-    ///    name; it wins so that aiming casr at a tree never disturbs the `pi`
+    /// 1. `PI_AGENT_HOME` — ags's own override. `pi` has no variable of that
+    ///    name; it wins so that aiming ags at a tree never disturbs the `pi`
     ///    the rest of the shell talks to.
     /// 2. `PI_CODING_AGENT_DIR` — the variable `pi` itself honours for this
-    ///    directory. Same semantics as casr's: it names the agent dir, whose
+    ///    directory. Same semantics as ags's: it names the agent dir, whose
     ///    default is `~/.pi/agent`, and `pi` puts sessions in `<dir>/sessions`.
     /// 3. `~/.pi/agent`.
     ///
@@ -82,7 +82,7 @@ impl PiAgent {
     /// those values then goes through `expandTildePath`
     /// (`dist/config.js:342-348`): `~` alone becomes the home directory and
     /// `~/rest` becomes `<home>/rest`. Nothing else is touched — `~user` is not
-    /// a form `pi` expands, so it is not one casr may expand either.
+    /// a form `pi` expands, so it is not one ags may expand either.
     fn pi_env_path(key: &str) -> Option<PathBuf> {
         let raw = std::env::var_os(key).filter(|value| !value.is_empty())?;
         let Some(text) = raw.to_str() else {
@@ -100,7 +100,7 @@ impl PiAgent {
     /// `PI_CODING_AGENT_SESSION_DIR` — the sessions directory `pi` is actually
     /// using, when it is not the default one.
     ///
-    /// This is a real variable, not a name casr made up: `pi` builds it from its
+    /// This is a real variable, not a name ags made up: `pi` builds it from its
     /// own app name (`ENV_SESSION_DIR = "${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR"`,
     /// `dist/config.js:341`, and `APP_NAME` is `"pi"` for the published package)
     /// and reads it at startup:
@@ -121,11 +121,11 @@ impl PiAgent {
     /// and `pi` creates it if it is missing (`session-manager.js:445-447`).
     ///
     /// Ignoring it was not a safe default. With it set, `pi` writes every
-    /// session somewhere casr never looked, so casr reported that the user had
+    /// session somewhere ags never looked, so ags reported that the user had
     /// no `pi` sessions at all.
     ///
     /// `PI_AGENT_HOME` suppresses it for the same reason `PI_AGENT_HOME` exists:
-    /// it is casr's own knob for aiming casr at a tree, and an aiming knob that
+    /// it is ags's own knob for aiming ags at a tree, and an aiming knob that
     /// an ambient `pi` variable can drag elsewhere does not aim.
     fn env_sessions_dir() -> Option<PathBuf> {
         if std::env::var_os("PI_AGENT_HOME").is_some_and(|value| !value.is_empty()) {
@@ -140,7 +140,7 @@ impl PiAgent {
     /// With no override this is `<agent-dir>/sessions`, which is one level
     /// *above* where `pi` puts a session of its own. It is kept as the fallback
     /// answer for an id that names no file on disk (see [`Self::session_path`]),
-    /// and as the location every session casr wrote before
+    /// and as the location every session ags wrote before
     /// [`Self::project_sessions_dir`] existed still occupies.
     fn leaf_sessions_dir() -> PathBuf {
         Self::env_sessions_dir().unwrap_or_else(|| Self::home_dir().join("sessions"))
@@ -190,7 +190,7 @@ impl PiAgent {
     /// only the *directories* under `<agent-dir>/sessions` and reads `.jsonl`
     /// inside them, and `list` (`:1055-1059`) reads `getDefaultSessionDir(cwd)`
     /// — the encoded-cwd directory — flat. A converted session resumed only if
-    /// the user still had casr's printed command; opening `pi` normally showed
+    /// the user still had ags's printed command; opening `pi` normally showed
     /// nothing.
     ///
     /// # With the override set, flat is right
@@ -223,9 +223,9 @@ impl PiAgent {
     ///   f.endsWith(".jsonl"))` with no recursion at all. One level.
     ///
     /// Depth **1** under `sessions/` is admitted as well, and that half is not
-    /// `pi`'s rule — it is casr's own writer's, which puts a converted session
+    /// `pi`'s rule — it is ags's own writer's, which puts a converted session
     /// at `sessions/<id>.jsonl`. Transcribing only `listAll`'s two-level rule
-    /// would make every session casr has ever written unlistable by casr, which
+    /// would make every session ags has ever written unlistable by ags, which
     /// is the same trap `vibe.rs` documents for the `session_` prefix. Both
     /// shapes are therefore listed, and the walk is bounded either way.
     ///
@@ -258,7 +258,7 @@ impl PiAgent {
     /// session's workspace, and an id does not carry one.
     ///
     /// So the file is found instead of computed, by the same walk that answers
-    /// `owns_session`. That also keeps every session casr wrote at
+    /// `owns_session`. That also keeps every session ags wrote at
     /// `sessions/<id>.jsonl` before this change resumable at exactly the path
     /// it is at: the walk finds it there, and the argument `pi` receives is
     /// still the verbatim path `dist/main.js:106-109` opens without consulting
@@ -394,7 +394,7 @@ impl Provider for PiAgent {
     /// `renameSync` into the directory the header's `cwd` implies. Until `pi`
     /// next starts, those files are real sessions sitting there.
     ///
-    /// Neither of `pi`'s listers shows them, so casr must not list them either —
+    /// Neither of `pi`'s listers shows them, so ags must not list them either —
     /// they would appear twice the moment the migration ran, once from each
     /// location. But a user who has one and names it by id should get it, which
     /// is the same split `codex.rs` makes for the legacy whole-file `.json`
@@ -406,7 +406,7 @@ impl Provider for PiAgent {
     /// (`${fileTimestamp}_${sessionId}.jsonl`, `session-manager.js:502`), but
     /// `pi` never *tests* for it, and `/attach` copies a file into the sessions
     /// directory under whatever basename it already had
-    /// (`agent-session-runtime.js:258`). Requiring it made casr list files it
+    /// (`agent-session-runtime.js:258`). Requiring it made ags convert list files it
     /// then refused to resolve.
     ///
     /// # What was there before
@@ -414,7 +414,7 @@ impl Provider for PiAgent {
     /// `sessions_dir` fell back to the whole of `<agent-dir>` whenever
     /// `sessions/` was absent, and walked it with no depth bound at all. Since
     /// `--source pi` reaches `owns_session` without going through `detect`,
-    /// `casr info <id> --source pi` resolved `<agent-dir>/logs/deep/deeper/
+    /// `ags convert info <id> --source pi` resolved `<agent-dir>/logs/deep/deeper/
     /// buried_transcript.jsonl` and `<agent-dir>/cache/tool_output.jsonl` and
     /// rendered each as a session. Neither the fallback nor the walk was
     /// answering a question about `pi`: `pi` reads sessions out of the two
@@ -497,7 +497,7 @@ impl Provider for PiAgent {
         let session_id = if session.session_id.is_empty() {
             let now = chrono::Utc::now();
             format!(
-                "{}_casr-{}",
+                "{}_ags-{}",
                 now.format("%Y-%m-%dT%H-%M-%S"),
                 uuid::Uuid::new_v4()
             )

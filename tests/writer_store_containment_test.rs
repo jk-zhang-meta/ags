@@ -1,13 +1,13 @@
 //! A writer must put the session inside the store the tool reads.
 //!
-//! Every other writer test in this repository asks whether casr can read back
-//! what casr wrote. That oracle cannot see this failure: a session written one
+//! Every other writer test in this repository asks whether ags can read back
+//! what ags wrote. That oracle cannot see this failure: a session written one
 //! directory above the store round-trips perfectly through
 //! [`Provider::read_session`] and is still invisible to the agent, because the
 //! agent enumerates a directory the file is not in. The question here is not
 //! "is the content right" but "is the file somewhere the tool will look", which
 //! is answered against [`Provider::session_roots`] — the same enumeration
-//! `casr list` walks and the one each provider's module documents against its
+//! `ags convert list` walks and the one each provider's module documents against its
 //! vendor's own listing rule.
 //!
 //! # What this pins
@@ -112,8 +112,8 @@ const REFUSES: &[&str] = &[
 // Environment sandbox
 // ---------------------------------------------------------------------------
 
-/// casr's own "write here" overrides, one per provider. Amp's store is XDG's.
-const CASR_HOMES: &[&str] = &[
+/// ags's own "write here" overrides, one per provider. Amp's store is XDG's.
+const AGS_HOMES: &[&str] = &[
     "CLAUDE_HOME",
     "CODEX_HOME",
     "GEMINI_HOME",
@@ -191,7 +191,7 @@ impl Drop for EnvGuard {
 /// the ones that will follow `../` wherever it points.
 fn sandbox(root: &Path) -> Vec<EnvGuard> {
     let deep = root.join("a/b/c/d/e/f");
-    let mut guards: Vec<EnvGuard> = CASR_HOMES
+    let mut guards: Vec<EnvGuard> = AGS_HOMES
         .iter()
         .map(|key| EnvGuard::set(key, &deep.join(key.to_ascii_lowercase())))
         .collect();
@@ -312,9 +312,9 @@ fn every_writer_lands_inside_a_root_it_declares() {
     });
 }
 
-/// And casr can find again what it just wrote.
+/// And ags can find again what it just wrote.
 ///
-/// The same lookup `casr resume` performs. It is casr-against-casr and so
+/// The same lookup `ags convert resume` performs. It is ags-against-ags and so
 /// cannot establish that the *vendor* will find the file — only
 /// `session_roots`, checked above against each provider's transcription of the
 /// vendor's listing rule, speaks to that. What it does establish is that the id

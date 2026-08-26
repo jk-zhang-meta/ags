@@ -7,7 +7,7 @@ use std::{
 
 use ags::{
     discovery::{DetectionResult, ProviderRegistry, SourceHint},
-    error::CasrError,
+    error::AgsError,
     model::{CanonicalMessage, CanonicalSession, MessageRole},
     providers::{Provider, WriteOptions, WrittenSession},
 };
@@ -272,7 +272,7 @@ fn resolve_auto_session_not_found_reports_installed_providers() {
         .resolve_session("missing-session", None)
         .expect_err("missing session should error");
     match err {
-        CasrError::SessionNotFound {
+        AgsError::SessionNotFound {
             providers_checked, ..
         } => {
             assert_eq!(providers_checked, vec!["Claude Code", "Codex"]);
@@ -306,7 +306,7 @@ fn resolve_auto_ambiguous_session_reports_candidates() {
         .expect_err("ambiguous session id should error");
 
     match err {
-        CasrError::AmbiguousSessionId { candidates, .. } => {
+        AgsError::AmbiguousSessionId { candidates, .. } => {
             assert_eq!(candidates.len(), 2);
             assert!(candidates.iter().any(|c| c.provider == "claude-code"));
             assert!(candidates.iter().any(|c| c.provider == "codex"));
@@ -351,7 +351,7 @@ fn source_alias_hint_unknown_alias_errors() {
     let err = registry
         .resolve_session("whatever", Some(&hint))
         .expect_err("unknown alias should error");
-    assert!(matches!(err, CasrError::UnknownProviderAlias { .. }));
+    assert!(matches!(err, AgsError::UnknownProviderAlias { .. }));
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn source_path_hint_non_file_non_virtual_errors() {
         .resolve_session("ignored-by-path-hint", Some(&hint))
         .expect_err("dir path hint should error");
 
-    assert!(matches!(err, CasrError::SessionNotFound { .. }));
+    assert!(matches!(err, AgsError::SessionNotFound { .. }));
 }
 
 #[test]
@@ -486,7 +486,7 @@ fn source_path_hint_without_root_match_rejects_multiple_plausible_parsers() {
         .expect_err("multiple successful parsers must not be used as an ownership oracle");
 
     match err {
-        CasrError::AmbiguousSessionId {
+        AgsError::AmbiguousSessionId {
             session_id,
             candidates,
         } => {

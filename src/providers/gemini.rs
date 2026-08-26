@@ -146,7 +146,7 @@ const PROJECT_ROOT_FILE: &str = ".project_root";
 /// # Why the slug cannot be computed
 ///
 /// Before 0.52.0 the directory was [`project_hash`], a pure function of the
-/// path, so casr could ask "is this `SHA256(ws)`?" and be done. 0.52.0
+/// path, so ags could ask "is this `SHA256(ws)`?" and be done. 0.52.0
 /// replaced it with a registry slug (`dist/src/config/storage.js:186`,
 /// `projectIdentifier = await registry.getShortId(this.getProjectRoot())`),
 /// minted in `dist/src/config/projectRegistry.js:255-261`:
@@ -224,7 +224,7 @@ pub fn project_dir_matches(project_dir: &Path, workspace: &Path) -> Option<bool>
 /// # Why it is consulted second
 ///
 /// The directory answers first and this only speaks when the directory is
-/// silent. They can disagree, and when they do the directory is right: casr's
+/// silent. They can disagree, and when they do the directory is right: ags's
 /// own writer carries a source session's `projectHash` through unchanged while
 /// filing the file in the *target* workspace's registered directory, so a
 /// converted session's header names where it came from. Asking the directory
@@ -363,9 +363,9 @@ fn is_jsonl(path: &Path) -> bool {
 impl Gemini {
     /// Root directory for Gemini data, in precedence order:
     ///
-    /// 1. `GEMINI_HOME` — casr's own override, naming the `.gemini` directory
+    /// 1. `GEMINI_HOME` — ags's own override, naming the `.gemini` directory
     ///    itself. Gemini CLI has no variable with those semantics, so this one
-    ///    is casr's alone; it wins so that aiming casr at a tree never disturbs
+    ///    is ags's alone; it wins so that aiming ags at a tree never disturbs
     ///    the Gemini CLI the rest of the shell talks to.
     /// 2. `GEMINI_CLI_HOME` — the variable Gemini CLI itself honours. It
     ///    replaces the *home directory*, not the `.gemini` directory, so
@@ -717,7 +717,7 @@ impl Provider for Gemini {
     /// `.json` alongside `.jsonl`, and `deriveSessionShortId` strips either
     /// extension. Legacy JSON is therefore the *wider* target — every Gemini
     /// reads it, including the ones predating JSONL — and this reader no longer
-    /// treats it as second class, so nothing here is written in a format casr
+    /// treats it as second class, so nothing here is written in a format ags
     /// itself has demoted.
     ///
     /// Each message carries an `id`, which is not decoration. The first time
@@ -848,7 +848,7 @@ struct Parsed {
     /// Session-level fields — `sessionId`, `projectHash`, `startTime`,
     /// `lastUpdated`, and whatever else the file carried. Never the `messages`
     /// array: that is [`Parsed::messages`], and copying a whole conversation
-    /// into the metadata blob would put it in `casr info --json` twice.
+    /// into the metadata blob would put it in `ags convert info --json` twice.
     metadata: serde_json::Map<String, serde_json::Value>,
     messages: Vec<serde_json::Value>,
     /// `Some` only for JSONL. Legacy whole-file JSON has no records to fail to
@@ -890,8 +890,8 @@ impl Drift {
 /// first and the file is JSONL only if the fold established both `sessionId`
 /// and `projectHash`, which is exactly the condition on
 /// `parseLegacyRecordFallback`. Extensions lie — the CLI's migration turns
-/// `.json` into `.jsonl` by appending a letter, casr writes legacy JSON under
-/// `.json`, and a user can hand `casr info` any path.
+/// `.json` into `.jsonl` by appending a letter, ags writes legacy JSON under
+/// `.json`, and a user can hand `ags convert info` any path.
 ///
 /// The strictness is the whole point, and a weaker test looks fine until it is
 /// not. "Did any line classify as a record?" fails on the most ordinary input

@@ -663,7 +663,7 @@ mod atomic_write_integration {
         let temps: Vec<_> = fs::read_dir(parent)
             .expect("read parent dir")
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".casr-tmp-"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".ags-tmp-"))
             .collect();
         assert!(
             temps.is_empty(),
@@ -686,7 +686,7 @@ mod atomic_write_integration {
         let temps: Vec<_> = fs::read_dir(parent)
             .expect("read parent dir")
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".casr-tmp-"))
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".ags-tmp-"))
             .collect();
         assert!(
             temps.is_empty(),

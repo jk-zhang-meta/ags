@@ -683,7 +683,7 @@ impl Store {
         let manifest = Manifest {
             store_version: STORE_VERSION,
             created_at: now_ms(),
-            created_by: format!("casr {}", env!("CARGO_PKG_VERSION")),
+            created_by: format!("ags {}", env!("CARGO_PKG_VERSION")),
         };
         write_json(&manifest_path, &manifest)?;
         debug!(root = %root.display(), "created session store");

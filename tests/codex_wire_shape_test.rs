@@ -282,7 +282,7 @@ fn the_history_channel_carries_the_messages() {
 
 /// The rule that governs this channel: restate what the IR knows, never
 /// synthesise what it does not. These four are the records Codex writes that
-/// casr cannot derive without asserting timings it never saw or a
+/// ags cannot derive without asserting timings it never saw or a
 /// sub-agent/MCP provenance no cross-agent source records.
 #[test]
 fn the_history_channel_invents_nothing() {

@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to [casr](https://github.com/Dicklesworthstone/cross_agent_session_resumer) (Cross Agent Session Resumer) are documented here.
+All notable changes to [ags](https://github.com/Dicklesworthstone/cross_agent_session_resumer) (Cross Agent Session Resumer) are documented here.
 
 Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cross_agent_session_resumer/releases) unless marked **Unreleased**. Both releases have accompanying git tags; the distinction between "tag" and "release" is noted per version. Where a GitHub Issue motivated a change, it is linked inline.
 
@@ -28,8 +28,8 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
   launches it in preference to stock Codex whenever it is on PATH, so an install
   that skipped it would leave every session quietly running on the machine's own
   account. It rides its own release train — the fork tracks upstream Codex,
-  casr tracks AGS — which is why it is a separate version check rather than a
-  branch of the casr update.
+  ags tracks AGS — which is why it is a separate version check rather than a
+  branch of the ags update.
 
   (Only context-mode was unbundled. An earlier commit took codext out along with
   it; this restores it.)
@@ -58,9 +58,9 @@ Versions correspond to [GitHub Releases](https://github.com/Dicklesworthstone/cr
   that rename therefore read as hand-written, was preserved, and would never
   have received a wrapper update again. Both markers are now recognised, and an
   actually hand-written wrapper is still left alone.
-- **`ags update` says `ags`**: it reported `casr`, the upstream binary name,
+- **`ags update` says `ags`**: it reported `ags`, the upstream binary name,
   beside lines naming `codext` and `Context Mode` — an implementation detail in
-  a line about a command nobody types `casr` to run. Only the messages changed:
+  a line about a command nobody types `ags` to run. Only the messages changed:
   the binary, the release asset names, and the cosign identity `install.sh`
   pins are untouched.
 - **Resuming asks which directory to work in**: a checkpoint records where its
@@ -188,10 +188,10 @@ This release exists primarily to attach binary distribution artifacts. The singl
 
 | Asset | Description |
 |---|---|
-| `casr-x86_64-unknown-linux-musl.tar.xz` | Statically linked Linux x86_64 binary (55 downloads) |
-| `casr-aarch64-apple-darwin.tar.xz` | macOS Apple Silicon binary (17 downloads) |
-| `casr_darwin_arm64` | macOS arm64 bare binary |
-| `casr` | Linux bare binary |
+| `ags-x86_64-unknown-linux-musl.tar.xz` | Statically linked Linux x86_64 binary (55 downloads) |
+| `ags-aarch64-apple-darwin.tar.xz` | macOS Apple Silicon binary (17 downloads) |
+| `ags_darwin_arm64` | macOS arm64 bare binary |
+| `ags` | Linux bare binary |
 | `SHA256SUMS` | Checksum file for all artifacts |
 | `cross_agent_session_resumer-v0.1.1-manifest.json` | Release manifest for the `curl\|bash` installer |
 
@@ -259,16 +259,16 @@ All 14 providers were implemented via a pluggable `Provider` trait with `detect`
 
 ### CLI and UX
 
-- **Subcommand and shorthand resume**: both `casr <target> resume <id>` and `casr -cc <id>` / `casr -cod <id>` / `casr -gmi <id>` forms supported; shorthand flags rewritten internally before clap parsing ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c)).
-- **Rich terminal table for `casr list`**: styled columns for provider, session ID, workspace, message count, tool-use count, and relative last-active age ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c), [`dc16517`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/dc16517ae34d9877f6c2bfb44a81b58bf59ff0d9)).
-- **Workspace-scoped list**: `casr list` defaults to sessions from the current working directory; `--workspace` overrides explicitly ([`474e765`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/474e765f6cb2d7907e83c9aab631211930ed9442)).
+- **Subcommand and shorthand resume**: both `ags <target> resume <id>` and `ags -cc <id>` / `ags -cod <id>` / `ags -gmi <id>` forms supported; shorthand flags rewritten internally before clap parsing ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c)).
+- **Rich terminal table for `ags convert list`**: styled columns for provider, session ID, workspace, message count, tool-use count, and relative last-active age ([`ebc7204`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/ebc72044a618ff72a41c11442c27067e9f2c3d8c), [`dc16517`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/dc16517ae34d9877f6c2bfb44a81b58bf59ff0d9)).
+- **Workspace-scoped list**: `ags convert list` defaults to sessions from the current working directory; `--workspace` overrides explicitly ([`474e765`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/474e765f6cb2d7907e83c9aab631211930ed9442)).
 - **Standard provider name aliases**: `claude` -> `claude-code`, `codex-cli` -> `codex`, `gemini-cli` -> `gemini` for natural command invocation ([`80c5789`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/80c5789d06770aca4d571ffe3e1cc070b58d7440)).
-- **Shell completions**: `casr completions bash|zsh|fish` generates registration stubs ([`e022b9b`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/e022b9bc58d6a80aebb105428279c36aaadf6cde)).
+- **Shell completions**: `ags completions bash|zsh|fish` generates registration stubs ([`e022b9b`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/e022b9bc58d6a80aebb105428279c36aaadf6cde)).
 - **Global flags**: `--dry-run`, `--force`, `--json`, `--verbose`, `--trace`, `--source <alias_or_path>`, `--enrich`.
 
 ### Session Listing Intelligence
 
-- **Session metrics**: message count, tool-use count, and per-provider grouping in `casr list` output ([`faf955c`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/faf955c285afdc3cd787cc31cb337ef49ccb8c44)).
+- **Session metrics**: message count, tool-use count, and per-provider grouping in `ags convert list` output ([`faf955c`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/faf955c285afdc3cd787cc31cb337ef49ccb8c44)).
 - **Parallel session parsing**: concurrent parsing with a configurable parallelism threshold to avoid thread overhead on small sets ([`edcc2c7`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/edcc2c72eaa91a23e071afa99e0da06a6c7b1282), [`faf955c`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/faf955c285afdc3cd787cc31cb337ef49ccb8c44)).
 - **Last-active tracking**: semantic relative-age rendering computed from canonical conversation timestamps and file modification time ([`dc16517`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/dc16517ae34d9877f6c2bfb44a81b58bf59ff0d9), [`80c5789`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/80c5789d06770aca4d571ffe3e1cc070b58d7440)).
 - **Tool-call/result extraction**: full extraction for Gemini (`functionCall`/`functionResponse`), Codex `output_text`, Claude Code tool-result serialization, and Factory/Codex/Gemini metric accuracy ([`f868918`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/f868918fffff37a77ff1960d8675ca66e913e6e9), [`4e474ff`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/4e474ffc73f4571dabe76b6060383b22cab1ff11)).
@@ -277,14 +277,14 @@ All 14 providers were implemented via a pluggable `Provider` trait with `detect`
 ### Installer
 
 - **`curl | bash` installer** (`install.sh`): platform detection (Linux/macOS, x86_64/aarch64), SHA256 and Sigstore/cosign verification, download fallback chain (versioned release -> latest naming variants -> source build), `--offline <tarball>` airgap mode, proxy-aware networking, and shell completion installation ([`5b39095`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/5b39095cf95579b55087c798fa8ed3bf24353541)).
-- **Agent auto-configuration**: installs `casr` skill file for Claude Code and Codex, plus optional `cc`/`cod`/`gmi` wrapper scripts; `--no-configure` and `--no-skill` flags to opt out ([`dc4c9b0`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/dc4c9b0a34e5faeb7ce54ce365a27235d1e880c1)).
+- **Agent auto-configuration**: installs `ags` skill file for Claude Code and Codex, plus optional `cc`/`cod`/`gmi` wrapper scripts; `--no-configure` and `--no-skill` flags to opt out ([`dc4c9b0`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/dc4c9b0a34e5faeb7ce54ce365a27235d1e880c1)).
 - **Installer flags**: `--verify` (post-install self-test), `--force` (reinstall), `--from-source`, `--easy-mode` (PATH auto-update), `--yes` (non-interactive), `--system` (system-wide install).
 - **Version extraction fix**: anchored regex for more robust version string parsing in the installer ([`690c5a3`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/690c5a3cf0aa882b4f5800d8e28c28d910a8a3b4)).
 
 ### Performance
 
 - **BufReader streaming IO**: all provider readers switched from `read_to_string` to buffered streaming, reducing peak memory on large sessions ([`f086e91`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/f086e91074219948b76a00a8dd8eeb508d907c8e)).
-- **Parallelism threshold**: avoids spawning threads for small provider sets during `casr list` ([`edcc2c7`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/edcc2c72eaa91a23e071afa99e0da06a6c7b1282)).
+- **Parallelism threshold**: avoids spawning threads for small provider sets during `ags convert list` ([`edcc2c7`](https://github.com/Dicklesworthstone/cross_agent_session_resumer/commit/edcc2c72eaa91a23e071afa99e0da06a6c7b1282)).
 
 ### Provider-Specific Bug Fixes
 
@@ -341,7 +341,7 @@ Issues that drove notable changes, linked to the versions where they were addres
 |---|---|---|
 | [#2](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/2) | Codex-to-CC read-back verification role mismatch on `developer` messages | v0.1.0 |
 | [#3](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/3) | Installer quirk as of `08b4091` | v0.1.1 |
-| [#4](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/4) | `casr resume cod` produces JSONL that Codex CLI 0.107.0 cannot parse | v0.1.0 |
+| [#4](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/4) | `ags convert resume cod` produces JSONL that Codex CLI 0.107.0 cannot parse | v0.1.0 |
 | [#5](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/5) | Workspace-aware metadata enrichment (proposal) | Unreleased |
 | [#6](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/6) | Versioned JSON envelope for `list --json` (proposal) | Unreleased |
 | [#7](https://github.com/Dicklesworthstone/cross_agent_session_resumer/issues/7) | Move repo discovery out of model layer (proposal) | Unreleased |

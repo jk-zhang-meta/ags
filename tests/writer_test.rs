@@ -467,7 +467,7 @@ fn writer_codex_output_valid_jsonl() {
 
 /// The real Codex 0.142.5 `threads` schema. Used as a fixture so the
 /// registration test exercises the exact NOT NULL / default constraints and
-/// column set casr must satisfy on a live database. Keep in sync with
+/// column set ags must satisfy on a live database. Keep in sync with
 /// `sqlite3 ~/.codex/state_5.sqlite '.schema threads'`.
 const CODEX_THREADS_SCHEMA: &str = r#"
 CREATE TABLE threads (
@@ -507,7 +507,7 @@ CREATE TABLE threads (
 
 /// Regression for issue #16: `codex resume <id>` looks the session up in
 /// `~/.codex/state_*.sqlite` (`threads` table), not by scanning JSONL. After a
-/// CC→Codex conversion, casr must register a `threads` row for the converted
+/// CC→Codex conversion, ags must register a `threads` row for the converted
 /// session pointing at the rollout file.
 #[test]
 fn writer_codex_registers_thread_in_state_db() {
@@ -1824,7 +1824,7 @@ fn writer_vibe_directory_structure_and_metadata() {
         metadata["environment"]["working_directory"],
         "/data/projects/myapp"
     );
-    assert_eq!(metadata["username"], "casr");
+    assert_eq!(metadata["username"], "ags");
     assert_eq!(metadata["loops"], serde_json::json!([]));
     assert_eq!(metadata["title"], "Fix the login bug");
     assert_eq!(metadata["title_source"], "auto");
@@ -2039,7 +2039,7 @@ fn writer_vibe_refuses_an_ambiguous_short_prefix_even_with_force() {
                 "git_commit": null,
                 "git_branch": null,
                 "environment": {"working_directory": "/data/projects/myapp"},
-                "username": "casr",
+                "username": "ags",
                 "total_messages": 1,
             }))
             .unwrap(),
@@ -2054,7 +2054,7 @@ fn writer_vibe_refuses_an_ambiguous_short_prefix_even_with_force() {
     let _env = EnvGuard::set("VIBE_HOME", tmp.path());
     assert!(
         Vibe.owns_session(&target_id).is_none(),
-        "CASR must not claim an id that the vendor resolver can redirect"
+        "AGS must not claim an id that the vendor resolver can redirect"
     );
     let error = Vibe
         .write_session(&session, &WriteOptions { force: true })
@@ -2184,7 +2184,7 @@ fn writer_factory_session_start_header() {
         "Factory session_start requires a non-null title"
     );
     assert_eq!(
-        first_line["owner"], "casr",
+        first_line["owner"], "ags",
         "Factory session_start requires an owner"
     );
     assert!(

@@ -4,13 +4,13 @@
 //! ## Which Amp this is
 //!
 //! Amp ships as two products, and only one of them stores threads locally.
-//! Saying "Amp" without saying which is how casr ended up describing a store
+//! Saying "Amp" without saying which is how ags ended up describing a store
 //! it does not read.
 //!
 //! * The **editor extension** — `sourcegraph.amp` on the VS Code Marketplace,
 //!   installed into VS Code and its forks (Cursor, Windsurf, VSCodium) —
 //!   writes one JSON file per thread into a directory on disk. That store is
-//!   what casr reads and writes, and it is the only Amp transcript that exists
+//!   what ags reads and writes, and it is the only Amp transcript that exists
 //!   locally.
 //! * The **CLI** — `@ampcode/cli`; the `@sourcegraph/amp` npm package is now a
 //!   rename stub whose `description` is literally
@@ -37,11 +37,11 @@
 //!   `resolve(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "amp")`
 //!   with no `win32`/`darwin` branch (`sourcegraph.amp` 0.0.1772799397,
 //!   `extension/dist/extension.cjs`). The CLI's own copy of that resolver
-//!   *does* branch and ignores `XDG_DATA_HOME` on Windows and macOS; casr
+//!   *does* branch and ignores `XDG_DATA_HOME` on Windows and macOS; ags
 //!   follows the extension, because the extension is what writes threads.
 //! - `AMP_HOME` relocates Amp's *install* tree (`<AMP_HOME>/bin`, default
-//!   `~/.amp`), never this one, so casr does not read it. `AMP_DATA_HOME` is
-//!   read by nothing casr can find: zero occurrences across the CLI binary and
+//!   `~/.amp`), never this one, so ags does not read it. `AMP_DATA_HOME` is
+//!   read by nothing ags can find: zero occurrences across the CLI binary and
 //!   six shipped extension builds spanning 2025-04 to 2026-03.
 //!
 //! ## Legacy `globalStorage` storage (still live, not historical trivia)
@@ -90,7 +90,7 @@
 //! it. (The clipboard "copy thread as markdown" exporter does emit
 //! `**Tool Use:** \`<name>\``, but that is not the conversation.)
 //!
-//! casr had it both ways. [`Amp::extract_tool_calls`] returns every `tool_use`
+//! ags had it both ways. [`Amp::extract_tool_calls`] returns every `tool_use`
 //! block in [`CanonicalMessage::tool_calls`], *and* the reader flattened
 //! `content` with [`crate::model::flatten_content`], whose `tool_use` arm
 //! writes `[Tool: <name>]` — or `[Tool: <name> - <path>]` — into the prose.
@@ -112,7 +112,7 @@
 //!
 //! `server_tool_use` is deliberately not treated as a call. Amp's own
 //! converter drops it before the request (`if(D.type==="server_tool_use")
-//! return!1`) and its UI declines to draw it, so a block casr represents
+//! return!1`) and its UI declines to draw it, so a block ags represents
 //! nowhere is a block the model never saw either.
 
 use std::path::{Path, PathBuf};
@@ -151,7 +151,7 @@ impl Amp {
     /// `AMP_HOME` is deliberately not read here. It is Amp's own variable, but
     /// what Amp means by it is the *install* directory — the tree holding
     /// `bin/`, default `~/.amp` — which never contains threads. Reading it as a
-    /// data directory silently aimed casr at a directory that does not exist for
+    /// data directory silently aimed ags at a directory that does not exist for
     /// exactly the users who had set it correctly for Amp. `XDG_DATA_HOME` is
     /// the only variable that moves Amp's data.
     ///
@@ -222,19 +222,19 @@ impl Amp {
     /// This is Amp's own key-to-path mapping and nothing more. `get(key)`
     /// opens `joinPath(<root>, `${key}.json`)` with no validation of `key`,
     /// because every key Amp passes it came out of `keys()` — one `readdir` of
-    /// that same directory. casr's ids arrive on the command line instead, so
+    /// that same directory. ags's ids arrive on the command line instead, so
     /// the mapping needs the one constraint `keys()` supplied implicitly: the
     /// id has to be a single path component. `..`, a separator, or an absolute
     /// path is not a key Amp could ever have produced.
     ///
-    /// What is deliberately *not* here is a shape test. casr used to require
+    /// What is deliberately *not* here is a shape test. ags used to require
     /// `T-<uuid>` — Amp's minter (`T-${uuid}`) and its `rz` validator both use
     /// that shape — and it made resolution stricter than listing:
     /// [`Provider::is_session_path`] transcribes Amp's `keys()` rule, *any*
-    /// `.json` file directly in a threads root, so `casr list` printed threads
-    /// that `casr info <id>` then refused as unknown. Nothing constrains a
+    /// `.json` file directly in a threads root, so `ags convert list` printed threads
+    /// that `ags convert info <id>` then refused as unknown. Nothing constrains a
     /// thread file's name to the minter's shape; a file copied in, restored
-    /// from a backup, or renamed is one Amp opens and casr would not. "Is this
+    /// from a backup, or renamed is one Amp opens and ags would not. "Is this
     /// a path I would list?" and "do I own this id?" are different questions,
     /// but they are not free to disagree, and this is the direction the
     /// disagreement had to be resolved: toward what the tool itself accepts.
@@ -275,10 +275,10 @@ impl Amp {
         Some(PathBuf::from(decoded))
     }
 
-    /// The thread-level facts casr publishes, and nothing else.
+    /// The thread-level facts ags publishes, and nothing else.
     ///
     /// This reader used to set `metadata = thread.clone()` — the whole file —
-    /// and `casr info --json` prints the metadata bag verbatim. Measured on a
+    /// and `ags convert info --json` prints the metadata bag verbatim. Measured on a
     /// 283 KB thread of 240 messages, that made the metadata **99.6% of the
     /// command's output**: 284 KB against 1.4 KB for the same session with the
     /// transcript left out, a 210× difference. `info` deliberately reports
@@ -313,7 +313,7 @@ impl Amp {
     ///   `platform.installationID` is a stable per-install UUID and
     ///   `platform.deviceFingerprint` is a `v1:fp_<sha256>` cohort hash —
     ///   tracking identifiers, in output people paste into public issues. The
-    ///   one thing casr wants from `env` is the workspace, and
+    ///   one thing ags wants from `env` is the workspace, and
     ///   [`Amp::extract_workspace`] already lifts that into `workspace`.
     /// * `meta` (`{traces: […]}`) and `"~debug"` — debug payloads. Amp's own
     ///   `getPluginTracer()` lets third-party plugins set span attributes, so
@@ -878,23 +878,23 @@ impl Provider for Amp {
         // whatever object it is handed with no check, and `ThreadSyncService`'s
         // `download` writes the server's thread verbatim under the server's
         // separate `action.id`. On a file where the two disagree Amp is broken
-        // in exactly the way casr was: it lists the thread under the inner id,
+        // in exactly the way ags was: it lists the thread under the inner id,
         // `storage.get(<inner id>)` misses, and it silently creates a *new*
         // empty thread there, orphaning the file. Following Amp here would mean
         // reproducing that.
         //
-        // # So the decision is casr's own contract
+        // # So the decision is ags's own contract
         //
-        // `session_id` is not a display name. It is the key `casr info <id>`
-        // and `casr resume <target> <id>` look up, and the only key that
+        // `session_id` is not a display name. It is the key `ags convert info <id>`
+        // and `ags convert resume <target> <id>` look up, and the only key that
         // resolves: [`Provider::is_session_path`] lists any `.json` in a
         // threads root and [`Self::thread_path_in`] opens `<root>/<id>.json`.
         // Reporting `.id` for a file whose name disagrees printed an id in
-        // `casr list` that `casr info` then refused as unknown — a session casr
+        // `ags convert list` that `ags convert info` then refused as unknown — a session ags
         // could see and could not open.
         //
         // Nothing is lost by the flip: [`Self::thread_metadata`] already
-        // publishes the file's own `id`, so `casr info --json` shows both and
+        // publishes the file's own `id`, so `ags convert info --json` shows both and
         // the disagreement is reported rather than resolved in silence.
         let session_id = path
             .file_stem()
@@ -996,7 +996,7 @@ impl Provider for Amp {
         );
 
         // Thread-level facts, and only those. Plus the native thread title
-        // under the canonical metadata key, so `casr list`/`info` can render it
+        // under the canonical metadata key, so `ags convert list`/`info` can render it
         // in the provider-neutral Name column.
         let mut metadata = Self::thread_metadata(thread_obj);
         if let (Some(name), Some(obj)) = (native_name, metadata.as_object_mut()) {
@@ -1055,14 +1055,14 @@ impl Provider for Amp {
     /// *global* option taking an optional value, so the quoted string was
     /// consumed as the prompt and `continue [threads...]` was left with no
     /// arguments — the branch that continues the **last** thread for the
-    /// current mode. The id casr had been asked about never reached the
+    /// current mode. The id ags had been asked about never reached the
     /// resolver. `continue`'s own help is explicit about the shape it wants:
     /// "Each thread can be a thread URL or ID."
     ///
-    /// One caveat casr cannot engineer away, and so states instead: the CLI
+    /// One caveat ags cannot engineer away, and so states instead: the CLI
     /// resolves that id against the Amp server (`amp login` required), while
-    /// the file casr just read or wrote is local to the editor extension. A
-    /// thread the extension has synced resumes; one casr wrote and nothing has
+    /// the file ags just read or wrote is local to the editor extension. A
+    /// thread the extension has synced resumes; one ags wrote and nothing has
     /// opened yet does not, because the server has never seen it.
     fn resume_command(&self, session_id: &str) -> String {
         format!("amp threads continue {session_id}")
@@ -1391,14 +1391,14 @@ mod tests {
         assert_eq!(
             Amp::owns_session_in_roots(&session.session_id, std::slice::from_ref(&root)).as_deref(),
             Some(path.as_path()),
-            "every id casr reports for a thread must be one it can resolve"
+            "every id ags reports for a thread must be one it can resolve"
         );
     }
 
     /// The minter has to keep matching Amp's own `rz` validator: `T-` plus a
     /// hyphenated 8-4-4-4-12 hex UUID. Nothing *reads* through this shape any
     /// more — resolution follows Amp's key-to-path mapping instead — but a
-    /// thread casr writes still has to be one the extension recognises.
+    /// thread ags writes still has to be one the extension recognises.
     #[test]
     fn writer_generate_thread_id_matches_amps_validator() {
         let tid = Amp::generate_thread_id();
@@ -1685,7 +1685,7 @@ mod tests {
             Amp::owns_session_in_roots("restored-from-backup", std::slice::from_ref(&root))
                 .as_deref(),
             Some(path.as_path()),
-            "a thread casr lists must be a thread casr can resolve"
+            "a thread ags convert lists must be a thread ags can resolve"
         );
     }
 

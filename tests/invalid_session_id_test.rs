@@ -9,7 +9,7 @@
 mod test_env;
 
 use ags::discovery::{ProviderRegistry, SourceHint};
-use ags::error::CasrError;
+use ags::error::AgsError;
 use ags::providers::Provider;
 use ags::providers::claude_code::ClaudeCode;
 use ags::providers::clawdbot::ClawdBot;
@@ -57,7 +57,7 @@ fn assert_session_not_found(session_id: &str, label: &str) {
     let result = registry.resolve_session(session_id, None);
 
     match result {
-        Err(CasrError::SessionNotFound { .. }) => {
+        Err(AgsError::SessionNotFound { .. }) => {
             // Expected — session ID not found.
         }
         Err(other) => {
@@ -117,7 +117,7 @@ fn registry_rejects_relative_traversal_that_reaches_an_existing_file() {
     let resolved = registry.resolve_session("../outside", Some(&hint));
 
     assert!(
-        matches!(resolved, Err(CasrError::SessionNotFound { .. })),
+        matches!(resolved, Err(AgsError::SessionNotFound { .. })),
         "a relative session id escaped the ClawdBot store: {resolved:?}"
     );
 }
@@ -284,7 +284,7 @@ fn cc_owns_session_empty_returns_none() {
 /// `join(format!("{session_id}.jsonl"))`), and `Path::join` throws the receiver
 /// away when the argument is absolute. Measured before the fix: `owns_session`
 /// on an absolute path was claimed by `claude-code`, `codex` and `kiro`, so
-/// `casr info <a-claude-transcript>` was parsed by the *Codex* reader and
+/// `ags convert info <a-claude-transcript>` was parsed by the *Codex* reader and
 /// reported `provider: "codex"` with zero messages — and with `--source cod`
 /// the same mismatch reached `resume`.
 ///

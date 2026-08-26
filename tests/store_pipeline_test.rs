@@ -748,7 +748,7 @@ fn is_uuid(text: &str) -> bool {
 }
 
 /// Replace every embedded hyphen-free uuid, such as Claude Code's
-/// `msg_casr_<32 hex>` message ids.
+/// `msg_ags_<32 hex>` message ids.
 ///
 /// A run of *exactly* 32 hex digits, so that a 40-character git object name and a
 /// 64-character digest — both of which are content — are left alone.
@@ -887,10 +887,10 @@ fn a_record_id_resolves_to_the_session_a_provider_can_resume() {
 // No test may write to the developer's own store
 // ---------------------------------------------------------------------------
 
-/// Every test file that runs `casr resume` in a child process must redirect the
+/// Every test file that runs `ags convert resume` in a child process must redirect the
 /// session store.
 ///
-/// The store is on by default, so `casr resume …` writes to
+/// The store is on by default, so `ags convert resume …` writes to
 /// `dirs::data_dir()/ags` — a real store belonging to whoever is running the
 /// suite — unless the test says otherwise. That is not hypothetical: turning the
 /// store on made `grok_test::cli_convert_into_grok_is_refused` file a fixture as
@@ -945,7 +945,7 @@ fn every_cli_test_that_resumes_redirects_the_store() {
     );
     assert!(
         offenders.is_empty(),
-        "{offenders:?} run `casr resume` in a child process without redirecting the session \
+        "{offenders:?} run `ags convert resume` in a child process without redirecting the session \
          store, so they write into the real one at `dirs::data_dir()/ags`. Set \
          `AGS_STORE` or `XDG_DATA_HOME` to a temp directory on the command, or pass \
          `--no-store`."

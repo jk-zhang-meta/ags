@@ -3,7 +3,7 @@
 //! `@google/gemini-cli-core@0.52.0` stopped naming a project's directory
 //! `SHA256(workspace)` and started naming it with a **registry slug**
 //! (`dist/src/config/storage.js:172-190`, `dist/src/config/projectRegistry.js`).
-//! casr modelled only the hash form, so on any current install every Gemini
+//! ags modelled only the hash form, so on any current install every Gemini
 //! session failed the `--workspace` test as "workspace could not be
 //! determined" and was hidden. A hidden session is worse than an over-listed
 //! one, which is why these drive the binary and assert on what the user sees.
@@ -57,12 +57,12 @@ impl Drop for EnvGuard {
     }
 }
 
-/// A `casr` invocation whose every provider home points inside `tmp`.
+/// A `ags` invocation whose every provider home points inside `tmp`.
 ///
-/// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* casr's own
+/// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* ags's own
 /// session store, so leaving it unset would have these tests create
 /// `~/.local/share/ags` on the machine running them.
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -162,13 +162,13 @@ impl Listed {
     }
 }
 
-/// `casr list --provider gemini --workspace <ws> --json`, parsed.
+/// `ags convert list --provider gemini --workspace <ws> --json`, parsed.
 fn list_for_workspace(tmp: &TempDir, ws: &Path) -> Listed {
-    let output = casr_cmd(tmp)
+    let output = ags_cmd(tmp)
         .args(["list", "--provider", "gemini", "--json", "--workspace"])
         .arg(ws)
         .output()
-        .expect("casr list should run");
+        .expect("ags convert list should run");
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {

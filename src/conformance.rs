@@ -1336,7 +1336,7 @@ impl TurnShape {
                     line["message"]["content"] =
                         serde_json::json!([{ "type": "text", "text": text }]);
                     line["message"]["id"] = serde_json::Value::String(format!(
-                        "msg_casr_{}",
+                        "msg_ags_{}",
                         uuid::Uuid::new_v4().as_simple()
                     ));
                 } else {
@@ -1679,12 +1679,12 @@ fn chain(
 /// Matched on the typed variant rather than on the message, so renaming the
 /// error text cannot silently turn a failure back into a note.
 fn is_write_defect(error: &anyhow::Error) -> bool {
-    match error.downcast_ref::<crate::error::CasrError>() {
+    match error.downcast_ref::<crate::error::AgsError>() {
         // The one refusal proven to describe the input rather than the crate:
         // `validate_session` found the session itself unusable and stopped
         // before writing anything.
-        Some(crate::error::CasrError::ValidationError { .. }) => false,
-        // Every other `CasrError`, and every error that is not one at all.
+        Some(crate::error::AgsError::ValidationError { .. }) => false,
+        // Every other `AgsError`, and every error that is not one at all.
         Some(_) | None => true,
     }
 }
@@ -1823,7 +1823,7 @@ fn hop_two(
     // holds one-sided transcripts `validate_session` correctly refuses — and
     // stays a note. A refusal because the file the pipeline just wrote does not
     // read back as the session it converted is this crate's own bug, and has to
-    // fail. `CasrError::VerifyFailed` is exactly that line and it is already
+    // fail. `AgsError::VerifyFailed` is exactly that line and it is already
     // typed, so the split needs no string matching.
     //
     // Both used to be notes, and that is how a real writer defect hid here in
@@ -2275,7 +2275,7 @@ mod tests {
     /// it as a printed note is how a real defect stays invisible.
     #[test]
     fn only_an_unusable_input_may_be_filed_as_a_note() {
-        let unusable = anyhow::Error::from(crate::error::CasrError::ValidationError {
+        let unusable = anyhow::Error::from(crate::error::AgsError::ValidationError {
             errors: vec!["one-sided transcript".into()],
             warnings: Vec::new(),
             info: Vec::new(),
@@ -2286,12 +2286,12 @@ mod tests {
         );
 
         for defect in [
-            crate::error::CasrError::SessionWriteError {
+            crate::error::AgsError::SessionWriteError {
                 path: PathBuf::from("/sandbox/out.jsonl"),
                 provider: "codex".into(),
                 detail: "no space left on device".into(),
             },
-            crate::error::CasrError::SessionReadError {
+            crate::error::AgsError::SessionReadError {
                 path: PathBuf::from("/sandbox/out.jsonl"),
                 provider: "codex".into(),
                 detail: "unexpected end of input".into(),

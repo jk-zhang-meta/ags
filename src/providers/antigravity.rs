@@ -40,7 +40,7 @@
 //!
 //! ### Why no model is pinned
 //!
-//! casr used to emit `--model "Gemini 3.1 Pro (High)"` alongside it. Verified
+//! ags used to emit `--model "Gemini 3.1 Pro (High)"` alongside it. Verified
 //! against the shipped `agy` 1.1.7 linux-x64 build (`antigravity --help`, run
 //! under a throwaway `HOME`), that flag surface is:
 //!
@@ -60,16 +60,16 @@
 //! with a non-zero exit, and in an interactive session silently falls back to
 //! another model with a warning.
 //!
-//! Emitting a *correct* pin would be no better. casr has nothing to derive one
+//! Emitting a *correct* pin would be no better. ags has nothing to derive one
 //! from: the transcript records no model (see [`Antigravity::read_session`]),
-//! so any slug casr chose would be casr's opinion, silently overriding whatever
+//! so any slug ags chose would be ags's opinion, silently overriding whatever
 //! the user picked. agy already persists the user's own `/model` and `/effort`
 //! choice across sessions, so omitting both flags resumes on the model the user
 //! actually selected. The argument the other way — that pinning makes a resumed
 //! conversation reproducible across machines, and stops a cheap default model
 //! from inheriting an expensive conversation — is real, but it is a decision
 //! for the user's agy settings or their own command line, not for a resume
-//! command casr prints on their behalf. If a caller wants a pin, appending
+//! command ags prints on their behalf. If a caller wants a pin, appending
 //! `--model <slug> --effort <low|medium|high>` is theirs to do.
 //!
 //! ## Write support
@@ -87,7 +87,7 @@
 //! A trailing user-side turn is refused because inventing an assistant reply
 //! would make the resumed history claim that an unanswered request was answered.
 //! The generated transcript sidecar preserves the canonical preview and makes
-//! casr's normal read-back verification and rollback cover the import.
+//! ags's normal read-back verification and rollback cover the import.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -1037,7 +1037,7 @@ impl Provider for Antigravity {
     }
 
     /// `agy --conversation <uuid>`, with no `--model` / `--effort` pin. See the
-    /// module docs for why casr does not choose a model here.
+    /// module docs for why ags does not choose a model here.
     fn resume_command(&self, session_id: &str) -> String {
         format!("agy --conversation {session_id}")
     }
@@ -1316,7 +1316,7 @@ mod tests {
     /// resuming by id. It must not carry a model pin: `--model` takes a slug
     /// and `--effort` is a separate `low|medium|high` flag, so a combined
     /// display label like `"Gemini 3.1 Pro (High)"` resolves to nothing and
-    /// hard-fails `-p` mode (agy 1.1.2), and casr has no source of truth for
+    /// hard-fails `-p` mode (agy 1.1.2), and ags has no source of truth for
     /// choosing a slug anyway.
     #[test]
     fn resume_command_is_conversation_id_only() {
@@ -1329,11 +1329,11 @@ mod tests {
         );
         assert!(
             !cmd.contains("--model"),
-            "casr must not pin a model the user did not choose: {cmd}"
+            "ags must not pin a model the user did not choose: {cmd}"
         );
         assert!(
             !cmd.contains("--effort"),
-            "casr must not pin a reasoning effort the user did not choose: {cmd}"
+            "ags must not pin a reasoning effort the user did not choose: {cmd}"
         );
     }
 
@@ -1570,7 +1570,7 @@ mod tests {
         // unknown and must be reported as unknown rather than guessed.
         assert_eq!(
             session.model_name, None,
-            "agy transcripts carry no model; casr must not invent one"
+            "agy transcripts carry no model; ags must not invent one"
         );
         // Housekeeping SYSTEM steps dropped; only user + model remain.
         assert_eq!(session.messages.len(), 2);

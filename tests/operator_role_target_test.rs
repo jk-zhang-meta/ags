@@ -11,7 +11,7 @@
 //!
 //! # Why this reads the file and not the session
 //!
-//! casr's own reader is not an oracle for casr's own writer. `parse_envelope`
+//! ags's own reader is not an oracle for ags's own writer. `parse_envelope`
 //! maps `"AssistantMessage"` to `MessageRole::Assistant`, so a writer that
 //! picked the wrong speaker and a reader that agrees with it produce a perfectly
 //! clean round trip. The Kiro test therefore opens the JSONL line and asserts

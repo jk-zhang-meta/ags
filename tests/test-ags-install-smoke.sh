@@ -3,7 +3,20 @@ set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_target="${CARGO_TARGET_DIR:-$project_root/target}"
-binary="${CASR_TEST_BINARY:-$cargo_target/debug/ags}"
+binary="${AGS_TEST_BINARY:-$cargo_target/debug/ags}"
+
+# 把继承来的 AGS_*/AGENT_SESSION_* 擦干净。
+#
+# 从一个 ags 起来的 shell 里跑这个套件，`AGS_ID` 会跟着进来，于是
+# `ags save installer-hook` 存出来的检查点用的是**外面那个会话的 ID**，断言找不到
+# 自己刚存的东西，报的却是「检查点不存在」——跟真实原因隔着十万八千里。
+# 套件要用的每个变量下面都用 `env` 显式给，全擦是安全的。
+while IFS='=' read -r ags_inherited _; do
+    case "$ags_inherited" in
+        AGS_*|AGENT_SESSION_*) unset "$ags_inherited" ;;
+    esac
+done < <(env)
+unset ags_inherited
 # 装的是哪个版本，问被测二进制自己。
 #
 # 这里原来写死 `v0.3.0-ags.1`，而安装器会拿它和产物的真实版本比对——也就是说
@@ -25,7 +38,7 @@ cleanup() {
 trap cleanup EXIT
 
 [[ -x "$binary" ]] || {
-    printf 'CASR test binary is missing: %s\n' "$binary" >&2
+    printf 'ags test binary is missing: %s\n' "$binary" >&2
     exit 1
 }
 
@@ -37,58 +50,6 @@ test_sha256_file() {
     fi
 }
 
-write_rmux_recovery_journal() {
-    local journal="$1" dest="$2" prefix="$3"
-    local candidate_client="$4" candidate_daemon="$5" candidate_helper="$6"
-    local previous_client="$7" previous_daemon="$8" previous_helper="$9"
-    local suffix="${10}"
-    jq -n \
-        --arg version 0.9.1 \
-        --arg client "$dest/rmux" \
-        --arg daemon "$dest/rmux-daemon" \
-        --arg helper "$prefix/libexec/rmux/rmux" \
-        --arg suffix "$suffix" \
-        --arg candidate_client "$candidate_client" \
-        --arg candidate_daemon "$candidate_daemon" \
-        --arg candidate_helper "$candidate_helper" \
-        --arg previous_client "$previous_client" \
-        --arg previous_daemon "$previous_daemon" \
-        --arg previous_helper "$previous_helper" \
-        --arg backup0 "$dest/.rmux.rollback.0.$suffix" \
-        --arg backup1 "$dest/.rmux.rollback.1.$suffix" \
-        --arg backup2 "$dest/.rmux.rollback.2.$suffix" '{
-          schema:1,
-          managed_by:"ags-rmux-installer",
-          version:$version,
-          entries:[
-            {
-              path:$client,
-              stage_path:($client + ".install-transaction." + $suffix),
-              candidate_sha256:$candidate_client,
-              previous:{
-                existed:true,sha256:$previous_client,backup_path:$backup0
-              }
-            },
-            {
-              path:$daemon,
-              stage_path:($daemon + ".install-transaction." + $suffix),
-              candidate_sha256:$candidate_daemon,
-              previous:{
-                existed:true,sha256:$previous_daemon,backup_path:$backup1
-              }
-            },
-            {
-              path:$helper,
-              stage_path:($helper + ".install-transaction." + $suffix),
-              candidate_sha256:$candidate_helper,
-              previous:{
-                existed:true,sha256:$previous_helper,backup_path:$backup2
-              }
-            }
-          ]
-        }' > "$journal"
-    chmod 600 "$journal"
-}
 
 artifact_root="$tmp/artifact"
 artifact="$tmp/ags.tar.xz"
@@ -99,21 +60,7 @@ offline_network_marker="$tmp/offline-network-used"
 mkdir -p "$artifact_root" "$home/.codex" "$home/.claude" "$offline_guard_bin"
 ln -s "$FAKE_REAL_NODE_BINARY" "$offline_guard_bin/node-real"
 install -m 0755 "$binary" "$artifact_root/ags"
-mkdir -p "$artifact_root/bin" "$artifact_root/libexec/rmux"
-cat > "$artifact_root/bin/rmux" <<'EOF'
-#!/bin/sh
-case "${1:-}" in
-    -V) printf 'rmux 0.9.1\n' ;;
-    list-commands) exit 0 ;;
-    *) exit 64 ;;
-esac
-EOF
-printf '%s\n' '#!/bin/sh' 'exit 0' > "$artifact_root/bin/rmux-daemon"
-printf '%s\n' '#!/bin/sh' 'exit 0' > "$artifact_root/libexec/rmux/rmux"
-chmod 0755 "$artifact_root/bin/rmux" "$artifact_root/bin/rmux-daemon" \
-    "$artifact_root/libexec/rmux/rmux"
-tar -cJf "$artifact" -C "$artifact_root" \
-    ags bin/rmux bin/rmux-daemon libexec/rmux/rmux
+tar -cJf "$artifact" -C "$artifact_root" ags
 
 cat > "$offline_guard_bin/curl" <<'EOF'
 #!/bin/sh
@@ -182,13 +129,6 @@ config="$home/.local/state/ags/storage.json"
 vault="$home/.local/share/ags/checkpoints"
 # 二进制自己就叫 ags 了，旁边不再有壳，装完也不该留下旧的 casr。
 [[ -x "$bin_dir/ags" && ! -e "$bin_dir/casr" ]]
-[[ -x "$bin_dir/rmux" && -x "$bin_dir/rmux-daemon" ]]
-[[ -x "$tmp/libexec/rmux/rmux" ]]
-[[ "$("$bin_dir/rmux" -V)" == 'rmux 0.9.1' ]]
-[[ ! -e "$bin_dir/.rmux-install-transaction.json" ]]
-[[ -z "$(find "$bin_dir" "$tmp/libexec/rmux" -type f \
-    \( -name '.rmux.rollback.*' -o -name '*.install-transaction.*' \) \
-    -print -quit)" ]]
 [[ -f "$identity" && -f "$config" && -d "$vault" ]]
 [[ "$(stat -c %a "$identity")" == 600 ]]
 [[ "$(stat -c %a "$config")" == 600 ]]
@@ -222,7 +162,9 @@ runtime_env=(
     XDG_STATE_HOME="$home/.local/state"
     PATH="$bin_dir:$PATH"
 )
-"${runtime_env[@]}" "$bin_dir/ags" --help | grep -Fq 'Usage:'
+# 裸命名空间归运行时，`convert` 下面才是转换 CLI，两边各验一句。
+"${runtime_env[@]}" "$bin_dir/ags" --help | grep -Fq '用法:'
+"${runtime_env[@]}" "$bin_dir/ags" convert --help | grep -Fq 'Usage:'
 "${runtime_env[@]}" "$bin_dir/ags" archives >/dev/null
 
 checkpoint_work="$tmp/checkpoint-work"
@@ -314,186 +256,28 @@ grep -Fq 'Offline tarball not found' "$tmp/interrupted.err"
 )" ]]
 [[ ! -e "$interrupted_journal" && ! -e "$interrupted_backup" ]]
 
-rmux_partial_home="$tmp/rmux-partial-home"
-rmux_partial_bin="$tmp/rmux-partial-bin"
-rmux_partial_helper="$rmux_partial_bin/libexec/rmux/rmux"
-rmux_partial_journal="$rmux_partial_bin/.rmux-install-transaction.json"
-rmux_partial_missing="$tmp/rmux-partial-missing.tar.xz"
-mkdir -p "$rmux_partial_home" "$(dirname "$rmux_partial_helper")"
-rmux_partial_destinations=(
-    "$rmux_partial_bin/rmux"
-    "$rmux_partial_bin/rmux-daemon"
-    "$rmux_partial_helper"
-)
-rmux_partial_sources=(
-    "$artifact_root/bin/rmux"
-    "$artifact_root/bin/rmux-daemon"
-    "$artifact_root/libexec/rmux/rmux"
-)
-rmux_partial_previous_shas=()
-rmux_partial_candidate_shas=()
-for index in 0 1 2; do
-    backup="$rmux_partial_bin/.rmux.rollback.$index.partial"
-    stage="${rmux_partial_destinations[$index]}.install-transaction.partial"
-    printf '#!/bin/sh\nprintf "previous-rmux-%s\\n"\n' "$index" > "$backup"
-    chmod 755 "$backup"
-    cp -p -- "$backup" "${rmux_partial_destinations[$index]}"
-    cp -p -- "${rmux_partial_sources[$index]}" "$stage"
-    rmux_partial_previous_shas[$index]="$(test_sha256_file "$backup")"
-    rmux_partial_candidate_shas[$index]="$(test_sha256_file "$stage")"
-done
-mv -f -- \
-    "${rmux_partial_destinations[0]}.install-transaction.partial" \
-    "${rmux_partial_destinations[0]}"
-mv -f -- \
-    "${rmux_partial_destinations[1]}.install-transaction.partial" \
-    "${rmux_partial_destinations[1]}"
-write_rmux_recovery_journal \
-    "$rmux_partial_journal" "$rmux_partial_bin" "$rmux_partial_bin" \
-    "${rmux_partial_candidate_shas[0]}" \
-    "${rmux_partial_candidate_shas[1]}" \
-    "${rmux_partial_candidate_shas[2]}" \
-    "${rmux_partial_previous_shas[0]}" \
-    "${rmux_partial_previous_shas[1]}" \
-    "${rmux_partial_previous_shas[2]}" \
-    partial
-if env HOME="$rmux_partial_home" \
-    XDG_CONFIG_HOME="$rmux_partial_home/.config" \
-    XDG_DATA_HOME="$rmux_partial_home/.local/share" \
-    XDG_STATE_HOME="$rmux_partial_home/.local/state" \
-    PATH="$offline_guard_bin:$rmux_partial_bin:$PATH" \
+# 装到一个已经有 `ags` 的目录上：要覆盖，不要保留。
+#
+# 这一条原来断言的是反过来的——那时 `ags` 是 `casr` 旁边的一个壳脚本，安装器认
+# `# casr-installer-wrapper` 标记，认不出来就当"手写的"留着。壳没了之后 `ags` 就是
+# 二进制本身，而 casr→ags 迁移**正是靠覆盖旧的 `ags` 壳**完成的（实测：144 字节的壳
+# → 4,504,688 字节的 Mach-O）。保留反而会让升级过的机器永远停在旧壳上。
+migrate_home="$tmp/migrate-home"
+migrate_bin="$tmp/migrate-bin"
+mkdir -p "$migrate_home" "$migrate_bin"
+printf 'unmanaged\n' > "$migrate_bin/ags"
+env HOME="$migrate_home" \
+    XDG_CONFIG_HOME="$migrate_home/.config" \
+    XDG_DATA_HOME="$migrate_home/.local/share" \
+    XDG_STATE_HOME="$migrate_home/.local/state" \
+    PATH="$offline_guard_bin:$migrate_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
     VERSION="$smoke_version" \
-    "$project_root/install.sh" --offline "$rmux_partial_missing" \
-    --dest "$rmux_partial_bin" --no-verify \
-    > "$tmp/rmux-partial.out" 2> "$tmp/rmux-partial.err"; then
-    printf 'installer unexpectedly accepted a missing RMUX recovery artifact\n' >&2
-    exit 1
-fi
-grep -Fq 'Rolled back an interrupted RMUX activation' \
-    "$tmp/rmux-partial.out" "$tmp/rmux-partial.err"
-grep -Fq 'Offline tarball not found' "$tmp/rmux-partial.err"
-for index in 0 1 2; do
-    [[ "$(test_sha256_file "${rmux_partial_destinations[$index]}")" == \
-       "${rmux_partial_previous_shas[$index]}" ]]
-    [[ ! -e "$rmux_partial_bin/.rmux.rollback.$index.partial" ]]
-    [[ ! -e "${rmux_partial_destinations[$index]}.install-transaction.partial" ]]
-done
-[[ ! -e "$rmux_partial_journal" ]]
-
-rmux_resume_home="$tmp/rmux-resume-home"
-rmux_resume_bin="$tmp/rmux-resume-bin"
-rmux_resume_helper="$rmux_resume_bin/libexec/rmux/rmux"
-rmux_resume_journal="$rmux_resume_bin/.rmux-install-transaction.json"
-rmux_resume_binary_journal="$rmux_resume_bin/.ags.install-transaction.json"
-rmux_resume_binary_backup="$rmux_resume_bin/.ags.rollback.recovery"
-rmux_resume_binary_stage="$rmux_resume_bin/.ags.install.recovery"
-rmux_resume_missing="$tmp/rmux-resume-missing.tar.xz"
-mkdir -p "$rmux_resume_home" "$(dirname "$rmux_resume_helper")"
-rmux_resume_destinations=(
-    "$rmux_resume_bin/rmux"
-    "$rmux_resume_bin/rmux-daemon"
-    "$rmux_resume_helper"
-)
-rmux_resume_sources=(
-    "$artifact_root/bin/rmux"
-    "$artifact_root/bin/rmux-daemon"
-    "$artifact_root/libexec/rmux/rmux"
-)
-rmux_resume_previous_shas=()
-rmux_resume_candidate_shas=()
-for index in 0 1 2; do
-    backup="$rmux_resume_bin/.rmux.rollback.$index.recovery"
-    printf '#!/bin/sh\nprintf "previous-rmux-%s\\n"\n' "$index" > "$backup"
-    chmod 755 "$backup"
-    install -m 0755 \
-        "${rmux_resume_sources[$index]}" \
-        "${rmux_resume_destinations[$index]}"
-    rmux_resume_previous_shas[$index]="$(test_sha256_file "$backup")"
-    rmux_resume_candidate_shas[$index]="$(
-        test_sha256_file "${rmux_resume_destinations[$index]}"
-    )"
-done
-write_rmux_recovery_journal \
-    "$rmux_resume_journal" "$rmux_resume_bin" "$rmux_resume_bin" \
-    "${rmux_resume_candidate_shas[0]}" \
-    "${rmux_resume_candidate_shas[1]}" \
-    "${rmux_resume_candidate_shas[2]}" \
-    "${rmux_resume_previous_shas[0]}" \
-    "${rmux_resume_previous_shas[1]}" \
-    "${rmux_resume_previous_shas[2]}" \
-    recovery
-printf '%s\n' '#!/bin/sh' 'printf "previous-ags\n"' \
-    > "$rmux_resume_binary_backup"
-chmod 755 "$rmux_resume_binary_backup"
-install -m 0755 "$binary" "$rmux_resume_bin/ags"
-rmux_resume_binary_candidate_sha="$(
-    test_sha256_file "$rmux_resume_bin/ags"
-)"
-rmux_resume_binary_previous_sha="$(
-    test_sha256_file "$rmux_resume_binary_backup"
-)"
-jq -n \
-    --arg binary "$rmux_resume_bin/ags" \
-    --arg candidate_sha "$rmux_resume_binary_candidate_sha" \
-    --arg stage "$rmux_resume_binary_stage" \
-    --arg previous_sha "$rmux_resume_binary_previous_sha" \
-    --arg backup "$rmux_resume_binary_backup" \
-    '{
-      schema:2,
-      managed_by:"ags-installer",
-      binary_path:$binary,
-      candidate:{sha256:$candidate_sha,stage_path:$stage},
-      previous:{
-        existed:true,
-        sha256:$previous_sha,
-        backup_path:$backup
-      },
-    }' > "$rmux_resume_binary_journal"
-chmod 600 "$rmux_resume_binary_journal"
-env HOME="$rmux_resume_home" \
-    XDG_CONFIG_HOME="$rmux_resume_home/.config" \
-    XDG_DATA_HOME="$rmux_resume_home/.local/share" \
-    XDG_STATE_HOME="$rmux_resume_home/.local/state" \
-    PATH="$offline_guard_bin:$rmux_resume_bin:$PATH" \
-    OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION="$smoke_version" \
-    "$project_root/install.sh" --offline "$rmux_resume_missing" \
-    --dest "$rmux_resume_bin" --no-verify \
-    > "$tmp/rmux-resume.out" 2> "$tmp/rmux-resume.err"
-grep -Fq 'Recovering interrupted RMUX installation' \
-    "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-grep -Fq 'Resuming the interrupted ags installation' \
-    "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-grep -Fq 'Finishing the recovered ags transaction' \
-    "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-[[ ! -e "$rmux_resume_missing" && ! -e "$offline_network_marker" ]]
-[[ "$(test_sha256_file "$rmux_resume_bin/ags")" == \
-   "$rmux_resume_binary_candidate_sha" ]]
-for index in 0 1 2; do
-    [[ "$(test_sha256_file "${rmux_resume_destinations[$index]}")" == \
-       "${rmux_resume_candidate_shas[$index]}" ]]
-    [[ ! -e "$rmux_resume_bin/.rmux.rollback.$index.recovery" ]]
-    [[ ! -e "${rmux_resume_destinations[$index]}.install-transaction.recovery" ]]
-done
-[[ "$("$rmux_resume_bin/rmux" -V)" == 'rmux 0.9.1' ]]
-[[ ! -e "$rmux_resume_journal" ]]
-[[ ! -e "$rmux_resume_binary_journal" ]]
-[[ ! -e "$rmux_resume_binary_backup" && ! -e "$rmux_resume_binary_stage" ]]
-unmanaged_home="$tmp/unmanaged-home"
-unmanaged_bin="$tmp/unmanaged-bin"
-mkdir -p "$unmanaged_home" "$unmanaged_bin"
-printf 'unmanaged\n' > "$unmanaged_bin/ags"
-env HOME="$unmanaged_home" \
-    XDG_CONFIG_HOME="$unmanaged_home/.config" \
-    XDG_DATA_HOME="$unmanaged_home/.local/share" \
-    XDG_STATE_HOME="$unmanaged_home/.local/state" \
-    PATH="$offline_guard_bin:$unmanaged_bin:$PATH" \
-    OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION="$smoke_version" \
-    "$project_root/install.sh" --offline "$artifact" --dest "$unmanaged_bin" \
-    --no-verify --quiet > "$tmp/unmanaged.out" 2> "$tmp/unmanaged.err"
-grep -Fqx 'unmanaged' "$unmanaged_bin/ags"
+    "$project_root/install.sh" --offline "$artifact" --dest "$migrate_bin" \
+    --no-verify --quiet > "$tmp/migrate.out" 2> "$tmp/migrate.err"
+! grep -Fqx 'unmanaged' "$migrate_bin/ags"
+[[ -x "$migrate_bin/ags" ]]
+"$migrate_bin/ags" --version >/dev/null
 
 symlink_home="$tmp/symlink-home"
 symlink_bin="$tmp/symlink-bin"
@@ -526,11 +310,6 @@ online_tools="$tmp/online-tools"
 online_fixture_home="$tmp/online-context-fixture"
 online_npm_log="$tmp/online-npm.log"
 mkdir -p "$online_home" "$online_bin" "$online_tools"
-mkdir -p "$online_bin/libexec/rmux"
-install -m 0755 "$artifact_root/bin/rmux" "$online_bin/rmux"
-install -m 0755 "$artifact_root/bin/rmux-daemon" "$online_bin/rmux-daemon"
-install -m 0755 "$artifact_root/libexec/rmux/rmux" \
-    "$online_bin/libexec/rmux/rmux"
 
 if (( EUID == 0 )); then
     if env HOME="$tmp/system-root-home" \

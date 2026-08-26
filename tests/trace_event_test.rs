@@ -14,7 +14,7 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -77,10 +77,10 @@ fn trace_emits_starting_conversion() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --trace");
+        .expect("run ags --trace");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -96,10 +96,10 @@ fn trace_emits_source_session_resolved() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --trace");
+        .expect("run ags --trace");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -115,10 +115,10 @@ fn trace_emits_source_session_read() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --trace");
+        .expect("run ags --trace");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -134,10 +134,10 @@ fn trace_emits_dry_run_skip() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --trace");
+        .expect("run ags --trace");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -153,10 +153,10 @@ fn trace_emits_atomic_write_on_real_write() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id])
         .output()
-        .expect("run casr --trace resume (write)");
+        .expect("run ags --trace resume (write)");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -172,10 +172,10 @@ fn trace_dry_run_omits_atomic_write() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --trace --dry-run");
+        .expect("run ags --trace --dry-run");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -190,16 +190,16 @@ fn trace_emits_enrichment_applied() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--enrich"])
         .output()
-        .expect("run casr --trace --enrich");
+        .expect("run ags --trace --enrich");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("applied casr enrichment"),
-        "trace should contain 'applied casr enrichment', got stderr:\n{}",
+        stderr.contains("applied ags enrichment"),
+        "trace should contain 'applied ags enrichment', got stderr:\n{}",
         &stderr[..stderr.len().min(500)]
     );
 }
@@ -213,10 +213,10 @@ fn trace_emits_target_provider_detection() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --trace");
+        .expect("run ags --trace");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -231,7 +231,7 @@ fn trace_emits_target_provider_detection() {
 fn trace_emits_auto_resolve_search() {
     let tmp = TempDir::new().unwrap();
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--trace",
             "resume",
@@ -240,7 +240,7 @@ fn trace_emits_auto_resolve_search() {
             "--dry-run",
         ])
         .output()
-        .expect("run casr --trace with bad session");
+        .expect("run ags --trace with bad session");
 
     // Should fail (session not found) but trace events should be present.
     assert!(!output.status.success());
@@ -261,10 +261,10 @@ fn verbose_emits_source_session_resolved() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--verbose", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --verbose");
+        .expect("run ags --verbose");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -281,10 +281,10 @@ fn verbose_emits_session_read() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--verbose", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("run casr --verbose");
+        .expect("run ags --verbose");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

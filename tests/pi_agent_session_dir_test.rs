@@ -1,4 +1,4 @@
-//! Which directories `casr` will read a `pi` session out of, and which it will
+//! Which directories `ags` will read a `pi` session out of, and which it will
 //! only *resolve* one out of.
 //!
 //! Two different bugs, on two different code paths, plus the decision that
@@ -8,15 +8,15 @@
 //!   `<agent-dir>` whenever `<agent-dir>/sessions` was absent, and walked it
 //!   with no `max_depth` at all. `detect` hid that on the automatic path, but
 //!   `--source pi` goes straight to `owns_session`
-//!   (`discovery.rs::resolve_with_alias`), so `casr info <id> --source pi`
+//!   (`discovery.rs::resolve_with_alias`), so `ags convert info <id> --source pi`
 //!   resolved a debug log and a cached tool output and rendered each as a
 //!   session. `<agent-dir>` is also where `auth.json` lives.
 //!
 //! * **List.** `PI_CODING_AGENT_SESSION_DIR` is real —
 //!   `@mariozechner/pi-coding-agent@0.73.1` builds the name at
-//!   `dist/config.js:341` and reads it at `dist/main.js:384-387` — and casr
+//!   `dist/config.js:341` and reads it at `dist/main.js:384-387` — and ags
 //!   ignored it on purpose. With it set, `pi` writes every session into a
-//!   directory casr never looked at, so casr answered "no `pi` sessions".
+//!   directory ags never looked at, so ags answered "no `pi` sessions".
 //!
 //! The join is that the fallback root was a guess standing in for the override:
 //! "sessions are probably somewhere under here". Replacing the guess with the
@@ -35,16 +35,16 @@ use std::path::{Path, PathBuf};
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-/// A `casr` invocation whose every provider home points inside `tmp`.
+/// A `ags` invocation whose every provider home points inside `tmp`.
 ///
 /// `HOME` is redirected too, which the sibling suites do not need to do: the
-/// point of several of these tests is what casr does when `PI_AGENT_HOME` is
+/// point of several of these tests is what ags does when `PI_AGENT_HOME` is
 /// *absent*, and without `PI_AGENT_HOME` the default agent dir is `~/.pi/agent`.
 ///
-/// `XDG_DATA_HOME` matters twice over — it is Amp's store *and* casr's own
+/// `XDG_DATA_HOME` matters twice over — it is Amp's store *and* ags's own
 /// session store — so leaving it unset would have these tests write into
 /// `~/.local/share/ags` on the machine running them.
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -82,14 +82,14 @@ fn casr_cmd(tmp: &TempDir) -> Command {
     cmd
 }
 
-/// `casr` aimed at `<tmp>/pi-agent` as the `pi` agent directory, the way a user
+/// `ags` aimed at `<tmp>/pi-agent` as the `pi` agent directory, the way a user
 /// with a real `pi` install is aimed at `~/.pi/agent`.
 ///
-/// `PI_CODING_AGENT_DIR` rather than casr's own `PI_AGENT_HOME`, because
+/// `PI_CODING_AGENT_DIR` rather than ags's own `PI_AGENT_HOME`, because
 /// `PI_AGENT_HOME` deliberately suppresses the session-dir override and most of
 /// these tests are about the override.
 fn pi_cmd(tmp: &TempDir) -> Command {
-    let mut cmd = casr_cmd(tmp);
+    let mut cmd = ags_cmd(tmp);
     cmd.env("PI_CODING_AGENT_DIR", agent_dir(tmp));
     cmd
 }
@@ -119,13 +119,13 @@ fn pi_transcript(cwd: &Path, id: &str) -> String {
     )
 }
 
-/// Run `casr list --json` for one provider and return the parsed envelope.
+/// Run `ags convert list --json` for one provider and return the parsed envelope.
 fn list_json(mut cmd: Command, tmp: &TempDir) -> serde_json::Value {
     let output = cmd
         .args(["list", "--provider", "pi-agent", "--json"])
         .current_dir(tmp.path())
         .output()
-        .expect("casr list should run");
+        .expect("ags convert list should run");
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -166,13 +166,13 @@ fn warnings(envelope: &serde_json::Value, tmp: &TempDir) -> Vec<String> {
     paths_under(envelope, "skipped", tmp)
 }
 
-/// The path `casr info <id> --source pi` resolved, or `None` if it refused.
+/// The path `ags convert info <id> --source pi` resolved, or `None` if it refused.
 fn resolved_path(mut cmd: Command, tmp: &TempDir, session_id: &str) -> Option<String> {
     let output = cmd
         .args(["--json", "info", session_id, "--source", "pi"])
         .current_dir(tmp.path())
         .output()
-        .expect("casr info should run");
+        .expect("ags convert info should run");
     if !output.status.success() {
         return None;
     }
@@ -195,7 +195,7 @@ fn resolved_path(mut cmd: Command, tmp: &TempDir, session_id: &str) -> Option<St
 /// `sessions/` directory in existence at all. Everything under `<agent-dir>`
 /// was fair game, to any depth.
 ///
-/// Both decoys are shapes casr itself has been measured resolving. Neither is a
+/// Both decoys are shapes ags itself has been measured resolving. Neither is a
 /// place `pi` puts a session: `pi` reads them out of `<agent-dir>/sessions`
 /// (`SessionManager.listAll`), out of the directory `--session-dir` /
 /// `PI_CODING_AGENT_SESSION_DIR` / `settings.json:sessionDir` names
@@ -239,13 +239,13 @@ fn resolve_by_id_still_finds_a_session_in_both_layouts() {
         &sessions.join("--tmp--/2026-01-01T00-00-00_vendor.jsonl"),
         &pi_transcript(tmp.path(), "2026-01-01T00-00-00_vendor"),
     );
-    // What casr's own writer produces: sessions/<id>.jsonl.
+    // What ags's own writer produces: sessions/<id>.jsonl.
     write(
-        &sessions.join("2026-01-01T00-00-00_casr.jsonl"),
-        &pi_transcript(tmp.path(), "2026-01-01T00-00-00_casr"),
+        &sessions.join("2026-01-01T00-00-00_ags.jsonl"),
+        &pi_transcript(tmp.path(), "2026-01-01T00-00-00_ags"),
     );
 
-    for id in ["2026-01-01T00-00-00_vendor", "2026-01-01T00-00-00_casr"] {
+    for id in ["2026-01-01T00-00-00_vendor", "2026-01-01T00-00-00_ags"] {
         assert!(
             resolved_path(pi_cmd(&tmp), &tmp, id).is_some(),
             "{id} should still resolve"
@@ -259,7 +259,7 @@ fn resolve_by_id_still_finds_a_session_in_both_layouts() {
 /// `~/.pi/agent/sessions/<encoded-cwd>/` (pi-mono issue #320), and
 /// `migrateSessionsFromAgentRoot` (`dist/migrations.js:75-116`) still runs on
 /// every startup to move them. Until it does, the file is a real session in a
-/// place neither of `pi`'s listers looks — so casr must not list it (it would
+/// place neither of `pi`'s listers looks — so ags must not list it (it would
 /// appear twice the moment the migration ran, once from each location) and must
 /// still resolve it when a user names it.
 #[test]
@@ -299,21 +299,21 @@ fn a_session_the_startup_migration_has_not_moved_yet_resolves_but_is_not_listed(
 /// `SessionManager.listAll` is exactly two levels —
 /// `readdir(getSessionsDir()).filter(isDirectory)` then
 /// `readdir(dir).filter(f => f.endsWith(".jsonl"))`,
-/// `dist/core/session-manager.js:1065-1081` — and casr's own writer puts a
+/// `dist/core/session-manager.js:1065-1081` — and ags's own writer puts a
 /// converted session one level up at `sessions/<id>.jsonl`.
 ///
 /// Both are listed. Transcribing only the vendor half would make every session
-/// casr has ever written unlistable by casr, which is the trap `vibe.rs`
+/// ags has ever written unlistable by ags, which is the trap `vibe.rs`
 /// documents for the `session_` prefix and `meta.json` requirement. What the
-/// rule does exclude is a third level, which no `pi` and no casr writes.
+/// rule does exclude is a third level, which no `pi` and no ags writes.
 #[test]
 fn the_sessions_tree_is_listed_two_levels_deep_and_no_further() {
     let tmp = TempDir::new().expect("tempdir");
     let sessions = agent_dir(&tmp).join("sessions");
 
     write(
-        &sessions.join("2026-01-01T00-00-00_casr.jsonl"),
-        &pi_transcript(tmp.path(), "2026-01-01T00-00-00_casr"),
+        &sessions.join("2026-01-01T00-00-00_ags.jsonl"),
+        &pi_transcript(tmp.path(), "2026-01-01T00-00-00_ags"),
     );
     write(
         &sessions.join("--tmp--/2026-01-01T00-00-01_vendor.jsonl"),
@@ -329,7 +329,7 @@ fn the_sessions_tree_is_listed_two_levels_deep_and_no_further() {
         rows(&envelope, &tmp),
         vec![
             "pi-agent/sessions/--tmp--/2026-01-01T00-00-01_vendor.jsonl",
-            "pi-agent/sessions/2026-01-01T00-00-00_casr.jsonl",
+            "pi-agent/sessions/2026-01-01T00-00-00_ags.jsonl",
         ],
         "the third level is not a place pi lists from; warnings were {:?}",
         warnings(&envelope, &tmp)
@@ -348,7 +348,7 @@ fn the_sessions_tree_is_listed_two_levels_deep_and_no_further() {
 /// `dist/core/session-manager.js:211-219`. So `.jsonl` files sit directly in it,
 /// and `SessionManager.list` reads it with a flat `readdir` (`:391-402`).
 ///
-/// The old behaviour was not "casr lists a little less". `detect` tests the
+/// The old behaviour was not "ags convert lists a little less". `detect` tests the
 /// listing roots, and with no `<agent-dir>/sessions` on disk it reported `pi` as
 /// not installed, so `resolve_auto` skipped the provider entirely: every session
 /// the user had was both unlistable and unresolvable.
@@ -386,7 +386,7 @@ fn the_session_dir_override_is_a_leaf_directory_and_is_both_listed_and_resolvabl
 ///
 /// `listSessionsFromDir` (`dist/core/session-manager.js:391-402`) is
 /// `readdir(dir).filter(f => f.endsWith(".jsonl"))` with no recursion at all,
-/// and casr's writer puts its file directly in the leaf, so nothing casr writes
+/// and ags's writer puts its file directly in the leaf, so nothing ags writes
 /// needs the looser rule either.
 #[test]
 fn the_session_dir_override_is_read_flat() {
@@ -517,7 +517,7 @@ fn a_tilde_in_the_session_dir_override_is_expanded() {
     );
 }
 
-/// `PI_AGENT_HOME` is casr's own knob for aiming casr at a tree, and an aiming
+/// `PI_AGENT_HOME` is ags's own knob for aiming ags at a tree, and an aiming
 /// knob an ambient `pi` variable can drag elsewhere does not aim. It suppresses
 /// the override rather than losing to it.
 #[test]
@@ -534,7 +534,7 @@ fn pi_agent_home_suppresses_the_session_dir_override() {
         &pi_transcript(tmp.path(), "2026-01-01T00-00-01_aimed"),
     );
 
-    let mut cmd = casr_cmd(&tmp);
+    let mut cmd = ags_cmd(&tmp);
     cmd.env("PI_AGENT_HOME", agent_dir(&tmp))
         .env("PI_CODING_AGENT_SESSION_DIR", &leaf);
     let envelope = list_json(cmd, &tmp);
@@ -550,12 +550,12 @@ fn pi_agent_home_suppresses_the_session_dir_override() {
 // Write
 // ---------------------------------------------------------------------------
 
-/// Honouring the override on the read side alone would be half a fix: casr
+/// Honouring the override on the read side alone would be half a fix: ags
 /// would list the sessions `pi` has and then write a converted one into the
 /// default tree `pi` has been configured away from, where neither
 /// `SessionManager.list` nor `SessionManager.listAll` would ever show it.
 ///
-/// The vendor artifact is the oracle for the *shape*, not casr's read-back: the
+/// The vendor artifact is the oracle for the *shape*, not ags's read-back: the
 /// assertion is on where the file lands, and `SessionManager.list` reads that
 /// directory with a flat `readdir`.
 #[test]
@@ -578,7 +578,7 @@ fn a_conversion_lands_in_the_overridden_session_dir() {
         .env("PI_CODING_AGENT_SESSION_DIR", &leaf)
         .args(["--json", "resume", "pi", "cc-simple-001"])
         .output()
-        .expect("casr resume should run");
+        .expect("ags convert resume should run");
     assert!(
         output.status.success(),
         "resume failed:\n{}\n{}",

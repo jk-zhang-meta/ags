@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 
 use tracing::{debug, info, trace, warn};
 
-use crate::error::{Candidate, CasrError};
+use crate::error::{AgsError, Candidate};
 use crate::model::{CanonicalSession, MessageRole};
 use crate::providers::Provider;
 
@@ -202,20 +202,20 @@ impl ProviderRegistry {
 
     /// Resolve a session ID to its source provider and file path.
     ///
-    /// This is the main entry point for the `casr <target> resume <session-id>`
+    /// This is the main entry point for the `ags <target> resume <session-id>`
     /// flow. It implements a deterministic multi-step algorithm:
     ///
     /// 1. If `source_hint` is a [`SourceHint::Path`], bypass discovery entirely.
     /// 2. If `source_hint` is a [`SourceHint::Alias`], search only that provider.
     /// 3. Otherwise, search all installed providers via fast-path ownership checks.
     /// 4. Exactly one match → return it.
-    /// 5. Multiple matches → [`CasrError::AmbiguousSessionId`].
-    /// 6. No matches → [`CasrError::SessionNotFound`] with diagnostics.
+    /// 5. Multiple matches → [`AgsError::AmbiguousSessionId`].
+    /// 6. No matches → [`AgsError::SessionNotFound`] with diagnostics.
     pub fn resolve_session(
         &self,
         session_id: &str,
         source_hint: Option<&SourceHint>,
-    ) -> Result<ResolvedSession<'_>, CasrError> {
+    ) -> Result<ResolvedSession<'_>, AgsError> {
         match source_hint {
             Some(SourceHint::Path(path)) => self.resolve_from_path(session_id, path),
             Some(SourceHint::Alias(alias)) => self.resolve_with_alias(session_id, alias),
@@ -231,7 +231,7 @@ impl ProviderRegistry {
         &self,
         session_id: &str,
         path: &Path,
-    ) -> Result<ResolvedSession<'_>, CasrError> {
+    ) -> Result<ResolvedSession<'_>, AgsError> {
         debug!(path = %path.display(), "resolving session from explicit path");
 
         // Some providers use "virtual" session paths that are not real files, e.g.
@@ -239,7 +239,7 @@ impl ProviderRegistry {
         let parent_is_file = path.parent().is_some_and(|p| p.is_file());
 
         if !path.is_file() && !parent_is_file {
-            return Err(CasrError::SessionNotFound {
+            return Err(AgsError::SessionNotFound {
                 session_id: session_id.to_string(),
                 providers_checked: vec!["(direct path)".to_string()],
                 sessions_scanned: 0,
@@ -318,7 +318,7 @@ impl ProviderRegistry {
                 candidate_count = candidates.len(),
                 "ambiguous explicit path — multiple providers parsed the same file"
             );
-            return Err(CasrError::AmbiguousSessionId {
+            return Err(AgsError::AmbiguousSessionId {
                 session_id: session_id.to_string(),
                 candidates,
             });
@@ -344,7 +344,7 @@ impl ProviderRegistry {
             });
         }
 
-        Err(CasrError::SessionReadError {
+        Err(AgsError::SessionReadError {
             path: path.to_path_buf(),
             provider: "(unknown)".to_string(),
             detail: format!(
@@ -358,18 +358,18 @@ impl ProviderRegistry {
         &self,
         session_id: &str,
         alias: &str,
-    ) -> Result<ResolvedSession<'_>, CasrError> {
+    ) -> Result<ResolvedSession<'_>, AgsError> {
         debug!(
             alias,
             session_id, "resolving session with source alias hint"
         );
 
-        let provider =
-            self.find_by_alias(alias)
-                .ok_or_else(|| CasrError::UnknownProviderAlias {
-                    alias: alias.to_string(),
-                    known_aliases: self.known_aliases(),
-                })?;
+        let provider = self
+            .find_by_alias(alias)
+            .ok_or_else(|| AgsError::UnknownProviderAlias {
+                alias: alias.to_string(),
+                known_aliases: self.known_aliases(),
+            })?;
 
         match Self::owned_by(provider, session_id) {
             Some((provider, path)) => {
@@ -392,7 +392,7 @@ impl ProviderRegistry {
                     ?roots,
                     "session not found in hinted provider"
                 );
-                Err(CasrError::SessionNotFound {
+                Err(AgsError::SessionNotFound {
                     session_id: session_id.to_string(),
                     providers_checked: vec![provider.name().to_string()],
                     sessions_scanned: 0,
@@ -404,7 +404,7 @@ impl ProviderRegistry {
     /// Fully automatic resolution — search all installed providers.
     ///
     /// Collects ALL matches (does not short-circuit) to detect ambiguity.
-    fn resolve_auto(&self, session_id: &str) -> Result<ResolvedSession<'_>, CasrError> {
+    fn resolve_auto(&self, session_id: &str) -> Result<ResolvedSession<'_>, AgsError> {
         debug!(session_id, "auto-resolving session across all providers");
 
         let mut matches: Vec<(&dyn Provider, PathBuf)> = Vec::new();
@@ -438,7 +438,7 @@ impl ProviderRegistry {
                     ?providers_checked,
                     "session not found in any provider"
                 );
-                Err(CasrError::SessionNotFound {
+                Err(AgsError::SessionNotFound {
                     session_id: session_id.to_string(),
                     providers_checked,
                     sessions_scanned: 0,
@@ -467,7 +467,7 @@ impl ProviderRegistry {
                     candidate_count = candidates.len(),
                     "ambiguous session ID — multiple providers match"
                 );
-                Err(CasrError::AmbiguousSessionId {
+                Err(AgsError::AmbiguousSessionId {
                     session_id: session_id.to_string(),
                     candidates,
                 })
@@ -499,7 +499,7 @@ impl ProviderRegistry {
 /// seventeen registered providers — `claude-code`, `codex` and `kiro` — and
 /// which of them wins is decided by registration order and by whether the path
 /// happens to end in that provider's extension. A Claude Code transcript passed
-/// to `casr info` was therefore read by the *Codex* parser and reported as
+/// to `ags convert info` was therefore read by the *Codex* parser and reported as
 /// `provider: "codex"` with zero messages. With `--source cod` the same
 /// mismatch reaches `resume`, which converts the wrong file and writes a
 /// session out of it.
@@ -665,7 +665,7 @@ impl ProviderRegistry {
                     if record_type == Some("leaf") {
                         return self.find_by_slug("openclaw");
                     }
-                    // casr's own Pi-Agent header, which carries the two fields
+                    // ags's own Pi-Agent header, which carries the two fields
                     // `pi` itself stopped writing: `SessionManager.newSession`
                     // (`dist/core/session-manager.js:486-494`) writes
                     // `{type,version,id,timestamp,cwd,parentSession}` and
@@ -867,7 +867,7 @@ pub fn repo_name_from_path(workspace: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{ProviderRegistry, SourceHint, is_plausible_session};
-    use crate::error::CasrError;
+    use crate::error::AgsError;
     use crate::model::{CanonicalMessage, CanonicalSession, MessageRole};
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -1091,7 +1091,7 @@ mod tests {
         let error = registry
             .resolve_session("shared-pi-family", Some(&hint))
             .expect_err("an indistinguishable Pi/OpenClaw transcript must not be guessed");
-        let CasrError::AmbiguousSessionId { candidates, .. } = error else {
+        let AgsError::AmbiguousSessionId { candidates, .. } = error else {
             panic!("expected AmbiguousSessionId, got {error:?}");
         };
         assert!(
@@ -1130,12 +1130,12 @@ mod tests {
         assert_eq!(infer_slug_for_file(&path).as_deref(), Some("openclaw"));
     }
 
-    /// casr's own Pi-Agent writer stamps `provider` and `modelId` into the
+    /// ags's own Pi-Agent writer stamps `provider` and `modelId` into the
     /// header; `SessionManager.newSession` (`session-manager.js:486-494`) does
-    /// not, so this rule fires only on files casr wrote and must outrank the
+    /// not, so this rule fires only on files ags wrote and must outrank the
     /// filename.
     #[test]
-    fn a_casr_written_pi_header_is_pi_agent_whatever_the_filename() {
+    fn an_ags_written_pi_header_is_pi_agent_whatever_the_filename() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("plain-name.jsonl");
         std::fs::write(

@@ -25,7 +25,7 @@
 //!   boundary marker. A message the user submitted while the compaction was
 //!   still running is written with its *pre-compaction* parent, so the live
 //!   branch can run back into the discarded history and pass the summary by.
-//!   Claude Code survives that by rewriting the graph on load; casr survives it
+//!   Claude Code survives that by rewriting the graph on load; ags survives it
 //!   because `replay::resolve` keeps the boundary's own children.
 
 mod test_env;

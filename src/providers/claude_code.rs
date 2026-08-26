@@ -54,7 +54,7 @@ pub fn project_dir_key(workspace: &Path) -> String {
 impl ClaudeCode {
     /// Root directory for Claude Code sessions, in precedence order:
     ///
-    /// 1. `CLAUDE_HOME` — casr's own override. It aims casr at one tree without
+    /// 1. `CLAUDE_HOME` — ags's own override. It aims ags at one tree without
     ///    disturbing the Claude Code the rest of the shell talks to, so it wins
     ///    over the ambient setting; the test harness and `scripts/` rely on that.
     /// 2. `CLAUDE_CONFIG_DIR` — the variable Claude Code itself honours to
@@ -489,7 +489,7 @@ impl Provider for ClaudeCode {
                 "userType": "external",
                 "cwd": workspace_str.to_string_lossy(),
                 "sessionId": target_session_id,
-                "version": "casr",
+                "version": "ags",
                 "gitBranch": "main",
                 "type": entry_type,
                 "message": inner_msg,
@@ -503,7 +503,7 @@ impl Provider for ClaudeCode {
 
         // Terminate the final line with a newline. Claude Code appends new turns
         // to this file on resume; without a trailing newline its first appended
-        // record is concatenated onto casr's last line, corrupting it.
+        // record is concatenated onto ags's last line, corrupting it.
         let mut content = lines.join("\n");
         if !content.is_empty() {
             content.push('\n');
@@ -589,7 +589,7 @@ impl Provider for ClaudeCode {
 
         // Claude Code appends new turns to this file on resume; without a
         // trailing newline its first appended record is concatenated onto
-        // casr's last line, corrupting it.
+        // ags's last line, corrupting it.
         let mut content = rendered.lines.join("\n");
         content.push('\n');
         let outcome = crate::pipeline::atomic_write(
@@ -837,7 +837,7 @@ fn build_inner_message(
     // benign defaults; provenance is preserved in `model` when available.
     if entry_type == "assistant" {
         inner_msg["id"] =
-            serde_json::Value::String(format!("msg_casr_{}", uuid::Uuid::new_v4().simple()));
+            serde_json::Value::String(format!("msg_ags_{}", uuid::Uuid::new_v4().simple()));
         inner_msg["type"] = serde_json::Value::String("message".to_string());
         if inner_msg.get("model").is_none() {
             inner_msg["model"] = serde_json::Value::String("unknown".to_string());

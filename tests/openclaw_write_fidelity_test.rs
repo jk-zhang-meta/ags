@@ -136,7 +136,7 @@ fn cli_refuses_without_official_openclaw_before_writing_state() {
             .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
             .env("NO_COLOR", "1")
             .output()
-            .expect("casr should run");
+            .expect("ags should run");
         assert!(!output.status.success(), "OpenClaw target must refuse");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains("official `openclaw` CLI"),
@@ -159,7 +159,7 @@ fn cli_refuses_without_official_openclaw_before_writing_state() {
 /// prompt released its file lock … attached as a side branch so rewrites
 /// retain external state without moving the prepared reply branch".
 ///
-/// casr is right that such an entry is not model-visible, and wrong to file it
+/// ags is right that such an entry is not model-visible, and wrong to file it
 /// under "abandoned", which is the report for a path the *user* rewound away
 /// from.
 #[test]

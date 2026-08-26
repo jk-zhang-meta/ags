@@ -1,7 +1,7 @@
 //! Integration tests for the Kiro CLI provider.
 //!
 //! These exercise the full filesystem round-trip (read → write → re-read) and
-//! the `casr` CLI against a temporary `$KIRO_HOME`. They live here rather than
+//! the `ags` CLI against a temporary `$KIRO_HOME`. They live here rather than
 //! in the in-crate `#[cfg(test)]` module because `src/lib.rs` declares
 //! `#![forbid(unsafe_code)]` and `std::env::set_var` is `unsafe` in edition
 //! 2024 — the shared `EnvGuard`/`EnvLock` harness (see `tests/test_env.rs`)
@@ -120,7 +120,7 @@ fn full_filesystem_round_trip_preserves_messages_and_drops_history() {
     // `.history` does not round-trip, on purpose. kiro-cli's `addToHistory`
     // records every submitted line, not just slash commands, so the file is
     // raw user input — and the metadata bag that would carry it is what
-    // `casr info --json` prints. Neither side may hold it.
+    // `ags convert info --json` prints. Neither side may hold it.
     assert!(
         original.metadata.get("history").is_none() && reread.metadata.get("history").is_none(),
         "`.history` must not be carried in either direction"
@@ -233,14 +233,14 @@ fn discovery_lists_and_owns_seeded_session() {
     assert_eq!(provider.slug(), "kiro");
 }
 
-/// CLI smoke test: `casr list --provider kiro` finds the seeded session.
+/// CLI smoke test: `ags convert list --provider kiro` finds the seeded session.
 #[test]
 fn cli_list_finds_seeded_kiro_session() {
     let _lock = KIRO_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     seed_kiro_home(tmp.path());
 
-    // `casr list` defaults to scoping by the current working-directory
+    // `ags convert list` defaults to scoping by the current working-directory
     // project; the captured fixture's workspace is a macOS path, so we pass
     // it explicitly via `--workspace` to take it out of cwd scope.
     let workspace =
@@ -258,13 +258,13 @@ fn cli_list_finds_seeded_kiro_session() {
         ])
         .env("KIRO_HOME", tmp.path())
         .output()
-        .expect("run casr list");
+        .expect("run ags convert list");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "casr list failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        "ags convert list failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
     assert!(
@@ -273,7 +273,7 @@ fn cli_list_finds_seeded_kiro_session() {
     );
 }
 
-/// CLI smoke test: `casr info <id> --source kr` reports the session details.
+/// CLI smoke test: `ags convert info <id> --source kr` reports the session details.
 #[test]
 fn cli_info_reports_seeded_kiro_session() {
     let _lock = KIRO_ENV.lock().unwrap();
@@ -284,13 +284,13 @@ fn cli_info_reports_seeded_kiro_session() {
         .args(["convert", "info", FIXTURE_ID, "--source", "kr"])
         .env("KIRO_HOME", tmp.path())
         .output()
-        .expect("run casr info");
+        .expect("run ags convert info");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "casr info failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        "ags convert info failed: status={:?}\nstdout={stdout}\nstderr={stderr}",
         output.status
     );
     assert!(

@@ -1,6 +1,6 @@
 # Fork baseline
 
-Test state of upstream casr at the fork point, measured **before** any change in
+Test state of upstream ags at the fork point, measured **before** any change in
 this fork, so later runs can be compared against something real.
 
 - Fork point: `8d94bfbef4364389e4d9e914cddf813930e77429` (upstream 0.2.3, 2026-07-18)

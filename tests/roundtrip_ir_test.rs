@@ -533,7 +533,7 @@ fn codex_to_claude_loses_only_what_cannot_cross() {
                     Body::Message { blocks, .. } => blocks
                         .iter()
                         .filter_map(Block::as_text)
-                        .any(|text| text.starts_with("[converted by casr]")),
+                        .any(|text| text.starts_with("[converted by ags]")),
                     _ => false,
                 })
                 .count();
@@ -761,7 +761,7 @@ fn a_lost_sealed_compaction_is_visible_in_the_claude_transcript() {
             Body::Message { blocks, .. } => blocks
                 .iter()
                 .filter_map(Block::as_text)
-                .any(|text| text.starts_with("[converted by casr]")),
+                .any(|text| text.starts_with("[converted by ags]")),
             _ => false,
         })
         .count();

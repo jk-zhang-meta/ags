@@ -1478,7 +1478,7 @@ fn raw_claude_record_at_lines(path: &Path) -> HashMap<u64, (String, String)> {
 }
 
 /// Collapse split IR events back to the native records the vendor oracle uses.
-fn casr_replayed_claude_records(path: &Path) -> anyhow::Result<Vec<String>> {
+fn ags_replayed_claude_records(path: &Path) -> anyhow::Result<Vec<String>> {
     let raw = raw_claude_record_at_lines(path);
     let ir = claude_code_ir::read(path)?;
     let plan = resolve(&ir);
@@ -1876,10 +1876,10 @@ fn claude_compaction_replay_matches_vendor_record_order() {
         .expect("vendor oracle finds a leaf");
     assert_eq!(expected, ["summary", "preserved", "inflight", "reply"]);
 
-    let actual = casr_replayed_claude_records(&path).expect("casr reads fixture");
+    let actual = ags_replayed_claude_records(&path).expect("ags reads fixture");
     assert_eq!(
         actual, expected,
-        "casr replay must agree record-for-record with Claude Code's loader"
+        "ags replay must agree record-for-record with Claude Code's loader"
     );
 }
 
@@ -1895,7 +1895,7 @@ fn claude_agent_replay_matches_vendor_newest_leaf() {
         .expect("vendor oracle finds a leaf");
     assert_eq!(expected, ["root", "live-user", "live-assistant"]);
 
-    let actual = casr_replayed_claude_records(&path).expect("casr reads fixture");
+    let actual = ags_replayed_claude_records(&path).expect("ags reads fixture");
     assert_eq!(
         actual, expected,
         "absence of `last-prompt` is not permission to keep every agent branch"
@@ -1923,7 +1923,7 @@ fn claude_parallel_tool_results_match_vendor_recovery() {
         ]
     );
 
-    let actual = casr_replayed_claude_records(&path).expect("casr reads fixture");
+    let actual = ags_replayed_claude_records(&path).expect("ags reads fixture");
     assert_eq!(
         actual, expected,
         "a parallel tool result is response context, not an abandoned fork"
@@ -1949,7 +1949,7 @@ fn claude_parallel_tool_results_keep_a_selected_followup() {
         ]
     );
 
-    let actual = casr_replayed_claude_records(&path).expect("casr reads fixture");
+    let actual = ags_replayed_claude_records(&path).expect("ags reads fixture");
     assert_eq!(
         actual, expected,
         "the selected followup belongs after its complete parallel tool response"
@@ -1968,10 +1968,10 @@ fn claude_explicit_clear_matches_vendor_empty_replay() {
         claude_vendor_oracle::replayed_conversation(&path).expect("vendor oracle reads fixture");
     assert_eq!(expected, None, "vendor clears every replay leaf");
 
-    let actual = casr_replayed_claude_records(&path).expect("casr reads fixture");
+    let actual = ags_replayed_claude_records(&path).expect("ags reads fixture");
     assert!(
         actual.is_empty(),
-        "casr must not replay history after an explicit clear: {actual:?}"
+        "ags must not replay history after an explicit clear: {actual:?}"
     );
 }
 
@@ -1988,14 +1988,14 @@ fn claude_non_explicit_head_advances_with_vendor_main_chain() {
         .expect("vendor oracle finds a leaf");
     assert_eq!(expected, ["root", "live-user", "live-assistant"]);
 
-    let actual = casr_replayed_claude_records(&path).expect("casr reads fixture");
+    let actual = ags_replayed_claude_records(&path).expect("ags reads fixture");
     assert_eq!(
         actual, expected,
         "a non-explicit head must not keep an abandoned descendant branch"
     );
 }
 
-/// Diff casr against Claude Code's own PBe+rsp+V+Bze reconstruction.
+/// Diff ags against Claude Code's own PBe+rsp+V+Bze reconstruction.
 ///
 /// Unlike the aggregate tests above, this is an oracle: each expected record
 /// comes from an independent reimplementation of the vendor's graph rewrite
@@ -2018,7 +2018,7 @@ fn claude_replay_matches_vendor_record_for_record() {
             no_leaf += 1;
             continue;
         };
-        let Ok(actual) = casr_replayed_claude_records(path) else {
+        let Ok(actual) = ags_replayed_claude_records(path) else {
             continue;
         };
         checked += 1;
@@ -2046,8 +2046,8 @@ fn claude_replay_matches_vendor_record_for_record() {
             .take(5)
             .collect();
         mismatches.push(format!(
-            "{}: first difference at record {first} (vendor={:?}, casr={:?}); \
-             vendor={}, casr={}, missing={missing:?}, extra={extra:?}",
+            "{}: first difference at record {first} (vendor={:?}, ags={:?}); \
+             vendor={}, ags={}, missing={missing:?}, extra={extra:?}",
             path.display(),
             expected.get(first),
             actual.get(first),

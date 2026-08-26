@@ -131,7 +131,7 @@ still impose real limits:
 - native token accounting and provider-specific sidecars do not cross.
 
 AGS never points the converter at a real Agent home. It invokes the current
-`casr --json resume` in empty temporary homes with `--no-store`, validates the
+`ags --json resume` in empty temporary homes with `--no-store`, validates the
 single reported target transcript, normalizes the selected target working
 directory and Codex `model_provider`, parses the final native file again, then
 sends only that main transcript through AGS's existing restore transaction.
@@ -258,7 +258,7 @@ The accepted implementation direction is:
 - format 2/3 read compatibility, marked as minimum-fidelity;
 - compact `ags list` plus detailed `ags show`;
 - live-session `ags sessions`, `ags attach`, and `ags describe` commands;
-- cross-Agent CLI: `casr checkpoint resume SELECTOR --to codex|claude [--cwd PATH] [--profile PROFILE] [-- AGENT_ARGS...]`;
+- cross-Agent CLI: `ags checkpoint resume SELECTOR --to codex|claude [--cwd PATH] [--profile PROFILE] [-- AGENT_ARGS...]`;
 - no dynamic plugin framework, plain FTP, or database payload adapter yet.
 
 The user accepted this direction. Format 4, local-first named Git/SFTP
@@ -307,7 +307,7 @@ client environment:
 
 ```text
 rmux -L ags -f /dev/null new-session -A -s <opaque-name>
-  -c <cwd> -- <casr-absolute-path> terminal-payload
+  -c <cwd> -- <ags-absolute-path> terminal-payload
 
 AGS_RMUX_LAUNCH_PAYLOAD={
   "program": "<agent>",

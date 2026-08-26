@@ -119,25 +119,25 @@ mod unix_error_paths {
 
     #[test]
     fn read_nonexistent_cc() {
-        let err = ClaudeCode.read_session(Path::new("/tmp/nonexistent-casr-test-file.jsonl"));
+        let err = ClaudeCode.read_session(Path::new("/tmp/nonexistent-ags-test-file.jsonl"));
         assert!(err.is_err(), "CC: reading nonexistent file should fail");
     }
 
     #[test]
     fn read_nonexistent_codex() {
-        let err = Codex.read_session(Path::new("/tmp/nonexistent-casr-test-file.jsonl"));
+        let err = Codex.read_session(Path::new("/tmp/nonexistent-ags-test-file.jsonl"));
         assert!(err.is_err(), "Codex: reading nonexistent file should fail");
     }
 
     #[test]
     fn read_nonexistent_gemini() {
-        let err = Gemini.read_session(Path::new("/tmp/nonexistent-casr-test-file.json"));
+        let err = Gemini.read_session(Path::new("/tmp/nonexistent-ags-test-file.json"));
         assert!(err.is_err(), "Gemini: reading nonexistent file should fail");
     }
 
     #[test]
     fn read_nonexistent_clawdbot() {
-        let err = ClawdBot.read_session(Path::new("/tmp/nonexistent-casr-test-file.jsonl"));
+        let err = ClawdBot.read_session(Path::new("/tmp/nonexistent-ags-test-file.jsonl"));
         assert!(
             err.is_err(),
             "ClawdBot: reading nonexistent file should fail"
@@ -146,13 +146,13 @@ mod unix_error_paths {
 
     #[test]
     fn read_nonexistent_vibe() {
-        let err = Vibe.read_session(Path::new("/tmp/nonexistent-casr-test-file.jsonl"));
+        let err = Vibe.read_session(Path::new("/tmp/nonexistent-ags-test-file.jsonl"));
         assert!(err.is_err(), "Vibe: reading nonexistent file should fail");
     }
 
     #[test]
     fn read_nonexistent_factory() {
-        let err = Factory.read_session(Path::new("/tmp/nonexistent-casr-test-file.jsonl"));
+        let err = Factory.read_session(Path::new("/tmp/nonexistent-ags-test-file.jsonl"));
         assert!(
             err.is_err(),
             "Factory: reading nonexistent file should fail"
@@ -161,7 +161,7 @@ mod unix_error_paths {
 
     #[test]
     fn read_nonexistent_openclaw() {
-        let err = OpenClaw.read_session(Path::new("/tmp/nonexistent-casr-test-file.jsonl"));
+        let err = OpenClaw.read_session(Path::new("/tmp/nonexistent-ags-test-file.jsonl"));
         assert!(
             err.is_err(),
             "OpenClaw: reading nonexistent file should fail"
@@ -170,7 +170,7 @@ mod unix_error_paths {
 
     #[test]
     fn read_nonexistent_pi_agent() {
-        let err = PiAgent.read_session(Path::new("/tmp/nonexistent-casr-test-file.json"));
+        let err = PiAgent.read_session(Path::new("/tmp/nonexistent-ags-test-file.json"));
         assert!(
             err.is_err(),
             "PiAgent: reading nonexistent file should fail"

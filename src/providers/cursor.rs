@@ -27,14 +27,14 @@
 //! Cursor's IDE composer store has no verified direct resume command, so the
 //! resume command opens the workspace in Cursor (`cursor <workspace-path>`).
 //! `cursor-agent --resume <id>` does exist, but it addresses the separate
-//! `~/.cursor` agent store described below; it cannot open a composer casr
+//! `~/.cursor` agent store described below; it cannot open a composer ags
 //! reads from the IDE's `state.vscdb`.
 //!
 //! ## Writing
 //!
 //! A composer visible in Cursor's UI requires the workbench-managed
 //! `allComposers` index as well as the `composerData` and `bubbleId` records.
-//! casr can read the latter, but has no vendor-authoritative way to update the
+//! ags can read the latter, but has no vendor-authoritative way to update the
 //! shared index without risking an invisible or damaged composer. Cursor is
 //! therefore read/resume-only until that lifecycle is verified end to end.
 //!
@@ -681,7 +681,7 @@ impl Cursor {
     /// neither of which this reader touches.
     ///
     /// So this filter removes nothing that ships today. It is here for the
-    /// same reason [`Cursor::cli_chat_metadata`] is: `casr info --json` prints
+    /// same reason [`Cursor::cli_chat_metadata`] is: `ags convert info --json` prints
     /// the metadata bag verbatim, and the entry this object came from *does*
     /// carry live secrets one level up — `blobEncryptionKey` and
     /// `speculativeSummarizationEncryptionKey`, both 32 bytes of
@@ -920,7 +920,7 @@ impl Provider for Cursor {
             }
         }
 
-        // Always, including zero. "Cursor is installed" and "casr found a
+        // Always, including zero. "Cursor is installed" and "ags found a
         // database to read" are different facts, and reporting the count only
         // when it is non-zero made the interesting case the silent one.
         if installed {
@@ -1081,7 +1081,7 @@ impl Provider for Cursor {
                 Ok(conn) => conn,
                 Err(err) => {
                     // `find_db_files_reporting` only returns databases that
-                    // exist, so this is a store casr found and could not open.
+                    // exist, so this is a store ags found and could not open.
                     listing.unreadable.push(UnreadableSource {
                         path: db_path.clone(),
                         error: format!("{err:#}"),

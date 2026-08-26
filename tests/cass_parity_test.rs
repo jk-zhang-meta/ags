@@ -1,6 +1,6 @@
 //! CASS parity regression suite for provider readers.
 //!
-//! Asserts casr reader behavior stays aligned with CASS-derived parsing
+//! Asserts ags reader behavior stays aligned with CASS-derived parsing
 //! expectations for Claude Code, Codex, and Gemini.
 //!
 //! Unlike `fixtures_test.rs` (which checks structural summaries), this suite
@@ -25,19 +25,19 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Helper: parse an ISO-8601 string to epoch millis the same way casr does.
+/// Helper: parse an ISO-8601 string to epoch millis the same way ags does.
 fn iso_to_millis(s: &str) -> i64 {
     parse_timestamp(&serde_json::Value::String(s.to_string()))
         .unwrap_or_else(|| panic!("Failed to parse timestamp: {s}"))
 }
 
-/// Helper: parse a float epoch-seconds value to millis the same way casr does.
+/// Helper: parse a float epoch-seconds value to millis the same way ags does.
 fn float_secs_to_millis(secs: f64) -> i64 {
     parse_timestamp(&serde_json::json!(secs))
         .unwrap_or_else(|| panic!("Failed to parse float timestamp: {secs}"))
 }
 
-/// Helper: parse integer epoch-seconds to millis the same way casr does.
+/// Helper: parse integer epoch-seconds to millis the same way ags does.
 fn int_secs_to_millis(secs: i64) -> i64 {
     parse_timestamp(&serde_json::json!(secs))
         .unwrap_or_else(|| panic!("Failed to parse int timestamp: {secs}"))
@@ -214,7 +214,7 @@ mod cc_parity {
         );
         assert_eq!(s.model_name.as_deref(), Some("claude-sonnet-4-5-20250929"));
 
-        // CASR divergence: tool_result-only user messages are preserved
+        // AGS divergence: tool_result-only user messages are preserved
         // so they can be resumed. File-history-snapshot is skipped.
         // Original 7 lines → 6 canonical messages.
         assert_eq!(s.messages.len(), 6);
@@ -1064,7 +1064,7 @@ mod normalization_parity {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Divergence tracking — explicit tests for documented casr-vs-CASS differences
+// Divergence tracking — explicit tests for documented ags-vs-CASS differences
 // ═══════════════════════════════════════════════════════════════════════════
 
 mod divergence_tracking {
@@ -1072,7 +1072,7 @@ mod divergence_tracking {
 
     #[test]
     fn divergence_role_naming_agent_vs_assistant() {
-        // CASS uses MessageRole::Agent; casr uses MessageRole::Assistant.
+        // CASS uses MessageRole::Agent; ags uses MessageRole::Assistant.
         // Both normalize_role("agent") and normalize_role("assistant") should
         // yield the same variant.
         assert_eq!(normalize_role("agent"), normalize_role("assistant"));
@@ -1080,7 +1080,7 @@ mod divergence_tracking {
 
     #[test]
     fn divergence_idx_type_usize_not_i64() {
-        // CASS uses idx: i64; casr uses idx: usize.
+        // CASS uses idx: i64; ags uses idx: usize.
         // Verify our idx values are valid usize (non-negative, sequential).
         let path = fixtures_dir().join("claude_code/cc_simple.jsonl");
         let s = ClaudeCode.read_session(&path).unwrap();
@@ -1091,7 +1091,7 @@ mod divergence_tracking {
 
     #[test]
     fn divergence_no_snippet_type() {
-        // CASS has a Snippet type for code extraction. casr omits it
+        // CASS has a Snippet type for code extraction. ags omits it
         // (not needed for session conversion). This is documented.
         // Just a marker test for regression tracking.
         // If we ever add Snippet, update docs/cass-porting-notes.md.
@@ -1099,7 +1099,7 @@ mod divergence_tracking {
 
     #[test]
     fn divergence_no_source_id_or_origin_host() {
-        // CASS has source_id and origin_host. casr omits them (local-only tool).
+        // CASS has source_id and origin_host. ags omits them (local-only tool).
         // Verify our CanonicalSession doesn't accidentally include these.
         let path = fixtures_dir().join("claude_code/cc_simple.jsonl");
         let s = ClaudeCode.read_session(&path).unwrap();
@@ -1111,7 +1111,7 @@ mod divergence_tracking {
     #[test]
     fn divergence_token_data_in_extra_not_top_level() {
         // CASS has approx_tokens as a top-level field.
-        // casr stores token data in the extra field if present.
+        // ags stores token data in the extra field if present.
         let path = fixtures_dir().join("codex/codex_token_count.jsonl");
         let s = Codex.read_session(&path).unwrap();
         let serialized = serde_json::to_value(&s).unwrap();
@@ -1121,7 +1121,7 @@ mod divergence_tracking {
     #[test]
     fn divergence_codex_token_count_skipped_not_attached() {
         // CASS attaches token_count events to preceding assistant messages
-        // as extra.cass.token_usage. casr simply skips token_count events
+        // as extra.cass.token_usage. ags simply skips token_count events
         // (they're non-conversational). This is an intentional simplification.
         let path = fixtures_dir().join("codex/codex_token_count.jsonl");
         let s = Codex.read_session(&path).unwrap();
@@ -1131,7 +1131,7 @@ mod divergence_tracking {
         for msg in &s.messages {
             assert!(
                 msg.extra.get("cass").is_none(),
-                "casr should not attach CASS-style token_usage to messages"
+                "ags should not attach CASS-style token_usage to messages"
             );
         }
     }

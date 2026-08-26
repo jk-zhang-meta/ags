@@ -4,7 +4,7 @@
 //! - `~/.clawdbot/agents/<agent-id>/sessions/*.jsonl` — current
 //! - `~/.clawdbot/sessions/*.jsonl` — through `clawdbot@2026.1.2x`
 //!
-//! Override root: `CLAWDBOT_HOME` (casr's own), else `CLAWDBOT_STATE_DIR`.
+//! Override root: `CLAWDBOT_HOME` (ags's own), else `CLAWDBOT_STATE_DIR`.
 //!
 //! ## JSONL format
 //!
@@ -66,7 +66,7 @@ use crate::providers::{
 
 /// ClawdBot's default agent id (`dist/routing/session-key.js`:
 /// `DEFAULT_AGENT_ID = "main"`). Sessions are keyed by agent and the id is
-/// mandatory in the path, so casr writes as the agent ClawdBot itself defaults
+/// mandatory in the path, so ags writes as the agent ClawdBot itself defaults
 /// to rather than inventing one.
 const DEFAULT_AGENT_ID: &str = "main";
 
@@ -87,11 +87,11 @@ impl ClawdBot {
         dirs::home_dir().unwrap_or_default().join(".clawdbot")
     }
 
-    /// Where casr writes, in precedence order:
+    /// Where ags writes, in precedence order:
     ///
-    /// 1. `CLAWDBOT_HOME` — casr's own override, naming the sessions directory
+    /// 1. `CLAWDBOT_HOME` — ags's own override, naming the sessions directory
     ///    itself. ClawdBot has no variable with those semantics, so this one is
-    ///    casr's alone; it wins so that aiming casr at a tree never disturbs the
+    ///    ags's alone; it wins so that aiming ags at a tree never disturbs the
     ///    ClawdBot the rest of the shell talks to.
     /// 2. `<state>/agents/main/sessions` — where current ClawdBot looks.
     fn home_dir() -> PathBuf {
@@ -108,7 +108,7 @@ impl ClawdBot {
     /// first. Only directories that exist are returned.
     ///
     /// `CLAWDBOT_HOME` names the sessions directory outright, so when it is set
-    /// it is the whole answer — the point of that override is that casr looks
+    /// it is the whole answer — the point of that override is that ags looks
     /// nowhere else.
     fn session_dirs_reporting(unreadable: &mut Vec<UnreadableSource>) -> Vec<PathBuf> {
         if let Some(home) = std::env::var_os("CLAWDBOT_HOME").filter(|value| !value.is_empty()) {
@@ -340,7 +340,7 @@ impl Provider for ClawdBot {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let session_id = if session.session_id.is_empty() {
-            format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
+            format!("ags-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
         } else {
             session.session_id.clone()
         };
@@ -515,7 +515,7 @@ impl ClawdBot {
                         // `dist/config/sessions/transcript.js` writes
                         // `openai-responses` with a non-model `model` value.
                         "api": field("api").unwrap_or_else(|| "openai-responses".to_string()),
-                        "provider": field("provider").unwrap_or_else(|| "casr".to_string()),
+                        "provider": field("provider").unwrap_or_else(|| "ags".to_string()),
                         "model": msg.author.clone()
                             .or_else(|| session.model_name.clone())
                             .unwrap_or_else(|| "unknown".to_string()),
@@ -615,7 +615,7 @@ mod tests {
     /// The regression that started this: every published ClawdBot writes the
     /// `SessionManager` envelope, and a reader that looks for top-level `role`
     /// and `content` finds neither on any line, so it returns `Ok` with an
-    /// empty session — indistinguishable, to whoever ran `casr list`, from
+    /// empty session — indistinguishable, to whoever ran `ags convert list`, from
     /// having no sessions at all.
     #[test]
     fn reads_a_real_session_manager_transcript() {
@@ -785,7 +785,7 @@ mod tests {
     }
 
     /// A record type the flat track cannot hold is reported, not skipped: the
-    /// whole point of the field is that `casr info --json` can say what was in
+    /// whole point of the field is that `ags convert info --json` can say what was in
     /// the file and did not survive.
     #[test]
     fn reader_reports_records_it_cannot_represent() {

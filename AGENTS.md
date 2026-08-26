@@ -588,7 +588,7 @@ ags runs in interactive CLI loops, so latency matters:
 
 <!-- ags-machine-readable-v1 -->
 
-## CASR CLI Protocol (Machine-Readable Reference)
+## AGS CLI Protocol (Machine-Readable Reference)
 
 > This section provides structured documentation for agents integrating with ags.
 

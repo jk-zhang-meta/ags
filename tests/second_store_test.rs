@@ -20,7 +20,7 @@
 //! * `home-u-demo-project` — cursor-agent `../utils/dist/workspace-paths.js`,
 //!   `s.replace(/[^a-zA-Z0-9]/g, "-")…` over the same path.
 //!
-//! These tests run the `casr` binary rather than the provider directly, because
+//! These tests run the `ags` binary rather than the provider directly, because
 //! the gap they cover is not "the reader is wrong" — it is "`list` never asked
 //! the reader about these files".
 
@@ -199,7 +199,7 @@ fn seed_cursor_agent(root: &Path) {
     }
 }
 
-/// Run `casr list --json` against a seeded home, with the store kept out of the
+/// Run `ags convert list --json` against a seeded home, with the store kept out of the
 /// way of any real one.
 fn list_json(
     provider: &str,
@@ -218,10 +218,10 @@ fn list_json(
     let output = cmd
         .env("XDG_DATA_HOME", store)
         .output()
-        .expect("run casr list");
+        .expect("run ags convert list");
     assert!(
         output.status.success(),
-        "casr list failed: {}\n{}",
+        "ags convert list failed: {}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -266,7 +266,7 @@ fn kiro_ide_sessions_are_listed() {
         ids(&envelope),
         vec![KIRO_IDE_ID],
         "the IDE session must be listed; before the fix this was empty while \
-         `casr providers` still reported Kiro installed"
+         `ags convert providers` still reported Kiro installed"
     );
     // Nine, not eight: `session_start` carries the prompt that opened the
     // session and is the only copy of it, so it is a message.
@@ -390,14 +390,14 @@ fn kiro_home_moves_both_of_the_cli_layouts() {
     );
 }
 
-/// The gap the listing tests above could not see: a path handed to casr
+/// The gap the listing tests above could not see: a path handed to ags
 /// directly is matched against `session_roots()`, and `session_roots()` was
 /// `~/.kiro/sessions` alone.
 ///
 /// With `KIRO_HOME` set that root contains none of kiro-cli's sessions, so
-/// `casr info $KIRO_HOME/sessions/cli/<id>.json` matched no provider root at
+/// `ags convert info $KIRO_HOME/sessions/cli/<id>.json` matched no provider root at
 /// all and fell through to the best-effort parser — reporting some other
-/// agent's format for a file casr can read perfectly well.
+/// agent's format for a file ags can read perfectly well.
 #[test]
 fn kiro_session_roots_cover_every_root_a_session_can_live_under() {
     let _lock = ENV.lock().unwrap();
@@ -440,7 +440,7 @@ fn kiro_session_roots_cover_every_root_a_session_can_live_under() {
 /// roots reverted this still passes, because discovery's file-signature
 /// inference recognises a real `kiro-cli` metadata file on its own. That
 /// fallback is a safety net and not the contract — it is a guess that happens
-/// to be right here — so what is pinned is that casr resolves the file without
+/// to be right here — so what is pinned is that ags resolves the file without
 /// needing it. `kiro_session_roots_cover_every_root_a_session_can_live_under`
 /// above is the one that fails on the unfixed source.
 #[test]
@@ -489,10 +489,10 @@ fn kiro_session_passed_by_path_is_read_as_kiro() {
         .env("KIRO_HOME", kiro_home.path())
         .env("XDG_DATA_HOME", store.path())
         .output()
-        .expect("run casr info");
+        .expect("run ags convert info");
     assert!(
         output.status.success(),
-        "casr info failed: {}",
+        "ags convert info failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let envelope: serde_json::Value =
@@ -518,7 +518,7 @@ fn kiro_session_passed_by_path_is_read_as_kiro() {
         .env("KIRO_HOME", kiro_home.path())
         .env("XDG_DATA_HOME", store.path())
         .output()
-        .expect("run casr info");
+        .expect("run ags convert info");
     let stderr = String::from_utf8_lossy(&plain.stderr);
     assert!(
         !stderr.contains("pi-agent") && !stderr.contains("clawdbot"),
@@ -628,7 +628,7 @@ fn cursor_agent_chat_without_transcript_is_reported_not_dropped() {
         .env("CURSOR_HOME", vscdb.path())
         .env("XDG_DATA_HOME", store.path())
         .output()
-        .expect("run casr list");
+        .expect("run ags convert list");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("could not be read") && stderr.contains("cursor: 1"),

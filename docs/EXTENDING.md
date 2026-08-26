@@ -248,7 +248,7 @@ events and 30,143 capsules for Codex, 22,026 and 4,234 for Claude Code, event
 for event, capsule for capsule, nothing invented, every session graded
 `ContextComplete` with an empty loss list. Cross-agent, nothing is unexplained,
 nothing foreign is carried, no grade is overclaimed, and the 352 sealed Codex
-compactions become 352 `[converted by casr]` markers. The counts move between
+compactions become 352 `[converted by ags]` markers. The counts move between
 runs because the corpus is being appended to; that is the point of printing them
 rather than pinning them.
 

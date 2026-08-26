@@ -103,7 +103,7 @@ impl SessionListing {
 /// The one place that decides which failures are worth telling the user about:
 ///
 /// * [`std::io::ErrorKind::NotFound`] is not a failure. A provider's store
-///   directory does not exist until the tool has run, and every provider casr
+///   directory does not exist until the tool has run, and every provider ags
 ///   detects by binary-in-`PATH` has that state on a fresh install. It yields
 ///   an empty list and no entry.
 /// * Everything else is recorded — the `EACCES` of a directory owned by
@@ -157,8 +157,8 @@ pub fn read_dir_reporting(
 ///
 /// So the user sees `✓ Claude Code — installed` from one command and no rows
 /// from the other, with nothing in either output saying which of three
-/// different things happened: there are no sessions yet, casr is reading a
-/// directory that does not exist, or casr was refused. Those want three
+/// different things happened: there are no sessions yet, ags is reading a
+/// directory that does not exist, or ags was refused. Those want three
 /// different responses and were rendered identically.
 ///
 /// This is the same shape `opencode` already uses for each database it finds,
@@ -245,9 +245,9 @@ pub(crate) fn write_clawdbot_session_index(
     session_id: &str,
     force: bool,
     provider_slug: &str,
-) -> Result<crate::pipeline::AtomicWriteOutcome, crate::error::CasrError> {
+) -> Result<crate::pipeline::AtomicWriteOutcome, crate::error::AgsError> {
     let _lock = ClawdBotSessionIndexLock::acquire(store_path, provider_slug)?;
-    let write_error = |detail: String| crate::error::CasrError::SessionWriteError {
+    let write_error = |detail: String| crate::error::AgsError::SessionWriteError {
         path: store_path.to_path_buf(),
         provider: provider_slug.to_string(),
         detail,
@@ -285,7 +285,7 @@ pub(crate) fn write_clawdbot_session_index(
 
     let existing_id = row.get("sessionId").and_then(serde_json::Value::as_str);
     if entry_existed && existing_id != Some(session_id) && !force {
-        return Err(crate::error::CasrError::SessionConflict {
+        return Err(crate::error::AgsError::SessionConflict {
             session_id: session_id.to_string(),
             existing_path: store_path.to_path_buf(),
         });
@@ -317,8 +317,8 @@ struct ClawdBotSessionIndexLock {
 }
 
 impl ClawdBotSessionIndexLock {
-    fn acquire(store_path: &Path, provider_slug: &str) -> Result<Self, crate::error::CasrError> {
-        let write_error = |detail: String| crate::error::CasrError::SessionWriteError {
+    fn acquire(store_path: &Path, provider_slug: &str) -> Result<Self, crate::error::AgsError> {
+        let write_error = |detail: String| crate::error::AgsError::SessionWriteError {
             path: store_path.to_path_buf(),
             provider: provider_slug.to_string(),
             detail,
@@ -517,7 +517,7 @@ pub trait Provider: Send + Sync {
     /// Short slug used in session metadata (e.g. `"claude-code"`).
     fn slug(&self) -> &str;
 
-    /// CLI alias used in `casr <alias> resume …` (e.g. `"cc"`).
+    /// CLI alias used in `ags <alias> resume …` (e.g. `"cc"`).
     fn cli_alias(&self) -> &str;
 
     /// Probe whether this provider is installed on the machine.

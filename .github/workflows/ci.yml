@@ -270,7 +270,7 @@ jobs:
         run: cargo test --test scalability_test -- --nocapture --test-threads=1
         env:
           NO_COLOR: "1"
-          CASR_PERF_METRICS_FILE: perf-metrics.json
+          AGS_PERF_METRICS_FILE: perf-metrics.json
 
       - name: Validate perf metrics artifact
         run: |
@@ -280,7 +280,7 @@ jobs:
           import sys
 
           def main() -> int:
-              path = os.environ.get("CASR_PERF_METRICS_FILE", "perf-metrics.json")
+              path = os.environ.get("AGS_PERF_METRICS_FILE", "perf-metrics.json")
               if not os.path.exists(path):
                   print(f"::error::{path} not found (scalability_test did not write metrics)")
                   return 1

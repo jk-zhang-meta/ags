@@ -1,6 +1,6 @@
-//! What `casr resume kr <id>` prints, and what the Kiro IDE reader keeps.
+//! What `ags convert resume kr <id>` prints, and what the Kiro IDE reader keeps.
 //!
-//! Two defects with one cause: casr treated a Kiro session id as a single
+//! Two defects with one cause: ags treated a Kiro session id as a single
 //! thing. It is not. `kiro-cli --resume-id <id>` is implemented by handing the
 //! id straight to the internal wire subcommand `chat _ ensure-session`, and
 //! from the shipped TUI bundle that call is:
@@ -146,7 +146,7 @@ fn flat_session_resumes_with_the_bare_flag() {
 }
 
 /// A bucketed session is only findable from its own workspace, and only by the
-/// KAS engine. Before the fix casr printed the bare flag for this too, which
+/// KAS engine. Before the fix ags printed the bare flag for this too, which
 /// resolves nothing from anywhere else and nothing at all under the default
 /// engine.
 #[test]
@@ -201,7 +201,7 @@ fn a_workspace_with_a_space_is_quoted() {
 
 /// `workspacePaths: []` is Kiro's `_global` bucket. No `process.cwd()` hashes
 /// to `_global`, so `--resume-id` can never find one of these, and the IDE has
-/// no per-session CLI resume to fall back on. casr says that by naming no
+/// no per-session CLI resume to fall back on. ags says that by naming no
 /// session rather than by printing a command that resolves nothing.
 #[test]
 fn a_global_bucketed_session_is_reported_as_unreachable() {
@@ -252,7 +252,7 @@ fn a_bucketed_session_under_kiro_home_still_resolves_its_workspace() {
 /// (`Se17` → `V19`); Kiro's own model-context rebuild replays it as a human
 /// message ahead of everything else (`ke19` →
 /// `pt3.fromHuman(messageId).withText(content)`). Dropping it dropped the
-/// first thing the user said, in every IDE session casr read.
+/// first thing the user said, in every IDE session ags read.
 #[test]
 fn session_start_is_the_opening_user_message() {
     let tmp = tempfile::tempdir().unwrap();

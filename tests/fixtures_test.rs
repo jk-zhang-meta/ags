@@ -484,7 +484,7 @@ fn fixture_agy_simple() {
 
     // Extra: the resume command is the conversation id and nothing else.
     // `agy --help` (1.1.7) documents `--conversation` for resume; `--model`
-    // takes a slug and `--effort` is a separate low|medium|high flag, and casr
+    // takes a slug and `--effort` is a separate low|medium|high flag, and ags
     // has no model information in the transcript to pin either from.
     let resume = Antigravity.resume_command(&session.session_id);
     assert_eq!(
@@ -507,7 +507,7 @@ fn fixture_agy_simple() {
 #[test]
 fn fixture_agy_does_not_list_legacy_gmi_sessions() {
     let gemini_home = fixtures_dir().join("antigravity");
-    // SAFETY: env mutation in a test; casr fixture tests use HOME overrides.
+    // SAFETY: env mutation in a test; ags fixture tests use HOME overrides.
     unsafe {
         std::env::set_var("GEMINI_HOME", &gemini_home);
     }
@@ -677,7 +677,7 @@ fn fixture_openclaw_simple() {
         .join("\n");
 
     // The user rewound this branch away. OpenClaw's own buildSessionContext
-    // does not include it, so neither may casr: replaying it would show the
+    // does not include it, so neither may ags: replaying it would show the
     // target model work the user deleted.
     assert!(
         !all.contains("switch the whole pool to a different crate"),
@@ -971,11 +971,11 @@ fn manifest_all_fixtures_have_expected_files() {
 
         // Provenance is not optional for a fixture that claims to be evidence
         // about a tool. `synthetic` and `edge` fixtures are openly written for
-        // casr and claim nothing; `real` and `schema-derived` both assert that
+        // ags and claim nothing; `real` and `schema-derived` both assert that
         // the bytes came from somewhere outside this repository, and an
         // assertion like that has to say where — otherwise the next reader
         // cannot tell a capture from a guess, which is how a provider ends up
-        // with fixtures that encode casr's expectations instead of the tool's
+        // with fixtures that encode ags's expectations instead of the tool's
         // behaviour.
         if matches!(
             entry["category"].as_str(),

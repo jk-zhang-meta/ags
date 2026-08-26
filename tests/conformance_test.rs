@@ -501,7 +501,7 @@ fn one_of_every_role(workspace: &Path) -> CanonicalSession {
 /// The table `folded_role` holds was written from the writable providers'
 /// artifacts — the `"role"` field each writer emits — not from this round trip. Read-back
 /// is the drift alarm, not the oracle: it can only report a fold that a reader
-/// can see, and casr's readers normalise. That is why `Other` is probed under a
+/// can see, and ags's readers normalise. That is why `Other` is probed under a
 /// name no reader rewrites, and why the roles this asserts on are the three the
 /// artifact and the read-back agree about.
 #[test]

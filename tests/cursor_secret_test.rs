@@ -1,4 +1,4 @@
-//! `cursor-agent`'s chat metadata carries a live secret, and `casr` must not
+//! `cursor-agent`'s chat metadata carries a live secret, and `ags` must not
 //! repeat it.
 //!
 //! Every `cursor-agent` conversation is created from one metadata literal
@@ -12,7 +12,7 @@
 //!
 //! so `meta['0']` always ends with 32 random bytes, hex. The CLI sends that
 //! value to Cursor's backend as the `x-blob-encryption-key` header, which makes
-//! it a credential and not a curiosity. `casr info --json` is a command users
+//! it a credential and not a curiosity. `ags convert info --json` is a command users
 //! pipe to a file and paste into issues, so echoing the chat object wholesale
 //! published it. The reader wants exactly three fields — `name`, `createdAt`
 //! and `lastUsedModel` — and must copy only those.
@@ -58,7 +58,7 @@ fn seed(root: &Path) {
     .unwrap();
 }
 
-/// Run a `casr` subcommand against a seeded `cursor-agent` home, with the
+/// Run a `ags` subcommand against a seeded `cursor-agent` home, with the
 /// session store pointed somewhere disposable.
 fn run(args: &[&str], root: &Path, store: &Path) -> String {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ags"));
@@ -69,7 +69,7 @@ fn run(args: &[&str], root: &Path, store: &Path) -> String {
         .env("CURSOR_DATA_DIR", root)
         .env("XDG_DATA_HOME", store)
         .env_remove("AGS_STORE");
-    let out = cmd.output().expect("failed to run casr");
+    let out = cmd.output().expect("failed to run ags");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
@@ -100,7 +100,7 @@ fn the_fixture_still_carries_a_blob_encryption_key() {
     );
 }
 
-/// The regression. `casr info --json` reached the whole decoded `meta['0']`
+/// The regression. `ags convert info --json` reached the whole decoded `meta['0']`
 /// object into `metadata.cursor_agent_chat`, secret included.
 #[test]
 fn info_json_does_not_disclose_the_blob_encryption_key() {
@@ -112,7 +112,7 @@ fn info_json_does_not_disclose_the_blob_encryption_key() {
 
     assert!(
         !stdout.contains(PLANTED_KEY),
-        "`casr info --json` disclosed the cursor-agent blobEncryptionKey.\n\
+        "`ags convert info --json` disclosed the cursor-agent blobEncryptionKey.\n\
          It is sent to Cursor's backend as x-blob-encryption-key, and this \
          command is routinely piped to a file or pasted into an issue.\n\
          --- stdout ---\n{stdout}"
@@ -134,7 +134,7 @@ fn list_json_does_not_disclose_the_blob_encryption_key() {
 
     assert!(
         !stdout.contains(PLANTED_KEY),
-        "`casr list --json` disclosed the cursor-agent blobEncryptionKey.\n\
+        "`ags convert list --json` disclosed the cursor-agent blobEncryptionKey.\n\
          --- stdout ---\n{stdout}"
     );
 }
@@ -163,7 +163,7 @@ fn chat_metadata_is_an_allow_list_not_a_blob() {
         keys,
         ["createdAt", "lastUsedModel", "name"],
         "cursor_agent_chat must carry only the fields this reader uses; \
-         anything else is a vendor blob whose contents casr does not control"
+         anything else is a vendor blob whose contents ags does not control"
     );
 
     // The three that are kept must still be the real values, or the fix has

@@ -517,10 +517,10 @@ impl Cline {
 
     /// Directories that each contain a `tasks/` (and possibly `state/`) tree.
     ///
-    /// `CLINE_HOME` is casr's own override and names such a directory outright;
-    /// when set it is used alone, which is what aims casr at a single tree.
+    /// `CLINE_HOME` is ags's own override and names such a directory outright;
+    /// when set it is used alone, which is what aims ags at a single tree.
     ///
-    /// Otherwise Cline keeps tasks in two unrelated places and casr reads both:
+    /// Otherwise Cline keeps tasks in two unrelated places and ags reads both:
     ///
     /// - the SDK/CLI store, whose location Cline resolves from its own
     ///   `CLINE_DATA_DIR`, else `$CLINE_DIR/data`, else `~/.cline/data`; and
@@ -653,7 +653,7 @@ impl Cline {
     /// Every field a `taskHistory.json` entry is known to hold.
     ///
     /// This list is an *allow-list*, and that is the point: the entry lands in
-    /// canonical metadata under `taskHistoryItem`, which `casr info --json`
+    /// canonical metadata under `taskHistoryItem`, which `ags convert info --json`
     /// prints verbatim — a command users pipe to a file and paste into issues.
     /// Copying the entry wholesale means whatever Cline adds to it next is
     /// republished with no change here and no one looking. Adding a name to
@@ -1424,9 +1424,9 @@ impl Provider for Cline {
     /// ```
     ///
     /// so a task is `tasks/<digits>/`, exactly one level down — the id being
-    /// the `Date.now()` that created it. casr's own writer agrees:
+    /// the `Date.now()` that created it. ags's own writer agrees:
     /// `generate_task_id` returns `Utc::now().timestamp_millis().to_string()`,
-    /// so tightening the predicate cannot orphan a session casr wrote.
+    /// so tightening the predicate cannot orphan a session ags wrote.
     ///
     /// Both halves were leaking, and in different directions. A transcript
     /// copied a level deeper — `tasks/<id>/checkpoints/…`, `tasks/backups/a/…`
@@ -1524,7 +1524,7 @@ impl Provider for Cline {
             anyhow::anyhow!("could not derive Cline storage root for {}", path.display())
         })?;
 
-        // Prefer API history for canonical messages (and avoid duplicates in `casr list`).
+        // Prefer API history for canonical messages (and avoid duplicates in `ags convert list`).
         let api_path = task_dir.join(FILE_API_HISTORY);
         let api_source_path = if file_name == FILE_API_HISTORY {
             path.to_path_buf()

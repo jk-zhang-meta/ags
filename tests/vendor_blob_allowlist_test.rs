@@ -1,6 +1,6 @@
 //! Vendor-owned objects that reach canonical metadata must be allow-listed.
 //!
-//! `casr info --json` prints `session.metadata` verbatim (`src/main.rs`), and
+//! `ags convert info --json` prints `session.metadata` verbatim (`src/main.rs`), and
 //! it is a command users pipe to a file and paste into issues. Any reader that
 //! copies a whole vendor object into that bag has made a standing promise to
 //! publish whatever the vendor puts there next — which is how the
@@ -36,7 +36,7 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Run `casr` with a disposable store and the given provider home variables.
+/// Run `ags` with a disposable store and the given provider home variables.
 ///
 /// `AGS_STORE` is removed rather than set: it overrides the `XDG_DATA_HOME`
 /// redirect, so a value inherited from the developer's shell would aim these
@@ -50,11 +50,11 @@ fn run(args: &[&str], envs: &[(&str, &Path)], store: &Path) -> String {
         cmd.env(key, value);
     }
     cmd.env_remove("AGS_STORE");
-    let out = cmd.output().expect("failed to run casr");
+    let out = cmd.output().expect("failed to run ags");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Parse `casr … --json` stdout, failing with the raw text when it is not JSON.
+/// Parse `ags … --json` stdout, failing with the raw text when it is not JSON.
 fn parse(stdout: &str) -> serde_json::Value {
     serde_json::from_str(stdout)
         .unwrap_or_else(|e| panic!("expected JSON on stdout ({e})\n--- stdout ---\n{stdout}"))
@@ -116,7 +116,7 @@ fn cline_info_json_drops_an_unlisted_task_history_field() {
 
     assert!(
         !stdout.contains(PLANTED_CLINE_SECRET),
-        "`casr info --json` republished a taskHistory.json field no reader \
+        "`ags convert info --json` republished a taskHistory.json field no reader \
          asks for. `Cline::read_task_history_item` must copy only the fields \
          its allow-list names.\n--- stdout ---\n{stdout}"
     );
@@ -210,7 +210,7 @@ fn grok_info_json_does_not_republish_summary_json() {
 
     assert!(
         !stdout.contains(PLANTED_GROK_SECRET),
-        "`casr info --json` republished a summary.json field no reader asks \
+        "`ags convert info --json` republished a summary.json field no reader asks \
          for. The Grok reader must name the keys it lifts out of summary.json, \
          not copy the file.\n--- stdout ---\n{stdout}"
     );
@@ -332,7 +332,7 @@ fn cursor_info_json_discloses_nothing_from_the_composer_entry() {
 
     assert!(
         !stdout.contains(PLANTED_CURSOR_SECRET),
-        "`casr info --json` republished a value from the composerData entry \
+        "`ags convert info --json` republished a value from the composerData entry \
          that no reader asks for. Cursor persists two 32-byte random keys at \
          the top level of that entry, so nothing in it may be copied \
          wholesale.\n--- stdout ---\n{stdout}"
@@ -440,7 +440,7 @@ fn amp_info_json_does_not_republish_the_thread_file() {
 
     assert!(
         !stdout.contains(PLANTED_AMP_SECRET),
-        "`casr info --json` republished the Amp thread file. The transcript is \
+        "`ags convert info --json` republished the Amp thread file. The transcript is \
          already the canonical `messages` array, which this command reports as \
          counts plus an opt-in --peek tail; copying the thread wholesale \
          reverses that and prints every tool result verbatim.\n\
@@ -448,7 +448,7 @@ fn amp_info_json_does_not_republish_the_thread_file() {
     );
     assert!(
         !stdout.contains(PLANTED_AMP_INSTALL_ID),
-        "`casr info --json` republished Amp's per-install identifier from \
+        "`ags convert info --json` republished Amp's per-install identifier from \
          env.initial.platform.\n--- stdout ---\n{stdout}"
     );
 }
@@ -572,18 +572,18 @@ fn kiro_info_json_publishes_neither_history_nor_unbounded_state_fields() {
 
     assert!(
         !stdout.contains(PLANTED_KIRO_HISTORY_SECRET),
-        "`casr info --json` republished a line from <id>.history. That file is \
+        "`ags convert info --json` republished a line from <id>.history. That file is \
          every prompt the user submitted, not a slash-command log, so a pasted \
          key is in it verbatim.\n--- stdout ---\n{stdout}"
     );
     assert!(
         !stdout.contains(PLANTED_KIRO_STATE_SECRET),
-        "`casr info --json` republished a session_state field that \
+        "`ags convert info --json` republished a session_state field that \
          SessionStateV1 does not declare.\n--- stdout ---\n{stdout}"
     );
     assert!(
         !stdout.contains(PLANTED_KIRO_NESTED_SECRET),
-        "`casr info --json` republished an unbounded nested session_state \
+        "`ags convert info --json` republished an unbounded nested session_state \
          value. Naming a parent object is not a recursive allow-list.\n\
          --- stdout ---\n{stdout}"
     );
@@ -621,7 +621,7 @@ fn kiro_session_state_is_an_allow_list_and_history_is_absent() {
         ["version"],
         "session_state must carry only the audited format tag. Kiro accepts \
          this minimal state, while every nested state object contains fields \
-         casr cannot safely publish wholesale."
+         ags cannot safely publish wholesale."
     );
     assert_eq!(state["version"], "v1");
 

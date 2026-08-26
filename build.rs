@@ -1,7 +1,7 @@
 use vergen_gix::{BuildBuilder, CargoBuilder, Emitter, GixBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Embed build metadata for `casr --version` output.
+    // Embed build metadata for `ags --version` output.
     // Generates VERGEN_* env vars consumed by option_env!() in main.rs.
     let build = BuildBuilder::default().build_timestamp(true).build()?;
     let cargo = CargoBuilder::default().target_triple(true).build()?;

@@ -3536,13 +3536,13 @@ codex_pool_status() {
 resolve_ags_converter_binary() {
     local binary="${AGS_CONVERTER_BINARY:-}" version
     if [[ -z "$binary" ]]; then
-        binary="$(command -v casr 2>/dev/null || true)"
+        binary="$(command -v ags 2>/dev/null || true)"
     fi
     valid_local_binary_path "$binary" ||
         die "cannot find the ags program; reinstall ags"
     if [[ "$ags_converter_version" == unknown ]]; then
         version="$("$binary" --version 8>&- 9>&- </dev/null 2>/dev/null || true)"
-        if [[ "$version" =~ ^casr[[:space:]]+([^[:space:]]+) ]]; then
+        if [[ "$version" =~ ^ags[[:space:]]+([^[:space:]]+) ]]; then
             ags_converter_version="${BASH_REMATCH[1]}"
         fi
     fi
@@ -3841,6 +3841,14 @@ ags_consume_option() {
             ;;
         --id)
             (( $# >= 2 )) || die "--id 需要一个会话 ID"
+            # 空串也是"给过了"。分成两个开关而不是只看值空不空：`--id ''` 是一个
+            # 明确的、写错了的意图，把它和"根本没提 --id"混为一谈的结果是悄悄自动
+            # 起一个名字——人以为自己命了名，实际没有。
+            #
+            # 这以前被另一个 bug 盖住了：顶层重切参数数组时没加引号，空串在词分割
+            # 里直接消失，于是 `--id ''` 表现成 `--id` 缺值而被拒。引号补上之后空串
+            # 留了下来，这里就得自己认。
+            [[ -n "$2" ]] || die "--id 需要一个会话 ID"
             ags_id_option="$2"
             ags_consumed=2
             ;;
@@ -6849,14 +6857,14 @@ load_local_checkpoint_menu() {
 #
 # - **不写进 Agent 自己的会话文件。** 那是它的数据，往里塞字段等于让它自己的解析
 #   器去猜我们的意思。
-# - **不放进 casr 的 store。** 那里的规矩写在 `src/store.rs` 开头——除了 `Loss` /
+# - **不放进 ags 的 store。** 那里的规矩写在 `src/store.rs` 开头——除了 `Loss` /
 #   `Fidelity` 这类「当时发生过、事后再也算不出来」的记录，其余一切都必须能从原生
 #   字节重建，版本不认就删掉重建。人手写的描述既不能重建，也不该在版本升级时被
 #   当成缓存丢掉。
 
 # 一个注解键是否可以直接当路径用。
 #
-# 会话 ID 来自 casr，不同 Agent 的形状不一样（Codex 是 UUID，别家可能是文件名），
+# 会话 ID 来自 ags，不同 Agent 的形状不一样（Codex 是 UUID，别家可能是文件名），
 # 所以这里不能用 `validate_session_id` 那条 UUID 规则。要求的是「能安全地当一段
 # 文件名」：没有分隔符、没有控制字符、不以点开头、有长度上限。不合格的会话仍然
 # 照常列出，只是没有注解可存——注解是附加信息，不该让一个列不出的名字变成错误。
@@ -6958,14 +6966,14 @@ write_session_summary() {
 #
 # 列表要认得出一条会话，靠的是"它在干什么"。这件事只有两个来源：
 #
-#   - **Agent 自己写的。** Claude Code 会给会话起名（casr 读出来叫 `native_name`），
+#   - **Agent 自己写的。** Claude Code 会给会话起名（ags 读出来叫 `native_name`），
 #     一台机器上最近 40 条里 25 条有。这一份是白捡的，优先用。
 #   - **我们自己算的。** Codex 一个字都不写——同一批 40 条里 0 条有——所以只能退回
 #     "第一条用户消息"，而那条消息前面往往挂着客户端注入的一大块上下文。实测最近
 #     14 条 codex 里 8 条的标题是 `# AGENTS.md instructions for /mnt/c/…`，其中 6
 #     条一模一样。列表于是完全没法用来认会话。
 #
-# casr 那边已经把注入块跳掉了，所以标题现在是人写的话。但那是**原话的第一行**，
+# ags 那边已经把注入块跳掉了，所以标题现在是人写的话。但那是**原话的第一行**，
 # 不是概括——"帮我看看codex和claude的近期会话 全部被杀死了 大概有5个…"这样的一行
 # 塞不进一列。这里把它交给模型压成一句。
 #
@@ -6990,7 +6998,7 @@ session_content_stamp() {
 
 # 交给模型的原料：这段会话里人自己说过的话，掐头去尾。
 #
-# 不发整段会话——中间绝大部分是工具往返，既贵又不改变答案。casr 的 `--digest`
+# 不发整段会话——中间绝大部分是工具往返，既贵又不改变答案。ags 的 `--digest`
 # 已经把注入块和非用户消息剔掉了。
 session_digest_text() {
     local provider="$1" session_id="$2" path="$3" binary
@@ -7209,7 +7217,7 @@ selector_for_ordinal() {
 # 一次把所有注解读进内存，别一行起一次 jq。
 #
 # 渲染一屏列表原来要为每条会话调 4~5 次 jq（描述、参数、置顶、总结、短号），一百
-# 条会话就是五百多次进程启动——实测 `ags ls` 里 casr 只占 0.85 秒，剩下 1.85 秒
+# 条会话就是五百多次进程启动——实测 `ags ls` 里 ags 只占 0.85 秒，剩下 1.85 秒
 # 全花在这上面。这里一次 jq 读完全部注解文件。
 #
 # 一个文件坏了 jq 会整批失败，所以失败时返回非零、调用方退回逐条读。批量是优化，
@@ -7270,7 +7278,7 @@ annotation_from_map() {
 
 # 每个 Agent 最多取多少条。
 #
-# casr 的 `--limit` 是**按 provider** 算的，这里取完之后再全局按时间排一次，所以
+# ags 的 `--limit` 是**按 provider** 算的，这里取完之后再全局按时间排一次，所以
 # 这个数字是「每家最多贡献多少」，不是屏幕上最终看到多少。给得比一屏多，翻页才有
 # 东西可翻。
 native_session_limit() {
@@ -7282,7 +7290,7 @@ native_session_limit() {
 # 跑转换那半边的 CLI。
 #
 # 二进制现在叫 `ags`，而它默认就是这个运行时——`ags ls`、`ags resume 7` 都是这里
-# 的命令。跨 Agent 转换那套（原来的 `casr list` / `casr info` / `casr resume`）
+# 的命令。跨 Agent 转换那套（原来的 `ags convert list` / `ags convert info` / `ags convert resume`）
 # 收在 `ags convert` 底下，因为两边都想叫 `list` 和 `resume`，而日常敲的是这边。
 #
 # 收成一个函数而不是每处各写一遍 `convert`：这个前缀是命令布局的一部分，将来它
@@ -7303,7 +7311,7 @@ converter_cli() {
 #
 # 输出：provider · session_id · 时间 · 时间(epoch 秒) · 工作区 · Agent 自己起的名字 · 标题 · 路径
 #
-# 排序在 jq 里做而不是交给 `sort`：`casr list` 是按 provider 分组各自截断的，跨
+# 排序在 jq 里做而不是交给 `sort`：`ags convert list` 是按 provider 分组各自截断的，跨
 # provider 的先后只有把两边合起来看才成立。
 native_session_rows() {
     local binary
@@ -7319,7 +7327,7 @@ native_session_rows() {
             # `<recommended_plugins>`），列表于是完全没法用来认会话。
             #
             # 所以跳过开头这些包装，取第一段真正是人写的文字。只影响显示：
-            # casr 那边的 `title` 一个字都不改，这里也不猜内容，只是不把注入块
+            # ags 那边的 `title` 一个字都不改，这里也不猜内容，只是不把注入块
             # 当成标题。跳完还是空的（整条消息都是注入的）就退回原文，因为
             # 「显示不出好的」不该变成「什么都不显示」。
             def human_line:
@@ -7617,7 +7625,7 @@ resume_live_session() {
 
 # 这个会话的工作目录。
 #
-# 从 casr 现读一次而不是在列表里带着走：列表那行是给人看的（可能只有仓库名），
+# 从 ags 现读一次而不是在列表里带着走：列表那行是给人看的（可能只有仓库名），
 # 而 `cd` 需要的是完整路径。
 native_session_workspace() {
     local provider="$1" session_id="$2" binary
@@ -7632,7 +7640,7 @@ native_session_workspace() {
 # AGS 不负责启动的 Agent：把它自己的恢复命令说出来，不代跑。
 #
 # 代跑要么 `eval` 一个字符串，要么在这里替十几个 Agent 各写一遍它们的命令行规则。
-# 前者是这个文件到处在躲的东西，后者是把 casr 已经知道的事再抄一份。
+# 前者是这个文件到处在躲的东西，后者是把 ags 已经知道的事再抄一份。
 show_foreign_resume_command() {
     local provider="$1" session_id="$2" binary command
     binary="$(resolve_ags_converter_binary)"
@@ -7806,7 +7814,7 @@ start_background_summary() {
     # `ls` 一退出它就跟着没了——实测只写下第一行日志就断了。补描述要跑几十秒，
     # 必须活得比起它的那条命令长，所以单独开一个会话组。
     #
-    # 走 `casr checkpoint` 这个入口而不是在本进程里起子 shell：那样新进程有自己
+    # 走 `ags checkpoint` 这个入口而不是在本进程里起子 shell：那样新进程有自己
     # 干净的一份状态，不会因为父进程正占着终端而互相干扰。
     local binary
     binary="$(resolve_ags_converter_binary 2>/dev/null)" || return 0
@@ -7854,7 +7862,7 @@ summarize_native_sessions() {
     for index in "${!queue_id[@]}"; do
         provider="${queue_provider[$index]}"
         session_id="${queue_id[$index]}"
-        # 名字直接从行里取。以前这里为每条会话单独跑一次 `casr info`——上百条会话
+        # 名字直接从行里取。以前这里为每条会话单独跑一次 `ags convert info`——上百条会话
         # 就是上百次进程启动，而这个值列表本来就已经拿到了。
         native_name="${queue_native[$index]}"
         # 还在写的会话跳过：它的总结下一分钟就过期，而缓存指纹一定不命中，等于
@@ -9588,13 +9596,21 @@ resume_checkpoint() {
             die "saved Agent arguments are unreadable; resume with -- ARGS"
         client_args=("${launch_args_decoded[@]}")
     fi
-    # Replayed arguments go through the source Agent's rules because that is
-    # whose command line they are; typed ones through the Agent actually being
-    # launched. Both are needed: records written before this existed still
-    # carry `resume`, and nothing stops a caller from typing it.
-    strip_session_selection_args "$runtime_source_agent" "${client_args[@]}"
+    # 回放的参数按**源** Agent 的规矩剥，因为那本来就是它的命令行；手敲的按**真正
+    # 要启动**的那个 Agent 的规矩剥。这两件事以前是对同一组参数把两套规矩都跑一遍。
+    #
+    # 那样有一个具体的后果：`ags resume <claude 的记录> --to codex -- -c model_provider=…`
+    # 里的 `-c` 是 Codex 的 `--config`，但第一遍用的是 Claude 的规矩，那里 `-c` 是
+    # `--continue`（选会话），于是它被剥掉、只留下一个孤零零的值。结果有两个，都不好：
+    # 「不许改工作区/配置」那道防护看不到 `-c`，因此不拦；而那个值还是原样传给了
+    # codex。手敲的参数不该被另一个 Agent 的规矩解释。
     runtime_effective_agent="${resume_target_agent:-$runtime_source_agent}"
-    strip_session_selection_args "$runtime_effective_agent" "${stripped_launch_args[@]}"
+    if (( client_args_explicit == 1 )); then
+        strip_session_selection_args "$runtime_effective_agent" "${client_args[@]}"
+    else
+        strip_session_selection_args "$runtime_source_agent" "${client_args[@]}"
+        strip_session_selection_args "$runtime_effective_agent" "${stripped_launch_args[@]}"
+    fi
     if (( ${#client_args[@]} != ${#stripped_launch_args[@]} )); then
         client_args=("${stripped_launch_args[@]}")
         # Said out loud rather than dropped quietly: something in that
@@ -11666,12 +11682,12 @@ legacy_command() {
 
 # Keep the installed codext current, as part of `ags update`.
 #
-# Separate from the casr update because they are separate release trains: the
-# fork tracks upstream Codex, casr tracks AGS. Folding them into one version
+# Separate from the ags update because they are separate release trains: the
+# fork tracks upstream Codex, ags tracks AGS. Folding them into one version
 # check would mean a Codex release could not reach a machine until AGS also
 # cut one.
 #
-# Unlike the casr path there is no installer to hand over to — codext ships a
+# Unlike the ags path there is no installer to hand over to — codext ships a
 # single binary — so the download happens here. It is written beside the binary
 # it replaces and moved into place, so an interrupted download never leaves a
 # half-written executable on PATH.
@@ -11852,7 +11868,7 @@ update_codext() {
             binary="$(dirname "$codex_binary")/codext"
         else
             # No Codex at all on this host. codext is a complete Codex, so
-            # installing it is still the right answer — next to casr, which is
+            # installing it is still the right answer — next to ags, which is
             # the installer's --dest and the one directory install.sh's
             # maybe_add_path puts on PATH. Anywhere else and `codext` would not
             # be a command the user can type.
@@ -12028,7 +12044,7 @@ update_codext() {
         # their own account and never learn why.
         #
         # The directory is already on PATH — it is the one Codex itself is in,
-        # or the one casr is in. What is not is zsh's command table: it is built
+        # or the one ags is in. What is not is zsh's command table: it is built
         # once and a binary that appears afterwards stays invisible until
         # `rehash`. AGS launches codext by absolute path and does not care, but
         # someone typing `codext` in the shell they ran this from does.
@@ -12069,7 +12085,7 @@ update_ags() {
 
     # codext first, and never fatally: it is a separate release train, and a
     # machine that has not installed it at all is a normal machine. Running it
-    # before the casr update means a failure here still leaves casr updatable.
+    # before the ags update means a failure here still leaves ags updatable.
     update_codext "$check_only" || true
 
     binary="$(resolve_ags_converter_binary)"
@@ -12411,19 +12427,27 @@ done
 unset ags_word ags_separator_seen
 
 # `--` 之前：ags 的参数和命令的位置参数混在一起，按顺序拆开。
+#
+# 下面每一次重切 `ags_words` 都必须带引号。不带的话数组展开会再走一遍词分割和通配符
+# ——`ags save 'bad id' '描述'` 里的 `bad id` 被拆成两个词，于是 ID 成了 `bad`、
+# 描述成了 `id 描述`，而校验 ID 字符集的那道闸门根本没看到那个空格。带 `*` 的参数
+# 更糟：它会按当前目录展开。
+#
+# 末位参数看不出来，因为描述是 `"$*"` 拼回去的——所以这个 bug 只在非末位参数带空格
+# 时才露头。
 ags_positionals=()
 while (( ${#ags_words[@]} > 0 )); do
     case "${ags_words[0]}" in
         -h|--help|help)
             ags_positionals+=("${ags_words[0]}")
-            ags_words=(${ags_words[@]:1})
+            ags_words=("${ags_words[@]:1}")
             continue
             ;;
     esac
     if [[ "${ags_words[0]}" == -* ]]; then
         ags_consume_option "${ags_words[@]}"
         if (( ags_consumed > 0 )); then
-            ags_words=(${ags_words[@]:$ags_consumed})
+            ags_words=("${ags_words[@]:$ags_consumed}")
             continue
         fi
         # 顶层不认识它，不代表它是错的：ags 的每个子命令都有自己的参数
@@ -12433,7 +12457,7 @@ while (( ${#ags_words[@]} > 0 )); do
         # 指向 `--`。
     fi
     ags_positionals+=("${ags_words[0]}")
-    ags_words=(${ags_words[@]:1})
+    ags_words=("${ags_words[@]:1}")
 done
 unset ags_words
 set -- ${ags_positionals[@]+"${ags_positionals[@]}"}
@@ -12503,7 +12527,7 @@ case "${1:-}" in
     codext-update)
         # install.sh's hook into the same function `ags update` uses, so a
         # fresh install lands codext too. Deliberately not `ags update` itself:
-        # that one would also self-update casr, and would therefore undo an
+        # that one would also self-update ags, and would therefore undo an
         # explicit `install.sh --version` seconds after it landed.
         shift
         (( $# == 0 )) || die "usage: ags codext-update"

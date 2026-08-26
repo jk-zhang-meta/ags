@@ -71,7 +71,7 @@ fn announce(message: &str) {
 /// a write despite its mode. Callers treat `false` as "skip the assertion".
 #[track_caller]
 pub fn directory_rejects_writes(path: &Path) -> bool {
-    let probe = path.join(".casr-permission-probe");
+    let probe = path.join(".ags-permission-probe");
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)

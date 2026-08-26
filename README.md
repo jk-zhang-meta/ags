@@ -1,7 +1,7 @@
 # ags
 
 <div align="center">
-  <img src="casr_illustration.webp" alt="ags - Cross Agent Session Resumer">
+  <img src="ags_illustration.webp" alt="ags - Cross Agent Session Resumer">
 </div>
 
 Cross Agent Session Resumer for coding agents: resume a session created in one provider (Claude Code, Codex, Gemini, and more) using a different provider by converting through a canonical session model.

@@ -324,7 +324,7 @@ impl Provider for Vibe {
     /// gives every subagent its own session logger rooted *inside* the parent
     /// session — `save_dir=str(ctx.session_dir / "agents")` — so
     /// `session_<stamp>/agents/<agent>_<stamp>/messages.jsonl` is a real
-    /// transcript Vibe writes and never lists. casr was listing it as a peer of
+    /// transcript Vibe writes and never lists. ags was listing it as a peer of
     /// the session that spawned it.
     ///
     fn is_session_path(&self, path: &Path) -> bool {
@@ -473,7 +473,7 @@ impl Provider for Vibe {
         opts: &WriteOptions,
     ) -> anyhow::Result<WrittenSession> {
         let source_session_id = if session.session_id.is_empty() {
-            format!("casr-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
+            format!("ags-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S"))
         } else {
             session.session_id.clone()
         };
@@ -483,7 +483,7 @@ impl Provider for Vibe {
         // full id lives in metadata and is what `vibe --resume` resolves.
         let short_id = &session_id[..8];
         let candidates = Self::vendor_candidates(short_id).map_err(|error| {
-            crate::error::CasrError::SessionWriteError {
+            crate::error::AgsError::SessionWriteError {
                 path: Self::home_dir(),
                 provider: self.slug().to_string(),
                 detail: format!(
@@ -496,7 +496,7 @@ impl Provider for Vibe {
             .find(|(_, full_id, _)| full_id.as_deref() != Some(session_id.as_str()))
         {
             let collision_id = collision_id.as_deref().unwrap_or("<missing>");
-            return Err(crate::error::CasrError::SessionWriteError {
+            return Err(crate::error::AgsError::SessionWriteError {
                 path: collision_dir.clone(),
                 provider: self.slug().to_string(),
                 detail: format!(
@@ -511,7 +511,7 @@ impl Provider for Vibe {
             .map(|(session_dir, _, _)| session_dir);
         let target_dir = match existing_dir {
             Some(existing_dir) if !opts.force => {
-                return Err(crate::error::CasrError::SessionConflict {
+                return Err(crate::error::AgsError::SessionConflict {
                     session_id,
                     existing_path: existing_dir.join(MESSAGES_FILENAME),
                 }
@@ -528,7 +528,7 @@ impl Provider for Vibe {
                 // `--force` must never turn that ambiguity into permission to
                 // overwrite a directory we did not identify as this session.
                 if generated.exists() {
-                    return Err(crate::error::CasrError::SessionWriteError {
+                    return Err(crate::error::AgsError::SessionWriteError {
                         path: generated,
                         provider: self.slug().to_string(),
                         detail: "refusing to overwrite an unrecognized Vibe session directory"
@@ -616,7 +616,7 @@ impl Provider for Vibe {
             "git_commit": null,
             "git_branch": null,
             "environment": { "working_directory": workspace },
-            "username": "casr",
+            "username": "ags",
             "loops": [],
             "title": session.title,
             "title_source": "auto",

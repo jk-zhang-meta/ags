@@ -15,7 +15,7 @@ The libtest JSON stream is JSONL (one JSON object per line). This script
 extracts per-test status + duration, and optionally merges extra per-test
 metrics emitted via stdout lines of the form:
 
-  CASR_TEST_METRIC:{"trace_events_count":123,"files_written":2,"files_read":7}
+  AGS_TEST_METRIC:{"trace_events_count":123,"files_written":2,"files_read":7}
 """
 
 from __future__ import annotations
@@ -34,9 +34,9 @@ def _utc_now_iso() -> str:
 def _parse_optional_metrics(stdout: str) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
     for line in stdout.splitlines():
-        if not line.startswith("CASR_TEST_METRIC:"):
+        if not line.startswith("AGS_TEST_METRIC:"):
             continue
-        payload = line[len("CASR_TEST_METRIC:") :].strip()
+        payload = line[len("AGS_TEST_METRIC:") :].strip()
         try:
             decoded = json.loads(payload)
         except json.JSONDecodeError:

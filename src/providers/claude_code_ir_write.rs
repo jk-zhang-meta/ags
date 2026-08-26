@@ -68,7 +68,7 @@ const USER_TYPE: &str = "external";
 /// for three quarters of rollouts it *is* the entire earlier conversation.
 /// Omitting it silently is the worst option available: the target then answers
 /// confidently as though it has the full history.
-const SEALED_CONTEXT_MARKER: &str = "[converted by casr] The earlier part of this conversation was \
+const SEALED_CONTEXT_MARKER: &str = "[converted by ags] The earlier part of this conversation was \
 compacted by the source agent, which returned it sealed in a format only that \
 agent's provider can read. It could not be transferred and is missing from this \
 session. Do not assume the history above is complete — ask before relying on \
@@ -166,7 +166,7 @@ pub fn render(
         .to_string();
     let version = match (writer.same_agent, ir.origin.agent_version.as_deref()) {
         (true, Some(version)) => version.to_string(),
-        _ => "casr".to_string(),
+        _ => "ags".to_string(),
     };
     // The model names the *record's* author. Carrying the source agent's model
     // across would label a Codex turn as though Claude had produced it.
@@ -384,7 +384,7 @@ impl Record {
         match self.side {
             Side::User => json!({ "role": "user", "content": content }),
             Side::Assistant => json!({
-                "id": format!("msg_casr_{}", uuid::Uuid::new_v4().simple()),
+                "id": format!("msg_ags_{}", uuid::Uuid::new_v4().simple()),
                 "type": "message",
                 "role": "assistant",
                 "model": model,
@@ -1460,6 +1460,6 @@ mod tests {
             Fidelity::HistoryIncomplete,
             "losing the conversation ranks worse than losing the train of thought"
         );
-        assert!(out.lines[0].contains("[converted by casr]"));
+        assert!(out.lines[0].contains("[converted by ags]"));
     }
 }

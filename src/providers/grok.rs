@@ -598,7 +598,7 @@ fn chunk_kind_label(kind: ChunkKind) -> &'static str {
     }
 }
 
-/// Resolve the path casr was handed to the session's `updates.jsonl`.
+/// Resolve the path ags was handed to the session's `updates.jsonl`.
 ///
 /// Accepts the `updates.jsonl` itself, a sibling session file
 /// (`summary.json`, `chat_history.jsonl`, …), or the session directory.
@@ -1151,7 +1151,7 @@ impl Provider for Grok {
             // `glpat-`, `xai-`, `AKIA`, JWTs…) is wired to its sampler and
             // telemetry paths, not to session persistence. So the value lands
             // in `summary.json` unredacted, and the wholesale copy put it into
-            // `casr info --json` — a command users pipe to a file and paste
+            // `ags convert info --json` — a command users pipe to a file and paste
             // into issues. `grok_home`, `info.cwd`, `prompt_display_cwd`,
             // `source_workspace_dir` and `git_root_dir` rode along with it.
             //

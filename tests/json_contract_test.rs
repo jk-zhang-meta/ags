@@ -21,7 +21,7 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -246,7 +246,7 @@ fn assert_provider_object(obj: &serde_json::Value, idx: usize) {
 #[test]
 fn contract_providers_json_shape() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "providers"])
         .output()
         .expect("providers should run");
@@ -273,7 +273,7 @@ fn contract_providers_json_shape() {
 #[test]
 fn contract_providers_known_slugs() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "providers"])
         .output()
         .unwrap();
@@ -308,7 +308,7 @@ fn contract_providers_known_slugs() {
 #[test]
 fn contract_providers_aliases_match_slugs() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "providers"])
         .output()
         .unwrap();
@@ -426,7 +426,7 @@ fn assert_list_item(obj: &serde_json::Value, idx: usize) {
 #[test]
 fn contract_list_json_empty() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list"])
         .output()
         .expect("list should run");
@@ -445,7 +445,7 @@ fn contract_list_json_shape_cc() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
         .expect("list should run");
@@ -471,7 +471,7 @@ fn contract_list_json_shape_codex() {
     let tmp = TempDir::new().unwrap();
     setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/backend"])
         .output()
         .expect("list should run");
@@ -499,7 +499,7 @@ fn contract_list_json_shape_gemini() {
         Some("/data/projects/cross_agent_session_resumer"),
     );
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
@@ -528,7 +528,7 @@ fn contract_list_json_messages_is_nonnegative() {
     let tmp = TempDir::new().unwrap();
     setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/myapp"])
         .output()
         .unwrap();
@@ -662,7 +662,7 @@ fn contract_info_json_shape_cc() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &session_id])
         .output()
         .expect("info should run");
@@ -682,7 +682,7 @@ fn contract_info_json_shape_codex() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &session_id])
         .output()
         .expect("info should run");
@@ -701,7 +701,7 @@ fn contract_info_json_shape_gemini() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_gemini_fixture(&tmp, "gmi_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &session_id])
         .output()
         .expect("info should run");
@@ -720,7 +720,7 @@ fn contract_info_json_source_path_is_absolute() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &session_id])
         .output()
         .unwrap();
@@ -749,7 +749,7 @@ fn contract_info_accepts_a_session_file_path() {
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
     let by_id: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(
-        &casr_cmd(&tmp)
+        &ags_cmd(&tmp)
             .args(["--json", "info", &session_id])
             .output()
             .expect("info by id should run")
@@ -758,7 +758,7 @@ fn contract_info_accepts_a_session_file_path() {
     .expect("info by id emits JSON");
     let path = by_id["source_path"].as_str().unwrap().to_string();
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &path])
         .output()
         .expect("info by path should run");
@@ -795,8 +795,8 @@ fn contract_info_accepts_a_session_file_path() {
 fn contract_list_tool_uses_is_null_when_uncountable() {
     const AMP_THREAD: &str = "T-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     let tmp = TempDir::new().unwrap();
-    // `$XDG_DATA_HOME/amp/threads`, matching what `casr_cmd` exports. Not
-    // `$AMP_HOME`: Amp means its *install* tree by that name, so casr does not
+    // `$XDG_DATA_HOME/amp/threads`, matching what `ags_cmd` exports. Not
+    // `$AMP_HOME`: Amp means its *install* tree by that name, so ags does not
     // read it at all and a thread seeded under it belongs to nobody.
     let threads = tmp.path().join("xdg-data/amp/threads");
     fs::create_dir_all(&threads).expect("mkdir");
@@ -806,7 +806,7 @@ fn contract_list_tool_uses_is_null_when_uncountable() {
     )
     .expect("seed amp thread");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "list",
@@ -840,7 +840,7 @@ fn contract_list_tool_uses_is_null_when_uncountable() {
     // the absence of an answer rather than the field having gone away.
     let gemini_tmp = TempDir::new().unwrap();
     setup_gemini_fixture(&gemini_tmp, "gmi_simple");
-    let output = casr_cmd(&gemini_tmp)
+    let output = ags_cmd(&gemini_tmp)
         .args(["--json", "list", "--provider", "gemini"])
         .output()
         .expect("list should run");
@@ -860,7 +860,7 @@ fn contract_info_from_forces_the_reader() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", &session_id, "--from", "cod"])
         .output()
         .expect("info --from should run");
@@ -871,7 +871,7 @@ fn contract_info_from_forces_the_reader() {
     assert_eq!(parsed["detected_format"], "codex");
 
     // An unknown slug is refused up front rather than silently detected.
-    let refused = casr_cmd(&tmp)
+    let refused = ags_cmd(&tmp)
         .args(["--json", "info", &session_id, "--from", "not-an-agent"])
         .output()
         .expect("info --from bogus should run");
@@ -893,7 +893,7 @@ fn contract_info_summary_null_means_unknowable_not_zero() {
 
     let cc_id = setup_cc_fixture(&tmp, "cc_simple");
     let structured: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(
-        &casr_cmd(&tmp)
+        &ags_cmd(&tmp)
             .args(["--json", "info", &cc_id])
             .output()
             .expect("claude-code info should run")
@@ -919,7 +919,7 @@ fn contract_info_summary_null_means_unknowable_not_zero() {
 
     let gemini_id = setup_gemini_fixture(&tmp, "gmi_simple");
     let flat: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(
-        &casr_cmd(&tmp)
+        &ags_cmd(&tmp)
             .args(["--json", "info", &gemini_id])
             .output()
             .expect("gemini info should run")
@@ -1081,7 +1081,7 @@ fn contract_resume_json_no_store_adds_no_field() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id, "--no-store"])
         .output()
         .expect("resume --no-store should run");
@@ -1108,7 +1108,7 @@ fn contract_resume_json_reports_a_substituted_source() {
 
     // Hop one: out of Codex, which teaches the store that both sessions are one
     // conversation.
-    let first = casr_cmd(&tmp)
+    let first = ags_cmd(&tmp)
         .args(["--json", "resume", "cc", &codex_id])
         .output()
         .expect("codex -> claude should run");
@@ -1125,7 +1125,7 @@ fn contract_resume_json_reports_a_substituted_source() {
         .to_string();
 
     // Hop two: back into Codex, naming the Claude session.
-    let second = casr_cmd(&tmp)
+    let second = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &cc_id])
         .output()
         .expect("claude -> codex should run");
@@ -1179,7 +1179,7 @@ fn contract_resume_json_reports_a_substituted_source() {
     assert_eq!(parsed["target_session_id"], codex_id.as_str());
 
     // And the escape hatch on the very same command reverts to today's answer.
-    let bare = casr_cmd(&tmp)
+    let bare = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &cc_id, "--no-store"])
         .output()
         .expect("claude -> codex --no-store should run");
@@ -1195,7 +1195,7 @@ fn contract_resume_json_dry_run_cc_to_codex() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id, "--dry-run"])
         .output()
         .expect("resume should run");
@@ -1255,7 +1255,7 @@ fn contract_resume_json_dry_run_matches_the_real_run() {
             if dry {
                 argv.push("--dry-run".into());
             }
-            let output = casr_cmd(&tmp)
+            let output = ags_cmd(&tmp)
                 .args(&argv)
                 .output()
                 .expect("resume should run");
@@ -1306,7 +1306,7 @@ fn contract_resume_json_actual_write_cc_to_codex() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id])
         .output()
         .expect("resume should run");
@@ -1334,7 +1334,7 @@ fn contract_resume_json_actual_write_cc_to_gemini() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "gmi", &session_id])
         .output()
         .expect("resume should run");
@@ -1355,7 +1355,7 @@ fn contract_resume_json_warnings_are_strings() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id, "--dry-run"])
         .output()
         .unwrap();
@@ -1374,7 +1374,7 @@ fn contract_resume_json_codex_to_cc() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_codex_fixture(&tmp, "codex_modern", "jsonl");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cc", &session_id])
         .output()
         .expect("resume should run");
@@ -1394,7 +1394,7 @@ fn contract_resume_json_gemini_to_codex() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_gemini_fixture(&tmp, "gmi_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id])
         .output()
         .expect("resume should run");
@@ -1421,7 +1421,7 @@ fn contract_resume_json_launch_command_is_in_the_envelope_not_on_stderr() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id, "--launch-dry-run"])
         .output()
         .expect("resume should run");
@@ -1453,7 +1453,7 @@ fn contract_resume_json_launch_passthrough_flags_are_in_the_command() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--json",
             "resume",
@@ -1485,7 +1485,7 @@ fn contract_resume_json_refuses_cursor_target() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cur", &session_id, "--launch-dry-run"])
         .output()
         .expect("resume should run");
@@ -1534,7 +1534,7 @@ fn parse_json_from_maybe_logged_stream(raw: &str, stream_name: &str) -> serde_js
 #[test]
 fn contract_error_json_unknown_session() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "nonexistent-session-id-12345"])
         .output()
         .expect("info should run");
@@ -1552,7 +1552,7 @@ fn contract_error_json_unknown_provider() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "nonexistent", &session_id])
         .output()
         .expect("resume should run");
@@ -1571,7 +1571,7 @@ fn contract_error_json_unknown_provider() {
 #[test]
 fn contract_error_json_unknown_resume_session() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", "nonexistent-session-99999"])
         .output()
         .expect("resume should run");
@@ -1587,7 +1587,7 @@ fn contract_error_json_unknown_resume_session() {
 #[test]
 fn contract_error_json_message_is_nonempty() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "nonexistent-session-id-12345"])
         .output()
         .unwrap();
@@ -1605,7 +1605,7 @@ fn contract_error_json_message_is_nonempty() {
 
 #[test]
 fn contract_error_json_known_error_types() {
-    // Verify all error types map to valid CasrError variant names.
+    // Verify all error types map to valid AgsError variant names.
     let known_types = [
         "SessionNotFound",
         "AmbiguousSessionId",
@@ -1621,7 +1621,7 @@ fn contract_error_json_known_error_types() {
 
     // Trigger SessionNotFound.
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "no-such-session"])
         .output()
         .unwrap();
@@ -1642,7 +1642,7 @@ fn contract_error_json_known_error_types() {
 #[test]
 fn contract_success_json_on_stdout_not_stderr() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "providers"])
         .output()
         .unwrap();
@@ -1666,7 +1666,7 @@ fn contract_success_json_on_stdout_not_stderr() {
 #[test]
 fn contract_error_json_on_stderr_not_stdout() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "no-such-session"])
         .output()
         .unwrap();
@@ -1697,7 +1697,7 @@ fn contract_list_provider_field_matches_slug() {
     setup_codex_fixture(&tmp, "codex_modern", "jsonl");
     setup_gemini_fixture(&tmp, "gmi_simple");
 
-    let output = casr_cmd(&tmp).args(["--json", "list"]).output().unwrap();
+    let output = ags_cmd(&tmp).args(["--json", "list"]).output().unwrap();
 
     let parsed: serde_json::Value =
         serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
@@ -1737,7 +1737,7 @@ fn contract_resume_source_session_id_matches_input() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "resume", "cod", &session_id, "--dry-run"])
         .output()
         .unwrap();
@@ -1794,7 +1794,7 @@ fn contract_list_json_native_name_present() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "rename-1", "/data/projects/named", CC_RENAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/named"])
         .output()
         .expect("list should run");
@@ -1815,7 +1815,7 @@ fn contract_list_json_native_name_absent_is_null() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "plain-1", "/data/projects/plain", CC_UNNAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "list", "--workspace", "/data/projects/plain"])
         .output()
         .expect("list should run");
@@ -1836,7 +1836,7 @@ fn contract_list_human_shows_name_column() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "rename-1", "/data/projects/named", CC_RENAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["list", "--workspace", "/data/projects/named"])
         .output()
         .expect("list should run");
@@ -1854,7 +1854,7 @@ fn contract_info_human_shows_name_line() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "rename-1", "/data/projects/named", CC_RENAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["info", "rename-1"])
         .output()
         .expect("info should run");
@@ -1875,7 +1875,7 @@ fn contract_info_peek_json_includes_ordered_tail() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "rename-1", "/data/projects/named", CC_RENAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "rename-1", "--peek", "--peek-lines", "2"])
         .output()
         .expect("info --peek should run");
@@ -1899,7 +1899,7 @@ fn contract_info_without_peek_has_no_tail() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "rename-1", "/data/projects/named", CC_RENAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "rename-1"])
         .output()
         .expect("info should run");
@@ -1917,7 +1917,7 @@ fn contract_info_human_peek_shows_tail_section() {
     let tmp = TempDir::new().unwrap();
     install_cc_raw_session(&tmp, "rename-1", "/data/projects/named", CC_RENAMED_SESSION);
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["info", "rename-1", "--peek", "--peek-lines", "3"])
         .output()
         .expect("info --peek should run");

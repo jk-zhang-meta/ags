@@ -1,6 +1,6 @@
 //! Vendor-owned target tests for the OpenCode provider.
 //!
-//! OpenCode owns the schema and migration invariants of `opencode.db`, so casr
+//! OpenCode owns the schema and migration invariants of `opencode.db`, so ags
 //! never writes SQLite. Ordinary tests prove a missing official CLI fails
 //! before touching the store. Set `OPENCODE_TEST_BIN` to an official binary to
 //! exercise the real import/export/delete lifecycle in an isolated database.
@@ -303,7 +303,7 @@ fn official_cli_imports_exports_and_deletes_the_written_session() {
 
     let readback = OpenCode
         .read_session(&written.paths[0])
-        .expect("casr reads the vendor-imported session");
+        .expect("ags reads the vendor-imported session");
     assert_eq!(readback.messages.len(), 2);
     assert_eq!(
         readback.messages[0].content,

@@ -41,7 +41,7 @@
 //!   are not, at the correct depth, with genuine rollout content. 0.145.0
 //!   compresses rollouts in place (`rollout/src/compression.rs`), so a
 //!   `.jsonl.zst` is an ordinary session of the user's — see
-//!   [`reject_compressed_rollout`] for why casr reports rather than decodes it.
+//!   [`reject_compressed_rollout`] for why ags reports rather than decodes it.
 //! * **Prefix.** `rollout-` is required; the same content under another name is
 //!   not listed.
 //! * **Content, not position.** `thread/list` filters on the `ThreadSourceKind`
@@ -49,11 +49,11 @@
 //!   "defaults to interactive sources". A `subagent` source is excluded there
 //!   while sitting in the same day directory as its parent, so no path
 //!   predicate can express it — see [`is_subagent_rollout`]. The default also
-//!   drops `source: "exec"`, which casr keeps on purpose;
+//!   drops `source: "exec"`, which ags keeps on purpose;
 //!   [`Codex::list_sessions`] says why.
 //! * **Archived.** `archived_sessions/` is a flat *sibling* of `sessions/`, and
 //!   a rollout's archive state is which of the two it is under. `thread/list`
-//!   returns archived threads only when asked (`archived: true`), so casr
+//!   returns archived threads only when asked (`archived: true`), so ags
 //!   resolves an archived session by id but does not list it.
 
 use std::collections::HashMap;
@@ -197,7 +197,7 @@ impl Provider for Codex {
 
     /// Both `sessions/` and `archived_sessions/`.
     ///
-    /// The archived root is here so that `casr <path-to-an-archived-rollout>`
+    /// The archived root is here so that `ags <path-to-an-archived-rollout>`
     /// is attributed to Codex — `ProviderRegistry::resolve_session` decides
     /// ownership of an explicit path by `path.starts_with(root)`, and with only
     /// the live root an archived rollout fell through to the signature-sniffing
@@ -229,7 +229,7 @@ impl Provider for Codex {
     /// `thread/list` also drops `source: "exec"` — pointed at a store holding
     /// three `cli`, two `exec` and two subagent rollouts it returned the three
     /// `cli`; `sourceKinds: ["exec"]` returned the two. But a `codex exec` run
-    /// is the user's own work, not the agent's plumbing, and casr converts
+    /// is the user's own work, not the agent's plumbing, and ags converts
     /// sessions rather than offering them to Codex's picker: withholding those
     /// 39 of the user's 660 would be losing sessions to match a filter whose
     /// purpose is a resume menu. If that trade is ever revisited, it is one
@@ -456,7 +456,7 @@ impl Provider for Codex {
                 "session_id": target_session_id,
                 "cwd": cwd,
                 "timestamp": now_iso,
-                "originator": "casr",
+                "originator": "ags",
                 "cli_version": env!("CARGO_PKG_VERSION"),
                 "source": "cli",
                 "thread_source": "user",
@@ -506,7 +506,7 @@ impl Provider for Codex {
             .unwrap_or_else(|| {
                 let t = truncate_title(first_user, 100);
                 if t.is_empty() {
-                    "Resumed session (via casr)".to_string()
+                    "Resumed session (via ags)".to_string()
                 } else {
                     t
                 }
@@ -597,7 +597,7 @@ impl Provider for Codex {
         );
 
         // Codex appends new turns to the rollout on resume; without a trailing
-        // newline its first appended record lands on casr's last line.
+        // newline its first appended record lands on ags's last line.
         let mut content = rendered.lines.join("\n");
         content.push('\n');
         let outcome = crate::pipeline::atomic_write(
@@ -617,7 +617,7 @@ impl Provider for Codex {
         let title = {
             let title = truncate_title(&rendered.first_user_text, 100);
             if title.is_empty() {
-                "Resumed session (via casr)".to_string()
+                "Resumed session (via ags)".to_string()
             } else {
                 title
             }
@@ -1093,7 +1093,7 @@ fn register_thread_in_db(
     if !missing.is_empty() {
         missing.sort_unstable();
         anyhow::bail!(
-            "Codex `threads` schema requires column(s) casr cannot populate: {}",
+            "Codex `threads` schema requires column(s) ags cannot populate: {}",
             missing.join(", ")
         );
     }
@@ -2027,7 +2027,7 @@ fn session_meta_payload(path: &Path) -> Option<serde_json::Value> {
     /// into this struct instead lexes the line and discards every other field
     /// through serde's `IgnoredAny`, allocating one short string.
     ///
-    /// Measured on 2,767 local rollouts: `casr list --provider codex` spent
+    /// Measured on 2,767 local rollouts: `ags convert list --provider codex` spent
     /// 10.8s, against 1.4s for the file reads themselves.
     /// [`Codex::list_sessions`] calls this once per rollout before any limit is
     /// applied, so that cost lands on every listing.
@@ -2096,7 +2096,7 @@ fn is_subagent_rollout(payload: &serde_json::Value) -> bool {
 /// The `rollout-` prefix plus `.jsonl` or `.jsonl.zst`, and nothing else.
 /// `.json` is excluded deliberately: a genuine rollout renamed to
 /// `rollout-….json` and planted at the correct depth is not returned by
-/// `thread/list`, so listing one would be casr inventing a session. The legacy
+/// `thread/list`, so listing one would be ags inventing a session. The legacy
 /// whole-file `{session, items}` form is still *read* — by
 /// [`Codex::read_legacy_json`], reached by content — and still resolved by
 /// [`Codex::owns_session`]; it is only the enumeration that no longer claims
@@ -2146,12 +2146,12 @@ fn is_rollout_layout(path: &Path, roots: &[PathBuf]) -> bool {
         && component(day).is_some_and(|c| c.parse::<u8>().is_ok())
 }
 
-/// Refuse a rollout casr can see but cannot decode, by name.
+/// Refuse a rollout ags can see but cannot decode, by name.
 ///
 /// 0.145.0 compresses rollouts in place — `rollout/src/compression.rs`, whose
 /// outcomes include `compressed`, `skipped_already_compressed` and
 /// `plain_exists` — leaving `rollout-….jsonl.zst` where the `.jsonl` was, and
-/// `thread/list` goes on listing the thread. casr has no zstd decoder and
+/// `thread/list` goes on listing the thread. ags has no zstd decoder and
 /// adding one would be a new C toolchain dependency for a format the shipped
 /// corpus this was measured against contains none of.
 ///
@@ -2168,7 +2168,7 @@ fn reject_compressed_rollout(path: &Path) -> anyhow::Result<()> {
     if compressed {
         let display = path.display();
         anyhow::bail!(
-            "{display} is a zstd-compressed Codex rollout and casr has no zstd \
+            "{display} is a zstd-compressed Codex rollout and ags has no zstd \
              decoder. Decompress it first (`zstd -d {display}`) and convert the \
              resulting .jsonl."
         );

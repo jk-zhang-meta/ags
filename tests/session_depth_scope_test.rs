@@ -1,6 +1,6 @@
 //! How deep under a provider's session root a session is allowed to live.
 //!
-//! `casr list` walks each root recursively — `main.rs`, `max_depth(4)`, and the
+//! `ags convert list` walks each root recursively — `main.rs`, `max_depth(4)`, and the
 //! same number in ClawdBot's and OpenClaw's own `list_sessions`. None of the
 //! five providers here had a depth rule anywhere, so everything that survived
 //! did so only because it happened to sit deeper than four levels. Attachments,
@@ -29,13 +29,13 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
-/// A `casr` invocation whose every provider home points inside `tmp`.
+/// A `ags` invocation whose every provider home points inside `tmp`.
 ///
-/// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* casr's own
+/// `XDG_DATA_HOME` matters twice over: it is Amp's store *and* ags's own
 /// session store, so leaving it unset would have these tests create
 /// `~/.local/share/ags` on the machine running them. `current_dir` is set for
-/// the same class of reason: casr subcommands write relative to the cwd.
-fn casr_cmd(tmp: &TempDir) -> Command {
+/// the same class of reason: ags subcommands write relative to the cwd.
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -68,12 +68,12 @@ fn casr_cmd(tmp: &TempDir) -> Command {
     cmd
 }
 
-/// Run `casr list --json` and return the parsed envelope.
+/// Run `ags convert list --json` and return the parsed envelope.
 fn list_json(tmp: &TempDir) -> serde_json::Value {
-    let output = casr_cmd(tmp)
+    let output = ags_cmd(tmp)
         .args(["list", "--json"])
         .output()
-        .expect("casr list should run");
+        .expect("ags convert list should run");
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!(
@@ -230,7 +230,7 @@ fn amp_only_lists_threads_directly_in_a_threads_root() {
 /// ```
 ///
 /// — one `readdir` of `tasks/`, keeping directories whose name is all digits.
-/// A task is therefore `tasks/<digits>/`, exactly one level down, and casr's
+/// A task is therefore `tasks/<digits>/`, exactly one level down, and ags's
 /// own writer agrees: `generate_task_id` returns
 /// `chrono::Utc::now().timestamp_millis().to_string()`.
 ///
@@ -334,7 +334,7 @@ fn cline_only_lists_tasks_one_level_under_the_tasks_root() {
 /// ```
 ///
 /// so `session_<stamp>/agents/<agent>_<stamp>/messages.jsonl` is a real
-/// transcript Vibe writes, two levels down, that Vibe itself never lists. casr
+/// transcript Vibe writes, two levels down, that Vibe itself never lists. ags
 /// listed it as a peer of the session that spawned it.
 ///
 #[test]
@@ -356,7 +356,7 @@ fn vibe_does_not_list_a_subagent_transcript_as_a_session() {
   "git_commit": null,
   "git_branch": null,
   "environment": {"working_directory": null},
-  "username": "casr",
+  "username": "ags",
   "total_messages": 1
 }
 "#,
@@ -379,7 +379,7 @@ fn vibe_does_not_list_a_subagent_transcript_as_a_session() {
   "git_commit": null,
   "git_branch": null,
   "environment": {"working_directory": null},
-  "username": "casr",
+  "username": "ags",
   "total_messages": 1
 }
 "#,
@@ -577,10 +577,10 @@ fn claw_providers_do_not_resolve_sessions_they_would_not_list() {
         &pi_transcript("openclaw-deep"),
     );
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--json", "info", "deep"])
         .output()
-        .expect("casr info should run");
+        .expect("ags convert info should run");
     assert!(!output.status.success(), "an unlisted id must not resolve");
 
     let stderr = String::from_utf8_lossy(&output.stderr);

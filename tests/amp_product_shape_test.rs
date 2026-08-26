@@ -1,10 +1,10 @@
-//! Which Amp casr reads, stated as tests rather than as a comment.
+//! Which Amp ags reads, stated as tests rather than as a comment.
 //!
-//! casr's Amp provider was described as reading "Amp's local JSON thread
+//! ags's Amp provider was described as reading "Amp's local JSON thread
 //! store" without saying whose. Amp ships two products and they do not agree:
 //!
 //! * The **CLI** (`@ampcode/cli`) keeps thread bodies server-side. Its data
-//!   directory — the same `<XDG_DATA_HOME>/amp` casr looks in — holds
+//!   directory — the same `<XDG_DATA_HOME>/amp` ags looks in — holds
 //!   `daemon/`, `ide/`, `oauth/`, `runner/`, `device-id.json`,
 //!   `history.jsonl`, `session.json` and `secrets.json`, and no transcript.
 //! * The **editor extension** (`sourcegraph.amp`) writes one JSON file per
@@ -12,7 +12,7 @@
 //!   `<globalStorage>/sourcegraph.amp/threads3/`.
 //!
 //! The fixtures below are built from the vendor's own layout, so what they
-//! check is casr against Amp rather than casr against casr.
+//! check is ags against Amp rather than ags against ags.
 
 mod test_env;
 
@@ -168,7 +168,7 @@ fn all_files(root: &Path) -> Vec<PathBuf> {
 // Which product is installed
 // ---------------------------------------------------------------------------
 
-/// A machine with only the Amp CLI has no Amp session casr can read, and
+/// A machine with only the Amp CLI has no Amp session ags can read, and
 /// `detect` has to say that rather than claim a store it cannot list from.
 #[test]
 fn a_cli_only_install_is_not_reported_as_a_readable_store() {
@@ -200,7 +200,7 @@ fn a_cli_only_install_is_not_reported_as_a_readable_store() {
     );
 }
 
-/// The store casr does read belongs to the editor extension, and the evidence
+/// The store ags does read belongs to the editor extension, and the evidence
 /// says so — the whole defect was calling it "Amp's".
 #[test]
 fn the_detected_store_is_named_as_the_extensions() {
@@ -260,13 +260,13 @@ fn the_pre_migration_global_storage_root_is_still_read() {
 // Listing and resolution answer about the same set
 // ---------------------------------------------------------------------------
 
-/// Whatever casr lists, casr must be able to resolve.
+/// Whatever ags convert lists, ags must be able to resolve.
 ///
 /// The listing rule is Amp's `keys()` — any `.json` file directly in a threads
 /// root — so resolution has to accept the same names. It used to demand
 /// `T-<uuid>`, which refused threads it had just printed.
 #[test]
-fn every_listed_thread_is_a_thread_casr_can_resolve() {
+fn every_listed_thread_is_a_thread_ags_can_resolve() {
     let _lock = AMP_ENV.lock().unwrap();
     let amp = AmpFixture::new();
     let threads = amp.threads_root();

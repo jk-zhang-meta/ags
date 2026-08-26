@@ -2,7 +2,7 @@
 
 ## This is a fork
 
-`ags` is a fork of **casr (Cross Agent Session Resumer)** by Jeffrey Emanuel.
+`ags` is a fork of **ags (Cross Agent Session Resumer)** by Jeffrey Emanuel.
 
 | | |
 |---|---|
@@ -51,7 +51,7 @@ but embedding it here does not remove the rider from the combined artifact.
 
 ## What this fork changes
 
-Upstream casr normalizes every provider's session into a flat text model
+Upstream ags normalizes every provider's session into a flat text model
 (`CanonicalMessage.content: String`). That is sufficient for conversational
 handoff and is retained here for the providers that only need it.
 

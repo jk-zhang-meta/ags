@@ -58,7 +58,7 @@ const SAME_AGENT: &str = "codex";
 ///
 /// Silence is the worst option available: the target then answers confidently
 /// as though it has the full history. See [`Fidelity::HistoryIncomplete`].
-const SEALED_CONTEXT_MARKER: &str = "[converted by casr] The earlier part of this conversation was \
+const SEALED_CONTEXT_MARKER: &str = "[converted by ags] The earlier part of this conversation was \
 compacted by the source agent, which returned it sealed in a format only that \
 agent's provider can read. It could not be transferred and is missing from this \
 session. Do not assume the history above is complete — ask before relying on \
@@ -589,7 +589,7 @@ impl Writer {
                         // original argument text — Claude Code records
                         // `tool_use.input` as an object, so that is every
                         // Claude Code tool call — used to lose the call *and*
-                        // its result on resume, silently, with casr's own
+                        // its result on resume, silently, with ags's own
                         // read-back clean because [`ToolInput::from_json_field`]
                         // accepts the object it wrote.
                         payload.insert(
@@ -881,7 +881,7 @@ fn session_meta(ir: &SessionIr, session_id: &str, now_iso: &str) -> Value {
     payload.insert("session_id".into(), json!(session_id));
     payload.insert("timestamp".into(), json!(now_iso));
     payload.insert("cwd".into(), json!(cwd));
-    payload.insert("originator".into(), json!("casr"));
+    payload.insert("originator".into(), json!("ags"));
     payload.insert(
         "cli_version".into(),
         json!(match (same_agent, ir.origin.agent_version.as_deref()) {
@@ -982,7 +982,7 @@ fn turn_context(ir: &SessionIr) -> Option<Value> {
 ///   boundary is genuinely written into this file — the `compacted` envelope in
 ///   [`render`], and [`Body::SealedContext`] here when the blob could not be
 ///   carried and the marker stands in its place.
-/// - `token_count` would require token counts casr does not have.
+/// - `token_count` would require token counts ags does not have.
 /// - `task_started` / `task_complete` carry `started_at`, `duration_ms` and a
 ///   `model_context_window` that only the original run knew.
 /// - `turn_aborted` carries the same wall-clock fields.
@@ -1395,7 +1395,7 @@ mod tests {
         let version = env!("CARGO_PKG_VERSION");
         let expected = [
             format!(
-                r#"{{"payload":{{"base_instructions":null,"cli_version":"{version}","context_window":null,"cwd":"/tmp","history_mode":"legacy","id":"sid","model_provider":"openai","originator":"casr","session_id":"sid","source":"cli","thread_source":"user","timestamp":"2023-11-14T22:13:20.000Z"}},"timestamp":"2023-11-14T22:13:20.000Z","type":"session_meta"}}"#
+                r#"{{"payload":{{"base_instructions":null,"cli_version":"{version}","context_window":null,"cwd":"/tmp","history_mode":"legacy","id":"sid","model_provider":"openai","originator":"ags","session_id":"sid","source":"cli","thread_source":"user","timestamp":"2023-11-14T22:13:20.000Z"}},"timestamp":"2023-11-14T22:13:20.000Z","type":"session_meta"}}"#
             ),
             r#"{"payload":{"content":[{"text":"fix the build","type":"input_text"}],"internal_chat_message_metadata_passthrough":{"turn_id":"t1"},"role":"user","type":"message"},"timestamp":"2023-11-14T22:13:20.000Z","type":"response_item"}"#.to_string(),
             // The history channel, immediately after the conversation record it
@@ -1694,7 +1694,7 @@ mod tests {
         assert!(
             out.lines
                 .iter()
-                .any(|line| line.contains("[converted by casr]")),
+                .any(|line| line.contains("[converted by ags]")),
             "omitting the hole silently is the worst option available"
         );
     }

@@ -15,7 +15,7 @@ fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn casr_cmd(tmp: &TempDir) -> Command {
+fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
     let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
@@ -76,10 +76,10 @@ fn setup_cc_fixture(tmp: &TempDir, fixture_name: &str) -> String {
 #[test]
 fn verbose_providers_emits_debug_on_stderr() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--verbose", "providers"])
         .output()
-        .expect("casr --verbose providers");
+        .expect("ags --verbose providers");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -101,10 +101,10 @@ fn verbose_resume_shows_session_info_on_stderr() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--verbose", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("casr --verbose resume");
+        .expect("ags --verbose resume");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -121,7 +121,7 @@ fn verbose_does_not_leak_debug_to_stdout() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--verbose",
             "--json",
@@ -131,7 +131,7 @@ fn verbose_does_not_leak_debug_to_stdout() {
             "--dry-run",
         ])
         .output()
-        .expect("casr --verbose --json resume");
+        .expect("ags --verbose --json resume");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -156,10 +156,10 @@ fn verbose_does_not_leak_debug_to_stdout() {
 #[test]
 fn trace_providers_emits_trace_on_stderr() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "providers"])
         .output()
-        .expect("casr --trace providers");
+        .expect("ags --trace providers");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -181,10 +181,10 @@ fn trace_resume_shows_detailed_parsing_on_stderr() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("casr --trace resume");
+        .expect("ags --trace resume");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -209,7 +209,7 @@ fn trace_does_not_leak_to_stdout() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args([
             "--trace",
             "--json",
@@ -219,7 +219,7 @@ fn trace_does_not_leak_to_stdout() {
             "--dry-run",
         ])
         .output()
-        .expect("casr --trace --json resume");
+        .expect("ags --trace --json resume");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -245,15 +245,15 @@ fn trace_produces_more_output_than_verbose() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let verbose_output = casr_cmd(&tmp)
+    let verbose_output = ags_cmd(&tmp)
         .args(["--verbose", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("casr --verbose");
+        .expect("ags --verbose");
 
-    let trace_output = casr_cmd(&tmp)
+    let trace_output = ags_cmd(&tmp)
         .args(["--trace", "resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("casr --trace");
+        .expect("ags --trace");
 
     assert!(verbose_output.status.success());
     assert!(trace_output.status.success());
@@ -280,10 +280,10 @@ fn normal_mode_has_minimal_stderr() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["resume", "cod", &session_id, "--dry-run"])
         .output()
-        .expect("casr resume (normal)");
+        .expect("ags convert resume (normal)");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -298,10 +298,10 @@ fn normal_mode_has_minimal_stderr() {
 #[test]
 fn normal_mode_list_has_no_debug_stderr() {
     let tmp = TempDir::new().unwrap();
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["list"])
         .output()
-        .expect("casr list (normal)");
+        .expect("ags convert list (normal)");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -320,10 +320,10 @@ fn verbose_list_shows_provider_scanning() {
     let tmp = TempDir::new().unwrap();
     let _session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--verbose", "list"])
         .output()
-        .expect("casr --verbose list");
+        .expect("ags --verbose list");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -343,10 +343,10 @@ fn verbose_info_shows_session_details_on_stderr() {
     let tmp = TempDir::new().unwrap();
     let session_id = setup_cc_fixture(&tmp, "cc_simple");
 
-    let output = casr_cmd(&tmp)
+    let output = ags_cmd(&tmp)
         .args(["--verbose", "info", &session_id])
         .output()
-        .expect("casr --verbose info");
+        .expect("ags --verbose info");
 
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

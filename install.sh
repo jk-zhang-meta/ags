@@ -43,6 +43,14 @@ VERSION="${VERSION:-}"
 OWNER="${OWNER:-jk-zhang-meta}"
 REPO="${REPO:-ags}"
 BINARY_NAME="ags"
+
+# 装的过程里不要让运行时自己去查更新。
+#
+# 它每天会去 GitHub 问一次有没有新版本。装到一半时那个问题没有意义——版本这会儿正在
+# 被决定——而在 `--offline` 下它是**实打实的联网**，正是 `--offline` 承诺不会发生的
+# 事。设在这里而不是逐个调用点：安装器会用好几种方式碰到运行时（init、钩子、技能、
+# codext），漏一个就等于没设。
+export AGS_UPDATE_CHECK=0
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 SYSTEM_INSTALL=0
@@ -76,7 +84,7 @@ RESUME_CORE_ONLY=0
 BINARY_PREEXISTED=0
 BINARY_BACKUP=""
 BINARY_STAGE=""
-PROVIDER_VERSION_TIMEOUT="${CASR_INSTALLER_PROVIDER_VERSION_TIMEOUT:-1}"
+PROVIDER_VERSION_TIMEOUT="${AGS_INSTALLER_PROVIDER_VERSION_TIMEOUT:-1}"
 SKILL_ARCHIVE_STATUS="not-attempted"
 CLAUDE_SKILL_STATUS="not-detected"
 CODEX_SKILL_STATUS="not-detected"
@@ -422,7 +430,7 @@ has_provider() {
 # Agent Auto-Configuration (Skills + Wrapper Commands)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-CASR_SKILL_ARCHIVE=""
+AGS_CONVERT_SKILL_ARCHIVE=""
 
 write_inline_skill() {
   local dest="$1"
@@ -482,7 +490,7 @@ download_skill_archive() {
   for url in "${urls[@]}"; do
     if curl -fsSL "${PROXY_ARGS[@]}" "$url" -o "$dest" 2>/dev/null; then
       if tar -tzf "$dest" >/dev/null 2>&1; then
-        CASR_SKILL_ARCHIVE="$dest"
+        AGS_CONVERT_SKILL_ARCHIVE="$dest"
         SKILL_ARCHIVE_STATUS="downloaded (${url})"
         return 0
       fi
@@ -507,9 +515,9 @@ install_skill_for_agent() {
     return 0
   fi
 
-  if [ -n "$CASR_SKILL_ARCHIVE" ]; then
+  if [ -n "$AGS_CONVERT_SKILL_ARCHIVE" ]; then
     mkdir -p "$skills_root"
-    if tar -xzf "$CASR_SKILL_ARCHIVE" -C "$skills_root" 2>/dev/null \
+    if tar -xzf "$AGS_CONVERT_SKILL_ARCHIVE" -C "$skills_root" 2>/dev/null \
       && [ -f "$skills_root/ags-convert/SKILL.md" ]; then
       printf -v "$status_var" '%s' "installed (release skill.tar.gz)"
       return 0
@@ -636,12 +644,12 @@ checkpoint_path_has_symlink() {
 }
 
 retire_legacy_casr_binary() {
-  # 二进制以前叫 `casr`，`ags` 只是它旁边一个四行的壳
+  # 二进制以前叫 `ags`，`ags` 只是它旁边一个四行的壳
   # （`exec "$script_dir/casr" checkpoint "$@"`）。现在二进制自己就叫 `ags`，
   # 所以那个壳的位置**正是新二进制要落的位置**——装完之后再写一次壳，等于把刚
-  # 装好的二进制覆盖成一个指向已经不存在的 `casr` 的壳。这个函数因此只做减法。
+  # 装好的二进制覆盖成一个指向已经不存在的 `ags` 的壳。这个函数因此只做减法。
   #
-  # 旧的 `casr` 留在那儿不会坏事，但它是 6 MiB 的死重量，而且 PATH 里多一个叫
+  # 旧的 `ags` 留在那儿不会坏事，但它是 6 MiB 的死重量，而且 PATH 里多一个叫
   # 这个名字的东西会让人以为它还有用。
   local legacy="$DEST/casr"
   local stale_skill
@@ -667,18 +675,18 @@ retire_legacy_casr_binary() {
   fi
 }
 
-# 转换那份 skill 以前叫 `casr`，现在叫 `ags-convert`。装了新的就把旧的收走——两份
+# 转换那份 skill 以前叫 `ags`，现在叫 `ags-convert`。装了新的就把旧的收走——两份
 # 同时摆在 skills 目录里，Agent 会把它们当成两个不同的能力，而它们说的是同一件事。
 retire_legacy_casr_skill() {
   local root stale
   for root in "$CODEX_CONFIG_ROOT/skills" "$CLAUDE_CONFIG_ROOT/skills"; do
-    stale="$root/casr"
+    stale="$root/ags"
     # 只删我们自己写的那份：里面得有我们生成的 SKILL.md，而且不能是符号链接。
     [ -d "$stale" ] || continue
     [ ! -L "$stale" ] || continue
     [ -f "$stale/SKILL.md" ] || continue
     grep -Fq 'ags convert' "$stale/SKILL.md" 2>/dev/null ||
-      grep -Fq 'casr' "$stale/SKILL.md" 2>/dev/null || continue
+      grep -Fq 'ags' "$stale/SKILL.md" 2>/dev/null || continue
     rm -rf -- "$stale"
   done
 }
@@ -1450,7 +1458,7 @@ check_installed_version() {
   local target_clean="${target_version#v}"
   local installed_clean="${installed_version#v}"
 
-  INSTALLED_CASR_VERSION="$installed_clean"
+  INSTALLED_AGS_VERSION="$installed_clean"
   version_at_least "$installed_clean" "$target_clean"
 }
 
@@ -1943,12 +1951,12 @@ preflight_checks
 
 # Check if already at target version.
 # Keep post-install steps idempotent so installer still refreshes local setup.
-INSTALLED_CASR_VERSION=""
+INSTALLED_AGS_VERSION=""
 if [ "$RESUME_CORE_ONLY" -eq 0 ] && [ "$FORCE_INSTALL" -eq 0 ] &&
    check_installed_version "$VERSION"; then
-  ok "ags $INSTALLED_CASR_VERSION is already installed at $DEST/$BINARY_NAME (target $VERSION)"
+  ok "ags $INSTALLED_AGS_VERSION is already installed at $DEST/$BINARY_NAME (target $VERSION)"
   info "Use --force to reinstall"
-  INSTALL_SOURCE="already installed ($INSTALLED_CASR_VERSION)"
+  INSTALL_SOURCE="already installed ($INSTALLED_AGS_VERSION)"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════

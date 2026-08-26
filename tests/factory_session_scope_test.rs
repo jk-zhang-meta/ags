@@ -15,7 +15,7 @@
 //! and the scan over that set skips anything that is not a file
 //! (`if (!E.isFile()) continue;`) before testing `E.name.endsWith(".jsonl")`.
 //!
-//! casr's listing walk is recursive (`main.rs`, `max_depth(4)`), so without a
+//! ags's listing walk is recursive (`main.rs`, `max_depth(4)`), so without a
 //! depth rule in `Provider::is_session_path` a transcript a user *attached* to
 //! a session (`sessions/<slug>/attachments/*.jsonl`) — or any `.jsonl` under a
 //! directory droid never opens — is rendered as a session.
@@ -260,11 +260,11 @@ fn a_btw_fork_is_not_listed_but_stays_resolvable_by_id() {
 }
 
 /// `is_session_path` now resolves the session root itself, so it has to follow
-/// the root wherever the override precedence puts it. `FACTORY_HOME` is casr's
+/// the root wherever the override precedence puts it. `FACTORY_HOME` is ags's
 /// own override and names the *sessions directory* directly, with no
 /// `.factory/sessions` joined onto it.
 #[test]
-fn the_depth_rule_follows_the_casr_owned_override() {
+fn the_depth_rule_follows_the_ags_owned_override() {
     let _lock = FACTORY_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let sessions = tmp.path().join("elsewhere");

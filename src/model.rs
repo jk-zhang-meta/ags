@@ -1,4 +1,4 @@
-//! Canonical session model — the IR (intermediate representation) for casr.
+//! Canonical session model — the IR (intermediate representation) for ags.
 //!
 //! Every provider's native format is parsed into these types, and every
 //! target format is generated from them. This is the Rosetta Stone of
@@ -9,15 +9,15 @@
 //! These types are adapted from CASS (`coding_agent_session_search/src/model/types.rs`).
 //!
 //! **Naming difference:** CASS uses `Agent` for the assistant role variant;
-//! casr uses `Assistant`, which matches the convention used by Claude, Codex,
+//! ags uses `Assistant`, which matches the convention used by Claude, Codex,
 //! and most LLM APIs. The [`normalize_role`] helper maps `"agent"` →
 //! [`MessageRole::Assistant`] to bridge this.
 //!
 //! **Deliberately omitted from CASS** (not needed for session conversion):
 //! - `approx_tokens` — per-message token data lives in `extra` if present.
-//! - `source_id` / `origin_host` — casr works with local files only.
+//! - `source_id` / `origin_host` — ags works with local files only.
 //! - `Snippet` type — code snippet extraction is a CASS indexing feature.
-//! - Database `id` fields — casr has no database.
+//! - Database `id` fields — ags has no database.
 
 use std::path::PathBuf;
 
@@ -320,7 +320,7 @@ pub fn native_name_from_metadata(metadata: &serde_json::Value) -> Option<String>
 
 /// A compact, human-readable snapshot of one conversation turn.
 ///
-/// Used by `casr info --peek` to show the tail of a transcript so a human can
+/// Used by `ags convert info --peek` to show the tail of a transcript so a human can
 /// recognize a session by its most recent turns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptTurn {
