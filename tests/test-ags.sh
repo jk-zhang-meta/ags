@@ -1150,6 +1150,17 @@ case "${1:-}" in
               warnings: ["test conversion warning"]
             }'
         ;;
+    list)
+        # `ags ls` 和 `ags gc` 都靠这个。会话清单由用例用 FAKE_LIST_ITEMS 指一个
+        # JSON 数组文件喂进来——时间戳要能精确控制（"31 天前"必须真的是 31 天前），
+        # 在磁盘上摆 rollout 文件再指望解析器算出想要的 last_active_at 做不到这点。
+        # 不设就是空列表，等同于加这个分支之前的 `exit 64`（那时 stdout 也是空的）。
+        if [[ -n "${FAKE_LIST_ITEMS:-}" && -f "${FAKE_LIST_ITEMS:-}" ]]; then
+            jq -c '{items: .}' "$FAKE_LIST_ITEMS"
+        else
+            printf '{"items":[]}\n'
+        fi
+        ;;
     info)
         path="${2:-}"
         shift 2
@@ -5689,5 +5700,133 @@ grep -Fqx upstream-resource < "$codext_pkg_root/0.146.0/codex-resources/marker"
 # PATH 上那个名字变成指进树里的软链接，跑起来仍然是我们的构建。
 [[ -L "$codext_root/bin/codext" ]]
 grep -Fq '0.146.0 fifth' <<< "$("$codext_root/bin/codext")"
+
+# ---------------------------------------------------------------------------
+# 按保留期自动清理
+#
+# `ags gc` 在这之前一行测试都没有，而现在它会被自动触发去真删文件——三条"永不删"
+# 的规矩（pin 住的、已存档的、还在跑的）从此是无人看管地在执行。
+# ---------------------------------------------------------------------------
+gc_home="$tmp/gc-home"
+gc_codex="$gc_home/codex"
+gc_state="$tmp/gc-state"
+gc_items="$tmp/gc-items.json"
+mkdir -p "$gc_home" "$gc_codex/sessions" "$gc_state"
+
+gc_now_ms="$(( $(date +%s) * 1000 ))"
+gc_day_ms=86400000
+gc_expired_id=aaaaaaaa-1111-4111-8111-111111111111
+gc_pinned_id=bbbbbbbb-2222-4222-8222-222222222222
+gc_fresh_id=cccccccc-3333-4333-8333-333333333333
+for gc_id in "$gc_expired_id" "$gc_pinned_id" "$gc_fresh_id"; do
+    printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$gc_id" \
+        > "$gc_codex/sessions/rollout-$gc_id.jsonl"
+done
+
+# 90 天前两个、今天一个。时间戳直接给，不指望解析器从文件里算出来。
+jq -n --arg expired "$gc_expired_id" --arg pinned "$gc_pinned_id" \
+    --arg fresh "$gc_fresh_id" --arg dir "$gc_codex/sessions" \
+    --argjson old "$(( gc_now_ms - 90 * gc_day_ms ))" \
+    --argjson new "$gc_now_ms" '[
+      {provider:"codex", session_id:$expired, last_active_at:$old,
+       workspace:"/w", title:"过期的", path:($dir + "/rollout-" + $expired + ".jsonl")},
+      {provider:"codex", session_id:$pinned, last_active_at:$old,
+       workspace:"/w", title:"过期但 pin 住的", path:($dir + "/rollout-" + $pinned + ".jsonl")},
+      {provider:"codex", session_id:$fresh, last_active_at:$new,
+       workspace:"/w", title:"没过期的", path:($dir + "/rollout-" + $fresh + ".jsonl")}
+    ]' > "$gc_items"
+
+gc_env=(
+    env
+    HOME="$gc_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$gc_codex"
+    CLAUDE_CONFIG_DIR="$gc_home/claude"
+    AGENT_SESSION_DIR="$tmp/gc-store"
+    AGENT_SESSION_STATE_DIR="$gc_state"
+    # 不设 AGENT_SESSION_LOCAL_DIR：它指的是"已经配置好的"保险库，指一个没配过的
+    # 目录会让 gc 死在 `local storage directory is unavailable` 上，而那和保留期
+    # 毫无关系。让 `ags init` 建的默认保险库来当这个角色。
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/ags"
+    AGS_CONVERTER_VERSION=0.3.0-test
+    FAKE_LIST_ITEMS="$gc_items"
+)
+
+# 1. 没配保留期：一个字都不删，而且**不该**去报存储配置的错。
+gc_out="$("${gc_env[@]}" "$tool" gc 2>&1)"
+grep -Fq '没有配置保留期' <<< "$gc_out"
+[[ -f "$gc_codex/sessions/rollout-$gc_expired_id.jsonl" ]]
+
+"${gc_env[@]}" "$tool" init >/dev/null
+"${gc_env[@]}" "$tool" set retention --agent codex 30 >/dev/null
+# pin 没有 CLI 命令（只有 `ags ls` 菜单里按 p），所以直接写运行时读的那个注解
+# 文件。测的是"pin 住的永不删"这条规矩本身，不是按键。
+mkdir -p "$gc_state/annotations/codex"
+printf '{"description":"","args":[],"pinned":true}\n' \
+    > "$gc_state/annotations/codex/$gc_pinned_id.json"
+
+# 2. 手敲的那次只说不做。
+gc_out="$("${gc_env[@]}" "$tool" gc 2>&1)"
+grep -Fq 'dry-run' <<< "$gc_out"
+[[ -f "$gc_codex/sessions/rollout-$gc_expired_id.jsonl" ]]
+
+# 3. --yes 真删；没过期的活着。
+gc_out="$("${gc_env[@]}" "$tool" gc --agent codex --yes 2>&1)"
+[[ ! -f "$gc_codex/sessions/rollout-$gc_expired_id.jsonl" ]]
+[[ -f "$gc_codex/sessions/rollout-$gc_fresh_id.jsonl" ]]
+grep -Fq '删了 1 个' <<< "$gc_out"
+
+# 4. pin 住的那个虽然同样过期，一动不动。
+[[ -f "$gc_codex/sessions/rollout-$gc_pinned_id.jsonl" ]]
+grep -Fq 'pin 跳过 1' <<< "$gc_out"
+
+# 5. 手敲的那次不写 report——敲的人当场就看见输出了。
+[[ ! -e "$gc_state/auto-gc.report" ]]
+
+# 6. `--auto` 删完写一行 report，给下一次启动去报。
+printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$gc_expired_id" \
+    > "$gc_codex/sessions/rollout-$gc_expired_id.jsonl"
+"${gc_env[@]}" "$tool" gc --agent codex --yes --auto >/dev/null 2>&1
+[[ ! -f "$gc_codex/sessions/rollout-$gc_expired_id.jsonl" ]]
+[[ -s "$gc_state/auto-gc.report" ]]
+grep -Fq 'auto gc: 按 30 天的保留期删了 1 个' "$gc_state/auto-gc.report"
+
+# 7. 一个都没删就不写 report——不该为"什么都没发生"去烦人。
+rm -f "$gc_state/auto-gc.report"
+"${gc_env[@]}" "$tool" gc --agent codex --yes --auto >/dev/null 2>&1
+[[ ! -e "$gc_state/auto-gc.report" ]]
+
+# 8. 启动 Agent 会开闸。
+#    这里只断言闸门本身（时间戳落地）：后台那一轮走的是 `<binary> checkpoint gc`，
+#    而套件里那个 binary 是假转换器，真跑不起来。删除行为在 3–7 已经验过。
+rm -f "$gc_state/auto-gc.stamp"
+"${gc_env[@]}" "$tool" codex >/dev/null 2>&1 </dev/null || true
+[[ -f "$gc_state/auto-gc.stamp" ]]
+
+# 9. 闸门开过一次，24 小时内不再开——时间戳不该被刷新成更晚的值。
+gc_stamp_first="$(cat "$gc_state/auto-gc.stamp")"
+"${gc_env[@]}" "$tool" codex >/dev/null 2>&1 </dev/null || true
+[[ "$(cat "$gc_state/auto-gc.stamp")" == "$gc_stamp_first" ]]
+
+# 10. AGS_AUTO_GC=0 一切都不发生。
+rm -f "$gc_state/auto-gc.stamp"
+"${gc_env[@]}" AGS_AUTO_GC=0 "$tool" codex >/dev/null 2>&1 </dev/null || true
+[[ ! -e "$gc_state/auto-gc.stamp" ]]
+
+# 11. 上一轮删了什么，由下一次启动说出来，而且只说一次。
+#     自动删而不说是这个功能最危险的形态，所以这条一定要有。
+printf 'auto gc: 按 30 天的保留期删了 2 个 Codex 会话，省下 5 MiB（x，AGS_AUTO_GC=0 关掉）\n' \
+    > "$gc_state/auto-gc.report"
+gc_launch_out="$("${gc_env[@]}" "$tool" codex 2>&1 </dev/null || true)"
+grep -Fq '删了 2 个 Codex 会话' <<< "$gc_launch_out"
+[[ ! -e "$gc_state/auto-gc.report" ]]
+gc_launch_out="$("${gc_env[@]}" "$tool" codex 2>&1 </dev/null || true)"
+! grep -Fq '删了 2 个 Codex 会话' <<< "$gc_launch_out"
+
+# 12. report 里混进别的东西，不许借 `[ags]` 这个前缀说话。
+printf 'rm -rf /\nauto gc: 真的那一行\n' > "$gc_state/auto-gc.report"
+gc_launch_out="$("${gc_env[@]}" "$tool" codex 2>&1 </dev/null || true)"
+grep -Fq 'auto gc: 真的那一行' <<< "$gc_launch_out"
+! grep -Fq 'rm -rf /' <<< "$gc_launch_out"
 
 printf 'ags self-check passed\n'

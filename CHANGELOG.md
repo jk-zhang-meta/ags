@@ -36,6 +36,30 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
 
 ### AGS Runtime
 
+- **`ags gc` 按保留期自动跑了。** Codex 的 rollout 一天堆几百兆而它自己从不清理，
+  一个"要人记得每周敲一次"的清理等于没有清理。配了保留期之后，启动 Agent 会在后台
+  跑一轮真删。
+
+  | | |
+  |---|---|
+  | 什么时候跑 | 启动 Agent 时，每 `AGS_AUTO_GC_INTERVAL`（86400 秒）最多一次 |
+  | 什么时候不跑 | 没配保留期、`AGS_AUTO_GC=0`、离上次不够间隔 |
+  | 关掉 | `AGS_AUTO_GC=0` |
+
+  **按下去的那一下是 `ags set retention`。** 一台没配过保留期的机器行为一个字都没变
+  ——这条老规矩("没配置就不删")没有动。手敲 `ags gc` 仍然是 dry-run，真删仍然要
+  `--yes`；变的只是"配了保留期"从此额外意味着"让它自己跑"。
+
+  三条"永不删"照旧：pin 住的、已经存过档的、以及 AGS 认不出来的。真删之前还会再复核
+  一遍会话是不是又活了。
+
+  **删完一定会说。** 后台那一轮删了什么写进 `auto-gc.report`，下一次启动打出来，
+  然后就删掉——报一次，不反复烦人。自动删而不说，比不自动删糟得多。
+
+  `ags gc` 在这之前**一行测试都没有**。这次连着补了 12 条：闸门的六种情况、三条永不删
+  的规矩、report 写不写、只报一次、以及 report 里混进别的东西时不许借 `[ags]` 前缀说话。
+
+
 - **The launcher menu detects an Agent the same way it launches one**: the menu
   asked `command -v codex` while `resolve_agent_binary` accepts codext, so a
   codext-only host could run `ags codex` yet be told no Codex was installed.

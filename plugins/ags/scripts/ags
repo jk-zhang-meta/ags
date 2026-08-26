@@ -23,6 +23,13 @@ trusted_binary_dir="$state/trusted-binaries"
 update_check_lines="$state/update-check.lines"
 update_check_stamp="$state/update-check.stamp"
 update_decline_file="$state/update-declined.lines"
+# 自动 gc：上一次跑完的时刻，和它删掉了什么。
+#
+# 和 update-check 一样分成两个纯文本文件而不是一个 JSON：启动那条路读它，读的东西
+# 越简单越好——那条路上任何一个 `jq` 失败都挡在用户和 Agent 之间。
+auto_gc_stamp="$state/auto-gc.stamp"
+auto_gc_report="$state/auto-gc.report"
+auto_gc_log="$state/auto-gc.log"
 managed_identity_file="$config_home/ags/identity.agekey"
 default_vault="$data_home/ags/checkpoints"
 remote_store_prefix="ags-v1"
@@ -266,16 +273,24 @@ Usage:
   ags archives                         List only the saved archives
   ags set retention [--agent codex|claude] DAYS
                                        One retention period for both Agents.
+                                       Setting one turns on the automatic sweep
+                                       described under `ags gc`.
                                        Claude Code has its own cleanup, so this
                                        writes `cleanupPeriodDays` into its
                                        settings and lets it do the deleting;
                                        Codex has none, so `ags gc` does it.
   ags gc [--agent codex|claude] [--yes]
                                        Delete Codex sessions past the retention
-                                       period. Dry-run unless --yes, never
-                                       automatic, and never touches a pinned
+                                       period. Typing it is a dry-run unless
+                                       --yes, and it never touches a pinned
                                        session, one that has been saved, or
                                        anything AGS does not recognise.
+                                       Once a retention period is set, starting
+                                       an Agent also runs this in the background
+                                       at most once every AGS_AUTO_GC_INTERVAL
+                                       (86400s), and the next start reports what
+                                       it deleted. AGS_AUTO_GC=0 turns that off;
+                                       no retention period means it never runs.
   ags show ID|AGENT/RECORD_ID          Show complete local archive details
   ags save [--id ID] DESCRIPTION       Export this active Codex or Claude session
                                        The ID is fixed when the session starts;
@@ -4486,6 +4501,11 @@ launch_managed_agent() {
     # notice is the least important thing this function does, and nothing about
     # it may stand between a validated launch and the Agent.
     announce_pending_updates || true
+    # 同样的道理，同样的 `|| true`：先报上一轮自动 gc 删了什么，再让这一轮有机会
+    # 起来。两件事都在**所有能拒绝这次启动的检查之后**——一条"删了 12 个会话"的
+    # 提示绝不该是一次拒绝之前的最后一句话，那读起来像是拒绝的一部分。
+    announce_auto_gc || true
+    maybe_start_background_gc || true
     exec "$launch_binary" "$@"
 }
 
@@ -8141,8 +8161,17 @@ list_native_sessions() {
 #
 # 1. **没配置就不删。** 「保留期」这个概念以前在这套工具里不存在，任何默认值都会
 #    在某个人的机器上删掉他没打算删的东西。
-# 2. **默认只说不做。** `ags gc` 是 dry-run，真删要 `--yes`。而且不挂任何自动触发
-#    ——没有钩子、没有定时器。删别人 home 里的文件这件事必须是有人按下去的。
+# 2. **手敲的那次只说不做，自动的那次会删。** `ags gc` 是 dry-run，真删要 `--yes`。
+#    配了保留期之后，启动 Agent 会在后台跑一轮真删（每 `AGS_AUTO_GC_INTERVAL` 秒
+#    最多一次，`AGS_AUTO_GC=0` 关掉）。
+#
+#    这里原来写的是"不挂任何自动触发——删别人 home 里的文件必须是有人按下去的"。
+#    改掉它的理由是：Codex 的 rollout 一天堆几百兆而它自己从不清理，一个"要人记得
+#    每周敲一次"的清理等于没有清理。**按下去的那一下改成了 `ags set retention`**
+#    ——配置保留期本身就是那个授权动作，一台没配过的机器行为一个字都没变。
+#
+#    代价是必须说话：删完写一行进 report，下一次启动打出来（`announce_auto_gc`）。
+#    自动删而不说，比不自动删糟得多。
 # 3. **三类永不删**：pin 住的、已经导出过存档的、以及 AGS 认不出来的。「认不出来
 #    就不动」是底线：这里动的是 Agent 自己的数据。
 retention_config="$state/retention.json"
@@ -8153,6 +8182,96 @@ read_retention_days() {
     jq -er --arg agent "$agent" '
         .[$agent] | select(type == "number" and . >= 1 and . <= 3650) | floor
     ' "$retention_config" 2>/dev/null
+}
+
+# 到点了就在后台按保留期清一次。
+#
+# 挂在"启动 Agent"上而不是 cron / systemd timer / launchd：ags 没有常驻进程，装一个
+# 定时器意味着一套新的安装、卸载、状态查询接口，还要在四个平台上各做一遍——而"启动
+# Agent"是这台机器上一定会发生、频率又恰好合适的事件。每天开工一次，正好清一次。
+#
+# 三道闸门，任何一道不过就什么都不做：
+#
+# 1. `AGS_AUTO_GC=0` 关掉。
+# 2. **codex 没配保留期就不跑。** Claude 那半是它自己按 `cleanupPeriodDays` 删的，
+#    ags 一个文件都不碰，所以只有 codex 配了才有活儿干。这同时保住了那条老规矩：
+#    没配置就不删。
+# 3. 距上次不足 `AGS_AUTO_GC_INTERVAL`（默认 86400 秒）就不跑。
+#
+# 闸门通过就先写时间戳再干活，不是干完再写：后台那一轮可能失败、可能被 kill，如果
+# 等它成功才记时间，一台每次都失败的机器会在**每一次启动**上都重跑一遍。
+auto_gc_should_run() {
+    local interval now last
+    [[ "${AGS_AUTO_GC:-1}" != 0 ]] || return 1
+    read_retention_days codex >/dev/null 2>&1 || return 1
+    interval="${AGS_AUTO_GC_INTERVAL:-86400}"
+    [[ "$interval" =~ ^[0-9]{1,9}$ ]] || interval=86400
+    now="$(date +%s 2>/dev/null)" || return 1
+    last=0
+    if [[ -f "$auto_gc_stamp" && ! -L "$auto_gc_stamp" ]]; then
+        last="$(cat -- "$auto_gc_stamp" 2>/dev/null)" || last=0
+    fi
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= interval )) || return 1
+    mkdir -p "$state" 2>/dev/null || true
+    printf '%s\n' "$now" > "$auto_gc_stamp" 2>/dev/null || true
+    return 0
+}
+
+# 起一轮后台 gc。
+#
+# 后台而不是当场做：它要把整台机器的会话列一遍，还要解密存档核对哪些已经存过档
+# （那是"永不删"的三类之一），几秒起步。而这条路一步之外就是 `exec` 进 Agent，
+# 没有任何东西该挡在一次验证通过的启动和 Agent 之间。
+#
+# `setsid` 的理由和后台补描述那处一样：裸 `&` 起的活儿和当前进程同组，这个进程马上
+# 要 `exec` 换成 Agent，同组的后台活儿会被一起带走。
+#
+# 走 `ags checkpoint gc` 这个入口而不是在本进程里起子 shell：本运行时给自己的工作
+# 目录注册了 `rm -rf` 的 EXIT trap，fork 出来的子进程退出时会去跑那些 trap，把父
+# 进程还在用的目录删掉。
+start_background_gc() {
+    local binary
+    binary="$(resolve_ags_converter_binary 2>/dev/null)" || return 0
+    mkdir -p "$state" 2>/dev/null || true
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$binary" checkpoint gc --agent codex --yes --auto \
+            >"$auto_gc_log" 2>&1 </dev/null &
+    else
+        # 没有 setsid（部分 macOS）就退回本进程后台，并挡住挂断信号。
+        ( trap '' HUP INT; ags_gc --agent codex --yes --auto ) \
+            >"$auto_gc_log" 2>&1 </dev/null &
+    fi
+    disown 2>/dev/null || true
+    return 0
+}
+
+maybe_start_background_gc() {
+    auto_gc_should_run || return 0
+    start_background_gc
+}
+
+# 把上一次自动 gc 删掉的东西报出来。
+#
+# **自动删而不说，是这套工具最不该有的行为。** 后台那一轮删完写一行进 report，
+# 下一次启动打出来就把它删掉——报一次，不反复烦人。
+#
+# 和 update-check 同样的写法：读之前不测存在性，直接读并吞掉错误。这条路一步之外
+# 就是 `exec` 进 Agent，`set -e` 下一个"测完到读之间文件没了"的竞态会直接终结它。
+# 只认 `auto gc: ` 开头的行，别的一概不打——省得任何拿到这个文件的东西能借
+# `[ags]` 这个前缀说话。
+announce_auto_gc() {
+    local recorded= line
+    [[ "${AGS_AUTO_GC:-1}" != 0 ]] || return 0
+    if [[ -f "$auto_gc_report" && ! -L "$auto_gc_report" ]]; then
+        recorded="$(cat -- "$auto_gc_report" 2>/dev/null)" || recorded=
+    fi
+    [[ -n "$recorded" ]] || return 0
+    rm -f -- "$auto_gc_report" 2>/dev/null || true
+    while IFS= read -r line; do
+        [[ "$line" == "auto gc: "* ]] || continue
+        log "$line"
+    done <<< "$recorded"
 }
 
 write_retention_days() {
@@ -8235,7 +8354,8 @@ configure_retention() {
             printf 'claude=%s (written to %s as cleanupPeriodDays)\n' \
                 "$days" "$claude_home/settings.json"
         else
-            printf 'codex=%s (ags gc deletes; nothing is automatic)\n' "$days"
+            printf 'codex=%s (ags gc deletes; a background sweep now runs at most once every %ss when an Agent starts — AGS_AUTO_GC=0 turns it off)\n' \
+                "$days" "${AGS_AUTO_GC_INTERVAL:-86400}"
         fi
     done
 }
@@ -8263,7 +8383,8 @@ retention_cutoff_millis() {
 }
 
 ags_gc() {
-    local agent_filter= assume_yes=0 days agent cutoff
+    local agent_filter= assume_yes=0 auto_mode=0 days agent cutoff
+    local codex_days= removed_bytes=0
     local provider session_id when_ms workspace title path
     local pinned_skipped=0 saved_skipped=0 removed=0 candidates=0 bytes=0
     local binary size
@@ -8280,6 +8401,10 @@ ags_gc() {
                 ;;
             --yes) assume_yes=1; shift ;;
             --dry-run) shift ;;
+            # 后台那一轮用的。它只改一件事：删完了往 report 里写一行，让**下一次
+            # 启动 Agent** 把删了什么说出来。手敲 `ags gc` 的人当场就看见了输出，
+            # 不需要这个。
+            --auto) auto_mode=1; shift ;;
             *) die "usage: ags gc [--agent codex|claude] [--yes]" ;;
         esac
     done
@@ -8317,6 +8442,7 @@ ags_gc() {
                 "$(jq -r '.cleanupPeriodDays // "unset"' "$claude_home/settings.json" 2>/dev/null || printf 'unset')"
             continue
         fi
+        codex_days="$days"
         cutoff="$(retention_cutoff_millis "$days")"
         printf 'codex: %s 天，早于这个时间的会话会被删\n' "$days"
         while IFS=$'\t' read -r provider session_id when_ms workspace title path; do
@@ -8360,12 +8486,22 @@ ags_gc() {
         read_session_annotation codex "$session_id"
         (( annotation_pinned == 0 )) || { log "跳过 ${session_id}：已 pin"; continue; }
         [[ -z "${saved[$session_id]:-}" ]] || { log "跳过 ${session_id}：已存档"; continue; }
+        # 大小要在 rm **之前**取。计划阶段那次 stat 统计的是候选，而候选和真删
+        # 之间会被上面三道复核刷掉一部分，拿它当"省下多少"会虚报。
+        size="$(stat -c %s -- "$path" 2>/dev/null || printf 0)"
         rm -f -- "$path" || { log "删不掉：$path"; continue; }
         rm -f -- "$(session_annotation_file codex "$session_id" || true)"
         removed=$((removed + 1))
+        removed_bytes=$((removed_bytes + size))
         printf 'deleted=%s\n' "$path"
     done
     printf '删了 %s 个\n' "$removed"
+    if (( auto_mode == 1 && removed > 0 )); then
+        mkdir -p "$state" 2>/dev/null || true
+        printf 'auto gc: 按 %s 天的保留期删了 %s 个 Codex 会话，省下 %s MiB（%s，AGS_AUTO_GC=0 关掉）\n' \
+            "${codex_days:-?}" "$removed" "$(( removed_bytes / 1048576 ))" \
+            "$auto_gc_log" > "$auto_gc_report" 2>/dev/null || true
+    fi
 }
 
 # gc 用的会话清单。
