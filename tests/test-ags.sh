@@ -2639,8 +2639,16 @@ EOF
         # 时只有一个退出码——看不到实际画出来的是什么，就只能靠反复推送去猜。
         ags_suite_last_pty_out="$output"
         ags_suite_last_pty_input="$input"
+        # TERM 要钉死，不能继承。
+        #
+        # 运行时的 `terminal_can_set_title` 第一个条件就是 `TERM != dumb`；
+        # GitHub 跑步机上 TERM 是空的（于是取默认值 dumb），标题序列一条不发，
+        # 下面那条 `grep -Fq $'\033]0;with-args\007'` 就必然失败——而在开发机上
+        # TERM 是 xterm-256color，它一直是绿的。想验"不支持标题的终端"的用例自己
+        # 在 "$@" 里传 TERM=dumb，排在后面会覆盖这一个。
         printf -v pty_command '%q ' \
             env "${source_env[@]}" \
+            TERM=xterm-256color \
             AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
             "$tmp/stty-guard" "$tool" archives
         feed_keys "$input" | \
