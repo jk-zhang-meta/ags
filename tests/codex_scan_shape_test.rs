@@ -17,8 +17,8 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::providers::Provider;
-use casr::providers::codex::Codex;
+use ags::providers::Provider;
+use ags::providers::codex::Codex;
 
 static CODEX_ENV: test_env::EnvLock = test_env::EnvLock;
 

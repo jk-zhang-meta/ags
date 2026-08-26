@@ -1,5 +1,5 @@
 [package]
-name = "cross_agent_session_resumer"
+name = "ags"
 version = "0.4.36"
 edition = "2024"
 description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: casr)"
@@ -16,11 +16,11 @@ readme = "README.md"
 # stay on the short name because we keep `casr` as both the lib name (for
 # `casr::*` paths) and the binary entry point.
 [lib]
-name = "casr"
+name = "ags"
 path = "src/lib.rs"
 
 [[bin]]
-name = "casr"
+name = "ags"
 path = "src/main.rs"
 
 [dependencies]

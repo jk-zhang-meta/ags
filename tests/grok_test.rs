@@ -11,9 +11,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::discovery::ProviderRegistry;
-use casr::model::MessageRole;
-use casr::providers::{Provider, WriteOptions, grok::Grok};
+use ags::discovery::ProviderRegistry;
+use ags::model::MessageRole;
+use ags::providers::{Provider, WriteOptions, grok::Grok};
 
 static GROK_ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -145,7 +145,7 @@ fn read_session_from_seeded_home_matches_fixture_expectations() {
 
 #[test]
 fn write_session_is_refused_without_official_cli() {
-    use casr::model::{CanonicalMessage, CanonicalSession};
+    use ags::model::{CanonicalMessage, CanonicalSession};
 
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -200,8 +200,9 @@ fn cli_list_finds_seeded_grok_session() {
     // `casr list` defaults to scoping by the current working-directory
     // project; the fixture's workspace is a synthetic path, so pass it
     // explicitly via `--workspace` to take it out of cwd scope.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
         .args([
+            "convert",
             "list",
             "--provider",
             "grok",
@@ -234,8 +235,8 @@ fn cli_info_reports_seeded_grok_session() {
     let tmp = tempfile::tempdir().unwrap();
     seed_grok_home(tmp.path());
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
-        .args(["info", FIXTURE_ID, "--source", "grk"])
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+        .args(["convert", "info", FIXTURE_ID, "--source", "grk"])
         .env("GROK_HOME", tmp.path())
         .output()
         .expect("run casr info");
@@ -269,8 +270,15 @@ fn cli_convert_into_grok_is_refused_without_official_cli() {
     std::fs::create_dir_all(&cc_dir).unwrap();
     std::fs::copy(&cc_fixture, cc_dir.join("cc-simple-001.jsonl")).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
-        .args(["resume", "grok", "cc-simple-001", "--source", "cc"])
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+        .args([
+            "convert",
+            "resume",
+            "grok",
+            "cc-simple-001",
+            "--source",
+            "cc",
+        ])
         .env("GROK_HOME", tmp.path())
         .env("GROK_BIN", &missing_bin)
         .env("CLAUDE_HOME", tmp.path().join("claude"))
@@ -300,7 +308,7 @@ fn cli_convert_into_grok_is_refused_without_official_cli() {
 
 #[test]
 fn write_session_round_trips_and_rolls_back_with_vendor_cli_stub() {
-    use casr::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
+    use ags::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
 
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -382,7 +390,7 @@ fn official_grok_cli_lifecycle_when_configured() {
         return;
     }
 
-    use casr::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
+    use ags::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("GROK_HOME", tmp.path());

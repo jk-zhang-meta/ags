@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use casr::{
+use ags::{
     discovery::{DetectionResult, ProviderRegistry, SourceHint},
     error::CasrError,
     model::{CanonicalMessage, CanonicalSession, MessageRole},

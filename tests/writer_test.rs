@@ -12,19 +12,19 @@ mod test_env;
 
 use std::path::PathBuf;
 
-use casr::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall};
-use casr::providers::amp::Amp;
-use casr::providers::chatgpt::ChatGpt;
-use casr::providers::claude_code::ClaudeCode;
-use casr::providers::clawdbot::ClawdBot;
-use casr::providers::cline::Cline;
-use casr::providers::codex::Codex;
-use casr::providers::factory::Factory;
-use casr::providers::gemini::Gemini;
-use casr::providers::openclaw::OpenClaw;
-use casr::providers::pi_agent::PiAgent;
-use casr::providers::vibe::Vibe;
-use casr::providers::{Provider, WriteOptions};
+use ags::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall};
+use ags::providers::amp::Amp;
+use ags::providers::chatgpt::ChatGpt;
+use ags::providers::claude_code::ClaudeCode;
+use ags::providers::clawdbot::ClawdBot;
+use ags::providers::cline::Cline;
+use ags::providers::codex::Codex;
+use ags::providers::factory::Factory;
+use ags::providers::gemini::Gemini;
+use ags::providers::openclaw::OpenClaw;
+use ags::providers::pi_agent::PiAgent;
+use ags::providers::vibe::Vibe;
+use ags::providers::{Provider, WriteOptions};
 
 // ---------------------------------------------------------------------------
 // Env var isolation
@@ -590,7 +590,7 @@ fn checkpoint_restored_codex_registers_thread_in_state_db() {
     }
 
     let cwd = tmp.path().join("restored-workspace");
-    casr::providers::codex::register_restored_thread(&written.session_id, &written.paths[0], &cwd)
+    ags::providers::codex::register_restored_thread(&written.session_id, &written.paths[0], &cwd)
         .expect("checkpoint-restored rollout should be registered");
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1168,7 +1168,7 @@ fn writer_gemini_project_hash_matches_workspace() {
 
     let stored_hash = root["projectHash"].as_str().unwrap();
     let expected_hash =
-        casr::providers::gemini::project_hash(std::path::Path::new("/data/projects/myapp"));
+        ags::providers::gemini::project_hash(std::path::Path::new("/data/projects/myapp"));
     assert_eq!(
         stored_hash, expected_hash,
         "Gemini projectHash should match SHA256 of workspace"
@@ -2857,12 +2857,12 @@ fn writer_piagent_tool_role_normalized() {
 mod structured_ir {
     use std::io::Write;
 
-    use casr::budget::ContextBudget;
-    use casr::ir::{
+    use ags::budget::ContextBudget;
+    use ags::ir::{
         Block, Body, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, SessionIr, ToolInput,
         Visibility,
     };
-    use casr::providers::{claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write};
+    use ags::providers::{claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write};
     use serde_json::{Value, json};
 
     fn write_lines(lines: &[String]) -> tempfile::NamedTempFile {
@@ -2908,20 +2908,20 @@ mod structured_ir {
         Event {
             id: id.to_string(),
             parent: None,
-            branch: casr::ir::Branch::Main,
+            branch: ags::ir::Branch::Main,
             turn: Some("t1".to_string()),
             ts: None,
             visibility: Visibility::Model,
             body,
             capsules: Vec::new(),
-            source: casr::ir::SourceRef {
+            source: ags::ir::SourceRef {
                 line,
                 sha256: String::new(),
             },
         }
     }
 
-    fn text_message(id: &str, line: u64, role: casr::ir::Role, text: &str) -> Event {
+    fn text_message(id: &str, line: u64, role: ags::ir::Role, text: &str) -> Event {
         event(
             id,
             line,
@@ -3002,12 +3002,12 @@ mod structured_ir {
         let mut source = SessionIr::new("codex", "s1");
         source.origin.provider = Some("openai".into());
         source.events = vec![
-            text_message("u1", 1, casr::ir::Role::User, "hi"),
+            text_message("u1", 1, ags::ir::Role::User, "hi"),
             event(
                 "a1",
                 2,
                 Body::Message {
-                    role: casr::ir::Role::Assistant,
+                    role: ags::ir::Role::Assistant,
                     blocks: vec![
                         Block::Unknown {
                             native_type: Some("redacted_thinking".into()),
@@ -3143,7 +3143,7 @@ mod structured_ir {
     /// no `Loss`, and the conversion grades itself complete.
     #[test]
     fn a_foreign_capsule_on_a_message_is_counted_when_it_is_dropped() {
-        let mut assistant = text_message("a1", 2, casr::ir::Role::Assistant, "done");
+        let mut assistant = text_message("a1", 2, ags::ir::Role::Assistant, "done");
         assistant.capsules.push(Capsule {
             kind: CapsuleKind::OpenaiReasoningEncryptedContent,
             bound: CapsuleBinding {
@@ -3154,7 +3154,7 @@ mod structured_ir {
         });
         let mut source = SessionIr::new("codex", "s1");
         source.origin.provider = Some("openai".into());
-        source.events = vec![text_message("u1", 1, casr::ir::Role::User, "hi"), assistant];
+        source.events = vec![text_message("u1", 1, ags::ir::Role::User, "hi"), assistant];
 
         let rendered = claude_code_ir_write::render(
             &source,
@@ -3164,7 +3164,7 @@ mod structured_ir {
         )
         .expect("renders");
         let back = reparse(&rendered.lines, claude_code_ir::read);
-        let report = casr::compare::compare(&source, &back, "anthropic");
+        let report = ags::compare::compare(&source, &back, "anthropic");
 
         assert!(
             !rendered.losses.is_empty(),

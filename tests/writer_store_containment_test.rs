@@ -23,7 +23,7 @@
 //! | Vibe     | `<home>/logs/session/session_<utc>_<id8>/messages.jsonl` |
 //! | Pi-Agent | `<home>/sessions/{timestamp}_{id}.jsonl`      |
 //!
-//! These target stores are flat at the id boundary. [`casr::pipeline::atomic_write`]
+//! These target stores are flat at the id boundary. [`ags::pipeline::atomic_write`]
 //! calls `create_dir_all` on the supplied parent, so letting an incoming id
 //! supply that parent would materialise a traversal.
 //!
@@ -60,9 +60,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::discovery::ProviderRegistry;
-use casr::model::{CanonicalMessage, CanonicalSession, MessageRole};
-use casr::providers::{Provider, WriteOptions};
+use ags::discovery::ProviderRegistry;
+use ags::model::{CanonicalMessage, CanonicalSession, MessageRole};
+use ags::providers::{Provider, WriteOptions};
 
 /// Every test here rewrites the provider home environment, which is
 /// process-global and `unsafe` to touch concurrently in Rust 2024.
@@ -246,7 +246,7 @@ fn under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
 /// Write `id` with every provider that writes, and hand each result to `check`.
 fn for_each_writer(
     id: &str,
-    mut check: impl FnMut(&dyn Provider, &casr::providers::WrittenSession),
+    mut check: impl FnMut(&dyn Provider, &ags::providers::WrittenSession),
 ) {
     let registry = ProviderRegistry::default_registry();
     for provider in registry.all_providers() {

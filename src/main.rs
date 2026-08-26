@@ -16,14 +16,14 @@ use rayon::prelude::*;
 use rich_rust::prelude::{Cell, Column, Console, JustifyMethod, Row, Style, Table};
 use tracing_subscriber::EnvFilter;
 
-use casr::budget::ContextBudget;
-use casr::discovery::ProviderRegistry;
-use casr::ir::Fidelity;
-use casr::launch::{LaunchSpec, SessionTargeting};
-use casr::listing_cache::{LoadedRows, Stamp};
-use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
-use casr::providers::{Provider, SessionListing, read_dir_reporting, walk_entry_reporting};
-use casr::responses::{
+use ags::budget::ContextBudget;
+use ags::discovery::ProviderRegistry;
+use ags::ir::Fidelity;
+use ags::launch::{LaunchSpec, SessionTargeting};
+use ags::listing_cache::{LoadedRows, Stamp};
+use ags::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
+use ags::providers::{Provider, SessionListing, read_dir_reporting, walk_entry_reporting};
+use ags::responses::{
     self, ErrorEnvelope, InfoResponse, ListEnvelope, ListItem, ProviderInfo, ResumeSuccess,
     SkippedSession,
 };
@@ -37,7 +37,7 @@ const PEEK_SNIPPET_MAX_CHARS: usize = 200;
 /// ChatGPT so you can pick up where you left off with a different agent.
 #[derive(Parser, Debug)]
 #[command(
-    name = "casr",
+    name = "ags",
     version = long_version(),
     about,
     long_about = None,
@@ -62,7 +62,10 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Manage encrypted, portable session checkpoints.
-    #[command(trailing_var_arg = true, disable_help_flag = true)]
+    ///
+    /// Intercepted before clap sees it (see `main`); listed here only so the
+    /// dispatch below stays total.
+    #[command(trailing_var_arg = true, disable_help_flag = true, hide = true)]
     Checkpoint {
         /// Arguments passed unchanged to the AGS checkpoint runtime.
         #[arg(value_name = "AGS_ARGS", num_args = 0.., allow_hyphen_values = true)]
@@ -353,9 +356,9 @@ fn init_tracing(cli: &Cli) {
     let filter = if cli.json {
         EnvFilter::new("off")
     } else if cli.trace {
-        EnvFilter::new("casr=trace")
+        EnvFilter::new("ags=trace")
     } else if cli.verbose {
-        EnvFilter::new("casr=debug")
+        EnvFilter::new("ags=debug")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
     };
@@ -432,10 +435,38 @@ fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
 }
 
 fn main() -> ExitCode {
-    let argv = rewrite_shorthand_resume_args(std::env::args_os().collect());
-    if argv.get(1).is_some_and(|arg| arg == "checkpoint") {
-        return cmd_checkpoint(&argv[2..]);
-    }
+    let raw: Vec<OsString> = std::env::args_os().collect();
+    let first = raw.get(1).map(|arg| arg.to_string_lossy().into_owned());
+    // What people type is the session runtime — `ags ls`, `ags resume 7`,
+    // `ags save`. Cross-provider conversion is the occasional errand, so it
+    // lives under `ags convert` and the runtime owns the bare namespace.
+    //
+    // The split has to happen here rather than in clap because both halves
+    // want the same two words. `resume` means "carry on with session 7" to one
+    // and "convert this Codex session into a Claude one" to the other, and
+    // `list` is a picker on one side and a raw inventory on the other. Nesting
+    // one of them is the only way both keep their names.
+    let argv = match first.as_deref() {
+        Some("convert") => {
+            let mut rebuilt = Vec::with_capacity(raw.len().saturating_sub(1));
+            rebuilt.push(raw[0].clone());
+            rebuilt.extend(raw[2..].iter().cloned());
+            // The `-cc <id>` shorthand belongs to conversion, so it is only
+            // rewritten once we know that is where we are.
+            rewrite_shorthand_resume_args(rebuilt)
+        }
+        // The version must be answered by the binary itself. The runtime asks
+        // `"$binary" --version` in several places to decide what it is talking
+        // to; routing that into the runtime would have it ask itself.
+        Some("--version" | "-V") => raw,
+        // Hidden helpers the installer and the runtime call by name.
+        Some("checkpoint-register-codex" | "checkpoint-asset") => raw,
+        // `checkpoint` was how the old `ags` wrapper reached the runtime. Kept
+        // so a machine still holding that wrapper can run long enough to
+        // replace itself.
+        Some("checkpoint") => return cmd_checkpoint(&raw[2..]),
+        _ => return cmd_checkpoint(&raw[1..]),
+    };
     let cli = Cli::parse_from(argv);
     init_tracing(&cli);
 
@@ -445,9 +476,9 @@ fn main() -> ExitCode {
             session_id,
             rollout_path,
             cwd,
-        } => casr::providers::codex::register_restored_thread(&session_id, &rollout_path, &cwd)
+        } => ags::providers::codex::register_restored_thread(&session_id, &rollout_path, &cwd)
             .map(|()| ExitCode::SUCCESS),
-        Command::CheckpointAsset { name } => casr::checkpoint_runtime::asset(&name).map_or_else(
+        Command::CheckpointAsset { name } => ags::checkpoint_runtime::asset(&name).map_or_else(
             || Err(anyhow::anyhow!("unknown checkpoint asset: {name}")),
             |asset| {
                 print!("{asset}");
@@ -558,7 +589,7 @@ fn main() -> ExitCode {
 }
 
 fn cmd_checkpoint(args: &[OsString]) -> ExitCode {
-    match casr::checkpoint_runtime::run(args) {
+    match ags::checkpoint_runtime::run(args) {
         Ok(status) => status
             .code()
             .and_then(|code| u8::try_from(code).ok())
@@ -572,17 +603,17 @@ fn cmd_checkpoint(args: &[OsString]) -> ExitCode {
 
 /// Extract a short error type name for JSON output.
 fn error_type_name(e: &anyhow::Error) -> &'static str {
-    if let Some(casr_err) = e.downcast_ref::<casr::error::CasrError>() {
+    if let Some(casr_err) = e.downcast_ref::<ags::error::CasrError>() {
         match casr_err {
-            casr::error::CasrError::SessionNotFound { .. } => "SessionNotFound",
-            casr::error::CasrError::AmbiguousSessionId { .. } => "AmbiguousSessionId",
-            casr::error::CasrError::UnknownProviderAlias { .. } => "UnknownProviderAlias",
-            casr::error::CasrError::ProviderUnavailable { .. } => "ProviderUnavailable",
-            casr::error::CasrError::SessionReadError { .. } => "SessionReadError",
-            casr::error::CasrError::SessionWriteError { .. } => "SessionWriteError",
-            casr::error::CasrError::SessionConflict { .. } => "SessionConflict",
-            casr::error::CasrError::ValidationError { .. } => "ValidationError",
-            casr::error::CasrError::VerifyFailed { .. } => "VerifyFailed",
+            ags::error::CasrError::SessionNotFound { .. } => "SessionNotFound",
+            ags::error::CasrError::AmbiguousSessionId { .. } => "AmbiguousSessionId",
+            ags::error::CasrError::UnknownProviderAlias { .. } => "UnknownProviderAlias",
+            ags::error::CasrError::ProviderUnavailable { .. } => "ProviderUnavailable",
+            ags::error::CasrError::SessionReadError { .. } => "SessionReadError",
+            ags::error::CasrError::SessionWriteError { .. } => "SessionWriteError",
+            ags::error::CasrError::SessionConflict { .. } => "SessionConflict",
+            ags::error::CasrError::ValidationError { .. } => "ValidationError",
+            ags::error::CasrError::VerifyFailed { .. } => "VerifyFailed",
         }
     } else {
         "InternalError"
@@ -630,14 +661,14 @@ impl LaunchRequest {
 /// thing it could have said is that it had never seen this conversation. An
 /// existing store is opened and consulted in full, so `--dry-run` still reports
 /// the source a real run would read.
-fn open_store(no_store: bool, dry_run: bool) -> Option<casr::store::Store> {
+fn open_store(no_store: bool, dry_run: bool) -> Option<ags::store::Store> {
     if no_store {
         return None;
     }
-    if dry_run && !casr::store::default_root().is_ok_and(|root| root.join("store.json").is_file()) {
+    if dry_run && !ags::store::default_root().is_ok_and(|root| root.join("store.json").is_file()) {
         return None;
     }
-    match casr::store::Store::open() {
+    match ags::store::Store::open() {
         Ok(store) => Some(store),
         Err(error) => {
             eprintln!(
@@ -678,7 +709,7 @@ fn open_store(no_store: bool, dry_run: bool) -> Option<casr::store::Store> {
 /// event. What was worth fixing is that when the lookup *does* redirect, for any
 /// reason, it says so.
 fn redirect_record_id(
-    store: Option<&casr::store::Store>,
+    store: Option<&ags::store::Store>,
     target: &str,
     session_id: &str,
     source: Option<String>,
@@ -700,7 +731,7 @@ fn redirect_record_id(
         .find_by_alias(target)
         .map(|provider| provider.slug().to_string())
         .unwrap_or_else(|| target.to_string());
-    match casr::launch::session_named_by_record(&record, &target_slug) {
+    match ags::launch::session_named_by_record(&record, &target_slug) {
         Some(key) => (
             key.provider_session_id.clone(),
             Some(key.provider.clone()),
@@ -1396,7 +1427,7 @@ fn cmd_list(
         .and_then(|filter| registry.find_by_alias(filter).map(|p| p.slug().to_string()))
         .or_else(|| provider_filter.map(|filter| filter.to_ascii_lowercase()));
 
-    /// The shape [`casr::listing_cache`] stores, from its point of view.
+    /// The shape [`ags::listing_cache`] stores, from its point of view.
     ///
     /// Bump on any change to `SessionSummary` that changes what a field *means*
     /// as well as any change to which fields exist — the cache holds an opaque
@@ -1478,7 +1509,7 @@ fn cmd_list(
             let repo_name = if enrich_fs {
                 self.workspace
                     .as_ref()
-                    .and_then(|ws| casr::discovery::repo_name_from_path(ws))
+                    .and_then(|ws| ags::discovery::repo_name_from_path(ws))
             } else {
                 None
             };
@@ -1537,10 +1568,7 @@ fn cmd_list(
             .and_then(system_time_to_epoch_millis)
     }
 
-    fn session_activity_millis(
-        session: &casr::model::CanonicalSession,
-        path: &Path,
-    ) -> Option<i64> {
+    fn session_activity_millis(session: &ags::model::CanonicalSession, path: &Path) -> Option<i64> {
         let conversation_activity = session
             .ended_at
             .or_else(|| {
@@ -1826,7 +1854,7 @@ fn cmd_list(
 
     fn session_metrics(
         provider_slug: &str,
-        session: &casr::model::CanonicalSession,
+        session: &ags::model::CanonicalSession,
         path: &Path,
     ) -> (u64, usize, f64, Option<usize>) {
         let file_size_bytes = path.metadata().map(|meta| meta.len()).unwrap_or(0);
@@ -1840,13 +1868,13 @@ fn cmd_list(
         for msg in &session.messages {
             canonical_tool_uses = canonical_tool_uses.saturating_add(msg.tool_calls.len());
 
-            if msg.role == casr::model::MessageRole::User
+            if msg.role == ags::model::MessageRole::User
                 && let Some(normalized) = normalize_user_message_for_uniqueness(&msg.content)
             {
                 unique_user_messages.insert(normalized);
             }
 
-            if msg.role == casr::model::MessageRole::Assistant {
+            if msg.role == ags::model::MessageRole::Assistant {
                 let char_count = msg.content.chars().count().saturating_add(
                     msg.tool_results
                         .iter()
@@ -1887,12 +1915,12 @@ fn cmd_list(
     fn build_summary(
         provider_slug: &str,
         path: PathBuf,
-        session: casr::model::CanonicalSession,
+        session: ags::model::CanonicalSession,
     ) -> SessionSummary {
         let last_active_at = session_activity_millis(&session, &path);
         let (file_size_bytes, unique_user_messages, avg_agent_response_chars, tool_uses) =
             session_metrics(provider_slug, &session, &path);
-        let native_name = casr::model::native_name_from_metadata(&session.metadata);
+        let native_name = ags::model::native_name_from_metadata(&session.metadata);
 
         SessionSummary {
             session_id: session.session_id,
@@ -1956,7 +1984,7 @@ fn cmd_list(
 
         match provider_slug {
             "claude-code" => {
-                let expected = casr::providers::claude_code::project_dir_key(ws.as_path());
+                let expected = ags::providers::claude_code::project_dir_key(ws.as_path());
                 match path
                     .parent()
                     .and_then(|p| p.file_name())
@@ -1975,9 +2003,10 @@ fn cmd_list(
                 // testing for a 64-hex directory here reported `Unknown` for
                 // every session a current Gemini writes, because 0.52.0 names
                 // the directory with a registry slug.
-                let by_directory = path.parent().and_then(|p| p.parent()).and_then(|dir| {
-                    casr::providers::gemini::project_dir_matches(dir, ws.as_path())
-                });
+                let by_directory = path
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .and_then(|dir| ags::providers::gemini::project_dir_matches(dir, ws.as_path()));
                 // Neither marked nor hashed — but the file itself is a second
                 // witness, and an independent one: Gemini stamps
                 // `SHA256(projectRoot)` into every session header it writes
@@ -1992,9 +2021,8 @@ fn cmd_list(
                 // *sessions* end up in the "workspace could not be determined"
                 // count, which before this was every session in any project
                 // directory whose marker was missing or unreadable.
-                let resolved = by_directory.or_else(|| {
-                    casr::providers::gemini::session_workspace_hint(path, ws.as_path())
-                });
+                let resolved = by_directory
+                    .or_else(|| ags::providers::gemini::session_workspace_hint(path, ws.as_path()));
                 match resolved {
                     Some(true) => WorkspaceHint::Matches,
                     Some(false) => WorkspaceHint::Differs,
@@ -2014,10 +2042,10 @@ fn cmd_list(
             "claude-code" => {
                 // Reuse the provider's own resolver so this fast path cannot
                 // drift from the env-var precedence the provider implements.
-                let claude_home = casr::providers::claude_code::ClaudeCode::home_dir()?;
+                let claude_home = ags::providers::claude_code::ClaudeCode::home_dir()?;
                 let expected_dir = claude_home
                     .join("projects")
-                    .join(casr::providers::claude_code::project_dir_key(ws.as_path()));
+                    .join(ags::providers::claude_code::project_dir_key(ws.as_path()));
 
                 let mut listing = SessionListing::default();
                 for entry in read_dir_reporting(&expected_dir, &mut listing.unreadable) {
@@ -2036,7 +2064,7 @@ fn cmd_list(
             "gemini" => {
                 // Reuse the provider's own resolver so this fast path cannot
                 // drift from the env-var precedence the provider implements.
-                let gemini_home = casr::providers::gemini::Gemini::home_dir()?;
+                let gemini_home = ags::providers::gemini::Gemini::home_dir()?;
                 let tmp_root = gemini_home.join("tmp");
 
                 // One pass over `tmp/`, asking the provider about each project
@@ -2056,7 +2084,7 @@ fn cmd_list(
                     if !chats.is_dir() {
                         continue;
                     }
-                    match casr::providers::gemini::project_dir_matches(&dir, ws.as_path()) {
+                    match ags::providers::gemini::project_dir_matches(&dir, ws.as_path()) {
                         Some(true) => chats_dirs.push(chats),
                         Some(false) => {}
                         None => undetermined = true,
@@ -2099,7 +2127,7 @@ fn cmd_list(
                         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                             continue;
                         };
-                        if !casr::providers::gemini::is_session_file_name(name) {
+                        if !ags::providers::gemini::is_session_file_name(name) {
                             continue;
                         }
                         let session_id = name
@@ -2228,7 +2256,7 @@ fn cmd_list(
                     // written; only the activity time moved, and the stamp
                     // already carries it. See `reusable_after_growth` for what
                     // this trades away and how far.
-                    if casr::listing_cache::reusable_after_growth(cached_stamp, stamp) {
+                    if ags::listing_cache::reusable_after_growth(cached_stamp, stamp) {
                         summary.last_active_at = Some(stamp.mtime_millis);
                         summary.file_size_bytes = stamp.size;
                         return Candidate::Row(summary, RowSource::Cached);
@@ -2263,7 +2291,7 @@ fn cmd_list(
     // not open is not a failure: `cached` stays empty, nothing is written back,
     // and every candidate is read — which is what this command did before the
     // cache existed.
-    let mut cache = match casr::listing_cache::ListingCache::open(LIST_ROW_VERSION) {
+    let mut cache = match ags::listing_cache::ListingCache::open(LIST_ROW_VERSION) {
         Ok(cache) => Some(cache),
         Err(error) => {
             tracing::debug!(%error, "listing cache unavailable; reading every session");
@@ -2810,7 +2838,7 @@ fn cmd_info(
         .as_deref()
         .map(|alias| {
             registry.find_by_alias(alias).ok_or_else(|| {
-                casr::error::CasrError::UnknownProviderAlias {
+                ags::error::CasrError::UnknownProviderAlias {
                     alias: alias.to_string(),
                     known_aliases: registry.known_aliases(),
                 }
@@ -2823,7 +2851,7 @@ fn cmd_info(
         (Some(provider), Some(path)) => (provider, path),
         // An ID plus a forced reader: that provider is the one asked to find it.
         (Some(provider), None) => {
-            let hint = casr::discovery::SourceHint::Alias(provider.slug().to_string());
+            let hint = ags::discovery::SourceHint::Alias(provider.slug().to_string());
             (
                 provider,
                 registry.resolve_session(argument, Some(&hint))?.path,
@@ -2833,8 +2861,8 @@ fn cmd_info(
         // specific of the two, and otherwise `--source` behaves as it always has.
         (None, path_argument) => {
             let hint = path_argument
-                .map(casr::discovery::SourceHint::Path)
-                .or_else(|| source.as_deref().map(casr::discovery::SourceHint::parse));
+                .map(ags::discovery::SourceHint::Path)
+                .or_else(|| source.as_deref().map(ags::discovery::SourceHint::parse));
             let resolved = registry.resolve_session(argument, hint.as_ref())?;
             (resolved.provider, resolved.path)
         }
@@ -2868,7 +2896,7 @@ fn cmd_info(
         }
     };
 
-    let native_name = casr::model::native_name_from_metadata(&session.metadata);
+    let native_name = ags::model::native_name_from_metadata(&session.metadata);
     // The tail shows when `--peek` is passed OR `--peek-lines N` is given on its
     // own (the latter implies `--peek`, as the help states); default to 5 turns.
     const DEFAULT_PEEK_LINES: usize = 5;
@@ -2876,7 +2904,7 @@ fn cmd_info(
     // Snippet width: wider for JSON (machine-consumed), tighter for the terminal.
     let transcript_tail = show_tail.then(|| {
         let n = peek_lines.unwrap_or(DEFAULT_PEEK_LINES);
-        casr::model::transcript_tail(&session.messages, n, PEEK_SNIPPET_MAX_CHARS)
+        ags::model::transcript_tail(&session.messages, n, PEEK_SNIPPET_MAX_CHARS)
     });
     // Head and tail of what the user typed. Three opening turns are enough to
     // say what the session is for — the first is often a one-line "look at X"
@@ -2886,7 +2914,7 @@ fn cmd_info(
     const DIGEST_TAIL_TURNS: usize = 2;
     const DIGEST_TURN_MAX_CHARS: usize = 600;
     let digest = digest.then(|| {
-        casr::model::session_digest(
+        ags::model::session_digest(
             &session.messages,
             DIGEST_HEAD_TURNS,
             DIGEST_TAIL_TURNS,
@@ -2901,7 +2929,7 @@ fn cmd_info(
             session
                 .workspace
                 .as_ref()
-                .and_then(|ws| casr::discovery::repo_name_from_path(ws))
+                .and_then(|ws| ags::discovery::repo_name_from_path(ws))
         } else {
             None
         };
@@ -2957,12 +2985,12 @@ fn cmd_info(
         let user_count = session
             .messages
             .iter()
-            .filter(|m| m.role == casr::model::MessageRole::User)
+            .filter(|m| m.role == ags::model::MessageRole::User)
             .count();
         let asst_count = session
             .messages
             .iter()
-            .filter(|m| m.role == casr::model::MessageRole::Assistant)
+            .filter(|m| m.role == ags::model::MessageRole::Assistant)
             .count();
         println!(
             "  {} {user_count} user, {asst_count} assistant",
@@ -3047,7 +3075,7 @@ fn cmd_completions(shell: &str) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("Unknown shell '{shell}'. Use: bash, zsh, fish"))?;
 
     let mut cmd = Cli::command();
-    generate(parsed_shell, &mut cmd, "casr", &mut std::io::stdout());
+    generate(parsed_shell, &mut cmd, "ags", &mut std::io::stdout());
 
     Ok(())
 }

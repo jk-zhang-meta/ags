@@ -7,11 +7,11 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::model::CanonicalSession;
-use casr::providers::claude_code::ClaudeCode;
-use casr::providers::codex::Codex;
-use casr::providers::gemini::Gemini;
-use casr::providers::{Provider, WriteOptions};
+use ags::model::CanonicalSession;
+use ags::providers::claude_code::ClaudeCode;
+use ags::providers::codex::Codex;
+use ags::providers::gemini::Gemini;
+use ags::providers::{Provider, WriteOptions};
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 

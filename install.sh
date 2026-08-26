@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# casr installer — Cross Agent Session Resumer
+# ags installer
 #
 # One-liner install (with cache buster):
 #   curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?$(date +%s)" | bash
@@ -42,7 +42,7 @@ fi
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-jk-zhang-meta}"
 REPO="${REPO:-ags}"
-BINARY_NAME="casr"
+BINARY_NAME="ags"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
 SYSTEM_INSTALL=0
@@ -59,7 +59,7 @@ SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/dist.yml@refs/tags/.*$}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/casr-install.lock"
+LOCK_FILE="/tmp/ags-install.lock"
 NO_GUM=0
 NO_CHECKSUM=0
 NO_CONFIGURE=0
@@ -256,7 +256,7 @@ print_provider_scan_notice() {
   [ "$QUIET" -eq 1 ] && return 0
 
   local line1="Scanning for installed coding agent providers..."
-  local line2="casr converts sessions between detected providers."
+  local line2="ags converts sessions between detected providers."
 
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     echo ""
@@ -355,7 +355,7 @@ detect_providers() {
 print_detected_providers() {
   if [[ ${#DETECTED_PROVIDERS[@]} -eq 0 ]]; then
     warn "No coding agent providers detected"
-    info "Install at least two providers to use casr for session conversion"
+    info "Install at least two providers to use ags for session conversion"
     return
   fi
 
@@ -378,10 +378,10 @@ print_detected_providers() {
 
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     echo ""
-    gum style --foreground 39 --bold "Detected ${count} Provider${plural} (casr conversion targets):"
+    gum style --foreground 39 --bold "Detected ${count} Provider${plural} (ags conversion targets):"
   else
     echo ""
-    echo -e "\033[1;34mDetected ${count} Provider${plural} (casr conversion targets):\033[0m"
+    echo -e "\033[1;34mDetected ${count} Provider${plural} (ags conversion targets):\033[0m"
   fi
 
   for provider in "${DETECTED_PROVIDERS[@]}"; do
@@ -400,7 +400,7 @@ print_detected_providers() {
   echo ""
 
   if [ "$count" -ge 2 ]; then
-    info "casr can convert sessions between any pair of detected providers"
+    info "ags convert can move a session between any pair of detected providers"
   else
     info "Install a second provider to enable cross-provider session conversion"
   fi
@@ -429,38 +429,38 @@ write_inline_skill() {
   mkdir -p "$dest"
   cat > "$dest/SKILL.md" <<'SKILL_EOF'
 ---
-name: casr
+name: ags-convert
 description: >-
   Cross Agent Session Resumer. Convert and resume sessions across Claude Code,
   Codex, Gemini, and other providers.
 ---
 
-# casr — Cross Agent Session Resumer
+# ags convert — 跨 Agent 会话转换
 
-Use `casr` when you need to keep working on the same session but switch providers.
+Use `ags convert` when you need to keep working on the same session but switch providers.
 
 ## Fast Path
 
 ```bash
-casr list
-casr info <session-id>
-casr -cc <session-id>   # open in Claude Code
-casr -cod <session-id>  # open in Codex
-casr -gmi <session-id>  # open in Gemini
+ags convert list
+ags convert info <session-id>
+ags convert -cc <session-id>   # open in Claude Code
+ags convert -cod <session-id>  # open in Codex
+ags convert -gmi <session-id>  # open in Gemini
 ```
 
 ## Helpful Commands
 
 ```bash
-casr providers
-casr list --workspace "$(pwd)" --sort date --limit 20
-casr cod resume <session-id> --source cc
-casr info <session-id> --json
+ags convert providers
+ags convert list --workspace "$(pwd)" --sort date --limit 20
+ags convert cod resume <session-id> --source cc
+ags convert info <session-id> --json
 ```
 
 ## Notes
 
-- `casr list` is project-scoped to your current working directory by default.
+- `ags convert list` is project-scoped to your current working directory by default.
 - `-cc`, `-cod`, and `-gmi` auto-detect source provider from the session ID.
 - Use `--json` output mode for automation.
 SKILL_EOF
@@ -473,7 +473,7 @@ download_skill_archive() {
     return 1
   }
 
-  local dest="$TMP/casr-skill.tar.gz"
+  local dest="$TMP/ags-convert-skill.tar.gz"
   local urls=(
     "https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/skill.tar.gz"
     "https://github.com/${OWNER}/${REPO}/releases/latest/download/skill.tar.gz"
@@ -501,22 +501,22 @@ install_skill_for_agent() {
     printf -v "$status_var" '%s' "skipped (--no-skill)"
     return 0
   fi
-  if checkpoint_path_has_symlink "$skills_root/casr"; then
+  if checkpoint_path_has_symlink "$skills_root/ags-convert"; then
     printf -v "$status_var" '%s' "refused (symbolic-link path)"
-    warn "$agent_label skill path contains a symbolic link: $skills_root/casr"
+    warn "$agent_label skill path contains a symbolic link: $skills_root/ags-convert"
     return 0
   fi
 
   if [ -n "$CASR_SKILL_ARCHIVE" ]; then
     mkdir -p "$skills_root"
     if tar -xzf "$CASR_SKILL_ARCHIVE" -C "$skills_root" 2>/dev/null \
-      && [ -f "$skills_root/casr/SKILL.md" ]; then
+      && [ -f "$skills_root/ags-convert/SKILL.md" ]; then
       printf -v "$status_var" '%s' "installed (release skill.tar.gz)"
       return 0
     fi
   fi
 
-  local skill_dir="$skills_root/casr"
+  local skill_dir="$skills_root/ags-convert"
   write_inline_skill "$skill_dir"
   if [ -f "$skill_dir/SKILL.md" ]; then
     printf -v "$status_var" '%s' "installed (inline fallback)"
@@ -567,7 +567,10 @@ install_wrapper_command() {
   local target_name="$2"
   local status_var="$3"
   local wrapper_path="$DEST/$alias_name"
-  local marker="# casr-installer-wrapper"
+  local marker="# ags-installer-wrapper"
+  # 改名之前写下的壳带的是旧标记。不认它的话，那些机器上的壳会被下面的分支当成
+  # "手写的"而保留，从此再也收不到任何一次壳的修改。
+  local legacy_marker="# casr-installer-wrapper"
   local target_path=""
 
   if [ "$NO_CONFIGURE" -eq 1 ]; then
@@ -589,7 +592,9 @@ install_wrapper_command() {
     fi
   fi
 
-  if [ -f "$wrapper_path" ] && ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null; then
+  if [ -f "$wrapper_path" ] &&
+     ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null &&
+     ! grep -Fq "$legacy_marker" "$wrapper_path" 2>/dev/null; then
     printf -v "$status_var" '%s' "preserved unmanaged ($(status_path "$wrapper_path"))"
     return 0
   fi
@@ -630,38 +635,35 @@ checkpoint_path_has_symlink() {
   return 1
 }
 
-install_checkpoint_wrapper() {
-  local wrapper_path="$DEST/ags"
-  local marker="# ags-installer-checkpoint-wrapper"
-  # Wrappers written before the agsx name was dropped carry the older marker,
-  # and `# ags-installer-` is not a substring of `# agsx-installer-`. Without
-  # recognising both, every machine installed before that rename looks
-  # hand-written: the branch below preserves it and the installer never touches
-  # that file again, so no future wrapper change can ever reach those machines.
-  local legacy_marker="# agsx-installer-checkpoint-wrapper"
-  local temporary
+retire_legacy_casr_binary() {
+  # 二进制以前叫 `casr`，`ags` 只是它旁边一个四行的壳
+  # （`exec "$script_dir/casr" checkpoint "$@"`）。现在二进制自己就叫 `ags`，
+  # 所以那个壳的位置**正是新二进制要落的位置**——装完之后再写一次壳，等于把刚
+  # 装好的二进制覆盖成一个指向已经不存在的 `casr` 的壳。这个函数因此只做减法。
+  #
+  # 旧的 `casr` 留在那儿不会坏事，但它是 6 MiB 的死重量，而且 PATH 里多一个叫
+  # 这个名字的东西会让人以为它还有用。
+  local legacy="$DEST/casr"
 
   if [ "$NO_CONFIGURE" -eq 1 ]; then
     AGS_WRAPPER_STATUS="skipped (--no-configure)"
     return 0
   fi
-  if [ -e "$wrapper_path" ] &&
-     ! grep -Fq "$marker" "$wrapper_path" 2>/dev/null &&
-     ! grep -Fq "$legacy_marker" "$wrapper_path" 2>/dev/null; then
-    AGS_WRAPPER_STATUS="preserved unmanaged ($(status_path "$wrapper_path"))"
+
+  # 只动我们自己装的那个：普通文件、就在我们的目标目录里、不是别人的符号链接。
+  if [ ! -e "$legacy" ]; then
+    AGS_WRAPPER_STATUS="ags is the binary now"
     return 0
   fi
-
-  temporary="$(mktemp "$DEST/.ags-wrapper.XXXXXX")"
-  cat > "$temporary" <<'EOF'
-#!/bin/sh
-# ags-installer-checkpoint-wrapper
-script_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
-exec "$script_dir/casr" checkpoint "$@"
-EOF
-  chmod 0755 "$temporary"
-  mv -f "$temporary" "$wrapper_path"
-  AGS_WRAPPER_STATUS="installed ($(status_path "$wrapper_path") -> casr checkpoint)"
+  if [ -L "$legacy" ] || [ ! -f "$legacy" ]; then
+    AGS_WRAPPER_STATUS="left $(status_path "$legacy") alone (not a plain file)"
+    return 0
+  fi
+  if rm -f "$legacy"; then
+    AGS_WRAPPER_STATUS="removed the old $(status_path "$legacy")"
+  else
+    AGS_WRAPPER_STATUS="could not remove $(status_path "$legacy")"
+  fi
 }
 
 install_checkpoint_skill() {
@@ -690,7 +692,7 @@ install_checkpoint_skill() {
 
 write_checkpoint_hooks() {
   local file="$1" kind="$2" directory temporary source
-  local command="$DEST/$BINARY_NAME checkpoint hook"
+  local command="$DEST/$BINARY_NAME hook"
   local legacy_ags="$DEST/ags hook"
   local legacy_session="$DEST/agent-session hook"
 
@@ -758,7 +760,7 @@ checkpoint_dependencies_ready() {
 }
 
 run_checkpoint_runtime() {
-  "$DEST/$BINARY_NAME" checkpoint "$@"
+  "$DEST/$BINARY_NAME" "$@"
 }
 
 
@@ -771,7 +773,7 @@ run_checkpoint_runtime() {
 # It rides its own release train, which is why this runs after the core install
 # transaction has been committed and can only report, never fail the install.
 # `ags codext-update` is the same function `ags update` calls; reaching for
-# `ags update` here instead would also self-update casr and undo an explicit
+# `ags update` here instead would also self-update ags and undo an explicit
 # `--version` seconds after it landed.
 configure_codext_only() {
   if [ "$NO_CONFIGURE" -eq 1 ]; then
@@ -812,7 +814,7 @@ configure_checkpoints() {
     return 0
   fi
 
-  install_checkpoint_wrapper
+  retire_legacy_casr_binary
   install_checkpoint_skill "$CODEX_CONFIG_ROOT/skills" AGS_CODEX_SKILL_STATUS
   install_checkpoint_skill "$CLAUDE_CONFIG_ROOT/skills" AGS_CLAUDE_SKILL_STATUS
   if write_checkpoint_hooks "$CODEX_CONFIG_ROOT/hooks.json" codex &&
@@ -922,7 +924,7 @@ detect_platform() {
 
   # WSL detection
   if [[ "$OS" == "linux" ]] && grep -qi microsoft /proc/version 2>/dev/null; then
-    warn "WSL detected. casr will work normally; provider paths may differ from Windows host"
+    warn "WSL detected. ags will work normally; provider paths may differ from Windows host"
   fi
 
   TARGET=""
@@ -948,7 +950,7 @@ set_artifact_url() {
       TAR=$(basename "$ARTIFACT_URL")
       URL="$ARTIFACT_URL"
     elif [ -n "$TARGET" ]; then
-      TAR="casr-${TARGET}.tar.xz"
+      TAR="ags-${TARGET}.tar.xz"
       URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
     else
       warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
@@ -1328,7 +1330,7 @@ recover_pending_install_transaction() {
     # Keep the binary journal active and rejoin the ordinary post-install path,
     # which commits the casr binary.
     INSTALL_TRANSACTION_ACTIVE=1
-    info "Resuming the interrupted casr installation"
+    info "Resuming the interrupted ags installation"
     return 0
   fi
 
@@ -1742,7 +1744,7 @@ Examples:
   bash install.sh --system --easy-mode --yes
 
   # Offline / airgap install
-  bash install.sh --offline ./casr-x86_64-unknown-linux-musl.tar.xz
+  bash install.sh --offline ./ags-x86_64-unknown-linux-musl.tar.xz
 
   # Build from source (requires Rust nightly)
   bash install.sh --from-source
@@ -1909,7 +1911,7 @@ fi
 setup_proxy
 
 if [ "$RESUME_CORE_ONLY" -eq 1 ]; then
-  info "Finishing the recovered casr transaction"
+  info "Finishing the recovered ags transaction"
 else
   # Resolve version and platform only for new installation work. A recovered
   # candidate is already identified by its journaled SHA-256.
@@ -1952,7 +1954,7 @@ if [ -n "$OFFLINE_TARBALL" ] && [ "$RESUME_CORE_ONLY" -eq 0 ]; then
   if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 0 ]; then
     BIN="$TMP/$BINARY_NAME"
     if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-      BIN="$TMP/casr-${TARGET}/$BINARY_NAME"
+      BIN="$TMP/ags-${TARGET}/$BINARY_NAME"
     fi
     if [ ! -x "$BIN" ]; then
       BIN=$(find "$TMP" -maxdepth 3 -type f -name "$BINARY_NAME" -perm -111 | head -n 1)
@@ -1997,7 +1999,7 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$URL" ]; then
 
   if [ "$DOWNLOAD_OK" -eq 0 ]; then
     # Tier 2: unversioned latest
-    TIER2_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/casr-${TARGET}.tar.xz"
+    TIER2_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/ags-${TARGET}.tar.xz"
     info "Trying unversioned latest: $TIER2_URL"
     if curl -fsSL "${PROXY_ARGS[@]}" "$TIER2_URL" -o "$TMP/$TAR" 2>/dev/null; then
       DOWNLOAD_OK=1
@@ -2006,7 +2008,7 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$URL" ]; then
 
   if [ "$DOWNLOAD_OK" -eq 0 ]; then
     # Tier 3: simple naming
-    TIER3_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/casr-${OS}-${ARCH}.tar.xz"
+    TIER3_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/ags-${OS}-${ARCH}.tar.xz"
     info "Trying simple naming: $TIER3_URL"
     if curl -fsSL "${PROXY_ARGS[@]}" "$TIER3_URL" -o "$TMP/$TAR" 2>/dev/null; then
       DOWNLOAD_OK=1
@@ -2084,7 +2086,7 @@ if [ -z "$INSTALL_SOURCE" ]; then
 
   BIN="$TMP/$BINARY_NAME"
   if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-    BIN="$TMP/casr-${TARGET}/$BINARY_NAME"
+    BIN="$TMP/ags-${TARGET}/$BINARY_NAME"
   fi
   if [ ! -x "$BIN" ]; then
     BIN=$(find "$TMP" -maxdepth 3 -type f -name "$BINARY_NAME" -perm -111 | head -n 1)
@@ -2161,10 +2163,10 @@ summary_lines=(
   "Get started:"
   "  casr providers"
   "  casr list"
-  "  casr -cc <session-id>"
-  "  casr -cod <session-id>"
-  "  casr -gmi <session-id>"
-  "  casr checkpoint list"
+  "  ags convert -cc <session-id>"
+  "  ags convert -cod <session-id>"
+  "  ags convert -gmi <session-id>"
+  "  ags ls"
   "  ags"
   ""
   "Managed paths:"

@@ -5,7 +5,7 @@ description: Save, inspect, restore, resume, delete, and synchronize encrypted l
 
 # AGS
 
-Use `casr checkpoint`. The installer also provides `ags` as a compatibility
+Use `ags checkpoint`. The installer also provides `ags` as a compatibility
 command. Use `$ags` in Codex and `/ags` in Claude.
 
 Preserve user-supplied IDs, descriptions, paths, remote names, and client
@@ -57,14 +57,14 @@ The installer normally initializes AGS. When the user explicitly asks to
 initialize or repair missing initialization, run:
 
 ```bash
-casr checkpoint init
+ags checkpoint init
 ```
 
 To import an existing identity on a new machine, require its exact absolute
 path and run:
 
 ```bash
-casr checkpoint init --identity "ABSOLUTE_AGE_IDENTITY"
+ags checkpoint init --identity "ABSOLUTE_AGE_IDENTITY"
 ```
 
 Complete only on `status=initialized`. Report the vault, identity path, and
@@ -77,7 +77,7 @@ Require one dedicated absolute local directory. Under WSL, reject `/mnt/c` and
 other Windows-mounted paths.
 
 ```bash
-casr checkpoint set "ABSOLUTE_DIR"
+ags checkpoint set "ABSOLUTE_DIR"
 ```
 
 Complete only on `status=configured`.
@@ -98,11 +98,11 @@ Queue the active native session:
 if [[ -n "${CODEX_THREAD_ID:-}" ]]; then
     AGENT_SESSION_AGENT=codex \
     AGENT_SESSION_ID="$CODEX_THREAD_ID" \
-        casr checkpoint save "ID" "DESCRIPTION"
+        ags checkpoint save "ID" "DESCRIPTION"
 elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
     AGENT_SESSION_AGENT=claude \
     AGENT_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
-        casr checkpoint save "ID" "DESCRIPTION"
+        ags checkpoint save "ID" "DESCRIPTION"
 else
     printf 'AGS must run inside an active Codex or Claude Code session.\n' >&2
     return 1
@@ -127,8 +127,8 @@ without rebuilding it.
 Run:
 
 ```bash
-casr checkpoint list
-casr checkpoint show "ID"
+ags checkpoint list
+ags checkpoint show "ID"
 ```
 
 `list` is the compact scanning view: `ID`, `AGENT`, `SAVED`, and
@@ -147,13 +147,13 @@ sessions may remain open. If AGS reports that the target native session UUID is
 active in a PID, the user must exit only that session before retrying.
 
 ```bash
-casr checkpoint resume "ID"
-casr checkpoint resume "ID" --cwd "ABSOLUTE_DIR"
-casr checkpoint resume "ID" --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
-casr checkpoint resume "ID" --to claude --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
-casr checkpoint resume "ID" --to claude --profile "PROFILE" -- CLIENT_ARGS...
-casr checkpoint resume "ID" --to codex -- CLIENT_ARGS...
-casr checkpoint resume "ID" --to codex --profile "PROFILE" -- CLIENT_ARGS...
+ags checkpoint resume "ID"
+ags checkpoint resume "ID" --cwd "ABSOLUTE_DIR"
+ags checkpoint resume "ID" --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
+ags checkpoint resume "ID" --to claude --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
+ags checkpoint resume "ID" --to claude --profile "PROFILE" -- CLIENT_ARGS...
+ags checkpoint resume "ID" --to codex -- CLIENT_ARGS...
+ags checkpoint resume "ID" --to codex --profile "PROFILE" -- CLIENT_ARGS...
 ```
 
 Use `--` before client arguments so AGS options and native client options
@@ -271,7 +271,7 @@ variable before starting the Agent.
 Require one exact ID or `AGENT/RECORD_ID` selector:
 
 ```bash
-casr checkpoint delete "ID"
+ags checkpoint delete "ID"
 ```
 
 Report `status=deleted`, `recoverable_path`, and the tombstone path. Deletion
@@ -283,7 +283,7 @@ the next named-remote synchronization.
 GitHub is a normal Git remote:
 
 ```bash
-casr checkpoint remote add "NAME" git "GIT_URL" --branch "BRANCH"
+ags checkpoint remote add "NAME" git "GIT_URL" --branch "BRANCH"
 ```
 
 Allow local paths, SSH URLs, and credential-helper-backed HTTPS URLs. Never put
@@ -297,7 +297,7 @@ Require `sftp://USER@HOST:PORT/ABSOLUTE/PATH`, an absolute readable
 password authentication:
 
 ```bash
-casr checkpoint remote add "NAME" \
+ags checkpoint remote add "NAME" \
     "sftp://USER@HOST:PORT/ABSOLUTE/PATH" \
     --known-hosts "ABSOLUTE_KNOWN_HOSTS" \
     --key "ABSOLUTE_KEY"
@@ -317,8 +317,8 @@ Complete only after the write/read/delete probe returns `status=configured`.
 Inspect the plan before a material transfer:
 
 ```bash
-casr checkpoint status
-casr checkpoint status "REMOTE"
+ags checkpoint status
+ags checkpoint status "REMOTE"
 ```
 
 The plan reports `push_records`, `pull_records`, `push_tombstones`,
@@ -327,9 +327,9 @@ The plan reports `push_records`, `pull_records`, `push_tombstones`,
 Then run the requested direction:
 
 ```bash
-casr checkpoint push "REMOTE"
-casr checkpoint pull "REMOTE"
-casr checkpoint sync "REMOTE"
+ags checkpoint push "REMOTE"
+ags checkpoint pull "REMOTE"
+ags checkpoint sync "REMOTE"
 ```
 
 Use `remote use NAME` to select a default. `push` publishes local additions,
@@ -342,10 +342,10 @@ never overwrite, force-push, or choose one side automatically.
 Every managed Agent launch selects a checkpoint storage policy:
 
 ```bash
-casr checkpoint storage list
-casr checkpoint storage use local
-casr checkpoint storage use neburst
-casr checkpoint storage use github
+ags checkpoint storage list
+ags checkpoint storage use local
+ags checkpoint storage use neburst
+ags checkpoint storage use github
 ```
 
 One configured mode is automatic. Several modes are listed in most-recently-
@@ -358,8 +358,8 @@ remote. The Agent still runs on the current machine.
 Merge replicas only with the explicit storage commands:
 
 ```bash
-casr checkpoint storage merge --into github local neburst
-casr checkpoint storage retire neburst --into github
+ags checkpoint storage merge --into github local neburst
+ags checkpoint storage retire neburst --into github
 ```
 
 The local vault is the deduplication hub. `merge` pulls the source union,

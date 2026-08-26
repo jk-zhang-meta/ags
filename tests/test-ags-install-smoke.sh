@@ -3,7 +3,13 @@ set -euo pipefail
 
 project_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cargo_target="${CARGO_TARGET_DIR:-$project_root/target}"
-binary="${CASR_TEST_BINARY:-$cargo_target/debug/casr}"
+binary="${CASR_TEST_BINARY:-$cargo_target/debug/ags}"
+# 装的是哪个版本，问被测二进制自己。
+#
+# 这里原来写死 `v0.3.0-ags.1`，而安装器会拿它和产物的真实版本比对——也就是说
+# 0.3.0 之后每一次发版都会让这个套件失败。它一直没被发现，是因为在 CI 里它排在
+# 运行时套件后面，而运行时套件先红，这一条根本没机会跑。
+smoke_version="v$("$binary" --version | awk '{print $2}')"
 platform="$(uname -s)"
 test_tmp_root=/tmp
 [[ "$platform" != Darwin ]] || test_tmp_root=/private/tmp
@@ -85,14 +91,14 @@ write_rmux_recovery_journal() {
 }
 
 artifact_root="$tmp/artifact"
-artifact="$tmp/casr.tar.xz"
+artifact="$tmp/ags.tar.xz"
 home="$tmp/home"
 bin_dir="$tmp/bin"
 offline_guard_bin="$tmp/offline-guard-bin"
 offline_network_marker="$tmp/offline-network-used"
 mkdir -p "$artifact_root" "$home/.codex" "$home/.claude" "$offline_guard_bin"
 ln -s "$FAKE_REAL_NODE_BINARY" "$offline_guard_bin/node-real"
-install -m 0755 "$binary" "$artifact_root/casr"
+install -m 0755 "$binary" "$artifact_root/ags"
 mkdir -p "$artifact_root/bin" "$artifact_root/libexec/rmux"
 cat > "$artifact_root/bin/rmux" <<'EOF'
 #!/bin/sh
@@ -107,7 +113,7 @@ printf '%s\n' '#!/bin/sh' 'exit 0' > "$artifact_root/libexec/rmux/rmux"
 chmod 0755 "$artifact_root/bin/rmux" "$artifact_root/bin/rmux-daemon" \
     "$artifact_root/libexec/rmux/rmux"
 tar -cJf "$artifact" -C "$artifact_root" \
-    casr bin/rmux bin/rmux-daemon libexec/rmux/rmux
+    ags bin/rmux bin/rmux-daemon libexec/rmux/rmux
 
 cat > "$offline_guard_bin/curl" <<'EOF'
 #!/bin/sh
@@ -155,7 +161,7 @@ run_installer() {
         XDG_STATE_HOME="$home/.local/state" \
         PATH="$offline_guard_bin:$bin_dir:$PATH" \
         OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-        VERSION=v0.3.0-ags.1 \
+        VERSION="$smoke_version" \
         "$project_root/install.sh" --offline "$artifact" --dest "$bin_dir" \
         --no-verify --quiet
 }
@@ -174,7 +180,8 @@ fi
 identity="$home/.config/ags/identity.agekey"
 config="$home/.local/state/ags/storage.json"
 vault="$home/.local/share/ags/checkpoints"
-[[ -x "$bin_dir/casr" && -x "$bin_dir/ags" ]]
+# 二进制自己就叫 ags 了，旁边不再有壳，装完也不该留下旧的 casr。
+[[ -x "$bin_dir/ags" && ! -e "$bin_dir/casr" ]]
 [[ -x "$bin_dir/rmux" && -x "$bin_dir/rmux-daemon" ]]
 [[ -x "$tmp/libexec/rmux/rmux" ]]
 [[ "$("$bin_dir/rmux" -V)" == 'rmux 0.9.1' ]]
@@ -195,7 +202,7 @@ for root in "$home/.codex/skills" "$home/.claude/skills"; do
     cmp "$project_root/plugins/ags/skills/ags/agents/openai.yaml" \
         "$root/ags/agents/openai.yaml"
 done
-hook_command="$bin_dir/casr checkpoint hook"
+hook_command="$bin_dir/ags hook"
 jq -e --arg command "$hook_command" '
     any(.hooks.Stop[]?.hooks[]?; .command == "keep-me") and
     any(.hooks.Stop[]?.hooks[]?; .command == $command) and
@@ -216,7 +223,7 @@ runtime_env=(
     PATH="$bin_dir:$PATH"
 )
 "${runtime_env[@]}" "$bin_dir/ags" --help | grep -Fq 'Usage:'
-"${runtime_env[@]}" "$bin_dir/casr" checkpoint list >/dev/null
+"${runtime_env[@]}" "$bin_dir/ags" archives >/dev/null
 
 checkpoint_work="$tmp/checkpoint-work"
 checkpoint_codex_home="$tmp/checkpoint-codex-home"
@@ -235,7 +242,7 @@ printf '%s\n' \
 ) >/dev/null
 printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$checkpoint_session_id" |
     "${runtime_env[@]}" CODEX_HOME="$checkpoint_codex_home" \
-        "$bin_dir/casr" checkpoint hook
+        "$bin_dir/ags" hook
 find "$vault/codex" -maxdepth 1 -type f \
     -name '*@installer-hook.checkpoint.tar.gz.age' | grep -q .
 [[ -z "$(find "$home/.local/state/ags/pending" -type f -name '*.json' -print -quit)" ]]
@@ -252,22 +259,23 @@ fi
 jq -e --arg vault "$custom_vault" '.local_path == $vault' "$config" >/dev/null
 interrupted_home="$tmp/interrupted-home"
 interrupted_bin="$tmp/interrupted-bin"
-interrupted_backup="$interrupted_bin/.casr.rollback.recovery"
-interrupted_stage="$interrupted_bin/.casr.install.recovery"
-interrupted_journal="$interrupted_bin/.casr.install-transaction.json"
+interrupted_backup="$interrupted_bin/.ags.rollback.recovery"
+interrupted_stage="$interrupted_bin/.ags.install.recovery"
+interrupted_journal="$interrupted_bin/.ags.install-transaction.json"
 interrupted_missing_artifact="$tmp/interrupted-missing.tar.xz"
 mkdir -p "$interrupted_home" "$interrupted_bin"
-printf '%s\n' '#!/bin/sh' 'printf "recovered-casr\n"' \
+printf '%s\n' '#!/bin/sh' 'printf "recovered-ags\n"' \
     > "$interrupted_backup"
 chmod 755 "$interrupted_backup"
 interrupted_previous_sha="$(test_sha256_file "$interrupted_backup")"
 interrupted_candidate_sha="$(test_sha256_file "$binary")"
 jq -n \
-    --arg binary "$interrupted_bin/casr" \
+    --arg binary "$interrupted_bin/ags" \
     --arg candidate_sha "$interrupted_candidate_sha" \
     --arg stage "$interrupted_stage" \
     --arg previous_sha "$interrupted_previous_sha" \
     --arg backup "$interrupted_backup" \
+    '{
       schema:2,
       managed_by:"ags-installer",
       binary_path:$binary,
@@ -285,7 +293,7 @@ if env HOME="$interrupted_home" \
     XDG_STATE_HOME="$interrupted_home/.local/state" \
     PATH="$offline_guard_bin:$interrupted_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-ags.1 \
+    VERSION="$smoke_version" \
     "$project_root/install.sh" --offline "$interrupted_missing_artifact" \
     --dest "$interrupted_bin" --no-verify \
     > "$tmp/interrupted.out" 2> "$tmp/interrupted.err"; then
@@ -300,9 +308,9 @@ if ! grep -Fq 'Restored the previous binary after interrupted activation' \
     exit 1
 fi
 grep -Fq 'Offline tarball not found' "$tmp/interrupted.err"
-[[ "$("$interrupted_bin/casr")" == recovered-casr ]]
+[[ "$("$interrupted_bin/ags")" == recovered-ags ]]
 [[ "$interrupted_previous_sha" == "$(
-    test_sha256_file "$interrupted_bin/casr"
+    test_sha256_file "$interrupted_bin/ags"
 )" ]]
 [[ ! -e "$interrupted_journal" && ! -e "$interrupted_backup" ]]
 
@@ -355,7 +363,7 @@ if env HOME="$rmux_partial_home" \
     XDG_STATE_HOME="$rmux_partial_home/.local/state" \
     PATH="$offline_guard_bin:$rmux_partial_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-ags.1 \
+    VERSION="$smoke_version" \
     "$project_root/install.sh" --offline "$rmux_partial_missing" \
     --dest "$rmux_partial_bin" --no-verify \
     > "$tmp/rmux-partial.out" 2> "$tmp/rmux-partial.err"; then
@@ -377,9 +385,9 @@ rmux_resume_home="$tmp/rmux-resume-home"
 rmux_resume_bin="$tmp/rmux-resume-bin"
 rmux_resume_helper="$rmux_resume_bin/libexec/rmux/rmux"
 rmux_resume_journal="$rmux_resume_bin/.rmux-install-transaction.json"
-rmux_resume_binary_journal="$rmux_resume_bin/.casr.install-transaction.json"
-rmux_resume_binary_backup="$rmux_resume_bin/.casr.rollback.recovery"
-rmux_resume_binary_stage="$rmux_resume_bin/.casr.install.recovery"
+rmux_resume_binary_journal="$rmux_resume_bin/.ags.install-transaction.json"
+rmux_resume_binary_backup="$rmux_resume_bin/.ags.rollback.recovery"
+rmux_resume_binary_stage="$rmux_resume_bin/.ags.install.recovery"
 rmux_resume_missing="$tmp/rmux-resume-missing.tar.xz"
 mkdir -p "$rmux_resume_home" "$(dirname "$rmux_resume_helper")"
 rmux_resume_destinations=(
@@ -415,23 +423,23 @@ write_rmux_recovery_journal \
     "${rmux_resume_previous_shas[1]}" \
     "${rmux_resume_previous_shas[2]}" \
     recovery
-printf '%s\n' '#!/bin/sh' 'printf "previous-casr\n"' \
+printf '%s\n' '#!/bin/sh' 'printf "previous-ags\n"' \
     > "$rmux_resume_binary_backup"
 chmod 755 "$rmux_resume_binary_backup"
-install -m 0755 "$binary" "$rmux_resume_bin/casr"
+install -m 0755 "$binary" "$rmux_resume_bin/ags"
 rmux_resume_binary_candidate_sha="$(
-    test_sha256_file "$rmux_resume_bin/casr"
+    test_sha256_file "$rmux_resume_bin/ags"
 )"
 rmux_resume_binary_previous_sha="$(
     test_sha256_file "$rmux_resume_binary_backup"
 )"
 jq -n \
-    --arg binary "$rmux_resume_bin/casr" \
+    --arg binary "$rmux_resume_bin/ags" \
     --arg candidate_sha "$rmux_resume_binary_candidate_sha" \
     --arg stage "$rmux_resume_binary_stage" \
     --arg previous_sha "$rmux_resume_binary_previous_sha" \
     --arg backup "$rmux_resume_binary_backup" \
-        0000000000000000000000000000000000000000000000000000000000000000 '{
+    '{
       schema:2,
       managed_by:"ags-installer",
       binary_path:$binary,
@@ -449,18 +457,18 @@ env HOME="$rmux_resume_home" \
     XDG_STATE_HOME="$rmux_resume_home/.local/state" \
     PATH="$offline_guard_bin:$rmux_resume_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-ags.1 \
+    VERSION="$smoke_version" \
     "$project_root/install.sh" --offline "$rmux_resume_missing" \
     --dest "$rmux_resume_bin" --no-verify \
     > "$tmp/rmux-resume.out" 2> "$tmp/rmux-resume.err"
 grep -Fq 'Recovering interrupted RMUX installation' \
     "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-grep -Fq 'Resuming the interrupted casr installation' \
+grep -Fq 'Resuming the interrupted ags installation' \
     "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
-grep -Fq 'Finishing the recovered casr transaction' \
+grep -Fq 'Finishing the recovered ags transaction' \
     "$tmp/rmux-resume.out" "$tmp/rmux-resume.err"
 [[ ! -e "$rmux_resume_missing" && ! -e "$offline_network_marker" ]]
-[[ "$(test_sha256_file "$rmux_resume_bin/casr")" == \
+[[ "$(test_sha256_file "$rmux_resume_bin/ags")" == \
    "$rmux_resume_binary_candidate_sha" ]]
 for index in 0 1 2; do
     [[ "$(test_sha256_file "${rmux_resume_destinations[$index]}")" == \
@@ -482,7 +490,7 @@ env HOME="$unmanaged_home" \
     XDG_STATE_HOME="$unmanaged_home/.local/state" \
     PATH="$offline_guard_bin:$unmanaged_bin:$PATH" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-ags.1 \
+    VERSION="$smoke_version" \
     "$project_root/install.sh" --offline "$artifact" --dest "$unmanaged_bin" \
     --no-verify --quiet > "$tmp/unmanaged.out" 2> "$tmp/unmanaged.err"
 grep -Fqx 'unmanaged' "$unmanaged_bin/ags"
@@ -504,7 +512,7 @@ env HOME="$symlink_home" \
     XDG_STATE_HOME="$symlink_home/.local/state" \
     PATH="$symlink_tools:$symlink_bin:/usr/bin:/bin" \
     OFFLINE_NETWORK_MARKER="$offline_network_marker" \
-    VERSION=v0.3.0-ags.1 \
+    VERSION="$smoke_version" \
     "$project_root/install.sh" --offline "$artifact" --dest "$symlink_bin" \
     --no-verify > "$tmp/symlink.out" 2> "$tmp/symlink.err"
 [[ ! -e "$skill_outside/SKILL.md" ]]
@@ -538,37 +546,32 @@ if (( EUID == 0 )); then
     grep -Fq -- '--system cannot run as root' "$tmp/system-root.err"
 fi
 
-# A wrapper written before the agsx name was dropped must still be recognised as
-# the installer's own. `# ags-installer-` is not a substring of
-# `# agsx-installer-`, so a single-marker check reads those machines as
-# hand-written, preserves the file, and never updates it again — which would
-# strand every installation predating that rename.
-cat > "$bin_dir/ags" <<'EOF'
+# 改名之前 ags 是个四行的壳，真正的二进制叫 casr。二进制现在自己就叫 ags，
+# 也就是说新二进制要落的位置，正是那个壳待着的位置——每一台装过旧版的机器都长这样，
+# 所以这条路必须能走通：壳被换成二进制，旧的 casr 被收走。
+#
+# 能覆盖的前提是目标得是个普通文件（见 install.sh 里那道 non-regular 闸门）。壳是
+# 普通文件，所以会被备份后替换。
+cat > "$bin_dir/ags" <<'LEGACY_WRAPPER'
 #!/bin/sh
-# agsx-installer-checkpoint-wrapper
-script_dir=$(CDPATH= cd -P -- "$(dirname -- "$0")" && pwd)
-exec "$script_dir/casr" checkpoint "$@"
-EOF
+# ags-installer-checkpoint-wrapper
+exec "$(dirname -- "$0")/casr" checkpoint "$@"
+LEGACY_WRAPPER
 chmod 0755 "$bin_dir/ags"
+install -m 0755 "$binary" "$bin_dir/casr"
 if ! run_installer > "$tmp/legacy-wrapper.out" 2> "$tmp/legacy-wrapper.err"; then
     printf 'installer run over a pre-rename wrapper failed:\n' >&2
     cat "$tmp/legacy-wrapper.err" >&2
     exit 1
 fi
-if grep -Fq 'agsx-installer-checkpoint-wrapper' "$bin_dir/ags"; then
-    printf 'installer left a pre-rename wrapper in place instead of adopting it\n' >&2
+if grep -Fq installer-checkpoint-wrapper "$bin_dir/ags"; then
+    printf 'installer left the old wrapper in place instead of replacing it\n' >&2
     exit 1
 fi
-grep -Fq '# ags-installer-checkpoint-wrapper' "$bin_dir/ags"
-
-# A wrapper the installer did not write is still left alone.
-printf '#!/bin/sh\n# mine\nexec true\n' > "$bin_dir/ags"
-chmod 0755 "$bin_dir/ags"
-if ! run_installer > "$tmp/unmanaged-wrapper.out" 2> "$tmp/unmanaged-wrapper.err"; then
-    printf 'installer run over an unmanaged wrapper failed:\n' >&2
-    cat "$tmp/unmanaged-wrapper.err" >&2
+"$bin_dir/ags" --version | grep -Fq ags
+if [ -e "$bin_dir/casr" ]; then
+    printf 'installer left the old casr binary behind\n' >&2
     exit 1
 fi
-grep -Fqx '# mine' "$bin_dir/ags"
 
 printf 'ags install smoke passed (%s/%s)\n' "$platform" "$(uname -m)"

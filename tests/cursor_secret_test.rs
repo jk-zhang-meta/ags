@@ -61,7 +61,9 @@ fn seed(root: &Path) {
 /// Run a `casr` subcommand against a seeded `cursor-agent` home, with the
 /// session store pointed somewhere disposable.
 fn run(args: &[&str], root: &Path, store: &Path) -> String {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_casr"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ags"));
+    // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。
+    cmd.arg("convert");
     cmd.args(args)
         .env("CURSOR_CONFIG_DIR", root)
         .env("CURSOR_DATA_DIR", root)

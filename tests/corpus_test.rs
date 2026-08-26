@@ -19,8 +19,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use casr::ir::{Body, CapsuleKind, SessionIr};
-use casr::providers::{claude_code_ir, codex_ir};
+use ags::ir::{Body, CapsuleKind, SessionIr};
+use ags::providers::{claude_code_ir, codex_ir};
 
 /// Collect up to `limit` session files under the corpus named by `env_var`.
 ///
@@ -714,7 +714,7 @@ fn assert_summaries_derivable(
         sessions += 1;
         events += ir.events.len() as u64;
 
-        let summary = casr::responses::EventSummary::of_ir(&ir);
+        let summary = ags::responses::EventSummary::of_ir(&ir);
         let mut bucketed = 0u64;
         for (kind, count) in summary.counts() {
             let count = count.unwrap_or_else(|| {
@@ -820,8 +820,8 @@ fn assert_live_diverges_from_all(
     for path in &files {
         let Ok(ir) = read(path) else { continue };
         sessions += 1;
-        let all = casr::responses::EventSummary::of_ir(&ir);
-        let live = casr::responses::EventSummary::of_live(&ir);
+        let all = ags::responses::EventSummary::of_ir(&ir);
+        let live = ags::responses::EventSummary::of_live(&ir);
         if all == live {
             identical += 1;
         }
@@ -899,9 +899,9 @@ fn claude_corpus_live_summary_diverges_from_summary() {
 mod into_openclaw {
     use std::path::PathBuf;
 
-    use casr::providers::claude_code::ClaudeCode;
-    use casr::providers::openclaw::OpenClaw;
-    use casr::providers::{Provider, WriteOptions};
+    use ags::providers::claude_code::ClaudeCode;
+    use ags::providers::openclaw::OpenClaw;
+    use ags::providers::{Provider, WriteOptions};
 
     use super::{corpus_files, is_claude_transcript};
 

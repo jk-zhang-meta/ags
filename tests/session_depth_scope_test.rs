@@ -37,7 +37,10 @@ use tempfile::TempDir;
 /// the same class of reason: casr subcommands write relative to the cwd.
 fn casr_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
-    let mut cmd = Command::cargo_bin("casr").expect("casr binary should be built");
+    let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
+    // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
+    // 而不是每个用例里：这个文件测的全是转换。
+    cmd.arg("convert");
     cmd.env("CLAUDE_HOME", tmp.path().join("claude"))
         .env("CODEX_HOME", tmp.path().join("codex"))
         .env("GEMINI_HOME", tmp.path().join("gemini"))

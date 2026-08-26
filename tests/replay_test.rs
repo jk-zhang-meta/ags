@@ -1,6 +1,6 @@
 //! Replay resolution against a real local session corpus.
 //!
-//! [`casr::replay::resolve`] answers "what should the target model be shown",
+//! [`ags::replay::resolve`] answers "what should the target model be shown",
 //! and the four mechanisms it folds — compaction, rollback, abort, forks — are
 //! all shapes that only occur at scale. A fixture proves the fold runs; only a
 //! corpus proves it does not eat the session, which is the failure mode every
@@ -21,9 +21,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use casr::ir::{Body, SessionIr, Visibility};
-use casr::providers::{claude_code_ir, codex_ir};
-use casr::replay::{ExclusionReason, ReplayPlan, resolve};
+use ags::ir::{Body, SessionIr, Visibility};
+use ags::providers::{claude_code_ir, codex_ir};
+use ags::replay::{ExclusionReason, ReplayPlan, resolve};
 
 /// Collect up to `limit` session files under the corpus named by `env_var`.
 fn corpus_files(env_var: &str, limit: usize) -> Vec<PathBuf> {

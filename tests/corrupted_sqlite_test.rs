@@ -6,9 +6,9 @@
 
 use std::fs;
 
-use casr::providers::Provider;
-use casr::providers::cursor::Cursor;
-use casr::providers::opencode::OpenCode;
+use ags::providers::Provider;
+use ags::providers::cursor::Cursor;
+use ags::providers::opencode::OpenCode;
 
 /// Create a valid SQLite database with custom SQL.
 fn create_sqlite_db(path: &std::path::Path, sql: &str) {

@@ -18,7 +18,7 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::providers::{Provider, amp::Amp};
+use ags::providers::{Provider, amp::Amp};
 
 static AMP_ENV: test_env::EnvLock = test_env::EnvLock;
 

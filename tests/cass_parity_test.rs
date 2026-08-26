@@ -12,14 +12,14 @@
 
 use std::path::{Path, PathBuf};
 
-use casr::model::{
+use ags::model::{
     CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
     parse_timestamp, truncate_title,
 };
-use casr::providers::Provider;
-use casr::providers::claude_code::ClaudeCode;
-use casr::providers::codex::Codex;
-use casr::providers::gemini::Gemini;
+use ags::providers::Provider;
+use ags::providers::claude_code::ClaudeCode;
+use ags::providers::codex::Codex;
+use ags::providers::gemini::Gemini;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

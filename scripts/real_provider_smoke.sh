@@ -26,7 +26,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Always default to the project-local debug binary so smoke runs match the
 # current source tree even when CARGO_TARGET_DIR points elsewhere.
-CASR="${CASR_BIN:-$PROJECT_ROOT/target/debug/casr}"
+# 二进制改名成 `ags` 之后，跨 Agent 转换那套收在 `ags convert` 底下——`list` 和
+# `resume` 两边都要用，而日常敲的是会话运行时那边。所以这里是个数组，每次调用都
+# 带上前缀；下面所有 `"${CASR[@]}"` 就是原来的 `"$CASR"`。
+CASR_PATH="${CASR_BIN:-$PROJECT_ROOT/target/debug/ags}"
+CASR=("$CASR_PATH" convert)
 VERBOSE="${VERBOSE:-0}"
 SMOKE_ACCEPT_TIMEOUT="${SMOKE_ACCEPT_TIMEOUT:-8}"
 SMOKE_WORKSPACE="${SMOKE_WORKSPACE:-/data/projects}"
@@ -202,7 +206,7 @@ ensure_prereqs() {
         echo "ERROR: timeout is required."
         exit 1
     fi
-    if [[ "$SMOKE_REBUILD" == "1" || ! -x "$CASR" ]]; then
+    if [[ "$SMOKE_REBUILD" == "1" || ! -x "$CASR_PATH" ]]; then
         banner "Building casr"
         if command -v rch > /dev/null 2>&1; then
             (cd "$PROJECT_ROOT" && rch exec -- cargo build --quiet)
@@ -210,8 +214,8 @@ ensure_prereqs() {
             (cd "$PROJECT_ROOT" && cargo build --quiet)
         fi
     fi
-    if [[ ! -x "$CASR" ]]; then
-        echo "ERROR: casr binary not found at $CASR"
+    if [[ ! -x "$CASR_PATH" ]]; then
+        echo "ERROR: ags binary not found at $CASR_PATH"
         exit 1
     fi
 }
@@ -277,7 +281,7 @@ source_session_for_alias() {
     esac
 
     # Also query casr list (workspace-scoped) and try candidates in recency order.
-    run_cmd "$prefix" timeout 25s "$CASR" --json list --provider "$slug" --workspace "$SMOKE_WORKSPACE" --limit 25
+    run_cmd "$prefix" timeout 25s "${CASR[@]}" --json list --provider "$slug" --workspace "$SMOKE_WORKSPACE" --limit 25
     if [[ "$LAST_EXIT" -eq 0 ]]; then
         while IFS= read -r sid; do
             [[ -n "$sid" ]] && candidate_ids+=("$sid")
@@ -295,7 +299,7 @@ source_session_for_alias() {
 
         local probe_prefix="$ARTIFACTS_DIR/validate_${alias}_${probe_idx}"
         probe_idx=$((probe_idx + 1))
-        run_cmd "$probe_prefix" "$CASR" --json resume "$probe_target" "$sid" --source "$alias" --dry-run
+        run_cmd "$probe_prefix" "${CASR[@]}" --json resume "$probe_target" "$sid" --source "$alias" --dry-run
         if [[ "$LAST_EXIT" -ne 0 ]]; then
             log "Rejected source candidate for $alias (dry-run probe failed): $sid"
             continue
@@ -416,7 +420,7 @@ run_pair() {
 
     run_cmd \
         "$pair_dir/convert" \
-        "$CASR" --json resume "$dst" "$source_session" --source "$src" --force
+        "${CASR[@]}" --json resume "$dst" "$source_session" --source "$src" --force
     local convert_exit="$LAST_EXIT"
     if [[ "$convert_exit" -ne 0 ]]; then
         status_fail "$pair conversion failed"
@@ -439,7 +443,7 @@ run_pair() {
     fi
 
     if [[ "$dst" == "cc" ]]; then
-        run_cmd "$pair_dir/target_info" "$CASR" --json info "$target_session"
+        run_cmd "$pair_dir/target_info" "${CASR[@]}" --json info "$target_session"
         if [[ "$LAST_EXIT" -eq 0 ]]; then
             target_workspace="$(jq -r '.workspace // empty' "$LAST_STDOUT_FILE")"
         fi
@@ -488,7 +492,7 @@ print_matrix() {
 
 main() {
     echo -e "${BOLD}casr real-provider smoke harness${RESET}"
-    echo "Binary: $CASR"
+    echo "Binary: $CASR_PATH"
     echo "Artifacts: $ARTIFACTS_DIR"
     echo "Timeout: ${SMOKE_ACCEPT_TIMEOUT}s"
     echo ""

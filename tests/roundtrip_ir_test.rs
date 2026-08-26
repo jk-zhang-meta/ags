@@ -26,16 +26,16 @@
 //! construction, because the target session is a new session.
 //!
 //! Same-agent must be exactly equal. Cross-agent must lose the capsules
-//! [`casr::ir::Capsule::fits`] predicted and account for everything else, which
+//! [`ags::ir::Capsule::fits`] predicted and account for everything else, which
 //! is why the cross-agent tests report a tally rather than assert a boolean.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use casr::budget::ContextBudget;
-use casr::ir::{Block, Body, Fidelity, Loss, LossKind, Role, SessionIr, ToolInput, ToolOutcome};
-use casr::providers::{
+use ags::budget::ContextBudget;
+use ags::ir::{Block, Body, Fidelity, Loss, LossKind, Role, SessionIr, ToolInput, ToolOutcome};
+use ags::providers::{
     Provider, WriteOptions, claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write,
 };
 
@@ -867,7 +867,7 @@ fn codex_write_session_ir_lands_where_codex_looks_for_it() {
     let _guard = EnvGuard::set("CODEX_HOME", home.path());
 
     let source = synthetic(CODEX_ROLLOUT);
-    let written = casr::providers::codex::Codex
+    let written = ags::providers::codex::Codex
         .write_session_ir(
             &source,
             &WriteOptions { force: false },
@@ -917,7 +917,7 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
 
     let source =
         claude_code_ir::read(&fixture("cc_real_world_sanitized.jsonl")).expect("fixture parses");
-    let written = casr::providers::claude_code::ClaudeCode
+    let written = ags::providers::claude_code::ClaudeCode
         .write_session_ir(
             &source,
             &WriteOptions { force: false },
@@ -930,7 +930,7 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
     let expected_dir =
         home.path()
             .join("projects")
-            .join(casr::providers::claude_code::project_dir_key(
+            .join(ags::providers::claude_code::project_dir_key(
                 source.workspace.cwd.as_deref().unwrap_or(Path::new("/tmp")),
             ));
     assert_eq!(path.parent(), Some(expected_dir.as_path()));
@@ -961,7 +961,7 @@ fn claude_write_session_ir_lands_in_the_project_directory() {
 /// Both writers are the inverse of their own reader, and both single-hop suites
 /// said so, and the chain still deleted an event. The input that broke it is one
 /// no *corpus* session holds and one only this crate's own writer produces:
-/// [`casr::ir::Body::Reasoning`] whose readable words are in `summary` and which
+/// [`ags::ir::Body::Reasoning`] whose readable words are in `summary` and which
 /// carries no capsule at all. Real Codex never writes that: of 106,289 corpus
 /// reasoning items, 106,255 keep their substance in `encrypted_content` and the
 /// 34 that carry a `summary` fill it with the empty string. So
@@ -1017,7 +1017,7 @@ fn readable_reasoning_survives_a_round_trip_through_codex() {
     .expect("hop two renders");
     let back = reparse(&rendered.lines, claude_code_ir::read);
 
-    let report = casr::compare::compare(&mid, &back, "anthropic");
+    let report = ags::compare::compare(&mid, &back, "anthropic");
     assert!(
         report.is_clean(),
         "hop two lost something nothing predicted: {}",
@@ -1094,7 +1094,7 @@ fn an_empty_reasoning_summary_is_still_nothing_to_carry() {
     assert_eq!(back.model_visible().len(), 2, "{:?}", items(&back));
     assert_eq!(rendered.fidelity, Fidelity::ContextComplete);
     assert!(rendered.losses.is_empty(), "{:?}", rendered.losses);
-    let report = casr::compare::compare(&ir, &back, "anthropic");
+    let report = ags::compare::compare(&ir, &back, "anthropic");
     assert!(report.is_clean(), "{}", report.damage_detail());
     assert_eq!(report.added_events, 0);
 }
@@ -1105,24 +1105,24 @@ fn conformance_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn bare_event(id: &str, body: Body) -> casr::ir::Event {
-    casr::ir::Event {
+fn bare_event(id: &str, body: Body) -> ags::ir::Event {
+    ags::ir::Event {
         id: id.to_string(),
         parent: None,
-        branch: casr::ir::Branch::Main,
+        branch: ags::ir::Branch::Main,
         turn: None,
         ts: None,
-        visibility: casr::ir::Visibility::Model,
+        visibility: ags::ir::Visibility::Model,
         body,
         capsules: Vec::new(),
-        source: casr::ir::SourceRef {
+        source: ags::ir::SourceRef {
             line: 1,
             sha256: String::new(),
         },
     }
 }
 
-fn message_event(id: &str, role: Role, text: &str) -> casr::ir::Event {
+fn message_event(id: &str, role: Role, text: &str) -> ags::ir::Event {
     bare_event(
         id,
         Body::Message {
@@ -1134,7 +1134,7 @@ fn message_event(id: &str, role: Role, text: &str) -> casr::ir::Event {
     )
 }
 
-fn reasoning_event(id: &str, summary: Vec<String>) -> casr::ir::Event {
+fn reasoning_event(id: &str, summary: Vec<String>) -> ags::ir::Event {
     bare_event(
         id,
         Body::Reasoning {

@@ -1,7 +1,7 @@
-# casr
+# ags
 
 <div align="center">
-  <img src="casr_illustration.webp" alt="casr - Cross Agent Session Resumer">
+  <img src="casr_illustration.webp" alt="ags - Cross Agent Session Resumer">
 </div>
 
 Cross Agent Session Resumer for coding agents: resume a session created in one provider (Claude Code, Codex, Gemini, and more) using a different provider by converting through a canonical session model.
@@ -22,41 +22,41 @@ That installer is the primary distribution path. It handles platform detection, 
 
 **The Problem**: AI coding sessions are siloed by provider. A useful Codex session cannot be resumed directly in Claude Code, and vice versa.
 
-**The Solution**: `casr` discovers a session across installed providers, reads it into a canonical IR, writes a verified native session for supported targets, and prints the exact resume command.
+**The Solution**: `ags` discovers a session across installed providers, reads it into a canonical IR, writes a verified native session for supported targets, and prints the exact resume command.
 
-### Why Use casr?
+### Why Use ags?
 
 | Feature | What It Does |
 |---|---|
-| Cross-provider resume | `casr cc resume <codex-session-id>` and similar conversions in one command |
+| Cross-provider resume | `ags convert cc resume <codex-session-id>` and similar conversions in one command |
 | Canonical IR | Normalizes provider formats into a common model, then exports back to native format |
 | Native-format writers | Produces plausible provider-native session files, not intermediate-only exports |
 | Safety-first writes | Atomic temp-then-rename writes, conflict detection, optional `.bak` backup with `--force` |
 | Provider auto-detection | Finds which provider owns a session ID without user guesswork |
 | Verification step | Re-reads written output to catch writer bugs before you try to resume |
 | Machine-friendly output | `--json` mode for scripts and automation |
-| Encrypted checkpoints | Save, restore, delete, and synchronize encrypted Codex/Claude records with `casr checkpoint` |
+| Encrypted checkpoints | Save, restore, delete, and synchronize encrypted Codex/Claude records with `ags checkpoint` |
 | Debuggability | `--verbose`, `--trace`, and structured tracing with `RUST_LOG` |
 
 ## Quick Example
 
 ```bash
 # 1) See what providers are available
-casr providers
+ags convert providers
 
 # 2) Find a session from any provider
-casr list --limit 20 --sort date
+ags convert list --limit 20 --sort date
 
 # 3) Inspect a single session
-casr info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+ags convert info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
 # 4) Convert that session to Claude Code format
-casr cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+ags convert cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
 
 # ergonomic shorthand (auto-detects source provider from the session ID)
-casr -cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # open in Claude Code
-casr -cod 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Codex
-casr -gmi 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Gemini CLI
+ags convert -cc 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # open in Claude Code
+ags convert -cod 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Codex
+ags convert -gmi 019c3eae-94c3-7d73-9b2a-9edb18f1563b  # open in Gemini CLI
 
 # 5) Resume in Claude Code using the generated ID
 claude --resume <new-session-id>
@@ -341,9 +341,9 @@ management.
 4. **Permissive conversion over brittle strictness**: warnings for imperfect input when conversion is still useful.
 5. **Observability by default**: rich logs and actionable errors for every pipeline stage.
 
-## How casr Compares
+## How ags Compares
 
-| Capability | casr | Manual copy/paste | Read-only session search tools | Ad-hoc one-off scripts |
+| Capability | ags | Manual copy/paste | Read-only session search tools | Ad-hoc one-off scripts |
 |---|---|---|---|---|
 | Convert sessions between providers | Yes | No | No | Partial |
 | Provider-native output files | Yes | No | No | Usually brittle |
@@ -375,14 +375,14 @@ management.
 | Grok Build | `grk` | Yes | Yes* | `grok --resume <session-id>` |
 
 Providers marked `Write: No` are valid sources and can resume their existing
-sessions, but casr refuses to target them—even with `--force` or `--dry-run`—
+sessions, but ags refuses to target them—even with `--force` or `--dry-run`—
 until a vendor-supported, natively resumable import path is verified.
 
 Notes:
 - Initial core focus is Claude Code, Codex, and Gemini CLI.
 - Additional providers are implemented through the same `Provider` trait model.
 - Antigravity target writes require Python and Google's official
-  `google-antigravity>=0.1.9` SDK. casr replays source user/model turns through
+  `google-antigravity>=0.1.9` SDK. ags replays source user/model turns through
   the SDK's local harness and a loopback deterministic model endpoint, then
   reopens the generated SQLite conversation through the SDK and verifies every
   stored step. `agy` resumes that native database directly. The public SDK has
@@ -392,13 +392,13 @@ Notes:
   `AGS_ANTIGRAVITY_PYTHON` when the SDK is installed in a non-default Python
   environment.
 - `OpenCode` target writes require its official `opencode` CLI in `PATH` (or
-  `OPENCODE_BIN`). casr delegates import and rollback to the vendor CLI and
+  `OPENCODE_BIN`). ags delegates import and rollback to the vendor CLI and
   never edits `opencode.db` directly.
 - Aider target writes create a dedicated
   `.aider.chat.history.ags-<session-id>.md` and launch Aider with that exact
   file. They never append to the shared `.aider.chat.history.md`.
 - Grok target writes require the official `grok` CLI in `PATH` (or `GROK_BIN`).
-  casr writes Grok's documented authoritative `summary.json` and
+  ags writes Grok's documented authoritative `summary.json` and
   `updates.jsonl`, then requires the vendor CLI to discover and export the
   session. Failed verification is rolled back through `grok sessions delete`;
   derived history and search indexes remain owned by Grok.
@@ -413,7 +413,7 @@ Notes:
   assistant note with a visible `ags:v1:<role>` label, so the text and labels
   survive but the original user/system/tool role semantics do not.
 - Cline target writes require the official `cline` CLI in `PATH` (or
-  `CLINE_BIN`). casr uses Cline's local Hub `client.register` →
+  `CLINE_BIN`). ags uses Cline's local Hub `client.register` →
   `session.create` → official `session.messages` read-back lifecycle and uses
   `session.delete` for rollback; it never edits Cline's database or indexes
   directly. The write is unavailable when the official CLI is not installed.
@@ -458,7 +458,7 @@ High-value installer flags:
 bash install.sh --verify
 # AGS configuration is per-user, so do not run this example with sudo.
 bash install.sh --system --easy-mode --yes
-bash install.sh --offline ./casr-x86_64-unknown-linux-musl.tar.xz
+bash install.sh --offline ./ags-x86_64-unknown-linux-musl.tar.xz
 bash install.sh --no-configure --no-skill
 ```
 
@@ -470,14 +470,14 @@ Run `bash install.sh --help` for the full option set.
 git clone -b ags https://github.com/jk-zhang-meta/ags
 cd ags
 cargo build --release
-./target/release/casr --help
+./target/release/ags --help
 ```
 
 ### Alternative: Cargo Local Install
 
 ```bash
 cargo install --path .
-casr --help
+ags --help
 ```
 
 ### Alternative: Development Mode
@@ -490,22 +490,22 @@ cargo run -- --help
 
 1. Confirm provider detection.
 ```bash
-casr providers
+ags convert providers
 ```
 
 2. List discoverable sessions.
 ```bash
-casr list --sort date --limit 50
+ags convert list --sort date --limit 50
 ```
 
 3. Inspect the source session.
 ```bash
-casr info <session-id>
+ags convert info <session-id>
 ```
 
 4. Convert to your target provider.
 ```bash
-casr <target-alias> resume <session-id>
+ags <target-alias> resume <session-id>
 ```
 
 5. Resume in target provider.
@@ -524,25 +524,25 @@ Global flags:
 --dry-run                 # Show what would happen without writing
 --force                   # Overwrite existing target session (creates .bak backup)
 --json                    # Structured JSON output
---verbose                 # Debug-level logging (casr=debug)
---trace                   # Trace-level logging (casr=trace)
+--verbose                 # Debug-level logging (ags=debug)
+--trace                   # Trace-level logging (ags=trace)
 --source <alias_or_path>  # Explicit source provider alias or direct session path
 --enrich                  # Add optional synthetic context/orientation messages
 ```
 
-### `casr <target> resume <session-id>`
+### `ags <target> resume <session-id>`
 
 Convert a source session into target provider format and print the target resume command.
 
 ```bash
-casr cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
-casr claude resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # standard name fallback
-casr cod resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
-casr codex resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
-casr gmi resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
-casr gemini resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
-casr cc resume <session-id> --force
-casr cc resume <session-id> --json
+ags convert cc resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+ags claude resume 019c3eae-94c3-7d73-9b2a-9edb18f1563b   # standard name fallback
+ags convert cod resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
+ags codex resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --dry-run
+ags convert gmi resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source cc
+ags gemini resume 40f2cb68-fed7-4cee-83de-2b63ba9b7813 --source claude
+ags convert cc resume <session-id> --force
+ags convert cc resume <session-id> --json
 ```
 
 **Context budget (opt-in).** By default nothing is trimmed: the whole session
@@ -567,57 +567,57 @@ either: reasoning that belongs to a turn the token cap removes goes with that
 turn, and is reported as a reasoning loss when it does.
 
 `--keep-reasoning` is still accepted and now names the default, so an existing
-`casr` command line keeps working and keeps getting what it asked for. Passing
+`ags` command line keeps working and keeps getting what it asked for. Passing
 it together with `--drop-reasoning` is refused.
 
 `--dry-run` grades the conversion it describes: the same track, the same budget,
 the same losses the real run would report. The one thing it cannot report is
 `verified_fidelity`, because nothing was written to read back.
 
-### `casr list`
+### `ags convert list`
 
 List sessions across installed providers.
 
 ```bash
-casr list
-casr list --provider codex
-casr list --workspace /data/projects/myapp
-casr list --limit 100 --sort messages
+ags convert list
+ags convert list --provider codex
+ags convert list --workspace /data/projects/myapp
+ags convert list --limit 100 --sort messages
 
 # default behavior (no args): current workspace only, top 10, styled table output
-casr list
+ags convert list
 ```
 
-### `casr info <session-id>`
+### `ags convert info <session-id>`
 
 Show non-converting session details.
 
 ```bash
-casr info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
-casr info 019c3eae-94c3-7d73-9b2a-9edb18f1563b --json
+ags convert info 019c3eae-94c3-7d73-9b2a-9edb18f1563b
+ags convert info 019c3eae-94c3-7d73-9b2a-9edb18f1563b --json
 ```
 
-### `casr providers`
+### `ags convert providers`
 
 Show provider detection and installation evidence.
 
 ```bash
-casr providers
+ags convert providers
 ```
 
-### `casr completions <shell>`
+### `ags convert completions <shell>`
 
 Generate shell completions.
 
 ```bash
-casr completions bash > /tmp/casr.bash
-casr completions zsh > "${fpath[1]}/_casr"
-casr completions fish > ~/.config/fish/completions/casr.fish
+ags convert completions bash > /tmp/ags.bash
+ags convert completions zsh > "${fpath[1]}/_ags"
+ags convert completions fish > ~/.config/fish/completions/ags.fish
 ```
 
 ## Configuration
 
-`casr` is primarily configured by environment variables.
+`ags` is primarily configured by environment variables.
 
 ```bash
 # Optional provider home overrides for non-standard locations
@@ -628,13 +628,13 @@ export CURSOR_HOME="$HOME/.config/Cursor"
 export CLINE_HOME="$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev"
 export AIDER_HOME="$HOME/.aider"
 export OPENCODE_HOME="$HOME/.opencode"
-# Amp has no casr override: its data dir moves only with XDG_DATA_HOME.
+# Amp has no ags override: its data dir moves only with XDG_DATA_HOME.
 export XDG_DATA_HOME="$HOME/.local/share"
 
 # Logging verbosity (alternative to --verbose / --trace)
-export RUST_LOG="casr=debug"
+export RUST_LOG="ags=debug"
 # or:
-export RUST_LOG="casr=trace"
+export RUST_LOG="ags=trace"
 ```
 
 ### Which variable belongs to whom
@@ -642,18 +642,18 @@ export RUST_LOG="casr=trace"
 Two different kinds of variable appear above and below, and mixing them up is
 how you end up reading the wrong directory:
 
-- **casr's own overrides** aim casr at a tree without touching the agent. Most
-  of the `*_HOME` names are casr's alone — the agent does not read them.
-- **the agent's own variables**, which casr also honours, so that relocating an
-  agent the supported way does not hide its sessions from casr.
+- **ags's own overrides** aim ags at a tree without touching the agent. Most
+  of the `*_HOME` names are ags's alone — the agent does not read them.
+- **the agent's own variables**, which ags also honours, so that relocating an
+  agent the supported way does not hide its sessions from ags.
 
-Where both exist, casr's override wins, so pointing casr somewhere never
+Where both exist, ags's override wins, so pointing ags somewhere never
 disturbs the agent the rest of your shell talks to. An empty value counts as
 unset. Note the semantics differ: several of the agents' variables name a *home
-directory* that the agent then appends a subdirectory to, so casr appends the
+directory* that the agent then appends a subdirectory to, so ags appends the
 same one.
 
-| Provider | casr's own override | The agent's own variable, also honoured |
+| Provider | ags's own override | The agent's own variable, also honoured |
 |---|---|---|
 | Claude Code | `CLAUDE_HOME` | `CLAUDE_CONFIG_DIR` → used as `~/.claude` |
 | Codex | — | `CODEX_HOME` → used as `~/.codex` |
@@ -682,7 +682,7 @@ something else by them:
   `$KIRO_HOME/sessions/cli/`. The Kiro **IDE** has no such variable at all —
   `KIRO_HOME` does not appear anywhere in the shipped desktop package, and every
   place the bundled agent extension builds its store path uses `os.homedir()`.
-  So with `KIRO_HOME` set, casr reads CLI sessions from there and IDE sessions
+  So with `KIRO_HOME` set, ags reads CLI sessions from there and IDE sessions
   from `~/.kiro/sessions/` — each store from where its own product actually
   writes. Moving `HOME` moves both, because both ultimately resolve the home
   directory. One further real variable is **not** read:
@@ -691,9 +691,9 @@ something else by them:
 - **`AMP_HOME` is not read.** It is Amp's own variable, but it relocates Amp's
   *install* directory (the tree holding `bin/`), which never contains threads.
   `XDG_DATA_HOME` is the only variable that moves Amp's data.
-  `AMP_DATA_HOME` is read by nothing casr can find — zero occurrences across the
+  `AMP_DATA_HOME` is read by nothing ags can find — zero occurrences across the
   CLI binary and six shipped extension builds — so it is not read either.
-- **The Amp store casr reads is the editor extension's, not the CLI's.** Both
+- **The Amp store ags reads is the editor extension's, not the CLI's.** Both
   products share `<XDG_DATA_HOME>/amp`, but the CLI keeps thread bodies
   server-side and writes only `daemon/`, `ide/`, `oauth/`, `runner/`,
   `notepad/`, `device-id.json`, `history.jsonl`, `session.json` and
@@ -703,19 +703,19 @@ something else by them:
   `.aider.chat.history.md` per *repository*, at the git work-tree root, found by
   walking up from wherever you started it (`aider/main.py` uses
   `git.Repo(search_parent_directories=True)`); with no repository at all it
-  falls back to `./.aider.chat.history.md`. casr resolves the file the same way,
+  falls back to `./.aider.chat.history.md`. ags resolves the file the same way,
   so it sees the same sessions aider does from anywhere inside a checkout.
   `AIDER_CHAT_HISTORY_FILE` is aider's own override of that path — aider's
   parser derives it from `--chat-history-file` via `auto_env_var_prefix="AIDER_"`
-  — and names one exact file. `AIDER_HOME` is casr's alone; aider never reads
-  it. It points casr at a tree of checkouts to scan, and is also where casr
+  — and names one exact file. `AIDER_HOME` is ags's alone; aider never reads
+  it. It points ags at a tree of checkouts to scan, and is also where ags
   writes converted sessions.
-- **`VIBE_HOME` is the `~/.vibe` root**, not the session-log directory; casr
+- **`VIBE_HOME` is the `~/.vibe` root**, not the session-log directory; ags
   appends `logs/session` exactly as Vibe does.
 - **`OPENCLAW_HOME` replaces `$HOME`**, so OpenClaw's state lives at
   `$OPENCLAW_HOME/.openclaw`. `OPENCLAW_STATE_DIR` names that state directory
   outright and outranks it. Sessions are keyed by agent —
-  `<state>/agents/<agent-id>/sessions/` — and casr reads every agent's
+  `<state>/agents/<agent-id>/sessions/` — and ags reads every agent's
   directory. Target imports use the authenticated Gateway and do not mutate
   this shared store directly.
 
@@ -757,7 +757,7 @@ Important helpers:
 
 ```text
 Input CLI
-  casr <target> resume <session-id>
+  ags <target> resume <session-id>
           |
           v
 Provider Registry + Detection
@@ -800,7 +800,7 @@ Output
 
 ## Why This Is Useful in Day-to-Day Work
 
-`casr` is built for practical agent handoff problems, not only format conversion demos.
+`ags` is built for practical agent handoff problems, not only format conversion demos.
 
 - You can switch models mid-task without rebuilding context from scratch.
 - You can recover from provider outages or rate limits by moving the same session to another CLI.
@@ -814,10 +814,10 @@ Common examples:
 
 ## CLI Ergonomics and Alias Normalization
 
-`casr` supports two equivalent resume styles:
+`ags` supports two equivalent resume styles:
 
-- Canonical subcommand form: `casr <target> resume <session-id>`
-- Shorthand form: `casr -cc <session-id>`, `casr -cod <session-id>`, `casr -agy <session-id>`, `casr -gmi <session-id>`
+- Canonical subcommand form: `ags <target> resume <session-id>`
+- Shorthand form: `ags convert -cc <session-id>`, `ags convert -cod <session-id>`, `ags -agy <session-id>`, `ags convert -gmi <session-id>`
 
 Shorthand flags are rewritten internally before clap parsing, so logging, JSON output, and error handling stay identical across both forms.
 
@@ -831,9 +831,9 @@ Alias normalization also accepts common provider tokens:
 
 The resolver is intentionally strict and deterministic.
 
-1. If `--source` parses as a path, `casr` bypasses provider scanning and resolves from that path.
-2. If `--source` parses as an alias, `casr` searches only that provider.
-3. If no source hint is provided, `casr` scans installed providers and collects all matches.
+1. If `--source` parses as a path, `ags` bypasses provider scanning and resolves from that path.
+2. If `--source` parses as an alias, `ags` searches only that provider.
+3. If no source hint is provided, `ags` scans installed providers and collects all matches.
 4. Zero matches returns `SessionNotFound`.
 5. One match proceeds.
 6. Multiple matches returns `AmbiguousSessionId` and includes candidates.
@@ -864,13 +864,13 @@ The conversion pipeline in `src/pipeline.rs` has a fixed stage order:
 8. Write target-native session.
 9. Re-read written output and verify structural fidelity.
 
-If read-back verification fails, `casr` rolls back written files and restores backups when available. This keeps failed conversions from leaving unverified artifacts in target storage.
+If read-back verification fails, `ags` rolls back written files and restores backups when available. This keeps failed conversions from leaving unverified artifacts in target storage.
 
 ## Core Normalization Algorithms
 
 ### Content normalization (`flatten_content`)
 
-`casr` accepts several message content shapes and normalizes them into canonical text:
+`ags` accepts several message content shapes and normalizes them into canonical text:
 
 - Plain strings.
 - Arrays of text blocks.
@@ -898,7 +898,7 @@ Read-back verification compares role buckets rather than raw role enums for know
 
 ## Atomic Write and Recovery Semantics
 
-File-backed `casr` write operations are temp-then-rename and include rollback
+File-backed `ags` write operations are temp-then-rename and include rollback
 behavior:
 
 1. Create parent directories if needed.
@@ -918,7 +918,7 @@ Providers with vendor-owned shared stores override this lifecycle. OpenCode
 imports and deletes sessions through the official CLI, so verification failure
 removes only the imported session and never rolls back the whole database.
 
-## `casr list` Selection and Ranking Internals
+## `ags convert list` Selection and Ranking Internals
 
 The `list` command is optimized for project-local triage first.
 
@@ -949,7 +949,7 @@ The `list` command is optimized for project-local triage first.
   `skipped: [{provider, path, error}]`, always present and `[]` on a clean run,
   because a short listing and a complete one are otherwise the same document.
   A store directory that simply does not exist yet is not one of these: that is
-  the ordinary state of an installed tool that has not been run, and `casr
+  the ordinary state of an installed tool that has not been run, and `ags
   providers` names the directory and says so instead.
 
 When sorting by date, probe size is capped to avoid slow scans:
@@ -995,7 +995,7 @@ Recommended test set for new providers:
 
 - Reader and writer unit tests for native fixtures.
 - Round-trip tests (`read(write(read(...)))`).
-- CLI integration test path through `casr list`, `casr info`, and `casr <target> resume`.
+- CLI integration test path through `ags convert list`, `ags convert info`, and `ags <target> resume`.
 - Error-path tests for malformed input and file I/O failures.
 
 ## Provider Format Notes
@@ -1021,7 +1021,7 @@ Recommended test set for new providers:
 - Readable transcript:
   `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`
 - Target writes delegate trajectory creation and resume verification to
-  `google-antigravity>=0.1.9`; casr does not synthesize Antigravity protobuf
+  `google-antigravity>=0.1.9`; ags does not synthesize Antigravity protobuf
   blobs or edit a shared SQLite database.
 - Install the optional target dependency with
   `python3 -m pip install "google-antigravity>=0.1.9"`.
@@ -1029,7 +1029,7 @@ Recommended test set for new providers:
 ### Cursor
 - Source path pattern: `~/.config/Cursor/User/globalStorage/state.vscdb`
 - SQLite `cursorDiskKV` keys: `composerData:<id>` and `bubbleId:<composerId>:<bubbleId>`.
-- `casr` uses a virtual per-session path (`state.vscdb/<encoded-session-id>`) for deterministic lookup and verification.
+- `ags` uses a virtual per-session path (`state.vscdb/<encoded-session-id>`) for deterministic lookup and verification.
 - Cursor is read/resume-only: the editor also needs its `allComposers` index, whose safe write lifecycle is not yet verified.
 
 ### Aider
@@ -1037,7 +1037,7 @@ Recommended test set for new providers:
 - Target writes use a dedicated native history file and pass it through
   `--chat-history-file <path> --restore-chat-history`; the shared append-only
   history is never modified.
-- Aider's official restore parser drops blockquote turns. casr uses blockquotes
+- Aider's official restore parser drops blockquote turns. ags uses blockquotes
   only as non-model-visible same-role boundaries and folds non-assistant roles
   into visible user turns, which is reported as a fidelity loss.
 
@@ -1121,9 +1121,9 @@ Test suite coverage includes:
 ### "Session not found"
 
 ```bash
-casr list
-casr info <session-id>
-casr cc resume <session-id> --source cod
+ags convert list
+ags convert info <session-id>
+ags convert cc resume <session-id> --source cod
 ```
 
 ### "Target provider not installed"
@@ -1131,7 +1131,7 @@ casr cc resume <session-id> --source cod
 Check provider availability:
 
 ```bash
-casr providers
+ags convert providers
 ```
 
 Install the missing provider, then retry.
@@ -1141,7 +1141,7 @@ Install the missing provider, then retry.
 Use force mode to back up and overwrite:
 
 ```bash
-casr cc resume <session-id> --force
+ags convert cc resume <session-id> --force
 ```
 
 ### "Write verification failed"
@@ -1149,7 +1149,7 @@ casr cc resume <session-id> --force
 Run in trace mode and inspect JSON diagnostics:
 
 ```bash
-casr cc resume <session-id> --trace --json
+ags convert cc resume <session-id> --trace --json
 ```
 
 ### "Wrong source provider was detected"
@@ -1157,8 +1157,8 @@ casr cc resume <session-id> --trace --json
 Pin source provider or session path explicitly:
 
 ```bash
-casr cc resume <session-id> --source cod
-casr cc resume <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.jsonl
+ags convert cc resume <session-id> --source cod
+ags convert cc resume <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.jsonl
 ```
 
 ## Limitations
@@ -1170,20 +1170,20 @@ casr cc resume <session-id> --source ~/.codex/sessions/2026/02/06/rollout-1.json
 
 ## Editor / Terminal Integrations
 
-Community-built shortcuts that wrap `casr` for one-keystroke session forking:
+Community-built shortcuts that wrap `ags` for one-keystroke session forking:
 
-- **iTerm2 (macOS)** — [pirate/iterm-agent-fork](https://github.com/pirate/iterm-agent-fork): native iTerm hotkey to fork the active session into a different coding agent via `casr`.
+- **iTerm2 (macOS)** — [pirate/iterm-agent-fork](https://github.com/pirate/iterm-agent-fork): native iTerm hotkey to fork the active session into a different coding agent via `ags`.
 
 These are external projects, not maintained here. If you've built a similar integration and want it linked here, file an issue with the URL — see the [Contributions](#about-contributions) policy below.
 
 ## FAQ
 
-### Is casr only for one-way migration?
+### Is ags only for one-way migration?
 
 No. It supports both directions where both providers expose verified native
 write paths; read/resume-only providers remain valid sources.
 
-### Does casr modify my source session?
+### Does ags modify my source session?
 
 No. It reads source sessions and writes only to a supported target provider's
 storage.
@@ -1192,13 +1192,13 @@ storage.
 
 By default it stops with a conflict error. With `--force`, it creates a `.bak` backup and overwrites.
 
-### Can I script casr in CI or automation?
+### Can I script ags in CI or automation?
 
 Yes. Use `--json` output and non-interactive command patterns.
 
 ### How do I debug a failed conversion?
 
-Use `--verbose` or `--trace`, optionally with `RUST_LOG=casr=trace`.
+Use `--verbose` or `--trace`, optionally with `RUST_LOG=ags=trace`.
 
 ### Can I convert within the same provider?
 

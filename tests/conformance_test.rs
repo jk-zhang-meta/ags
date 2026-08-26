@@ -1,4 +1,4 @@
-//! The provider conformance suite: a thin driver over [`casr::conformance`].
+//! The provider conformance suite: a thin driver over [`ags::conformance`].
 //!
 //! Everything about *what* conformance means lives in `src/conformance.rs`, so
 //! that a provider author can call it directly. This file holds only what a test
@@ -11,7 +11,7 @@
 //!
 //! There is no per-provider test body here, and adding a third structured
 //! provider requires no edit to this file: the battery derives its subject list
-//! from [`casr::discovery::ProviderRegistry::default_registry`] filtered by
+//! from [`ags::discovery::ProviderRegistry::default_registry`] filtered by
 //! `Provider::supports_structured_write`, and it derives which provider owns a
 //! given session file from which structured reader claims it.
 //!
@@ -43,11 +43,11 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::conformance::{self, HopReport, Report};
-use casr::discovery::ProviderRegistry;
-use casr::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
-use casr::pipeline::{folded_role, writer_carries_tool_calls};
-use casr::providers::WriteOptions;
+use ags::conformance::{self, HopReport, Report};
+use ags::discovery::ProviderRegistry;
+use ags::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
+use ags::pipeline::{folded_role, writer_carries_tool_calls};
+use ags::providers::WriteOptions;
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 

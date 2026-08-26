@@ -41,7 +41,7 @@ jobs:
         run: |
           # Fail if Cargo.toml or Cargo.lock references coding_agent_session_search
           if grep -q 'coding_agent_session_search' Cargo.toml Cargo.lock 2>/dev/null; then
-            echo "::error::Cargo.toml or Cargo.lock references coding_agent_session_search. casr must not depend on CASS at runtime."
+            echo "::error::Cargo.toml or Cargo.lock references coding_agent_session_search. ags must not depend on CASS at runtime."
             exit 1
           fi
 
@@ -92,7 +92,7 @@ jobs:
       - name: Upload test report artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: casr-test-report
+          name: ags-test-report
           path: |
             test-report.json
             test-report.jsonl
@@ -352,7 +352,7 @@ jobs:
       - name: Upload perf metrics artifact
         uses: actions/upload-artifact@v4
         with:
-          name: casr-perf-metrics
+          name: ags-perf-metrics
           path: perf-metrics.json
 
   e2e:

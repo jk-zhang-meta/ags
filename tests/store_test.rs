@@ -1,7 +1,7 @@
 //! Integration tests for the session store's public contract.
 //!
 //! These test the store the way `pipeline.rs` and `launch.rs` will use it —
-//! through `casr::store` only — so that the wiring has something to lean on.
+//! through `ags::store` only — so that the wiring has something to lean on.
 //! The three that matter most are the ones that turn a comment into a
 //! guarantee: a stale cached IR is *deleted*, a deleted index is *rebuilt*, and
 //! a store from the future is readable but not writable.
@@ -12,12 +12,12 @@
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
-use casr::ir::{
+use ags::ir::{
     Block, Body, Capsule, CapsuleBinding, CapsuleKind, Event, Fidelity, IR_VERSION, Loss, LossKind,
     Role as IrRole, SessionIr, SourceRef, Visibility,
 };
-use casr::providers::Provider;
-use casr::store::{
+use ags::providers::Provider;
+use ags::store::{
     Availability, DerivedWrite, OriginPolicy, OriginSnapshot, OriginState, Role, SessionKey, Store,
     StoreError,
 };
@@ -69,10 +69,10 @@ fn write_session(dir: &Path, name: &str, body: &str) -> PathBuf {
 /// pipeline borrows its own: `best_source_for` takes it rather than building
 /// one, so that the ranking counts capsules through the same providers the
 /// caller will read the chosen candidate with.
-fn registry() -> &'static casr::discovery::ProviderRegistry {
-    static REGISTRY: std::sync::OnceLock<casr::discovery::ProviderRegistry> =
+fn registry() -> &'static ags::discovery::ProviderRegistry {
+    static REGISTRY: std::sync::OnceLock<ags::discovery::ProviderRegistry> =
         std::sync::OnceLock::new();
-    REGISTRY.get_or_init(casr::discovery::ProviderRegistry::default_registry)
+    REGISTRY.get_or_init(ags::discovery::ProviderRegistry::default_registry)
 }
 
 fn provider(slug: &str) -> &'static dyn Provider {
@@ -88,7 +88,7 @@ fn ir_with_capsules(agent: &str, kind: CapsuleKind, count: usize) -> SessionIr {
         ir.events.push(Event {
             id: format!("e{i}"),
             parent: None,
-            branch: casr::ir::Branch::Main,
+            branch: ags::ir::Branch::Main,
             turn: None,
             ts: None,
             visibility: Visibility::Model,
@@ -175,7 +175,7 @@ fn corpus_session_with_capsules(
         .collect();
     candidates.sort();
 
-    let vendor = casr::compare::vendor_of(slug)?;
+    let vendor = ags::compare::vendor_of(slug)?;
     for (_, path) in candidates.into_iter().take(40) {
         let Ok(Some(ir)) = provider(slug).read_session_ir(&path) else {
             continue;
@@ -184,7 +184,7 @@ fn corpus_session_with_capsules(
             .model_visible()
             .iter()
             .flat_map(|event| event.capsules.iter())
-            .filter(|capsule| capsule.fits(vendor) == casr::ir::CapsuleFit::SameVendor)
+            .filter(|capsule| capsule.fits(vendor) == ags::ir::CapsuleFit::SameVendor)
             .count();
         if fitting > 0 {
             return Some((path, fitting));
@@ -205,7 +205,7 @@ fn the_store_creates_itself_under_ags_store() {
     let _guard = EnvGuard::set("AGS_STORE", &root);
 
     assert_eq!(
-        casr::store::default_root().expect("root"),
+        ags::store::default_root().expect("root"),
         root,
         "$AGS_STORE wins over every default"
     );
@@ -486,11 +486,11 @@ fn a_rebuild_cannot_erase_a_conversion_that_committed_while_it_scanned() {
         // rebuild can take the lock.
         let dir = store.root().join("records").join(b_id);
         std::fs::create_dir_all(&dir).expect("record dir");
-        let record = casr::store::Record {
+        let record = ags::store::Record {
             id: b_id.to_string(),
             created_at: 1,
             updated_at: 1,
-            incarnations: vec![casr::store::Incarnation {
+            incarnations: vec![ags::store::Incarnation {
                 key: b_key.clone(),
                 path: b_path.clone(),
                 recorded_at: 1,
@@ -652,7 +652,7 @@ fn a_store_from_the_future_stays_readable_and_refuses_writes() {
                 found, supported, ..
             }) => {
                 assert_eq!(*found, 999);
-                assert_eq!(*supported, casr::store::STORE_VERSION);
+                assert_eq!(*supported, ags::store::STORE_VERSION);
             }
             other => panic!("{what} should refuse with NewerStore, got {other:?}"),
         }
@@ -960,7 +960,7 @@ fn diverging_pair(
     store: &Store,
     tmp: &Path,
     capsules: usize,
-) -> (casr::store::Record, PathBuf, PathBuf) {
+) -> (ags::store::Record, PathBuf, PathBuf) {
     let codex_path = write_session(tmp, "rollout.jsonl", "{}\n");
     let cc_path = write_session(tmp, "cc.jsonl", "{}\n");
     let codex_key = SessionKey::new("codex", "01JCODEX");
@@ -1174,7 +1174,7 @@ fn a_single_incarnation_costs_no_parse_and_still_reports_its_origin() {
     assert!(
         matches!(
             choice.chosen().unwrap().capsules,
-            casr::store::Inventory::Unknown { .. }
+            ags::store::Inventory::Unknown { .. }
         ),
         "with nothing to choose between, counting capsules would be work for nothing"
     );

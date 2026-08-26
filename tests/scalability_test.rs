@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use casr::{
+use ags::{
     discovery::{DetectionResult, ProviderRegistry},
     error::CasrError,
     model::CanonicalSession,

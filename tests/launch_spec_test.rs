@@ -10,8 +10,8 @@
 
 mod test_env;
 
-use casr::discovery::ProviderRegistry;
-use casr::launch::{LaunchError, LaunchSpec, SessionTargeting};
+use ags::discovery::ProviderRegistry;
+use ags::launch::{LaunchError, LaunchSpec, SessionTargeting};
 
 /// Every test here resolves a provider's launch spec, and Pi-Agent's reads
 /// `PI_AGENT_HOME`. One test writes it, so all of them serialize on the test
@@ -318,16 +318,16 @@ fn pi_is_launched_at_the_file_it_wrote() {
         .find_by_slug("pi-agent")
         .expect("pi-agent in registry");
 
-    let session = casr::model::CanonicalSession {
+    let session = ags::model::CanonicalSession {
         session_id: format!("2026-01-01T00-00-00_{SESSION}"),
         provider_slug: "test-source".to_string(),
         workspace: Some(std::path::PathBuf::from("/data/projects/myapp")),
         title: None,
         started_at: Some(1_700_000_000_000),
         ended_at: Some(1_700_000_000_000),
-        messages: vec![casr::model::CanonicalMessage {
+        messages: vec![ags::model::CanonicalMessage {
             idx: 0,
-            role: casr::model::MessageRole::User,
+            role: ags::model::MessageRole::User,
             content: "hello".to_string(),
             timestamp: Some(1_700_000_000_000),
             author: None,
@@ -341,7 +341,7 @@ fn pi_is_launched_at_the_file_it_wrote() {
     };
 
     let written = pi
-        .write_session(&session, &casr::providers::WriteOptions { force: false })
+        .write_session(&session, &ags::providers::WriteOptions { force: false })
         .expect("write_session");
 
     let expected = home

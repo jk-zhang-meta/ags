@@ -2,7 +2,7 @@
 //!
 //! `tests/roundtrip_ir_test.rs` proves the writer is the inverse of the reader.
 //! That is necessary and it is not sufficient, because the two share a parser:
-//! [`casr::ir::ToolInput::from_json_field`] maps both `"{\"a\":1}"` and
+//! [`ags::ir::ToolInput::from_json_field`] maps both `"{\"a\":1}"` and
 //! `{"a":1}` onto the same `ToolInput::Json`, so a writer that emitted the
 //! object form for `function_call.arguments` round-tripped perfectly — and
 //! produced a rollout in which the real `codex` CLI failed the record's decode,
@@ -15,7 +15,7 @@
 //! Nothing in the IR can catch that class, because by the time an event exists
 //! the wire shape has already been parsed away. So these tests work on the
 //! serialised line, and the contract they check
-//! ([`casr::providers::codex_ir_write::wire_contract_violation`]) is derived
+//! ([`ags::providers::codex_ir_write::wire_contract_violation`]) is derived
 //! from the corpus rather than from belief: every field type below is the
 //! observed type of that field across a 66,376-payload sample of real Codex
 //! rollouts.
@@ -32,8 +32,8 @@
 
 use std::path::{Path, PathBuf};
 
-use casr::budget::ContextBudget;
-use casr::providers::{claude_code_ir, codex_ir, codex_ir_write};
+use ags::budget::ContextBudget;
+use ags::providers::{claude_code_ir, codex_ir, codex_ir_write};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -159,26 +159,26 @@ fn the_stringified_arguments_still_read_back() {
     );
 }
 
-fn tool_call_arguments(ir: &casr::ir::SessionIr) -> Vec<Value> {
+fn tool_call_arguments(ir: &ags::ir::SessionIr) -> Vec<Value> {
     ir.model_visible()
         .iter()
         .filter_map(|event| match &event.body {
-            casr::ir::Body::ToolCall { input, .. } => match input {
-                casr::ir::ToolInput::Json { value, .. } => Some(value.clone()),
-                casr::ir::ToolInput::Freeform { text } => Some(json!(text)),
+            ags::ir::Body::ToolCall { input, .. } => match input {
+                ags::ir::ToolInput::Json { value, .. } => Some(value.clone()),
+                ags::ir::ToolInput::Freeform { text } => Some(json!(text)),
             },
-            casr::ir::Body::Message { .. }
-            | casr::ir::Body::Reasoning { .. }
-            | casr::ir::Body::ToolResult { .. }
-            | casr::ir::Body::Compaction { .. }
-            | casr::ir::Body::SealedContext { .. }
-            | casr::ir::Body::TurnConfig { .. }
-            | casr::ir::Body::EnvSnapshot { .. }
-            | casr::ir::Body::Attachment { .. }
-            | casr::ir::Body::Rollback { .. }
-            | casr::ir::Body::Abort { .. }
-            | casr::ir::Body::Control { .. }
-            | casr::ir::Body::Unknown { .. } => None,
+            ags::ir::Body::Message { .. }
+            | ags::ir::Body::Reasoning { .. }
+            | ags::ir::Body::ToolResult { .. }
+            | ags::ir::Body::Compaction { .. }
+            | ags::ir::Body::SealedContext { .. }
+            | ags::ir::Body::TurnConfig { .. }
+            | ags::ir::Body::EnvSnapshot { .. }
+            | ags::ir::Body::Attachment { .. }
+            | ags::ir::Body::Rollback { .. }
+            | ags::ir::Body::Abort { .. }
+            | ags::ir::Body::Control { .. }
+            | ags::ir::Body::Unknown { .. } => None,
         })
         .collect()
 }

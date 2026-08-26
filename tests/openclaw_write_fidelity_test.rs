@@ -9,9 +9,9 @@ mod test_env;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
-use casr::model::{CanonicalMessage, CanonicalSession, MessageRole};
-use casr::providers::openclaw::OpenClaw;
-use casr::providers::{Provider, WriteOptions};
+use ags::model::{CanonicalMessage, CanonicalSession, MessageRole};
+use ags::providers::openclaw::OpenClaw;
+use ags::providers::{Provider, WriteOptions};
 use serde_json::json;
 
 static OPENCLAW_ENV: test_env::EnvLock = test_env::EnvLock;
@@ -125,7 +125,9 @@ fn cli_refuses_without_official_openclaw_before_writing_state() {
         if force {
             args.push("--force");
         }
-        let output = StdCommand::new(env!("CARGO_BIN_EXE_casr"))
+        // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。
+        let output = StdCommand::new(env!("CARGO_BIN_EXE_ags"))
+            .arg("convert")
             .args(args)
             .env("CLAWDBOT_HOME", &clawdbot)
             .env("OPENCLAW_STATE_DIR", &state_dir)

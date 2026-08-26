@@ -1,6 +1,6 @@
 //! The structural comparator against real sessions.
 //!
-//! [`casr::compare`] is the structured track's read-back oracle, and an oracle
+//! [`ags::compare`] is the structured track's read-back oracle, and an oracle
 //! is only worth what the sessions it has been pointed at are worth. Fixtures
 //! prove it runs; 592 Codex rollouts and 175 Claude transcripts prove it calls
 //! a correct same-agent write clean and a correct cross-agent write correct —
@@ -27,17 +27,17 @@
 //! happened as well as that nothing else did. An allowance that stops being
 //! exercised does not stay neutral: it silently widens until it covers a real
 //! regression. `tests/real_world_roundtrip_test.rs` makes the same argument for
-//! the flat round trips; [`casr::compare::Comparison::carried_foreign`] makes it
+//! the flat round trips; [`ags::compare::Comparison::carried_foreign`] makes it
 //! inside the comparator itself, for the individual capsule.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use casr::budget::ContextBudget;
-use casr::compare::{Comparison, compare, vendor_of};
-use casr::ir::{Fidelity, LossKind, SessionIr};
-use casr::providers::{claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write};
+use ags::budget::ContextBudget;
+use ags::compare::{Comparison, compare, vendor_of};
+use ags::ir::{Fidelity, LossKind, SessionIr};
+use ags::providers::{claude_code_ir, claude_code_ir_write, codex_ir, codex_ir_write};
 
 // ---------------------------------------------------------------------------
 // Corpus discovery (same discriminators as `roundtrip_ir_test.rs`)
@@ -415,7 +415,7 @@ fn claude_into_itself_is_clean() {
 ///
 /// Measured ground truth: 28,254 reasoning events and 352 sealed contexts go,
 /// and nothing else. Every one of those is a capsule
-/// [`casr::ir::Capsule::fits`] said an Anthropic target cannot read, which is
+/// [`ags::ir::Capsule::fits`] said an Anthropic target cannot read, which is
 /// the entire distinction this comparator exists to draw — a verifier that
 /// called this conversion damaged would be wrong about the case that matters.
 #[test]

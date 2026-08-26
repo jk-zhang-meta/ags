@@ -25,7 +25,7 @@ fn fixtures_dir() -> PathBuf {
 /// CLI never touches real provider data.
 fn casr_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
-    let mut cmd = Command::cargo_bin("casr").expect("casr binary should be built");
+    let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
     cmd.env("CLAUDE_HOME", tmp.path().join("claude"))
         .env("CODEX_HOME", tmp.path().join("codex"))
         .env("GEMINI_HOME", tmp.path().join("gemini"))
@@ -45,6 +45,10 @@ fn casr_cmd(tmp: &TempDir) -> Command {
         .env("XDG_DATA_HOME", tmp.path().join("xdg-data"))
         // Suppress colored output in tests.
         .env("NO_COLOR", "1");
+    // 转换那套现在收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
+    // 而不是每个用例里：这个文件测的全是转换，逐个加等于把同一件事写一百遍，而且
+    // 下次命令布局再动一次又要再改一百处。
+    cmd.arg("convert");
     cmd
 }
 
@@ -304,7 +308,7 @@ fn cli_version_outputs_metadata() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("casr"));
+        .stdout(predicate::str::contains("ags"));
 }
 
 #[test]
@@ -1888,8 +1892,8 @@ fn cli_resume_piagent_to_cc_works_with_source_hint() {
 // and leave an interactive agent attached to the test runner's terminal.
 // ---------------------------------------------------------------------------
 
-use casr::discovery::ProviderRegistry;
-use casr::launch::LaunchSpec;
+use ags::discovery::ProviderRegistry;
+use ags::launch::LaunchSpec;
 
 /// A Codex rollout whose live context is a sealed compaction.
 ///
@@ -2312,7 +2316,7 @@ fn cli_completions_bash() {
         .args(["completions", "bash"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("casr"));
+        .stdout(predicate::str::contains("ags"));
 }
 
 #[test]

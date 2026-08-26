@@ -3,6 +3,40 @@
 version = 4
 
 [[package]]
+name = "ags"
+version = "0.4.36"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "blake3",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "colored",
+ "dirs",
+ "glob",
+ "json5",
+ "predicates",
+ "rayon",
+ "rich_rust",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "tungstenite",
+ "urlencoding",
+ "uuid",
+ "vergen-gix",
+ "walkdir",
+ "which",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -400,40 +434,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "cross_agent_session_resumer"
-version = "0.4.36"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "blake3",
- "chrono",
- "clap",
- "clap_complete",
- "colored",
- "dirs",
- "glob",
- "json5",
- "predicates",
- "rayon",
- "rich_rust",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "shlex",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "tungstenite",
- "urlencoding",
- "uuid",
- "vergen-gix",
- "walkdir",
- "which",
 ]
 
 [[package]]

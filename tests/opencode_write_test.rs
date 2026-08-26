@@ -10,9 +10,9 @@ mod test_env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use casr::model::{CanonicalMessage, CanonicalSession, MessageRole};
-use casr::providers::opencode::OpenCode;
-use casr::providers::{Provider, WriteOptions};
+use ags::model::{CanonicalMessage, CanonicalSession, MessageRole};
+use ags::providers::opencode::OpenCode;
+use ags::providers::{Provider, WriteOptions};
 
 static OPENCODE_ENV: test_env::EnvLock = test_env::EnvLock;
 

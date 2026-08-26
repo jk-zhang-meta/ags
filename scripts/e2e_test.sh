@@ -22,7 +22,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 FIXTURES_DIR="$PROJECT_ROOT/tests/fixtures"
 CARGO_TARGET="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
-CASR="${CASR_BIN:-$CARGO_TARGET/debug/casr}"
+# 二进制改名成 `ags` 之后，跨 Agent 转换那套收在 `ags convert` 底下——`list` 和
+# `resume` 两边都要用，而日常敲的是会话运行时那边。所以这里是个数组，每次调用都
+# 带上前缀；下面所有 `"${CASR[@]}"` 就是原来的 `"$CASR"`。
+CASR_PATH="${CASR_BIN:-$CARGO_TARGET/debug/ags}"
+CASR=("$CASR_PATH" convert)
 VERBOSE="${VERBOSE:-0}"
 SLOW_THRESHOLD_MS="${SLOW_THRESHOLD_MS:-2000}"
 
@@ -35,7 +39,7 @@ Usage:
 
 Flags:
   --verbose                Show stdout/stderr snippets and extra timing diagnostics
-  --casr-bin PATH          Use a specific casr binary (default: target/debug/casr)
+  --casr-bin PATH          Use a specific casr binary (default: target/debug/ags)
   --artifacts-dir PATH     Write per-test artifacts under PATH (default: ./artifacts/e2e/<run-id>/)
   --slow-threshold-ms N    Warn when a single casr invocation exceeds N ms (default: 2000)
   -h, --help               Show this help and exit
@@ -62,7 +66,7 @@ while [[ $# -gt 0 ]]; do
                 echo "ERROR: --casr-bin requires a path" >&2
                 exit 2
             fi
-            CASR="$2"
+            CASR_PATH="$2"; CASR=("$CASR_PATH" convert)
             shift 2
             ;;
         --artifacts-dir)
@@ -201,7 +205,7 @@ record_result() {
 
 run_casr() {
     local desc="$1"; shift
-    local cmd_str="$CASR $*"
+    local cmd_str="${CASR[*]} $*"
 
     ARTIFACT_SEQ=$((ARTIFACT_SEQ + 1))
     local slug artifact_base stdout_file stderr_file cmd_file stdin_file meta_file
@@ -224,7 +228,7 @@ run_casr() {
     echo -e "  [$(ts_fmt)] ${CYAN}CMD${RESET}: $cmd_str"
 
     local exit_code=0
-    "$CASR" "$@" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
+    "${CASR[@]}" "$@" > "$stdout_file" 2> "$stderr_file" || exit_code=$?
 
     local run_end_ms
     run_end_ms=$(ts_ms)
@@ -536,19 +540,19 @@ reset_env() {
 # Ensure binary exists
 # ---------------------------------------------------------------------------
 
-if [[ ! -x "$CASR" ]]; then
+if [[ ! -x "$CASR_PATH" ]]; then
     echo "Building casr..."
     (cd "$PROJECT_ROOT" && cargo build --quiet 2>&1)
 fi
 
-if [[ ! -x "$CASR" ]]; then
-    echo "ERROR: casr binary not found at $CASR"
+if [[ ! -x "$CASR_PATH" ]]; then
+    echo "ERROR: ags binary not found at $CASR_PATH"
     echo "Run 'cargo build' first or set CASR_BIN."
     exit 1
 fi
 
 echo -e "${BOLD}casr e2e test suite${RESET}"
-echo "Binary: $CASR"
+echo "Binary: $CASR_PATH"
 echo "Fixtures: $FIXTURES_DIR"
 echo "Temp: $TMPDIR_ROOT"
 echo "Artifacts: $ARTIFACTS_DIR"
@@ -560,8 +564,8 @@ echo ""
 
 log "TEST: Version output"
 run_casr "version" --version
-assert_exit_ok "casr --version succeeds"
-assert_stdout_contains "version contains casr" "casr"
+assert_exit_ok "ags --version succeeds"
+assert_stdout_contains "version names the binary" "ags"
 
 log "TEST: Help output"
 run_casr "help" --help
@@ -1339,7 +1343,7 @@ setup_source_session() {
             # Seed: set up CC fixture, convert CC→source, return target sid.
             local _cc_sid _json_out _target_sid
             _cc_sid=$(setup_cc_fixture "cc_simple")
-            _json_out=$("$CASR" --json resume "$source_alias" "$_cc_sid" 2>/dev/null) || true
+            _json_out=$("${CASR[@]}" --json resume "$source_alias" "$_cc_sid" 2>/dev/null) || true
             _target_sid=$(echo "$_json_out" | jq -r '.target_session_id // empty' 2>/dev/null)
             echo "$_target_sid"
             ;;
@@ -1430,7 +1434,7 @@ echo -e "  ${BOLD}Matrix summary:${RESET} ${GREEN}${MATRIX_OK}/${MATRIX_PAIRS} b
 log "TEST: Completions bash"
 run_casr "completions" completions bash
 assert_exit_ok "completions bash succeeds"
-assert_stdout_contains "completions mentions casr" "casr"
+assert_stdout_contains "completions name the binary" "ags"
 
 log "TEST: Completions zsh"
 run_casr "completions zsh" completions zsh

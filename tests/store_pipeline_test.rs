@@ -21,10 +21,10 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::discovery::ProviderRegistry;
-use casr::ir::Fidelity;
-use casr::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
-use casr::store::{OriginPolicy, SessionKey, Store};
+use ags::discovery::ProviderRegistry;
+use ags::ir::Fidelity;
+use ags::pipeline::{ConversionPipeline, ConversionResult, ConvertOptions};
+use ags::store::{OriginPolicy, SessionKey, Store};
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -274,7 +274,7 @@ fn chain() -> Chain {
 
 /// Two hours of work in the intermediate, as the append-only log records it.
 fn work_in(path: &Path, provider: &str, turns: usize) -> u64 {
-    casr::conformance::append_turns(path, provider, MARKER, turns)
+    ags::conformance::append_turns(path, provider, MARKER, turns)
         .unwrap_or_else(|error| panic!("append to {}: {error}", path.display()))
 }
 
@@ -847,7 +847,7 @@ fn a_record_id_resolves_to_the_session_a_provider_can_resume() {
     // Only the origin so far: every target resolves to it.
     for target in ["codex", "claude-code", "gemini"] {
         assert_eq!(
-            casr::launch::session_named_by_record(&record, target),
+            ags::launch::session_named_by_record(&record, target),
             Some(&codex),
             "a record with one incarnation names it for every target"
         );
@@ -857,7 +857,7 @@ fn a_record_id_resolves_to_the_session_a_provider_can_resume() {
     let record = store
         .record_conversion(
             &record.id,
-            casr::store::DerivedWrite {
+            ags::store::DerivedWrite {
                 key: claude.clone(),
                 path: tmp.path().join("derived.jsonl"),
                 from: codex.clone(),
@@ -868,16 +868,16 @@ fn a_record_id_resolves_to_the_session_a_provider_can_resume() {
         .expect("record conversion");
 
     assert_eq!(
-        casr::launch::session_named_by_record(&record, "claude-code"),
+        ags::launch::session_named_by_record(&record, "claude-code"),
         Some(&claude),
         "the target's own incarnation needs no conversion, so it comes first"
     );
     assert_eq!(
-        casr::launch::session_named_by_record(&record, "codex"),
+        ags::launch::session_named_by_record(&record, "codex"),
         Some(&codex)
     );
     assert_eq!(
-        casr::launch::session_named_by_record(&record, "gemini"),
+        ags::launch::session_named_by_record(&record, "gemini"),
         Some(&codex),
         "a target with no incarnation falls back to the conversation's origin"
     );
@@ -921,7 +921,7 @@ fn every_cli_test_that_resumes_redirects_the_store() {
 
     for path in entries {
         let source = std::fs::read_to_string(&path).expect("read a test file");
-        let spawns = source.contains("CARGO_BIN_EXE_casr") || source.contains("cargo_bin");
+        let spawns = source.contains("CARGO_BIN_EXE_ags") || source.contains("cargo_bin");
         if !spawns || !source.contains("\"resume\"") {
             continue;
         }

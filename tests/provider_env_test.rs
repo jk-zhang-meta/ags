@@ -11,7 +11,7 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::providers::{
+use ags::providers::{
     Provider, amp::Amp, claude_code::ClaudeCode, clawdbot::ClawdBot, cline::Cline,
     factory::Factory, gemini::Gemini, openclaw::OpenClaw, opencode::OpenCode, pi_agent::PiAgent,
     vibe::Vibe,

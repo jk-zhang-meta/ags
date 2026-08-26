@@ -5,25 +5,25 @@
 
 use std::path::{Path, PathBuf};
 
-use casr::model::{CanonicalSession, MessageRole};
-use casr::providers::Provider;
-use casr::providers::aider::Aider;
-use casr::providers::amp::Amp;
-use casr::providers::antigravity::Antigravity;
-use casr::providers::chatgpt::ChatGpt;
-use casr::providers::claude_code::ClaudeCode;
-use casr::providers::clawdbot::ClawdBot;
-use casr::providers::cline::Cline;
-use casr::providers::codex::Codex;
-use casr::providers::cursor::Cursor;
-use casr::providers::factory::Factory;
-use casr::providers::gemini::Gemini;
-use casr::providers::grok::Grok;
-use casr::providers::kiro::Kiro;
-use casr::providers::openclaw::OpenClaw;
-use casr::providers::opencode::OpenCode;
-use casr::providers::pi_agent::PiAgent;
-use casr::providers::vibe::Vibe;
+use ags::model::{CanonicalSession, MessageRole};
+use ags::providers::Provider;
+use ags::providers::aider::Aider;
+use ags::providers::amp::Amp;
+use ags::providers::antigravity::Antigravity;
+use ags::providers::chatgpt::ChatGpt;
+use ags::providers::claude_code::ClaudeCode;
+use ags::providers::clawdbot::ClawdBot;
+use ags::providers::cline::Cline;
+use ags::providers::codex::Codex;
+use ags::providers::cursor::Cursor;
+use ags::providers::factory::Factory;
+use ags::providers::gemini::Gemini;
+use ags::providers::grok::Grok;
+use ags::providers::kiro::Kiro;
+use ags::providers::openclaw::OpenClaw;
+use ags::providers::opencode::OpenCode;
+use ags::providers::pi_agent::PiAgent;
+use ags::providers::vibe::Vibe;
 
 /// Root of the fixtures directory (relative to workspace root).
 fn fixtures_dir() -> PathBuf {
@@ -440,7 +440,7 @@ fn fixture_grok_simple() {
 
     // The generated title is surfaced as the provider-native session name.
     assert_eq!(
-        casr::model::native_name_from_metadata(&session.metadata).as_deref(),
+        ags::model::native_name_from_metadata(&session.metadata).as_deref(),
         Some("Echo hi probe session")
     );
 }
@@ -724,7 +724,7 @@ fn fixture_piagent_simple() {
     let tool_msgs: Vec<_> = session
         .messages
         .iter()
-        .filter(|m| m.role == casr::model::MessageRole::Tool)
+        .filter(|m| m.role == ags::model::MessageRole::Tool)
         .collect();
     assert!(
         !tool_msgs.is_empty(),
@@ -916,7 +916,7 @@ fn fixture_edge_single_sided_cc() {
     assert_session_matches(&session, &expected, "edge_single_sided_cc");
 
     // Extra: verify validation flags this as an error.
-    let validation = casr::pipeline::validate_session(&session);
+    let validation = ags::pipeline::validate_session(&session);
     assert!(
         validation.has_errors(),
         "Single-sided session should produce validation errors"

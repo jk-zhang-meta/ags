@@ -27,7 +27,10 @@ use tempfile::TempDir;
 /// `~/.local/share/ags` on the machine running them.
 fn casr_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
-    let mut cmd = Command::cargo_bin("casr").expect("casr binary should be built");
+    let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
+    // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
+    // 而不是每个用例里：这个文件测的全是转换。
+    cmd.arg("convert");
     cmd.env("CLAUDE_HOME", tmp.path().join("claude"))
         .env("CODEX_HOME", tmp.path().join("codex"))
         .env("GEMINI_HOME", tmp.path().join("gemini"))
@@ -227,7 +230,7 @@ fn absent_store_directory_is_not_reported_as_a_failure() {
 /// must reject at least one of the six extensions the default accepts.
 #[test]
 fn every_registered_provider_narrows_the_default_session_file_rule() {
-    use casr::discovery::ProviderRegistry;
+    use ags::discovery::ProviderRegistry;
 
     let registry = ProviderRegistry::default_registry();
     let inherited: Vec<&str> = registry

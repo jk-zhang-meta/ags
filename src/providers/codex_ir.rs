@@ -947,7 +947,7 @@ mod tests {
     /// The visibility must stay `Ui` — that is what Codex actually recorded,
     /// and promoting it to `Model` to make the resolver notice would put two
     /// rendering artifacts into the target's context. The resolver reads both
-    /// before its visibility gate instead; see `casr::replay::resolve`.
+    /// before its visibility gate instead; see `ags::replay::resolve`.
     #[test]
     fn history_directives_are_typed_rather_than_left_as_control_strings() {
         let file = rollout(&[

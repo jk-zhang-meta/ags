@@ -27,22 +27,22 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::model::{CanonicalSession, MessageRole};
-use casr::providers::aider::Aider;
-use casr::providers::amp::Amp;
-use casr::providers::chatgpt::ChatGpt;
-use casr::providers::claude_code::ClaudeCode;
-use casr::providers::clawdbot::ClawdBot;
-use casr::providers::cline::Cline;
-use casr::providers::codex::Codex;
-use casr::providers::cursor::Cursor;
-use casr::providers::factory::Factory;
-use casr::providers::gemini::Gemini;
-use casr::providers::openclaw::OpenClaw;
-use casr::providers::opencode::OpenCode;
-use casr::providers::pi_agent::PiAgent;
-use casr::providers::vibe::Vibe;
-use casr::providers::{Provider, WriteOptions};
+use ags::model::{CanonicalSession, MessageRole};
+use ags::providers::aider::Aider;
+use ags::providers::amp::Amp;
+use ags::providers::chatgpt::ChatGpt;
+use ags::providers::claude_code::ClaudeCode;
+use ags::providers::clawdbot::ClawdBot;
+use ags::providers::cline::Cline;
+use ags::providers::codex::Codex;
+use ags::providers::cursor::Cursor;
+use ags::providers::factory::Factory;
+use ags::providers::gemini::Gemini;
+use ags::providers::openclaw::OpenClaw;
+use ags::providers::opencode::OpenCode;
+use ags::providers::pi_agent::PiAgent;
+use ags::providers::vibe::Vibe;
+use ags::providers::{Provider, WriteOptions};
 
 // ---------------------------------------------------------------------------
 // Env var isolation (see `tests/test_env.rs`)

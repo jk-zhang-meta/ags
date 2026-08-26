@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use casr::{
+use ags::{
     budget::ContextBudget,
     discovery::{DetectionResult, ProviderRegistry},
     error::CasrError,
@@ -370,8 +370,8 @@ fn intact_ir() -> SessionIr {
     ir.events.push(ir_event(
         "e1",
         Body::Message {
-            role: casr::ir::Role::User,
-            blocks: vec![casr::ir::Block::Text {
+            role: ags::ir::Role::User,
+            blocks: vec![ags::ir::Block::Text {
                 text: "question one".to_string(),
             }],
         },
@@ -1655,7 +1655,7 @@ fn validate_session_warnings_and_info_for_quality_issues() {
 #[test]
 fn validate_session_reports_tool_call_info_when_present() {
     let mut session = valid_session_with_id("tool-calls");
-    session.messages[1].tool_calls.push(casr::model::ToolCall {
+    session.messages[1].tool_calls.push(ags::model::ToolCall {
         id: Some("call-1".to_string()),
         name: "Read".to_string(),
         arguments: serde_json::json!({"file":"src/lib.rs"}),
@@ -2404,7 +2404,7 @@ fn pairing_repair_leaves_a_call_that_arrived_unanswered() {
     // ones where the budget removed nothing at all.
     let (src, dst, pipeline) = flat_pair("sid-orphan");
     let mut trailing = msg(1, MessageRole::Assistant, "", Some(1_700_000_005_000));
-    trailing.tool_calls.push(casr::model::ToolCall {
+    trailing.tool_calls.push(ags::model::ToolCall {
         id: Some("call-1".to_string()),
         name: "bash".to_string(),
         arguments: serde_json::json!({"cmd": "ls"}),
@@ -2457,13 +2457,13 @@ fn pairing_repair_reports_the_pairs_the_budget_broke() {
     // result that answered it — the one shape where the repair is removing
     // something that was whole a moment ago.
     let mut caller = msg(1, MessageRole::Assistant, &"a".repeat(4000), Some(1));
-    caller.tool_calls.push(casr::model::ToolCall {
+    caller.tool_calls.push(ags::model::ToolCall {
         id: Some("call-1".to_string()),
         name: "bash".to_string(),
         arguments: serde_json::json!({}),
     });
     let mut answerer = msg(2, MessageRole::Tool, "ok", Some(2));
-    answerer.tool_results.push(casr::model::ToolResult {
+    answerer.tool_results.push(ags::model::ToolResult {
         call_id: Some("call-1".to_string()),
         content: "ok".to_string(),
         is_error: false,
@@ -2680,7 +2680,7 @@ fn a_forced_write_never_leaves_the_session_path_empty() {
 
     // Large enough that the write takes long enough to be observed.
     let content = vec![b'x'; 32 * 1024 * 1024];
-    casr::pipeline::atomic_write(&target, &content, true, "test").expect("forced write");
+    ags::pipeline::atomic_write(&target, &content, true, "test").expect("forced write");
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     watcher.join().expect("watcher");
 
@@ -2713,7 +2713,7 @@ fn concurrent_forced_writes_cannot_overwrite_each_others_backups() {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let payload = vec![b'0' + i as u8; 256 * 1024];
-                    let _ = casr::pipeline::atomic_write(&target, &payload, true, "test");
+                    let _ = ags::pipeline::atomic_write(&target, &payload, true, "test");
                 })
             })
             .collect();

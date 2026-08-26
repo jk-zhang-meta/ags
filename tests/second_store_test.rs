@@ -28,9 +28,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::providers::Provider;
-use casr::providers::cursor::Cursor;
-use casr::providers::kiro::Kiro;
+use ags::providers::Provider;
+use ags::providers::cursor::Cursor;
+use ags::providers::kiro::Kiro;
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -207,7 +207,9 @@ fn list_json(
     envs: &[(&str, &Path)],
     store: &Path,
 ) -> serde_json::Value {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_casr"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ags"));
+    // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。
+    cmd.arg("convert");
     cmd.args(["list", "--provider", provider, "--limit", "50", "--json"]);
     cmd.args(extra);
     for (key, value) in envs {
@@ -481,8 +483,8 @@ fn kiro_session_passed_by_path_is_read_as_kiro() {
     .unwrap();
     let path = cli.join(format!("{cli_id}.json"));
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
-        .args(["info", &path.display().to_string(), "--json"])
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+        .args(["convert", "info", &path.display().to_string(), "--json"])
         .env("HOME", home.path())
         .env("KIRO_HOME", kiro_home.path())
         .env("XDG_DATA_HOME", store.path())
@@ -510,8 +512,8 @@ fn kiro_session_passed_by_path_is_read_as_kiro() {
     // most plausible parse — which is how a Kiro session comes back as some
     // other agent's. The probe is silent under `--json`, so it is observed
     // without it: the losing providers complain on stderr as they are asked.
-    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
-        .args(["info", &path.display().to_string()])
+    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+        .args(["convert", "info", &path.display().to_string()])
         .env("HOME", home.path())
         .env("KIRO_HOME", kiro_home.path())
         .env("XDG_DATA_HOME", store.path())
@@ -619,8 +621,8 @@ fn cursor_agent_chat_without_transcript_is_reported_not_dropped() {
 
     // And the plain listing says so on stderr rather than silently coming up
     // one short.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_casr"))
-        .args(["list", "--provider", "cursor", "--limit", "50"])
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+        .args(["convert", "list", "--provider", "cursor", "--limit", "50"])
         .env("CURSOR_CONFIG_DIR", tmp.path())
         .env("CURSOR_DATA_DIR", tmp.path())
         .env("CURSOR_HOME", vscdb.path())

@@ -4967,8 +4967,10 @@ prepare_cross_agent_restore() {
     esac
     result_file="$sandbox/convert.json"
     stderr="$sandbox/convert.err"
+    # `convert` 前缀：转换那套收在它底下了（见 `converter_cli`）。这里不能直接用
+    # `converter_cli`——这一次要在隔离沙箱里跑。
     if ! run_ags_isolated "$binary" "$sandbox" \
-        --json resume "$target_alias" "$source_session_id" \
+        convert --json resume "$target_alias" "$source_session_id" \
         --source "$source_input" --force --exact-source \
         > "$result_file" 2> "$stderr"; then
         error_message="$(jq -r '.message // empty' "$stderr" 2>/dev/null || true)"
@@ -6992,8 +6994,7 @@ session_content_stamp() {
 # 已经把注入块和非用户消息剔掉了。
 session_digest_text() {
     local provider="$1" session_id="$2" path="$3" binary
-    binary="$(resolve_ags_converter_binary)"
-    "$binary" --json info "$session_id" --from "$provider" --digest \
+    converter_cli --json info "$session_id" --from "$provider" --digest \
         ${path:+--source "$path"} 2>/dev/null |
         jq -r '(.digest // []) | .[]' 2>/dev/null
 }
@@ -7278,6 +7279,20 @@ native_session_limit() {
     printf '%s\n' "$limit"
 }
 
+# 跑转换那半边的 CLI。
+#
+# 二进制现在叫 `ags`，而它默认就是这个运行时——`ags ls`、`ags resume 7` 都是这里
+# 的命令。跨 Agent 转换那套（原来的 `casr list` / `casr info` / `casr resume`）
+# 收在 `ags convert` 底下，因为两边都想叫 `list` 和 `resume`，而日常敲的是这边。
+#
+# 收成一个函数而不是每处各写一遍 `convert`：这个前缀是命令布局的一部分，将来它
+# 再变一次时，改一个地方比在脚本里找六处强。
+converter_cli() {
+    local binary
+    binary="$(resolve_ags_converter_binary)"
+    "$binary" convert "$@"
+}
+
 # 原生会话，最近的在前。
 #
 # 字段用 `\x1f`（US）分隔，**不用制表符**。bash 把制表符算作 IFS 空白字符，于是
@@ -7292,8 +7307,7 @@ native_session_limit() {
 # provider 的先后只有把两边合起来看才成立。
 native_session_rows() {
     local binary
-    binary="$(resolve_ags_converter_binary)"
-    "$binary" --json list --all-workspaces --sort date \
+    converter_cli --json list --all-workspaces --sort date \
         --limit "$(native_session_limit)" 2>/dev/null |
         jq -r '
             # 一行给人看的标题。
@@ -7607,8 +7621,7 @@ resume_live_session() {
 # 而 `cd` 需要的是完整路径。
 native_session_workspace() {
     local provider="$1" session_id="$2" binary
-    binary="$(resolve_ags_converter_binary)"
-    "$binary" --json list --all-workspaces --sort date \
+    converter_cli --json list --all-workspaces --sort date \
         --limit "$(native_session_limit)" 2>/dev/null |
         jq -r --arg provider "$provider" --arg id "$session_id" '
             (.items // [])
@@ -7623,7 +7636,7 @@ native_session_workspace() {
 show_foreign_resume_command() {
     local provider="$1" session_id="$2" binary command
     binary="$(resolve_ags_converter_binary)"
-    command="$("$binary" --json info "$session_id" 2>/dev/null |
+    command="$(converter_cli --json info "$session_id" 2>/dev/null |
         jq -r '.resume_command // ""' 2>/dev/null)"
     if [[ -n "$command" ]]; then
         log "$provider 会话要用它自己的命令打开："
@@ -7915,7 +7928,7 @@ push_pool_descriptions() {
         jq -c '[(.data.sessions // [])[] | select((.device_id // "") != "")]' 2>/dev/null)" || return 0
     [[ -n "$remote" && "$remote" != "[]" ]] || return 0
 
-    local_rows="$("$(resolve_ags_converter_binary)" --json list --all-workspaces \
+    local_rows="$(converter_cli --json list --all-workspaces \
         --sort date --limit "$(native_session_limit)" 2>/dev/null |
         jq -c '[(.items // [])[]
                | select(.provider == "codex")
@@ -7969,8 +7982,7 @@ push_pool_descriptions() {
 # Agent 自己给这条会话起的名字，没有就是空串。
 native_session_name() {
     local provider="$1" session_id="$2" path="$3" binary
-    binary="$(resolve_ags_converter_binary)"
-    "$binary" --json info "$session_id" --from "$provider" \
+    converter_cli --json info "$session_id" --from "$provider" \
         ${path:+--source "$path"} 2>/dev/null |
         jq -r '.native_name // ""' 2>/dev/null
 }
@@ -8354,7 +8366,7 @@ ags_gc() {
 # 因为过期的那些按定义就在列表的尾巴上，取前 50 条永远看不到它们。
 gc_candidate_rows() {
     local binary="$1"
-    "$binary" --json list --all-workspaces --sort date --limit 9999 2>/dev/null |
+    converter_cli --json list --all-workspaces --sort date --limit 9999 2>/dev/null |
         jq -r '
             (.items // [])
             | .[]

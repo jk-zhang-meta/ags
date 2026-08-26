@@ -1,4 +1,4 @@
-# AGENTS.md — casr (Cross Agent Session Resumer)
+# AGENTS.md — ags (Cross Agent Session Resumer)
 
 > Guidelines for AI coding agents working in this Rust codebase.
 
@@ -60,7 +60,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 | Crate | Purpose |
 |-------|---------|
-| `clap` + `clap_complete` | CLI argument parsing and shell completions (`casr <target> resume <session-id>`) |
+| `clap` + `clap_complete` | CLI argument parsing and shell completions (`ags <target> resume <session-id>`) |
 | `serde` + `serde_json` | Canonical session model + provider format parsing/writing |
 | `anyhow` + `thiserror` | Internal propagation + actionable user-facing errors |
 | `chrono` | Timestamp normalization (ISO-8601, epoch seconds/millis) |
@@ -246,7 +246,7 @@ Runs format, clippy, unit tests, and the CASS independence guardrail:
 - `cargo clippy --all-targets -- -D warnings` - Lints (default set; see the note above)
 - `cargo test --lib` - Unit tests only; the integration suites are separate jobs
 - A grep over `Cargo.toml` / `Cargo.lock` that fails if `coding_agent_session_search`
-  appears, so `casr` cannot acquire a runtime dependency on CASS
+  appears, so `ags` cannot acquire a runtime dependency on CASS
 
 ### Coverage Job
 
@@ -380,9 +380,9 @@ gh release view v0.1.1  # Check assets were uploaded
 ```
 
 Expected assets per release:
-- `casr-{target}.tar.xz` - Binary archive
-- `casr-{target}.tar.xz.sha256` - Checksum
-- `casr-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
+- `ags-{target}.tar.xz` - Binary archive
+- `ags-{target}.tar.xz.sha256` - Checksum
+- `ags-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
 - `install.sh`, `install.ps1` - Install scripts
 
 ### Troubleshooting Failed Releases
@@ -406,9 +406,9 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ---
 
-## casr (Cross Agent Session Resumer) — This Project
+## ags (Cross Agent Session Resumer) — This Project
 
-**This is the project you're working on.** casr is a high-fidelity Rust CLI that lets users resume sessions across AI coding providers by converting through a canonical intermediate representation (IR).
+**This is the project you're working on.** ags is a high-fidelity Rust CLI that lets users resume sessions across AI coding providers by converting through a canonical intermediate representation (IR).
 
 ### What It Does
 
@@ -430,7 +430,7 @@ CLI Input
 ### Project Structure
 
 ```
-cross_agent_session_resumer/
+ags/
 ├── Cargo.toml                        # Single crate (not a workspace)
 ├── build.rs                          # vergen-gix build metadata
 ├── src/
@@ -481,18 +481,18 @@ cross_agent_session_resumer/
 
 ### Provider System
 
-- casr is built around a `Provider` trait (`detect`, `owns_session`, `read_session`, `write_session`, `resume_command`).
+- ags is built around a `Provider` trait (`detect`, `owns_session`, `read_session`, `write_session`, `resume_command`).
 - Core aliases:
   - `cc` -> Claude Code
   - `cod` -> Codex
-  - `agy` -> Antigravity CLI (read plus optional target writes through the official `google-antigravity>=0.1.9` SDK; `agy --conversation <uuid>` — no model pin: `--model` takes a slug and `--effort` is a separate flag, and casr has no model to pin from)
+  - `agy` -> Antigravity CLI (read plus optional target writes through the official `google-antigravity>=0.1.9` SDK; `agy --conversation <uuid>` — no model pin: `--model` takes a slug and `--effort` is a separate flag, and ags has no model to pin from)
   - `gmi` -> Gemini CLI (legacy)
   - `grk` -> Grok Build (read/resume only; `grok --resume <session-id>`)
-- Provider home overrides — casr's own:
+- Provider home overrides — ags's own:
   - `CLAUDE_HOME`
   - `GEMINI_HOME`
-- Provider home overrides — the agent's own variable, which casr also honours so
-  that relocating an agent the supported way does not hide its sessions. casr's
+- Provider home overrides — the agent's own variable, which ags also honours so
+  that relocating an agent the supported way does not hide its sessions. ags's
   own override wins when both are set; see the table in `README.md`.
   - `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GEMINI_CLI_HOME`, `CLINE_DATA_DIR` /
     `CLINE_DIR`, `FACTORY_HOME_OVERRIDE`, `PI_CODING_AGENT_DIR`, `OPENCODE_DB`,
@@ -506,16 +506,16 @@ cross_agent_session_resumer/
   relocation variable and always uses `~/.kiro`. `Kiro::cli_home_dir` and
   `Kiro::ide_home_dir` are separate for that reason, and each quotes the shipped
   code it mirrors. Applying one store's variable to the other store's scan is
-  the same defect as not reading that store at all: casr ends up looking at a
+  the same defect as not reading that store at all: ags ends up looking at a
   path the tool never writes to.
 
 ### CLI Surface
 
-- Primary flow: `casr <target-alias> resume <session-id>`
+- Primary flow: `ags <target-alias> resume <session-id>`
 - Inspection flows:
-  - `casr list`
-  - `casr info <session-id>`
-  - `casr providers`
+  - `ags convert list`
+  - `ags convert info <session-id>`
+  - `ags convert providers`
 - Power flags:
   - `--dry-run`
   - `--force`
@@ -566,7 +566,7 @@ Colors are automatically disabled when stderr is not a TTY (e.g., piped to file)
 
 ### Performance Requirements
 
-casr runs in interactive CLI loops, so latency matters:
+ags runs in interactive CLI loops, so latency matters:
 
 - Fast provider detection with minimal filesystem probes
 - Early short-circuit session ID ownership checks
@@ -586,27 +586,27 @@ casr runs in interactive CLI loops, so latency matters:
 
 ---
 
-<!-- casr-machine-readable-v1 -->
+<!-- ags-machine-readable-v1 -->
 
 ## CASR CLI Protocol (Machine-Readable Reference)
 
-> This section provides structured documentation for agents integrating with casr.
+> This section provides structured documentation for agents integrating with ags.
 
 ### Command Input Format
 
-casr is a command-line tool (not a hook protocol). Primary command shape:
+ags is a command-line tool (not a hook protocol). Primary command shape:
 
 ```bash
-casr <target> resume <session-id> [--source <alias_or_path>] [--dry-run] [--force] [--json] [--verbose|--trace] [--enrich]
+ags <target> resume <session-id> [--source <alias_or_path>] [--dry-run] [--force] [--json] [--verbose|--trace] [--enrich]
 ```
 
 Additional command shapes:
 
 ```bash
-casr list [--provider <slug>] [--workspace <path>] [--limit <n>] [--sort <field>] [--json]
-casr info <session-id> [--json]
-casr providers [--json]
-casr completions <bash|zsh|fish>
+ags convert list [--provider <slug>] [--workspace <path>] [--limit <n>] [--sort <field>] [--json]
+ags convert info <session-id> [--json]
+ags convert providers [--json]
+ags convert completions <bash|zsh|fish>
 ```
 
 ### JSON Output Format (`--json`)
@@ -634,7 +634,7 @@ Error (representative shape):
 {
   "ok": false,
   "error_type": "SessionNotFound",
-  "message": "Session abc123 not found. Run 'casr list' to discover available sessions.",
+  "message": "Session abc123 not found. Run 'ags convert list' to discover available sessions.",
   "context": {
     "session_id": "abc123",
     "providers_checked": ["claude-code", "codex", "gemini"]
@@ -652,7 +652,7 @@ Error (representative shape):
 
 ### Error Types Reference
 
-casr exposes actionable error classes (names may appear in JSON mode and logs):
+ags exposes actionable error classes (names may appear in JSON mode and logs):
 
 - `SessionNotFound`
 - `ProviderNotInstalled`
@@ -715,10 +715,10 @@ with expected, documented metadata loss where schemas differ.
 
 ### Agent Integration Checklist
 
-When integrating with casr, ensure your agent:
+When integrating with ags, ensure your agent:
 
-- [ ] Runs `casr providers` before conversion attempts in unknown environments
-- [ ] Uses `casr list` / `casr info` to disambiguate session IDs
+- [ ] Runs `ags convert providers` before conversion attempts in unknown environments
+- [ ] Uses `ags convert list` / `ags convert info` to disambiguate session IDs
 - [ ] Uses `--source` when provider auto-detection is ambiguous
 - [ ] Parses `--json` output for automation instead of scraping human text
 - [ ] Treats `SessionConflict` as recoverable with explicit `--force`
@@ -742,7 +742,7 @@ Use these schemas for:
 - generating typed client bindings
 - enforcing stable machine-readable contracts
 
-<!-- end-casr-machine-readable -->
+<!-- end-ags-machine-readable -->
 
 ---
 
@@ -1064,7 +1064,7 @@ rg -l -t rust 'unwrap\(' | xargs ast-grep run -l Rust -p '$X.unwrap()' --json
 
 ```
 mcp__morph-mcp__warp_grep(
-  repoPath: "/dp/cross_agent_session_resumer",
+  repoPath: "/dp/ags",
   query: "How does provider detection and session lookup work?"
 )
 ```

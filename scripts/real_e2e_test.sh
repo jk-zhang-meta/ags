@@ -20,7 +20,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CARGO_TARGET="${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}"
-CASR="${CASR_BIN:-$CARGO_TARGET/debug/casr}"
+# 二进制改名成 `ags` 之后，跨 Agent 转换那套收在 `ags convert` 底下——`list` 和
+# `resume` 两边都要用，而日常敲的是会话运行时那边。所以这里是个数组，每次调用都
+# 带上前缀；下面所有 `"${CASR[@]}"` 就是原来的 `"$CASR"`。
+CASR_PATH="${CASR_BIN:-$CARGO_TARGET/debug/ags}"
+CASR=("$CASR_PATH" convert)
 VERBOSE="${VERBOSE:-0}"
 
 # ---------------------------------------------------------------------------
@@ -31,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --verbose) VERBOSE=1; shift ;;
         --casr-bin)
             [[ $# -lt 2 ]] && { echo "ERROR: --casr-bin requires a path" >&2; exit 2; }
-            CASR="$2"; shift 2 ;;
+            CASR_PATH="$2"; CASR=("$CASR_PATH" convert); shift 2 ;;
         --artifacts-dir)
             [[ $# -lt 2 ]] && { echo "ERROR: --artifacts-dir requires a path" >&2; exit 2; }
             E2E_ARTIFACTS_DIR="$2"; shift 2 ;;
@@ -136,7 +140,7 @@ run_casr() {
     start_ms=$(ts_ms)
 
     set +e
-    "$CASR" "$@" > "$stdout_file" 2> "$stderr_file"
+    "${CASR[@]}" "$@" > "$stdout_file" 2> "$stderr_file"
     LAST_EXIT=$?
     set -e
 
@@ -195,7 +199,7 @@ phase_prereqs() {
     log_step "sha256sum: available"
 
     # Build casr
-    if [[ ! -x "$CASR" ]]; then
+    if [[ ! -x "$CASR_PATH" ]]; then
         log_step "Building casr..."
         if command -v rch > /dev/null 2>&1; then
             rch exec cargo build --manifest-path "$PROJECT_ROOT/Cargo.toml" 2>&1 | tail -3
@@ -204,13 +208,13 @@ phase_prereqs() {
         fi
     fi
 
-    if [[ ! -x "$CASR" ]]; then
-        echo "ERROR: casr binary not found at $CASR" >&2
+    if [[ ! -x "$CASR_PATH" ]]; then
+        echo "ERROR: ags binary not found at $CASR_PATH" >&2
         exit 1
     fi
 
     local version
-    version=$("$CASR" --version 2>&1 || true)
+    version=$("${CASR[@]}" --version 2>&1 || true)
     log_step "casr: $version ($CASR)"
 }
 
@@ -561,7 +565,7 @@ check_fidelity() {
         CLAUDE_HOME="$sandbox_dir/claude" \
         CODEX_HOME="$sandbox_dir/codex" \
         GEMINI_HOME="$sandbox_dir/gemini" \
-        "$CASR" --json info "$target_session_id" > "$info_stdout" 2> "$info_stderr"
+        "${CASR[@]}" --json info "$target_session_id" > "$info_stdout" 2> "$info_stderr"
     local info_exit=$?
     set -e
 
@@ -659,7 +663,7 @@ run_conversion_pair() {
         CLAUDE_HOME="$sandbox/claude" \
         CODEX_HOME="$sandbox/codex" \
         GEMINI_HOME="$sandbox/gemini" \
-        "$CASR" --json info "$source_session_id" --source "$src" \
+        "${CASR[@]}" --json info "$source_session_id" --source "$src" \
         > "$source_canonical_info" 2> "$source_canonical_stderr"
     local source_info_exit=$?
     set -e
@@ -706,7 +710,7 @@ run_conversion_pair() {
         CLAUDE_HOME="$sandbox/claude" \
         CODEX_HOME="$sandbox/codex" \
         GEMINI_HOME="$sandbox/gemini" \
-        "$CASR" --json resume "$tgt" "$source_session_id" --source "$src" --force \
+        "${CASR[@]}" --json resume "$tgt" "$source_session_id" --source "$src" --force \
         > "$convert_stdout" 2> "$convert_stderr"
     local convert_exit=$?
     set -e
@@ -924,7 +928,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 main() {
     echo -e "${BOLD}casr real E2E integration test${RESET}"
-    echo "Binary: $CASR"
+    echo "Binary: $CASR_PATH"
     echo "Artifacts: $ARTIFACTS_DIR"
     echo ""
 

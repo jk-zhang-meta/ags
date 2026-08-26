@@ -38,9 +38,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use casr::launch::SessionTargeting;
-use casr::providers::Provider;
-use casr::providers::kiro::Kiro;
+use ags::launch::SessionTargeting;
+use ags::providers::Provider;
+use ags::providers::kiro::Kiro;
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -264,14 +264,14 @@ fn session_start_is_the_opening_user_message() {
         first.content, "Add a /health endpoint to the server.",
         "session_start.content is the prompt that opened the session"
     );
-    assert_eq!(first.role, casr::model::MessageRole::User);
+    assert_eq!(first.role, ags::model::MessageRole::User);
 
     // And it is not double-counted against the mid-turn `user` payload, which
     // is a different prompt.
     let user_texts: Vec<&str> = session
         .messages
         .iter()
-        .filter(|m| m.role == casr::model::MessageRole::User)
+        .filter(|m| m.role == ags::model::MessageRole::User)
         .map(|m| m.content.as_str())
         .collect();
     assert_eq!(

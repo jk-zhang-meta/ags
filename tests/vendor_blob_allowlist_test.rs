@@ -42,7 +42,9 @@ fn fixtures_dir() -> PathBuf {
 /// redirect, so a value inherited from the developer's shell would aim these
 /// tests at the real session store.
 fn run(args: &[&str], envs: &[(&str, &Path)], store: &Path) -> String {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_casr"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ags"));
+    // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。
+    cmd.arg("convert");
     cmd.args(args).env("XDG_DATA_HOME", store);
     for (key, value) in envs {
         cmd.env(key, value);

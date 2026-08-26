@@ -5,19 +5,19 @@
 //! wrong formats. Providers that support error recovery (CC, Codex) should
 //! produce partial sessions from mixed valid/invalid content.
 
-use casr::providers::Provider;
-use casr::providers::aider::Aider;
-use casr::providers::amp::Amp;
-use casr::providers::chatgpt::ChatGpt;
-use casr::providers::claude_code::ClaudeCode;
-use casr::providers::clawdbot::ClawdBot;
-use casr::providers::cline::Cline;
-use casr::providers::codex::Codex;
-use casr::providers::factory::Factory;
-use casr::providers::gemini::Gemini;
-use casr::providers::openclaw::OpenClaw;
-use casr::providers::pi_agent::PiAgent;
-use casr::providers::vibe::Vibe;
+use ags::providers::Provider;
+use ags::providers::aider::Aider;
+use ags::providers::amp::Amp;
+use ags::providers::chatgpt::ChatGpt;
+use ags::providers::claude_code::ClaudeCode;
+use ags::providers::clawdbot::ClawdBot;
+use ags::providers::cline::Cline;
+use ags::providers::codex::Codex;
+use ags::providers::factory::Factory;
+use ags::providers::gemini::Gemini;
+use ags::providers::openclaw::OpenClaw;
+use ags::providers::pi_agent::PiAgent;
+use ags::providers::vibe::Vibe;
 
 /// Test that a provider handles an empty file without panicking.
 /// Acceptable: Err or Ok(0 messages). NOT acceptable: panic or Ok(>0).
@@ -268,12 +268,12 @@ fn malformed_aider_garbage() {
 
 #[test]
 fn malformed_cursor_empty() {
-    assert_empty_file_handled(&casr::providers::cursor::Cursor, ".vscdb");
+    assert_empty_file_handled(&ags::providers::cursor::Cursor, ".vscdb");
 }
 
 #[test]
 fn malformed_cursor_garbage() {
-    assert_garbage_handled(&casr::providers::cursor::Cursor, ".vscdb");
+    assert_garbage_handled(&ags::providers::cursor::Cursor, ".vscdb");
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn malformed_opencode_empty() {
     std::fs::create_dir_all(&db_dir).expect("create .opencode dir");
     let db_path = db_dir.join("opencode.db");
     std::fs::write(&db_path, "").expect("write empty file");
-    let result = casr::providers::opencode::OpenCode.read_session(&db_path);
+    let result = ags::providers::opencode::OpenCode.read_session(&db_path);
     assert!(
         result.is_err(),
         "opencode: reading empty db should return Err"
@@ -297,7 +297,7 @@ fn malformed_opencode_garbage() {
     std::fs::create_dir_all(&db_dir).expect("create .opencode dir");
     let db_path = db_dir.join("opencode.db");
     std::fs::write(&db_path, b"\x00\x01garbage\xff\xfe").expect("write garbage");
-    let result = casr::providers::opencode::OpenCode.read_session(&db_path);
+    let result = ags::providers::opencode::OpenCode.read_session(&db_path);
     assert!(
         result.is_err(),
         "opencode: reading garbage db should return Err"
