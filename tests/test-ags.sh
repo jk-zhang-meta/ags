@@ -731,13 +731,27 @@ grep -q 'ags help all' <<< "$ags_help_short" || {
     printf 'ags help: the short help must point at `ags help all`\n' >&2
     exit 1
 }
-# 每个顶层动词都要在 `help all` 里出现过，一个都不能因为分层丢掉。
-for ags_help_verb in init set list show save resume delete update remote storage cloud; do
+# 在用的动词一个都不能因为分层丢掉。
+for ags_help_verb in init set list show save resume delete update store sync gc; do
     grep -q "ags $ags_help_verb" <<< "$ags_help_all" || {
         printf 'ags help: `help all` lost the %s command\n' "$ags_help_verb" >&2
         exit 1
     }
 done
+# 反过来也要钉住：并进 `ags store` 的那三个名字、以及已经自动化或被别的命令覆盖的
+# 那几个，**不许**再出现在帮助里。它们还能调用（老脚本和后台任务靠着），但帮助是
+# 给人读的——留在里面就等于这次简化没做。
+for ags_help_verb in remote storage cloud summarize archives legacy rehome-claude; do
+    grep -q "ags $ags_help_verb" <<< "$ags_help_all" && {
+        printf 'ags help: %s is deprecated but still documented\n' "$ags_help_verb" >&2
+        exit 1
+    }
+done
+# 但它们必须还能用——帮助里撤掉不等于删掉。
+"$tool" storage list >/dev/null 2>&1 || {
+    printf 'ags help: `ags storage list` stopped working\n' >&2
+    exit 1
+}
 unset ags_help_verb ags_help_short ags_help_all
 
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
@@ -2369,7 +2383,10 @@ age_checkpoint_output="$(
         age-only 'Native age identity'
 )"
 age_checkpoint_path="$(sed -n 's/^path=//p' <<< "$age_checkpoint_output")"
-age -d -i "$init_identity" "$age_checkpoint_path" | tar -tzf - | grep -Fqx manifest
+# `grep -Fx … >/dev/null` 而不是 `grep -Fqx`：`-q` 一匹配上就退出，此时 `tar` 还在
+# 往管道里写，拿到 SIGPIPE(141)，`pipefail` 于是把整条流水线判成失败。看起来像
+# "存档里没有 manifest"，其实是有，而且是**间歇性**的——取决于 tar 还剩多少没写完。
+age -d -i "$init_identity" "$age_checkpoint_path" | tar -tzf - | grep -Fx manifest >/dev/null
 env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
     -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
     "${age_env[@]}" "$tool" archives | grep -Fq 'Native age identity'
@@ -2393,7 +2410,7 @@ identity_priority_output="$(
         'Configured identity wins over SFTP key'
 )"
 identity_priority_path="$(sed -n 's/^path=//p' <<< "$identity_priority_output")"
-age -d -i "$init_identity" "$identity_priority_path" | tar -tzf - | grep -Fqx manifest
+age -d -i "$init_identity" "$identity_priority_path" | tar -tzf - | grep -Fx manifest >/dev/null
 if age -d -i "$tmp/key" "$identity_priority_path" >/dev/null 2>&1; then
     echo 'new record was encrypted to AGENT_SESSION_SSH_KEY after init' >&2
     exit 1
@@ -5828,5 +5845,75 @@ printf 'rm -rf /\nauto gc: 真的那一行\n' > "$gc_state/auto-gc.report"
 gc_launch_out="$("${gc_env[@]}" "$tool" codex 2>&1 </dev/null || true)"
 grep -Fq 'auto gc: 真的那一行' <<< "$gc_launch_out"
 ! grep -Fq 'rm -rf /' <<< "$gc_launch_out"
+
+# ---------------------------------------------------------------------------
+# 一套 store 命令
+#
+# `ags set DIR`（本地）、`ags remote *`（git/sftp）、`ags storage *`（切换）、
+# `ags cloud *`（sftp 的旧版重复实现）并成了 `ags store`。底下本来就是一个概念：
+# 一个 store 就是 `local` 或 `remote:<名字>`，两个 `use` 更是同一行代码。
+#
+# 真实远端（GitHub + sftp 服务器）另有一套端到端，那个要凭据，进不了 CI。
+# ---------------------------------------------------------------------------
+store_home="$tmp/store-home"
+store_state="$tmp/store-state"
+mkdir -p "$store_home/codex" "$store_home/claude" "$store_state"
+store_env=(
+    env
+    HOME="$store_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$store_home/codex"
+    CLAUDE_CONFIG_DIR="$store_home/claude"
+    XDG_CONFIG_HOME="$store_home/.config"
+    XDG_DATA_HOME="$store_home/.local/share"
+    XDG_STATE_HOME="$store_home/.local/state"
+    AGENT_SESSION_STATE_DIR="$store_state"
+)
+"${store_env[@]}" "$tool" init >/dev/null
+
+# 不带子命令就是列表。
+store_out="$("${store_env[@]}" "$tool" store)"
+grep -Fq local <<< "$store_out"
+[[ "$store_out" == "$("${store_env[@]}" "$tool" store list)" ]]
+[[ "$store_out" == "$("${store_env[@]}" "$tool" store ls)" ]]
+
+# `show local` 要报**路径**，不是列表里那一列的显示名（"Local"）。
+store_out="$("${store_env[@]}" "$tool" store show local)"
+grep -Fqx 'type=local' <<< "$store_out"
+grep -Fq "path=$store_home" <<< "$store_out"
+
+# `store add local DIR` 就是旧的 `ags set DIR`。
+"${store_env[@]}" "$tool" store add local "$tmp/store-vault2" >/dev/null
+grep -Fq "path=$tmp/store-vault2" \
+    <<< "$("${store_env[@]}" "$tool" store show local)"
+
+# local 是保留名字，删不掉，而且要说清楚怎么换。
+store_out="$("${store_env[@]}" "$tool" store remove local 2>&1)" && exit 1
+grep -Fq 'ags store add local' <<< "$store_out"
+
+# 参数校验。
+"${store_env[@]}" "$tool" store add local 2>/dev/null && exit 1
+"${store_env[@]}" "$tool" store add onlyname 2>/dev/null && exit 1
+"${store_env[@]}" "$tool" store show 2>/dev/null && exit 1
+store_rc=0
+"${store_env[@]}" "$tool" store bogus >/dev/null 2>&1 || store_rc=$?
+[[ "$store_rc" == 2 ]]
+
+# 老名字还认，提示改名，而且提示**只在 stderr**——`ags storage list` 的输出有脚本
+# 在解析，一行提示混进 stdout 会把它们弄坏。
+grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" storage list 2>&1 >/dev/null)"
+grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" remote list 2>&1 >/dev/null)"
+grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" set "$tmp/store-vault3" 2>&1 >/dev/null)"
+! grep -Fq '并进' <<< "$("${store_env[@]}" "$tool" storage list 2>/dev/null)"
+
+# `ags set retention` 和目录是两件事，它不该跟着报改名。
+! grep -Fq '并进' \
+    <<< "$("${store_env[@]}" "$tool" set retention --agent codex 45 2>&1 >/dev/null)"
+
+# `ags status` 是"只看计划的 sync"，所以它是个开关而不是第四个动词。两条路要走到
+# 同一个地方——这里没配远端，两边都该以同样的方式拒绝。
+store_out="$("${store_env[@]}" "$tool" sync --dry-run 2>&1)" || true
+store_ref="$("${store_env[@]}" "$tool" status 2>&1)" || true
+[[ "$store_out" == "$store_ref" ]]
 
 printf 'ags self-check passed\n'

@@ -1,6 +1,6 @@
 ---
 name: ags
-description: Save, inspect, restore, resume, delete, and synchronize encrypted local Codex or Claude Code session records. Use when the user explicitly invokes AGS or asks to manage AGS records or named Git/SFTP remotes.
+description: Save, inspect, restore, resume, delete, and synchronize encrypted local Codex or Claude Code session records. Use when the user explicitly invokes AGS or asks to manage AGS records or the stores they live in (local directory, Git, or SFTP).
 ---
 
 # AGS
@@ -20,7 +20,6 @@ archives directly.
 claude [CLAUDE_ARGS...]
 codex [CODEX_ARGS...]
 init [--identity ABSOLUTE_AGE_IDENTITY]
-set ABSOLUTE_DIR
 save ID DESCRIPTION
 list
 show ID|AGENT/RECORD_ID
@@ -28,28 +27,27 @@ resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH]
   [--profile PROFILE] [-- CLIENT_ARGS...]
 delete ID|AGENT/RECORD_ID
 
-remote add NAME git URL [--branch BRANCH]
-remote add NAME sftp://USER@HOST:PORT/PATH
-  [--known-hosts FILE] [--key FILE|--agent]
-remote list
-remote show NAME
-remote use NAME
-remote remove NAME
+store
+store add local ABSOLUTE_DIR
+store add NAME git URL [--branch BRANCH]
+store add NAME sftp://USER@HOST:PORT/PATH
+  [--known-hosts FILE] [--key FILE|--agent|--password]
+store use NAME|local
+store show NAME|local
+store remove NAME
+store merge --into NAME|local [SOURCE...]
+store retire SOURCE --into NAME|local
 
-storage list
-storage use local|NAME
-storage merge --into local|NAME [SOURCE...]
-storage retire SOURCE --into local|NAME
-
-status [REMOTE]
-push [REMOTE]
-pull [REMOTE]
-sync [REMOTE]
+sync [STORE]
+sync --dry-run [STORE]
 ```
 
-Treat local records and named remotes as the normal workflow. Use legacy
-`cloud` or `legacy history` commands only when the user explicitly requests
-the old storage model.
+A store is where records live. The backend — a local directory, Git, or SFTP —
+is settled by `store add`; every command after that only ever names the store.
+
+`remote`, `storage`, `cloud`, and `set ABSOLUTE_DIR` are the old names for the
+same thing and still work, but do not use them: prefer `store`. `legacy
+history` only when the user explicitly asks for the old whole-history model.
 
 ## Initialize
 
@@ -77,7 +75,7 @@ Require one dedicated absolute local directory. Under WSL, reject `/mnt/c` and
 other Windows-mounted paths.
 
 ```bash
-ags checkpoint set "ABSOLUTE_DIR"
+ags checkpoint store add local "ABSOLUTE_DIR"
 ```
 
 Complete only on `status=configured`.
@@ -283,7 +281,7 @@ the next named-remote synchronization.
 GitHub is a normal Git remote:
 
 ```bash
-ags checkpoint remote add "NAME" git "GIT_URL" --branch "BRANCH"
+ags checkpoint store add "NAME" git "GIT_URL" --branch "BRANCH"
 ```
 
 Allow local paths, SSH URLs, and credential-helper-backed HTTPS URLs. Never put
@@ -297,7 +295,7 @@ Require `sftp://USER@HOST:PORT/ABSOLUTE/PATH`, an absolute readable
 password authentication:
 
 ```bash
-ags checkpoint remote add "NAME" \
+ags checkpoint store add "NAME" \
     "sftp://USER@HOST:PORT/ABSOLUTE/PATH" \
     --known-hosts "ABSOLUTE_KNOWN_HOSTS" \
     --key "ABSOLUTE_KEY"
@@ -318,7 +316,7 @@ Inspect the plan before a material transfer:
 
 ```bash
 ags checkpoint status
-ags checkpoint status "REMOTE"
+ags checkpoint sync --dry-run "REMOTE"
 ```
 
 The plan reports `push_records`, `pull_records`, `push_tombstones`,
@@ -342,10 +340,10 @@ never overwrite, force-push, or choose one side automatically.
 Every managed Agent launch selects a checkpoint storage policy:
 
 ```bash
-ags checkpoint storage list
-ags checkpoint storage use local
-ags checkpoint storage use neburst
-ags checkpoint storage use github
+ags checkpoint store
+ags checkpoint store use local
+ags checkpoint store use neburst
+ags checkpoint store use github
 ```
 
 One configured mode is automatic. Several modes are listed in most-recently-
@@ -358,8 +356,8 @@ remote. The Agent still runs on the current machine.
 Merge replicas only with the explicit storage commands:
 
 ```bash
-ags checkpoint storage merge --into github local neburst
-ags checkpoint storage retire neburst --into github
+ags checkpoint store merge --into github local neburst
+ags checkpoint store retire neburst --into github
 ```
 
 The local vault is the deduplication hub. `merge` pulls the source union,

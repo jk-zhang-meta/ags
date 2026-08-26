@@ -213,10 +213,11 @@ usage() {
   ags codex [--id 名字]        起一个 Codex 会话
   ags claude [--id 名字]       起一个 Claude 会话
   ags ls [-a]                  列出会话，挑一个接着干（-a 连存档一起列）
-  ags summarize                调模型给会话起名（--force 重算）；ags ls 也会在后台顺手做
-                               关掉：AGS_AUTO_SUMMARY=0
+                               名字是模型在后台起的，不用管；AGS_AUTO_SUMMARY=0 关掉
   ags save "描述"              把这个会话导出成一份存档
   ags resume N|ID              接着第 N 号会话干，或者打开一份存档
+  ags store                    记录存在哪：本机目录 / git / sftp
+  ags sync                     和当前那个 store 对一遍
   ags update                   更新到最新版
 
   给 Agent 的参数写在 -- 之后：ags codex -- --model o3
@@ -239,7 +240,6 @@ Usage:
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
-  ags set ABSOLUTE_DIR                 Configure local checkpoint storage
   ags ls | ags list [-a]               Pick one of this machine's Agent sessions
                                        and carry on with it. Newest first, every
                                        workspace. -a also lists the archives
@@ -251,26 +251,15 @@ Usage:
                                        (Up/Down or j/k, Enter open, a edit the
                                        Agent arguments, p pin, s save, Del
                                        delete, Esc quit)
-  ags summarize [--force|--settled]    Have a model name each session in one
-                                       line, so the list can be read. Claude
-                                       Code names its own sessions and those are
-                                       left alone; Codex names none, which is
-                                       why its rows are otherwise the first line
-                                       the user typed. Cached against the
-                                       session file, so this only pays for what
-                                       changed; --force recomputes everything.
-                                       Set AGS_SUMMARY_CMD to use something
-                                       other than `codex exec`.
-                                       `ags ls` also starts this in the
-                                       background when rows are unnamed: at most
+                                       Rows are named by a model in the
+                                       background so the list reads as prose,
+                                       not hex. Claude Code names its own
+                                       sessions and those are left alone; Codex
+                                       names none. Nothing to run: `ags ls`
+                                       starts it when rows are unnamed, at most
                                        once every AGS_AUTO_SUMMARY_INTERVAL
-                                       (900s), never re-naming a session it
-                                       named within AGS_SUMMARY_REFRESH_SECONDS
-                                       (3600s), and not at all when
-                                       AGS_AUTO_SUMMARY=0. `--settled` restricts
-                                       a run to sessions nothing has written to
-                                       for AGS_SUMMARY_IDLE_SECONDS (600s).
-  ags archives                         List only the saved archives
+                                       (900s). AGS_AUTO_SUMMARY=0 turns it off,
+                                       AGS_SUMMARY_CMD replaces `codex exec`.
   ags set retention [--agent codex|claude] DAYS
                                        One retention period for both Agents.
                                        Setting one turns on the automatic sweep
@@ -314,36 +303,22 @@ Usage:
                                        day, from a cached answer; AGS_UPDATE_CHECK=0 turns
                                        that off, AGS_UPDATE_CHECK_INTERVAL sets the seconds
 
-Record synchronization:
-  ags remote add NAME git URL [--branch BRANCH]
-  ags remote add NAME sftp://USER@HOST:PORT/PATH [--known-hosts FILE]
+Stores — where records live. The backend is settled when you add one; after
+that every command only ever names the store:
+  ags store                            List them; * marks the one in use
+  ags store add local ABSOLUTE_DIR     A directory on this machine
+  ags store add NAME git URL [--branch BRANCH]
+  ags store add NAME sftp://USER@HOST:PORT/PATH [--known-hosts FILE]
                  [--key FILE|--agent|--password]
-  ags remote list
-  ags remote show NAME
-  ags remote use NAME
-  ags remote remove NAME
-  ags storage list
-  ags storage use local|NAME
-  ags storage merge --into local|NAME [SOURCE...]
-  ags storage retire SOURCE --into local|NAME
-  ags push [REMOTE]                    Publish missing local records and tombstones
-  ags pull [REMOTE]                    Fetch missing remote records and tombstones
-  ags sync [REMOTE]                    Plan, pull, then push
-  ags status [REMOTE]                  Show the synchronization plan
-
-Legacy direct SFTP repository:
-  ags cloud set SFTP_URL [--key ABSOLUTE_KEY|--agent|--password]
-  ags cloud list
-  ags cloud save ID DESCRIPTION
-  ags cloud resume ID|AGENT/RECORD_ID [AGENT_ARGS...]
-                   [-- --to codex|claude --cwd PATH --profile NAME]
-  ags cloud delete ID|AGENT/RECORD_ID
-
-Legacy whole-history backup:
-  ags legacy history push              Encrypt native sessions to the backup directory
-  ags legacy history pull              Merge snapshots into local native history
-  ags legacy history status            List encrypted machine snapshots
-  ags rehome-claude UUID              Make a restored Claude session visible in the current path
+  ags store use NAME|local             Make one of them the current store
+  ags store show NAME|local
+  ags store remove NAME
+  ags store merge --into NAME|local [SOURCE...]
+  ags store retire SOURCE --into NAME|local
+  ags sync [STORE]                     Plan, pull, then push
+  ags sync --dry-run [STORE]           Just the plan; nothing moves
+                                       (`ags push` and `ags pull` still do one
+                                       direction each when you need it)
 
 Local storage must be an absolute, dedicated directory on the local filesystem.
 SFTP_URL must be sftp://USER@HOST:PORT/ABSOLUTE/PATH. SFTP remotes require
@@ -11768,6 +11743,75 @@ cloud_command() {
     esac
 }
 
+# 记录存放的地方，一套命令。
+#
+# 以前这是三家：`ags set DIR`（本地）、`ags remote *`（git/sftp）、`ags storage *`
+# （在它们之间切换），外加 `ags cloud *`（sftp 的旧版重复实现）。而底下其实只有一个
+# 概念——**一个 store 就是 `local` 或 `remote:<名字>`**：`storage list` 列的本来就是
+# 这两者的并集，两个 `use` 更是同一行代码（都调 `promote_storage_mode`）。
+#
+# 后端在 `add` 的时候说清楚，之后每一条命令都只认名字。
+store_command() {
+    local command="${1:-}"
+    shift || true
+    case "$command" in
+        ''|list|ls) list_storage_modes "$@" ;;
+        add) store_add "$@" ;;
+        use|default) use_storage_mode "$@" ;;
+        show) store_show "$@" ;;
+        remove|rm)
+            [[ "${1:-}" != local ]] ||
+                die "本地 store 删不掉；换一个用 ags store add local ABSOLUTE_DIR"
+            remove_named_remote "$@"
+            ;;
+        merge) merge_storage_command "$@" ;;
+        retire) retire_storage_command "$@" ;;
+        -h|--help|help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+# `ags store add local DIR` 和 `ags store add NAME git|sftp LOCATION`。
+#
+# `local` 是保留名字：它不是一个远端，落到的是完全另一套代码（本地保险库的配置与
+# 迁移）。分在这里而不是在 `add_named_remote` 里，是因为那个函数从第一行起就在做
+# 只有远端才有的事——名字校验、远端锁、host key。
+store_add() {
+    local name="${1:-}"
+    (( $# >= 2 )) ||
+        die "usage: ags store add local ABSOLUTE_DIR | ags store add NAME git|sftp LOCATION [OPTIONS]"
+    if [[ "$name" == local ]]; then
+        (( $# == 2 )) || die "usage: ags store add local ABSOLUTE_DIR"
+        configure_local_storage "$2"
+        return
+    fi
+    add_named_remote "$@"
+}
+
+store_show() {
+    local name="${1:-}"
+    (( $# == 1 )) || die "usage: ags store show NAME|local"
+    if [[ "$name" == local ]]; then
+        need jq
+        [[ -s "$storage_config" ]] || die "no storage configured; run ags init"
+        # 读 `.local_path`，不是 `storage_mode_label` —— 后者返回的是列表里那一列的
+        # 显示名（"Local"），而 `show` 问的是"它到底在哪"。
+        printf 'store=local\ntype=local\npath=%s\n' \
+            "$(jq -r '.local_path // .paths.local // "unset"' "$storage_config")"
+        return
+    fi
+    show_named_remote "$name"
+}
+
+# 老名字还认，但从帮助里撤了。
+#
+# 写 stderr 不写 stdout：`ags remote list` 的输出有脚本在解析，一行提示混进 stdout
+# 会把它们弄坏——而提示本身对着人说就够了。
+deprecated_store_alias() {
+    printf '[ags] `ags %s` 并进 `ags store` 了（%s）；老名字下个版本移除\n' \
+        "$1" "$2" >&2
+}
+
 remote_command() {
     local command="${1:-}"
     shift || true
@@ -12684,13 +12728,25 @@ case "${1:-}" in
             shift
             configure_retention "$@"
         else
+            deprecated_store_alias 'set ABSOLUTE_DIR' 'ags store add local ABSOLUTE_DIR'
             configure_local_storage "$@"
         fi
         ;;
     gc) shift; ags_gc "$@" ;;
-    cloud) shift; cloud_command "$@" ;;
-    remote) shift; remote_command "$@" ;;
-    storage) shift; storage_command "$@" ;;
+    store) shift; store_command "$@" ;;
+    # 并进 `ags store` 之前的三个名字。还认，但帮助里没有了。
+    cloud) shift
+        deprecated_store_alias cloud 'ags store add NAME sftp://…；存/取用 ags store use 选目标'
+        cloud_command "$@"
+        ;;
+    remote) shift
+        deprecated_store_alias remote 'ags store add|list|show|use|remove'
+        remote_command "$@"
+        ;;
+    storage) shift
+        deprecated_store_alias storage 'ags store list|use|merge|retire'
+        storage_command "$@"
+        ;;
     # `ls` 是 `list` 的别名。这是手上敲得最多的一个，而 `ls` 是所有人肌肉记忆里
     # "列出来"的那个词。只给这一个加别名：别名不减少复杂度，它增加表面积，只有
     # 高频那一个才划算。
@@ -12717,7 +12773,16 @@ case "${1:-}" in
     restore) shift; restore_checkpoint "$@" ;;
     push) shift; sync_records push "$@" ;;
     pull) shift; sync_records pull "$@" ;;
-    sync) shift; sync_records sync "$@" ;;
+    # `ags status` 就是"只看计划的 sync"，所以它是 `sync` 的一个开关，不是第四个
+    # 动词。老名字还认。
+    sync) shift
+        if [[ "${1:-}" == --dry-run ]]; then
+            shift
+            sync_records status "$@"
+        else
+            sync_records sync "$@"
+        fi
+        ;;
     status) shift; sync_records status "$@" ;;
     legacy) shift; legacy_command "$@" ;;
     rehome-claude) rehome_claude "${2:-}" ;;

@@ -34,6 +34,45 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
   fetches its `install.sh` from the tag it is installing, so an old install is
   never locked out.
 
+### 命令收敛：一套 `ags store`，43 条降到 28 条
+
+- **`set DIR` / `remote *` / `storage *` / `cloud *` 并成 `ags store`。** 底下本来
+  就是一个概念——**一个 store 就是 `local` 或 `remote:<名字>`**：`storage list` 列的
+  是这两者的并集，`remote list` 只是它的子集，而两个 `use` **是同一行代码**（都调
+  `promote_storage_mode`）。后端在 `add` 的时候说清楚，之后每条命令只认名字。
+
+  ```
+  ags store                                  列出；* 是当前那个
+  ags store add local ABSOLUTE_DIR           本机一个目录
+  ags store add NAME git URL [--branch B]
+  ags store add NAME sftp://USER@HOST:PORT/PATH [--known-hosts F] [--key F|--agent|--password]
+  ags store use NAME|local
+  ags store show NAME|local
+  ags store remove NAME
+  ags store merge --into NAME|local [SOURCE...]
+  ags store retire SOURCE --into NAME|local
+  ```
+
+  `push`/`pull`/`sync`/`status` 不并进来：它们是**对着 store 做的动作**，不是管理
+  store 本身。但 `status` 就是"只看计划的 sync"，所以它变成 `ags sync --dry-run`。
+
+- **`ags summarize` 从帮助里消失。** 起名字本来就是自动的：`ags ls` 发现有没名字的
+  行就在后台补。留一个要手敲的命令，等于要求用户记住一件系统已经在做的事。
+
+- **`archives`、`legacy history`、`rehome-claude` 也撤出帮助**：第一个是 `ags ls -a`
+  的子集，后两个自己标着 legacy。
+
+  **撤出帮助不等于删掉。** 上面每一个老名字都还能调用（老脚本、后台任务靠着），
+  只是会打一行"改叫 X 了"到 **stderr**——不能进 stdout，那些输出有脚本在解析。
+
+- 一并修掉一个间歇性的测试假失败：`age -d … | tar -tzf - | grep -Fqx manifest` 里
+  `-q` 一匹配上就退出，`tar` 拿到 SIGPIPE，`pipefail` 把整条判成失败。看起来像
+  "存档里没有 manifest"，其实取决于 tar 还剩多少没写完。
+
+  验证：本地 40 项 + 真实远端 36 项。远端那套是真的跨"机器"——两个独立沙箱共用一份
+  age 身份，一个 push 一个 pull，GitHub（git）和 Vultr Sydney（sftp）两个后端各走
+  一遍，并回到服务器上核对文件真的落了地。
+
 ### AGS Runtime
 
 - **`ags gc` 按保留期自动跑了。** Codex 的 rollout 一天堆几百兆而它自己从不清理，
