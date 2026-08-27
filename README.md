@@ -208,6 +208,36 @@ under.
 after it replace the saved ones, and `--` with nothing after it starts the
 session with none. `ags show ID` prints what a checkpoint carries.
 
+### Enter asks which permission level
+
+Forgetting to turn permissions up is the most common thing you have to redo:
+the session is running, you are halfway into the work, and it turns out to be
+read-only. A key binding does not fix that, because you do not press a key you
+have already forgotten about — so pressing Enter in `ags ls` shows the levels
+first, most permissive at the top:
+
+```
+  yolo         不沙箱、不询问，什么都直接跑（最大）
+  auto         工作区内随便写，从不问你
+▸ default      工作区内可写，越界时问你
+  read-only    什么都改不了，要改就问你
+  locked       什么都改不了，也不问（最小）
+  keep         不改，沿用这个会话现在的参数
+
+  flags  --sandbox workspace-write --ask-for-approval on-request
+```
+
+Claude gets its own ladder — `--dangerously-skip-permissions`, then
+`--permission-mode` `auto` / `acceptEdits` / `manual` / `dontAsk` / `plan`. The
+`flags` line under the list is what will actually be added, so what you picked
+and what runs are the same thing.
+
+It preselects whatever that session used last time, so the usual path is a
+second Enter, and `keep` changes nothing at all rather than stripping a flag
+that is already there. Picking a level replaces the old one instead of putting
+two permission flags on the same command line. Esc goes back to the list;
+`AGS_PERMISSION_PROMPT=0` turns the whole thing off.
+
 ### Which directory it opens in
 
 A checkpoint also records the directory its session was working in. When that is

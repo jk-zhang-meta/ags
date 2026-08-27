@@ -42,6 +42,7 @@ declare -a terminal_menu_ids=() terminal_menu_labels=()
 # no array of arrays, so the argv stays encoded until the row is actually chosen.
 declare -a terminal_menu_args=() terminal_menu_details=()
 terminal_menu_selected=
+terminal_menu_selected_agent=
 terminal_menu_selected_args='[]'
 terminal_menu_agents=()
 terminal_menu_header=
@@ -214,6 +215,8 @@ usage() {
   ags claude [--id 名字]       起一个 Claude 会话
   ags ls [-a]                  列出会话，挑一个接着干（-a 连存档一起列）
                                名字是模型在后台起的，不用管；AGS_AUTO_SUMMARY=0 关掉
+                               回车之后先选权限档位（yolo/bypass 在最上面），
+                               预选上次用的那一档；AGS_PERMISSION_PROMPT=0 关掉
   ags save "描述"              把这个会话导出成一份存档
   ags resume N|ID              接着第 N 号会话干，或者打开一份存档
   ags store                    记录存在哪：本机目录 / git / sftp
@@ -260,6 +263,22 @@ Usage:
                                        once every AGS_AUTO_SUMMARY_INTERVAL
                                        (900s). AGS_AUTO_SUMMARY=0 turns it off,
                                        AGS_SUMMARY_CMD replaces `codex exec`.
+                                       Sessions with no name from any source are
+                                       not listed at all: an empty window is
+                                       nothing you can recognise, and `ags gc`
+                                       deletes them.
+                                       Enter asks for a permission level before
+                                       the Agent starts — most permissive first
+                                       (Codex `--dangerously-bypass-approvals-
+                                       and-sandbox`, Claude
+                                       `--dangerously-skip-permissions`) down to
+                                       plan/read-only, plus `keep`. It
+                                       preselects whatever that
+                                       session used last time, so the usual path
+                                       is a second Enter; Esc goes back to the
+                                       list. `keep` changes nothing rather than
+                                       stripping a flag already there.
+                                       AGS_PERMISSION_PROMPT=0 turns it off.
   ags set retention [--agent codex|claude] DAYS
                                        One retention period for both Agents.
                                        Setting one turns on the automatic sweep
@@ -270,7 +289,11 @@ Usage:
                                        Codex has none, so `ags gc` does it.
   ags gc [--agent codex|claude] [--yes]
                                        Delete Codex sessions past the retention
-                                       period. Typing it is a dry-run unless
+                                       period, plus any session with no
+                                       description at all (an empty window that
+                                       `ags ls` already hides) once it has been
+                                       idle for AGS_GC_EMPTY_IDLE_SECONDS
+                                       (3600s). Typing it is a dry-run unless
                                        --yes, and it never touches a pinned
                                        session, one that has been saved, or
                                        anything AGS does not recognise.
@@ -3958,6 +3981,211 @@ menu_turn_page() {
     (( index >= 0 )) || index=0
 }
 
+# 每个 Agent 的权限档位，从**最大到最小**排。
+#
+# 为什么要有这个：忘记开权限是这套工具里最常见的一次返工——会话起来了，干到一半
+# 发现是只读的，退出、翻文档想那个 flag 叫什么、重开。而"忘记"这件事做成一个按键
+# 是治不好的，因为你不会去按一个你已经忘了的东西。所以它挂在回车这条路上。
+#
+# 每一行是 `标签<TAB>说明<TAB>参数`，参数之间用 `\x1f` 分隔（一档往往是两个 flag）。
+# 外层用 TAB 是安全的：唯一可能为空的是最后那个字段，而 `read` 把行尾的 IFS 空白
+# 吃掉之后正好留一个空串——中间字段为空才会踩到 tab 合并那个坑（见 gc 那边）。
+#
+# 说明是从两个 Agent 自己的文档里抄的，不是猜的：
+#   - Codex：`codex --help` 的 `--sandbox` / `--ask-for-approval` 两段。
+#   - Claude：二进制里那段 permission mode 的说明（default/acceptEdits/
+#     bypassPermissions/plan/dontAsk/auto 逐条）。`manual` 是 CLI 收的名字，内部
+#     映射成 `default`。
+#
+# 顶格那一档故意用各自"最直白"的写法：Codex 是
+# `--dangerously-bypass-approvals-and-sandbox`，Claude 是
+# `--dangerously-skip-permissions` 而不是 `--permission-mode bypassPermissions`
+# ——后者还要 `allowDangerouslySkipPermissions` 才生效，选了却不生效比没得选更糟。
+permission_ladder() {
+    case "$1" in
+        codex)
+            printf '%s\n' \
+                $'yolo\t不沙箱、不询问，什么都直接跑（最大）\t--dangerously-bypass-approvals-and-sandbox' \
+                $'auto\t工作区内随便写，从不问你\t--sandbox\x1fworkspace-write\x1f--ask-for-approval\x1fnever' \
+                $'default\t工作区内可写，越界时问你\t--sandbox\x1fworkspace-write\x1f--ask-for-approval\x1fon-request' \
+                $'read-only\t什么都改不了，要改就问你\t--sandbox\x1fread-only\x1f--ask-for-approval\x1fon-request' \
+                $'locked\t什么都改不了，也不问（最小）\t--sandbox\x1fread-only\x1f--ask-for-approval\x1fnever' \
+                $'keep\t不改，沿用这个会话现在的参数\t'
+            ;;
+        claude)
+            printf '%s\n' \
+                $'bypass\t跳过所有权限检查（最大）\t--dangerously-skip-permissions' \
+                $'auto\t模型判官自动批准或拒绝每一次请求\t--permission-mode\x1fauto' \
+                $'acceptEdits\t文件编辑自动通过，其余照问\t--permission-mode\x1facceptEdits' \
+                $'manual\t危险操作问你（Claude 的默认）\t--permission-mode\x1fmanual' \
+                $'dontAsk\t不问；没预先批准过的一律拒绝\t--permission-mode\x1fdontAsk' \
+                $'plan\t计划模式，不执行任何工具（最小）\t--permission-mode\x1fplan' \
+                $'keep\t不改，沿用这个会话现在的参数\t'
+            ;;
+    esac
+}
+
+# 把参数拆成"权限那部分"和"其余"。
+#
+# 选完档位要把新的一档写回去，而**旧的一档必须先拿掉**：`--sandbox read-only` 后面
+# 再跟一个 `--sandbox workspace-write`，两个 Agent 谁赢都不该由我们来赌。
+#
+# 和 `strip_session_selection_args` 一样在裸 `--` 处收手：那之后是给模型的 prompt，
+# 里面出现 `--sandbox` 这个词也只是个词。
+strip_permission_args() {
+    local agent="$1" argument
+    shift
+    stripped_permission_args=()
+    permission_args_found=()
+    while (( $# > 0 )); do
+        argument="$1"
+        shift
+        if [[ "$argument" == -- ]]; then
+            stripped_permission_args+=("$argument" "$@")
+            return 0
+        fi
+        if [[ "$agent" == codex ]]; then
+            case "$argument" in
+                --dangerously-bypass-approvals-and-sandbox|--yolo|--full-auto|--approve-for-me)
+                    permission_args_found+=("$argument"); continue ;;
+                -s|--sandbox|-a|--ask-for-approval)
+                    permission_args_found+=("$argument")
+                    if (( $# > 0 )) && [[ "$1" != -* ]]; then
+                        permission_args_found+=("$1"); shift
+                    fi
+                    continue ;;
+                --sandbox=*|--ask-for-approval=*)
+                    permission_args_found+=("${argument%%=*}" "${argument#*=}"); continue ;;
+            esac
+        else
+            case "$argument" in
+                --dangerously-skip-permissions)
+                    permission_args_found+=("$argument"); continue ;;
+                --permission-mode)
+                    permission_args_found+=("$argument")
+                    if (( $# > 0 )) && [[ "$1" != -* ]]; then
+                        permission_args_found+=("$1"); shift
+                    fi
+                    continue ;;
+                --permission-mode=*)
+                    permission_args_found+=("${argument%%=*}" "${argument#*=}"); continue ;;
+            esac
+        fi
+        stripped_permission_args+=("$argument")
+    done
+}
+
+# 一组参数的比较用指纹：排过序再拼起来，所以 `-a never -s read-only` 和
+# `-s read-only -a never` 是同一档。用来把"这个会话上次用的"对回到某一行去预选。
+permission_args_key() {
+    (( $# > 0 )) || { printf '\n'; return 0; }
+    printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ' '
+}
+
+# 选权限档位。回车之后、真正把进程交出去之前的最后一屏。
+#
+# 预选的是这个会话**上次用的那一档**，所以老路径仍然是两次回车；认不出来（第一次
+# 开，或者参数是手写的）就停在 `keep`——那一档一个参数都不加，等于这个功能加进来
+# 之前的行为。Esc 退回列表，什么都不改。
+#
+# `AGS_PERMISSION_PROMPT=0` 整个关掉。
+pick_permission_mode() {
+    local agent="$1" current_json="$2"
+    local -a mode_label=() mode_desc=() mode_args=() base=() chosen=()
+    local label desc args index total row key second third want
+    permission_pick_args_json="$current_json"
+    [[ "${AGS_PERMISSION_PROMPT:-1}" != 0 ]] || return 0
+    [[ "$agent" == codex || "$agent" == claude ]] || return 0
+    while IFS=$'\t' read -r label desc args; do
+        [[ -n "$label" ]] || continue
+        mode_label+=("$label"); mode_desc+=("$desc"); mode_args+=("$args")
+    done < <(permission_ladder "$agent")
+    total=${#mode_label[@]}
+    (( total > 0 )) || return 0
+    decode_launch_args "$current_json" || launch_args_decoded=()
+    strip_permission_args "$agent" ${launch_args_decoded[@]+"${launch_args_decoded[@]}"}
+    base=(${stripped_permission_args[@]+"${stripped_permission_args[@]}"})
+    index=$(( total - 1 ))
+    want="$(permission_args_key ${permission_args_found[@]+"${permission_args_found[@]}"})"
+    for ((row = 0; row < total; row++)); do
+        chosen=()
+        [[ -z "${mode_args[$row]}" ]] ||
+            mapfile -t chosen < <(printf '%s' "${mode_args[$row]}" | tr '\037' '\n')
+        if [[ "$(permission_args_key ${chosen[@]+"${chosen[@]}"})" == "$want" ]]; then
+            index=$row
+            break
+        fi
+    done
+    init_terminal_style
+    printf '\033[?25l'
+    while true; do
+        printf '\033[H\033[2J'
+        printf '  %s%s 的权限%s  %s从最大到最小；回车确认，Esc/q 回列表%s\n\n' \
+            "$style_bold" "$agent" "$style_reset" "$style_dim" "$style_reset"
+        for ((row = 0; row < total; row++)); do
+            if (( row == index )); then
+                printf '%s%s%-12s %s%s\n' "$style_pointer" "$style_select" \
+                    "${mode_label[$row]}" "${mode_desc[$row]}" "$style_reset"
+            else
+                printf '  %-12s %s%s%s\n' "${mode_label[$row]}" \
+                    "$style_dim" "${mode_desc[$row]}" "$style_reset"
+            fi
+        done
+        # 这一行是"要生效"的证据：选中的档位到底会往命令行上加什么，当场看得见。
+        if [[ -n "${mode_args[$index]}" ]]; then
+            printf '\n  %sflags%s  %s\n' "$style_dim" "$style_reset" \
+                "$(printf '%s' "${mode_args[$index]}" | tr '\037' ' ')"
+        elif (( ${#permission_args_found[@]} > 0 )); then
+            printf '\n  %sflags%s  %s\n' "$style_dim" "$style_reset" \
+                "${permission_args_found[*]}"
+        else
+            printf '\n  %sflags%s  %s没有权限参数%s\n' \
+                "$style_dim" "$style_reset" "$style_dim" "$style_reset"
+        fi
+        if ! IFS= read -rsn1 key; then
+            terminal_menu_leave
+            return 1
+        fi
+        if [[ -z "$key" ]]; then
+            break
+        fi
+        case "$key" in
+            k) (( index > 0 )) && index=$((index - 1)); continue ;;
+            j) (( index + 1 < total )) && index=$((index + 1)); continue ;;
+            q|Q) terminal_menu_leave; return 1 ;;
+        esac
+        [[ "$key" == $'\033' ]] || continue
+        if ! IFS= read -rsn1 -t 0.05 second; then
+            terminal_menu_leave
+            return 1
+        fi
+        [[ "$second" == '[' || "$second" == O ]] || continue
+        IFS= read -rsn1 -t 0.05 third || continue
+        case "$third" in
+            A) (( index > 0 )) && index=$((index - 1)) ;;
+            B) (( index + 1 < total )) && index=$((index + 1)) ;;
+            H) index=0 ;;
+            F) index=$((total - 1)) ;;
+        esac
+    done
+    terminal_menu_leave
+    # `keep` 是**一个字都不改**，不是"不加权限参数"。
+    #
+    # 这两件事在一个已经写着 `--yolo` 的会话上是相反的：后者会把 `--yolo` 剥掉，
+    # 于是"我什么都没选"变成了一次降权。选项写着"沿用现在的参数"，那它就得真的
+    # 原样返回。
+    if [[ -z "${mode_args[$index]}" ]]; then
+        permission_pick_args_json="$current_json"
+        return 0
+    fi
+    mapfile -t chosen < <(printf '%s' "${mode_args[$index]}" | tr '\037' '\n')
+    # 权限参数放在**前面**：`base` 的尾巴上可能挂着一个裸 `--` 和给模型的 prompt，
+    # 追加到那后面就成了 prompt 的一部分，一个字都不会生效。
+    permission_pick_args_json="$(encode_launch_args \
+        ${chosen[@]+"${chosen[@]}"} ${base[@]+"${base[@]}"})"
+    return 0
+}
+
 terminal_menu() {
     local title="$1" allow_delete="$2" allow_actions="${3:-0}" key second third fourth
     local menu_page_rows confirm
@@ -4049,6 +4277,7 @@ terminal_menu() {
         if [[ -z "$key" ]]; then
             terminal_menu_selected="${terminal_menu_ids[$index]}"
             terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+            terminal_menu_selected_agent="${terminal_menu_agents[$index]:-}"
             terminal_menu_leave
             return 0
         fi
@@ -4066,6 +4295,7 @@ terminal_menu() {
                 [[ "$allow_actions" == 1 ]] || continue
                 terminal_menu_selected="${terminal_menu_ids[$index]}"
                 terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                terminal_menu_selected_agent="${terminal_menu_agents[$index]:-}"
                 terminal_menu_leave
                 return 3
                 ;;
@@ -4073,6 +4303,7 @@ terminal_menu() {
                 [[ "$allow_actions" == 1 ]] || continue
                 terminal_menu_selected="${terminal_menu_ids[$index]}"
                 terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                terminal_menu_selected_agent="${terminal_menu_agents[$index]:-}"
                 terminal_menu_leave
                 return 4
                 ;;
@@ -4146,6 +4377,7 @@ terminal_menu() {
                 if [[ "$confirm" == y || "$confirm" == Y ]]; then
                     terminal_menu_selected="${terminal_menu_ids[$index]}"
                     terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                    terminal_menu_selected_agent="${terminal_menu_agents[$index]:-}"
                     terminal_menu_leave
                     return 2
                 fi
@@ -6908,15 +7140,21 @@ native_session_rows() {
                 | (human_line as $line
                    | if ($line | length) > 0 then $line else (gsub("\n"; " ")) end)
                 | gsub("\n"; " ");
-            # **按启动时间排，不按最后活动时间。**
+            # **按最后活动时间排。**
             #
-            # 最后活动时间每被碰一次就变，于是同一批会话每次 `ags ls` 的顺序都不一样
-            # ——而人是靠"我大概什么时候开的这个"去找会话的，那个坐标必须稳定。
-            # 最后活动时间照旧显示（ACTIVE 列），只是不再决定顺序。
+            # 列表是「接着干」的入口，而要接的那条基本上就是刚才在动的那条，所以最
+            # 近动过的排在最上面。
+            #
+            # 还有一个更硬的理由：上面那一刀 `--limit` **本来就是按最后活动时间切的**
+            # （转换那边 `--sort date` 取的是 `last_active_at`）。按启动时间排的话，
+            # 表的下半截是「在最近活动的这 N 条里，开得最早的几条」——那个集合本身
+            # 是按另一个键截出来的，排出来的顺序看着稳定，其实成员一直在换。
+            #
+            # 启动时间照旧显示（STARTED 列），只是不再决定顺序。
             (.items // [])
             | map(. + {_when:    ((.last_active_at // .started_at // 0) | floor),
                        _started: ((.started_at // .last_active_at // 0) | floor)})
-            | sort_by(-._started)
+            | sort_by(-._when)
             | .[]
             | [ .provider,
                 .session_id,
@@ -7044,9 +7282,28 @@ load_native_session_menu() {
     done < <(native_session_rows)
     load_session_ordinals
     now="$(date +%s)"
-    (( ${#live_key[@]} == 0 )) || assign_session_ordinals "${live_key[@]}"
     # 一次读完，别一行起一次 jq。读不动就退回逐条，批量只是优化。
     load_all_annotations || annotations_batched=0
+    # **先剔掉不显示的，再发短号。**
+    #
+    # 短号发出去就不收回（那正是它作为坐标的价值）。所以给一条永远不会显示的空
+    # 会话发一个号，等于把后面每一条可见会话的号往后推一格——而 Codex 每起一次
+    # 就落一条 rollout，用不了多久 `ags ls` 的第一列就变成四位数了。
+    #
+    # 这一趟只是查一遍注解表（内存里的 map），不额外读盘。
+    local scan probe
+    local -a numbered_key=()
+    for scan in "${!live_id[@]}"; do
+        if (( annotations_batched == 1 )); then
+            annotation_from_map "${live_key[$scan]}"
+        else
+            read_session_annotation "${live_provider[$scan]}" "${live_id[$scan]}"
+        fi
+        probe="${annotation_description:-${live_native[$scan]:-${annotation_summary:-${live_title[$scan]}}}}"
+        [[ -n "$probe" ]] || (( annotation_pinned == 1 )) || continue
+        numbered_key+=("${live_key[$scan]}")
+    done
+    (( ${#numbered_key[@]} == 0 )) || assign_session_ordinals "${numbered_key[@]}"
     local ordinal_key ordinal_value
     while IFS=$'\t' read -r ordinal_key ordinal_value; do
         [[ -n "$ordinal_key" ]] || continue
@@ -7070,24 +7327,32 @@ load_native_session_menu() {
         fi
         marker=' '
         (( annotation_pinned == 0 )) || marker='*'
-        ordinal="${ordinal_map[${live_key[$index]}]:--}"
-        [[ -n "$ordinal" ]] || ordinal='-'
-        terminal_menu_ids+=("live:$provider/$session_id")
-        terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
-        terminal_menu_args+=("$annotation_args")
-        terminal_menu_details+=("$(format_launch_args "$annotation_args")")
         # 人写的 > Agent 自己起的 > 我们总结的 > 原话第一行。
         #
         # Agent 自己起的名字排在我们的总结**前面**：那一份是它在会话里边干边起的，
         # 通常更准，而且不花钱。顺序反过来的话，`ags summarize --force` 会给一条
         # 本来就有好名字的 Claude 会话生成一份总结，然后**永久压住**那个好名字。
         # `title` 是原话的第一行、不是概括，所以垫底。
+        description="${annotation_description:-${native_name:-${annotation_summary:-$title}}}"
+        # 四个来源全空 = 这条会话里一个字都没有。Codex 只要起来就落一个 rollout
+        # 文件，于是每次误敲、每个开完就关的窗口都在列表里占一行，而那一行**没有
+        # 任何能用来认它的东西**——短号、时间、工作目录都指不出它是哪一条。列出来
+        # 只会把真正干过活的会话往下挤。
+        #
+        # 置顶过的留着：那是明确说过「这条我要」的，藏起来就再也没有入口了。
+        [[ -n "$description" ]] || (( annotation_pinned == 1 )) || continue
+        ordinal="${ordinal_map[${live_key[$index]}]:--}"
+        [[ -n "$ordinal" ]] || ordinal='-'
+        terminal_menu_ids+=("live:$provider/$session_id")
+        terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
+        terminal_menu_args+=("$annotation_args")
+        terminal_menu_details+=("$(format_launch_args "$annotation_args")")
         if [[ -z "$annotation_description" && -z "$native_name" &&
               -z "$annotation_summary" ]] &&
            [[ -z "$annotation_summary_stamp" ]]; then
             native_menu_missing=$((native_menu_missing + 1))
         fi
-        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$started"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${native_name:-${annotation_summary:-$title}}}")
+        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$started"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"$description")
     done
 
     if (( include_archives == 1 )); then
@@ -7330,8 +7595,8 @@ split_live_selector() {
 # 会重算**——文件一直在长，指纹一直在变。自动补描述如果不挡住活会话，就会对着同
 # 几条会话反复付钱，而且算出来的东西下一分钟就过期。
 session_is_settled() {
-    local last="$1" now="$2" idle
-    idle="${AGS_SUMMARY_IDLE_SECONDS:-600}"
+    local last="$1" now="$2" idle="${3:-}"
+    [[ -n "$idle" ]] || idle="${AGS_SUMMARY_IDLE_SECONDS:-600}"
     [[ "$idle" =~ ^[0-9]{1,6}$ ]] || idle=600
     [[ "$last" =~ ^[0-9]+$ ]] || return 1
     (( last > 0 )) || return 1
@@ -7447,6 +7712,11 @@ summarize_native_sessions() {
         # 每一轮都为同一条会话再付一次钱。
         if (( settled_only == 1 )) && ! session_is_settled "${queue_when[$index]}" "$now"; then
             busy=$((busy + 1)); continue
+        fi
+        # 一个字都没有的会话不总结：模型没有任何输入可读，只会回一句废话，而每一
+        # 条都要花钱。这些会话在 `ags ls` 里本来也不显示。
+        if [[ -z "$native_name" && -z "${queue_title[$index]}" ]]; then
+            kept=$((kept + 1)); continue
         fi
         read_session_annotation "$provider" "$session_id"
         if [[ -n "$annotation_description" ]] ||
@@ -7609,13 +7879,24 @@ list_native_sessions() {
     while (( ${#terminal_menu_ids[@]} > 0 )); do
         if terminal_menu "Sessions" 1 1; then
             selector="$terminal_menu_selected"
+            # 回车之后先问权限。忘记开 yolo / bypass 是这套工具里最常见的一次返工，
+            # 而它只在**这个时刻**还来得及修——进程一交出去就晚了。
+            #
+            # Esc 是"我改主意了"，不是"用默认的"：退回列表，一个字都不改。
+            if ! pick_permission_mode "$terminal_menu_selected_agent" \
+                    "$terminal_menu_selected_args"; then
+                terminal_menu_notice=
+                continue
+            fi
+            terminal_menu_selected_args="$permission_pick_args_json"
             decode_launch_args "$terminal_menu_selected_args" ||
                 die "saved Agent arguments are unreadable; resume with -- ARGS"
             case "$selector" in
                 live:*)
                     split_live_selector "$selector"
-                    # 菜单里改过的参数在这里落盘。改完直接回车走人是最常见的用法，
-                    # 不写就等于没改。
+                    # 菜单里改过的参数在这里落盘——包括刚选的那一档权限，所以下次
+                    # 打开同一个会话，光标就停在你上次用的那一档上。改完直接回车
+                    # 走人是最常见的用法，不写就等于没改。
                     read_session_annotation "$selected_provider" "$selected_session_id"
                     write_session_annotation "$selected_provider" "$selected_session_id" \
                         "$annotation_description" "$terminal_menu_selected_args" \
@@ -7732,6 +8013,14 @@ list_native_sessions() {
 #    自动删而不说，比不自动删糟得多。
 # 3. **三类永不删**：pin 住的、已经导出过存档的、以及 AGS 认不出来的。「认不出来
 #    就不动」是底线：这里动的是 Agent 自己的数据。
+# 4. **一个字都没有的会话不等保留期。** Codex 只要起来就落一个 rollout 文件，于是
+#    误敲、开完就关、起来发现走错目录的窗口全都留下一条会话。它们在 `ags ls` 里
+#    已经不显示（四个描述来源全空，没有任何能用来认它的东西），留在磁盘上就只是
+#    垃圾，等三十天没有意义。
+#
+#    两道闸和上面一样：pin 住的、存过档的不动。再加一道 `AGS_GC_EMPTY_IDLE_SECONDS`
+#    （默认 3600 秒）——你正开着还没说话的那个窗口就是一条"空会话"，不能因为你还没
+#    敲第一句话就把它的文件删了。
 retention_config="$state/retention.json"
 
 read_retention_days() {
@@ -7943,8 +8232,9 @@ retention_cutoff_millis() {
 ags_gc() {
     local agent_filter= assume_yes=0 auto_mode=0 days agent cutoff
     local codex_days= removed_bytes=0
-    local provider session_id when_ms workspace title path
+    local provider session_id when_ms workspace native_name title path
     local pinned_skipped=0 saved_skipped=0 removed=0 candidates=0 bytes=0
+    local empty_candidates=0 empty_busy=0 empty_removed=0 reason now_s empty_idle
     local binary size
     local -a plan=()
     local -A saved=()
@@ -7967,6 +8257,9 @@ ags_gc() {
         esac
     done
     need jq
+    now_s="$(date +%s)"
+    empty_idle="${AGS_GC_EMPTY_IDLE_SECONDS:-3600}"
+    [[ "$empty_idle" =~ ^[0-9]{1,6}$ ]] || empty_idle=3600
     # 先看有没有配置过保留期。没配置就什么都不做，而且**不该**在这之前去要求存储
     # 配置好——一台刚装完、还没 `ags set` 的机器上，`ags gc` 应该说"没配置保留期"，
     # 而不是报一个和保留期无关的存储错误。
@@ -8002,12 +8295,34 @@ ags_gc() {
         fi
         codex_days="$days"
         cutoff="$(retention_cutoff_millis "$days")"
-        printf 'codex: %s 天，早于这个时间的会话会被删\n' "$days"
-        while IFS=$'\t' read -r provider session_id when_ms workspace title path; do
+        printf 'codex: %s 天，早于这个时间的会话会被删；一个字都没有的会话不等保留期\n' "$days"
+        while IFS=$'\x1f' read -r provider session_id when_ms workspace native_name title path; do
             [[ "$provider" == codex && -n "$session_id" && -n "$path" ]] || continue
-            (( when_ms < cutoff )) || continue
-            candidates=$((candidates + 1))
+            # 两个删的理由，先判便宜的那个。
+            #
+            # `expired` 和 `empty` 是互斥的分支而不是两个独立计数：一条又空又过期
+            # 的会话只该在计划里出现一次，也只该被数一次。
+            if (( when_ms < cutoff )); then
+                reason=expired
+            elif [[ -z "$native_name" && -z "$title" ]]; then
+                reason=empty
+            else
+                continue
+            fi
             read_session_annotation "$provider" "$session_id"
+            if [[ "$reason" == empty ]]; then
+                # 剩下两个描述来源在注解里。任何一个有值，这条会话就不是空的
+                # ——`ags ls` 也还在显示它，删掉就是删一条你看得见的会话。
+                [[ -z "$annotation_description" && -z "$annotation_summary" ]] || continue
+                # 你正开着、还没敲第一句话的那个窗口，此刻就是一条"空会话"。
+                if ! session_is_settled "$(( when_ms / 1000 ))" "$now_s" "$empty_idle"; then
+                    empty_busy=$((empty_busy + 1))
+                    continue
+                fi
+                empty_candidates=$((empty_candidates + 1))
+            else
+                candidates=$((candidates + 1))
+            fi
             if (( annotation_pinned == 1 )); then
                 pinned_skipped=$((pinned_skipped + 1))
                 continue
@@ -8019,23 +8334,26 @@ ags_gc() {
             [[ -f "$path" ]] || continue
             size="$(stat -c %s -- "$path" 2>/dev/null || printf 0)"
             bytes=$((bytes + size))
-            plan+=("$session_id"$'\t'"$path")
+            plan+=("$session_id"$'\t'"$path"$'\t'"$reason")
         done < <(gc_candidate_rows "$binary")
     done
 
-    printf '过期 %s 个；pin 跳过 %s，已存档跳过 %s；可删 %s，合计 %s MiB\n' \
-        "$candidates" "$pinned_skipped" "$saved_skipped" "${#plan[@]}" \
+    printf '过期 %s 个；空会话 %s 个（还在写的跳过 %s）；pin 跳过 %s，已存档跳过 %s；可删 %s，合计 %s MiB\n' \
+        "$candidates" "$empty_candidates" "$empty_busy" \
+        "$pinned_skipped" "$saved_skipped" "${#plan[@]}" \
         "$(( bytes / 1048576 ))"
     (( ${#plan[@]} > 0 )) || return 0
     if (( assume_yes == 0 )); then
-        printf '%s\n' "${plan[@]}" | cut -f2
+        # 空会话在这一屏里要能一眼认出来：它没有描述，路径也长得和别的一样，不标
+        # 出来的话看到的就是一串「这些是什么」。
+        printf '%s\n' "${plan[@]}" |
+            awk -F'\t' '{ printf "%s%s\n", $2, ($3 == "empty" ? "  ← 空会话" : "") }'
         printf '这是 dry-run，什么都没删。真要删：ags gc --yes（想留哪个先 ags ls 里按 p，或按 s 存一份）\n'
         return 0
     fi
     local entry
     for entry in "${plan[@]}"; do
-        session_id="${entry%%$'\t'*}"
-        path="${entry#*$'\t'}"
+        IFS=$'\t' read -r session_id path reason <<< "$entry"
         # 删之前再核一遍：dry-run 和真删之间可能过了很久，会话可能又活了。
         if active_native_session_pid codex "$codex_home" "$session_id" >/dev/null; then
             log "跳过 ${session_id}：它现在正在运行"
@@ -8050,14 +8368,15 @@ ags_gc() {
         rm -f -- "$path" || { log "删不掉：$path"; continue; }
         rm -f -- "$(session_annotation_file codex "$session_id" || true)"
         removed=$((removed + 1))
+        [[ "$reason" != empty ]] || empty_removed=$((empty_removed + 1))
         removed_bytes=$((removed_bytes + size))
         printf 'deleted=%s\n' "$path"
     done
-    printf '删了 %s 个\n' "$removed"
+    printf '删了 %s 个（其中空会话 %s 个）\n' "$removed" "$empty_removed"
     if (( auto_mode == 1 && removed > 0 )); then
         mkdir -p "$state" 2>/dev/null || true
-        printf 'auto gc: 按 %s 天的保留期删了 %s 个 Codex 会话，省下 %s MiB（%s，AGS_AUTO_GC=0 关掉）\n' \
-            "${codex_days:-?}" "$removed" "$(( removed_bytes / 1048576 ))" \
+        printf 'auto gc: 按 %s 天的保留期删了 %s 个 Codex 会话（其中 %s 个是一个字都没有的空会话），省下 %s MiB（%s，AGS_AUTO_GC=0 关掉）\n' \
+            "${codex_days:-?}" "$removed" "$empty_removed" "$(( removed_bytes / 1048576 ))" \
             "$auto_gc_log" > "$auto_gc_report" 2>/dev/null || true
     fi
 }
@@ -8066,6 +8385,13 @@ ags_gc() {
 #
 # 和 `ags ls` 不一样：这里要的是**全部**，不是最近的一屏。`--limit` 给到上限，
 # 因为过期的那些按定义就在列表的尾巴上，取前 50 条永远看不到它们。
+#
+# **分隔符是 `\x1f`，不是 tab。** 这里以前用 `@tsv`，能用是因为那时候没有一个字段
+# 可能是空的。加进 `native_name` 之后就不行了：tab 是 IFS 里的空白字符，bash 的
+# `read` 会把连着的两个 tab 当成一个分隔符，于是一条没有 `native_name` 的会话读出来
+# 整行右移一格——`title` 落进 `native_name`、`path` 落进 `title`、`path` 是空的。
+# 结果是 gc 一个文件都删不了，而且不报错。`native_session_rows` 早就是 `\x1f` 了，
+# 同一个原因。
 gc_candidate_rows() {
     local binary="$1"
     converter_cli --json list --all-workspaces --sort date --limit 9999 2>/dev/null |
@@ -8076,10 +8402,11 @@ gc_candidate_rows() {
                 .session_id,
                 (((.last_active_at // .started_at // 0) | floor) | tostring),
                 ((.workspace // .workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
-                (((.native_name // .title) // "") | tostring | gsub("[\t\r\n]"; " ")),
+                ((.native_name // "") | tostring | gsub("[\t\r\n]"; " ")),
+                ((.title // "") | tostring | gsub("[\t\r\n]"; " ")),
                 ((.path // "") | tostring)
               ]
-            | @tsv' 2>/dev/null
+            | map(tostring) | join("\u001f")' 2>/dev/null
 }
 
 list_local_checkpoints() {
@@ -8097,6 +8424,14 @@ list_local_checkpoints() {
         fi
         while (( ${#terminal_menu_ids[@]} > 0 )); do
             if terminal_menu "Saved AGS sessions" 1; then
+                # 和 `ags ls` 同一条路：还原出来的也是一个真的 Agent 进程，忘记开
+                # 权限一样要重来一遍。
+                if ! pick_permission_mode "$terminal_menu_selected_agent" \
+                        "$terminal_menu_selected_args"; then
+                    terminal_menu_notice=
+                    continue
+                fi
+                terminal_menu_selected_args="$permission_pick_args_json"
                 # Always explicit, including when the menu holds no arguments:
                 # the flag is what tells resume the caller decided, so clearing
                 # the arguments in the menu is honoured instead of being refilled

@@ -2746,7 +2746,8 @@ EOF
         printf -v pty_command '%q ' \
             env "${source_env[@]}" \
             TERM=xterm-256color \
-            AGENT_SESSION_LOCAL_DIR="$checkpoint_root" "$@" \
+            AGENT_SESSION_LOCAL_DIR="$checkpoint_root" \
+            AGS_PERMISSION_PROMPT=0 "$@" \
             "$tmp/stty-guard" "$tool" archives
         feed_keys "$input" "$output" | \
             SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
@@ -2895,6 +2896,64 @@ EOF
     )"
     ! grep -Fq 'saved in a different directory' <<< "$cwd_same_out"
     grep -Fqx "FAKE_PWD=$tmp/work" <<< "$cwd_same_out"
+
+    # -----------------------------------------------------------------------
+    # 回车之后的权限档位
+    #
+    # 忘记开 yolo / bypass 是这套工具里最常见的一次返工，所以这一屏挂在回车这条
+    # 路上。它必须做到三件事，而这三件都能在 PTY 里验：档位从大到小列全、选中的
+    # 那一档真的落到 Agent 的命令行上、旧的那个 flag 被**换掉**而不是并排留着。
+    #
+    # 上面所有 PTY 用例都跑在 `AGS_PERMISSION_PROMPT=0` 下（它们验的是别的事，多
+    # 一屏只会把喂进去的键错位一个）。这里显式打开——`"$@"` 排在后面，覆盖得掉。
+    # -----------------------------------------------------------------------
+    # 键是 `\n q q`，不是 `\n Esc`。两件事：
+    #   - 退出权限屏之后程序**回到列表继续等键**，不是退出。喂完最后一个键就没有
+    #     输入了，而 `script` 不会因为自己的 stdin 到头就把 PTY 关掉——被测程序会
+    #     在那儿一直等下去，整个套件挂住（不是失败，是挂住）。所以要把列表也关掉。
+    #   - `q` 是单字节，`Esc` 是"一个 ESC 之后 50ms 内没有别的字节"。连着喂两个
+    #     Esc 的话，第二个可能正好落进第一个的那 50ms 窗口里，被当成 CSI 的第二
+    #     个字节吃掉——那一路是**间歇性**挂住，比稳定挂住还难查。
+    run_checkpoint_pty $'\nqq' "$tmp/permission-ladder.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/permission-ladder/codex" \
+        AGS_PERMISSION_PROMPT=1
+    perm_frame="$(strip_terminal_control < "$tmp/permission-ladder.out")"
+    # 从最大到最小，一档不少，而且顺序就是这个顺序。
+    perm_order="$(grep -oE '不沙箱、不询问|工作区内随便写|工作区内可写|要改就问你|也不问（最小）|沿用这个会话现在的参数' \
+        <<< "$perm_frame" | tr '\n' '|')"
+    [[ "$perm_order" == '不沙箱、不询问|工作区内随便写|工作区内可写|要改就问你|也不问（最小）|沿用这个会话现在的参数|' ]] || {
+        printf '权限档位的顺序不对：%s\n%s\n' "$perm_order" "$perm_frame" >&2
+        exit 1
+    }
+    # Esc 是"我改主意了"：退回列表，一个进程都不许起。
+    ! grep -Fq 'FAKE_CODEX' <<< "$perm_frame"
+
+    # 选最上面那一档，真的落到命令行上；而记录里原来那个 `--yolo` 被**换掉**了，
+    # 不是并排留着——两个权限 flag 同时在场，谁赢不该由我们来赌。
+    # 键：回车打开 → Home 跳到第一档 → 回车确认 → 2 选"回原来的目录"。
+    run_checkpoint_pty $'\n\033[H\n2\n' "$tmp/permission-top.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/permission-top/codex" \
+        AGS_PERMISSION_PROMPT=1
+    perm_top_frame="$(strip_terminal_control < "$tmp/permission-top.out")"
+    grep -Fq '<--dangerously-bypass-approvals-and-sandbox>' <<< "$perm_top_frame" || {
+        printf '选中的权限档位没有传给 Agent\n%s\n' "$perm_top_frame" >&2
+        exit 1
+    }
+    ! grep -Fq '<--yolo>' <<< "$perm_top_frame"
+    # 会话本来带的参数一个都不能丢。
+    grep -Fq "<--model> <o3 mini>" <<< "$perm_top_frame"
+
+    # 默认停在 `keep`，而 `keep` 是**一个字都不改**——不是"不加权限参数"。这条会话
+    # 记着 `--yolo`，两次回车之后它必须还在：否则"我什么都没选"就成了一次降权。
+    run_checkpoint_pty $'\n\n2\n' "$tmp/permission-keep.out" \
+        "$args_menu_root" CODEX_HOME="$tmp/permission-keep/codex" \
+        AGS_PERMISSION_PROMPT=1
+    perm_keep_frame="$(strip_terminal_control < "$tmp/permission-keep.out")"
+    grep -Fq '<--yolo>' <<< "$perm_keep_frame" || {
+        printf 'keep 档把原来的 --yolo 弄丢了\n%s\n' "$perm_keep_frame" >&2
+        exit 1
+    }
+    ! grep -Fq '<--dangerously-bypass-approvals-and-sandbox>' <<< "$perm_keep_frame"
 
     unsafe_selector_root="$tmp/unsafe-checkpoint-selector"
     unsafe_selector_id=$'0000\033]52;c;AGS_CHECKPOINT\a'
@@ -5398,6 +5457,105 @@ grep -Fq 'auto gc: 真的那一行' <<< "$gc_launch_out"
 ! grep -Fq 'rm -rf /' <<< "$gc_launch_out"
 
 # ---------------------------------------------------------------------------
+# 一个字都没有的空会话不等保留期
+#
+# Codex 只要起来就落一个 rollout 文件，误敲和开完就关的窗口于是都留下一条会话。
+# 它们在 `ags ls` 里已经不显示，留在磁盘上就只是垃圾。
+#
+# 这一段单独开一套 home/state/items：上面那 12 条断言的是"过期"这条规则，往同一份
+# 清单里加会话会改掉它们的计数，测出来的就不是原来那件事了。
+# ---------------------------------------------------------------------------
+mt_home="$tmp/gc-empty-home"
+mt_codex="$mt_home/codex"
+mt_state="$tmp/gc-empty-state"
+mt_items="$tmp/gc-empty-items.json"
+mkdir -p "$mt_home" "$mt_codex/sessions" "$mt_state"
+
+mt_idle_id=dddddddd-4444-4444-8444-444444444444
+mt_busy_id=eeeeeeee-5555-4555-8555-555555555555
+mt_pin_id=ffffffff-6666-4666-8666-666666666666
+mt_named_id=99999999-7777-4777-8777-777777777777
+for mt_id in "$mt_idle_id" "$mt_busy_id" "$mt_pin_id" "$mt_named_id"; do
+    printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$mt_id" \
+        > "$mt_codex/sessions/rollout-$mt_id.jsonl"
+done
+
+# 四条全都在保留期以内，所以任何删除都只可能来自"空会话"这条规则。
+jq -n --arg idle "$mt_idle_id" --arg busy "$mt_busy_id" --arg pin "$mt_pin_id" \
+    --arg named "$mt_named_id" --arg dir "$mt_codex/sessions" \
+    --argjson quiet "$(( gc_now_ms - 7200000 ))" \
+    --argjson now "$(( gc_now_ms - 60000 ))" '[
+      {provider:"codex", session_id:$idle, last_active_at:$quiet,
+       workspace:"/w", title:"", native_name:"",
+       path:($dir + "/rollout-" + $idle + ".jsonl")},
+      {provider:"codex", session_id:$busy, last_active_at:$now,
+       workspace:"/w", title:"", native_name:"",
+       path:($dir + "/rollout-" + $busy + ".jsonl")},
+      {provider:"codex", session_id:$pin, last_active_at:$quiet,
+       workspace:"/w", title:"", native_name:"",
+       path:($dir + "/rollout-" + $pin + ".jsonl")},
+      {provider:"codex", session_id:$named, last_active_at:$quiet,
+       workspace:"/w", title:"有名字的",
+       path:($dir + "/rollout-" + $named + ".jsonl")}
+    ]' > "$mt_items"
+
+mt_env=(
+    env
+    HOME="$mt_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$mt_codex"
+    CLAUDE_CONFIG_DIR="$mt_home/claude"
+    AGENT_SESSION_DIR="$tmp/gc-empty-store"
+    AGENT_SESSION_STATE_DIR="$mt_state"
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/ags"
+    AGS_CONVERTER_VERSION=0.3.0-test
+    FAKE_LIST_ITEMS="$mt_items"
+)
+"${mt_env[@]}" "$tool" init >/dev/null
+"${mt_env[@]}" "$tool" set retention --agent codex 30 >/dev/null
+mkdir -p "$mt_state/annotations/codex"
+printf '{"pinned":true}\n' > "$mt_state/annotations/codex/$mt_pin_id.json"
+
+# 13. dry-run：安静下来的两条空会话都被认出来，但 pin 住的那条随后被跳掉，最后
+#     只有一条真进计划。计数和"过期"那条规则同构：先数认出来多少，再数跳掉多少。
+mt_out="$("${mt_env[@]}" "$tool" gc --agent codex 2>&1)"
+grep -Fq '过期 0 个' <<< "$mt_out"
+grep -Fq '空会话 2 个' <<< "$mt_out"
+grep -Fq '还在写的跳过 1' <<< "$mt_out"
+grep -Fq 'pin 跳过 1' <<< "$mt_out"
+grep -Fq '可删 1' <<< "$mt_out"
+grep -Fq '← 空会话' <<< "$mt_out"
+[[ -f "$mt_codex/sessions/rollout-$mt_idle_id.jsonl" ]]
+
+# 14. --yes 真删，而且只删那一条。
+mt_out="$("${mt_env[@]}" "$tool" gc --agent codex --yes 2>&1)"
+grep -Fq '删了 1 个（其中空会话 1 个）' <<< "$mt_out"
+[[ ! -f "$mt_codex/sessions/rollout-$mt_idle_id.jsonl" ]]
+# 还在写的、pin 住的、有名字的，一个都不许动。
+[[ -f "$mt_codex/sessions/rollout-$mt_busy_id.jsonl" ]]
+[[ -f "$mt_codex/sessions/rollout-$mt_pin_id.jsonl" ]]
+[[ -f "$mt_codex/sessions/rollout-$mt_named_id.jsonl" ]]
+
+# 15. 注解里有描述或总结的，即使 title/native_name 都空，也不是空会话——
+#     `ags ls` 还在显示它，删掉就是删一条你看得见的会话。
+printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "$mt_idle_id" \
+    > "$mt_codex/sessions/rollout-$mt_idle_id.jsonl"
+printf '{"summary":"我们总结出来的名字"}\n' \
+    > "$mt_state/annotations/codex/$mt_idle_id.json"
+mt_out="$("${mt_env[@]}" "$tool" gc --agent codex --yes 2>&1)"
+[[ -f "$mt_codex/sessions/rollout-$mt_idle_id.jsonl" ]] || {
+    printf 'ags gc: 有总结的会话被当成空会话删了\n%s\n' "$mt_out" >&2
+    exit 1
+}
+
+# 16. AGS_GC_EMPTY_IDLE_SECONDS 能把闸门开大——那条一分钟前还在动的就进计划了。
+rm -f "$mt_state/annotations/codex/$mt_idle_id.json"
+mt_out="$("${mt_env[@]}" AGS_GC_EMPTY_IDLE_SECONDS=1 "$tool" gc --agent codex 2>&1)"
+grep -Fq '空会话 3 个' <<< "$mt_out"
+grep -Fq '还在写的跳过 0' <<< "$mt_out"
+grep -Fq '可删 2' <<< "$mt_out"
+
+# ---------------------------------------------------------------------------
 # 一套 store 命令
 #
 # `ags set DIR`（本地）、`ags remote *`（git/sftp）、`ags storage *`（切换）、
@@ -5475,10 +5633,14 @@ store_ref="$("${store_env[@]}" "$tool" status 2>&1)" || true
 [[ "$store_out" == "$store_ref" ]]
 
 # ---------------------------------------------------------------------------
-# `ags ls` 按启动时间排，两个时间都列
+# `ags ls` 按最后活动时间排，两个时间都列，一个字都没有的会话不列
 #
-# 按最后活动时间排的问题是：那个值每被碰一次就变，同一批会话每次 `ags ls` 的顺序
-# 都不一样。而人是靠"我大概什么时候开的这个"去找会话的，那个坐标必须稳定。
+# 列表是「接着干」的入口，要接的那条基本就是刚才在动的那条。而且上游那一刀
+# `--limit` 本来就是按最后活动时间切的，按启动时间排等于给一个按另一个键截出来的
+# 集合排序——顺序看着稳，成员一直在换。
+#
+# 第二件事：Codex 只要起来就落一个 rollout 文件，误敲和开完就关的窗口于是都在列表
+# 里占一行，而那一行没有任何能用来认它的东西。四个描述来源全空就不显示。
 # ---------------------------------------------------------------------------
 ls_home="$tmp/ls-sort-home"
 ls_state="$tmp/ls-sort-state"
@@ -5487,6 +5649,8 @@ mkdir -p "$ls_home/codex" "$ls_home/claude" "$ls_state"
 ls_now_ms="$(( $(date +%s) * 1000 ))"
 ls_day_ms=86400000
 # 故意让启动顺序和最后活动顺序**相反**：早开的那条刚刚还在动。
+# 最后那条是空会话：`started_at` 最新，`title` 和 `native_name` 都是空的——按时间
+# 它该排第一，按「有没有名字」它一行都不该出现。
 jq -n --argjson now "$ls_now_ms" --argjson day "$ls_day_ms" '[
   {provider:"codex", session_id:"aaaaaaaa-1111-4111-8111-111111111111",
    started_at:($now - 3*$day), last_active_at:($now - 60000),
@@ -5496,7 +5660,10 @@ jq -n --argjson now "$ls_now_ms" --argjson day "$ls_day_ms" '[
    workspace:"/w", title:"中间开的", path:"/w/b.jsonl"},
   {provider:"codex", session_id:"cccccccc-3333-4333-8333-333333333333",
    started_at:($now - 3600000), last_active_at:($now - 3600000),
-   workspace:"/w", title:"最晚开的", path:"/w/c.jsonl"}
+   workspace:"/w", title:"最晚开的", path:"/w/c.jsonl"},
+  {provider:"codex", session_id:"dddddddd-4444-4444-8444-444444444444",
+   started_at:($now - 30000), last_active_at:($now - 30000),
+   workspace:"/w", title:"", native_name:"", path:"/w/d.jsonl"}
 ]' > "$ls_items"
 ls_env=(
     env
@@ -5520,10 +5687,34 @@ ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 # 两个时间都要有自己的一列。
 grep -Eq 'STARTED[[:space:]]+ACTIVE' <<< "$ls_out"
 
-# 顺序：最晚开的在最上面，最早开的在最下面——哪怕它刚刚还在动。
+# 顺序：刚动过的在最上面，哪怕它是三天前开的；两天没动的在最下面，哪怕它比一小时
+# 前那条开得早。
 ls_order="$(grep -oE '最早开的但刚动过|中间开的|最晚开的' <<< "$ls_out" | tr '\n' ' ')"
-[[ "$ls_order" == '最晚开的 中间开的 最早开的但刚动过 ' ]] || {
-    printf 'ags ls: 应该按启动时间排，实际顺序是 %s\n' "$ls_order" >&2
+[[ "$ls_order" == '最早开的但刚动过 最晚开的 中间开的 ' ]] || {
+    printf 'ags ls: 应该按最后活动时间排，实际顺序是 %s\n' "$ls_order" >&2
+    printf '%s\n' "$ls_out" >&2
+    exit 1
+}
+
+# 空会话一行都不该有。查的是它的短 ID：描述本来就是空的，只能靠 ID 认。
+if grep -q 'dddddddd' <<< "$ls_out"; then
+    printf 'ags ls: 一个字都没有的空会话不该出现在列表里\n' >&2
+    printf '%s\n' "$ls_out" >&2
+    exit 1
+fi
+# 但另外三条一条都不能少——过滤只该砍掉真的没名字的那些。
+[[ "$(grep -c 'codex' <<< "$ls_out")" == 3 ]] || {
+    printf 'ags ls: 过滤把有名字的会话也砍掉了\n' >&2
+    printf '%s\n' "$ls_out" >&2
+    exit 1
+}
+
+# 空会话也不该**占掉一个短号**。短号发出去就不收回，给一条永远不显示的会话发一个，
+# 等于把后面每一条的号往后推——Codex 每起一次就落一条 rollout，第一列很快就四位数。
+ls_numbers="$(grep -E '最早开的但刚动过|中间开的|最晚开的' <<< "$ls_out" |
+    grep -oE '^[[:space:]]*[0-9]+' | tr -d ' \n')"
+[[ "$ls_numbers" == 123 ]] || {
+    printf 'ags ls: 短号应该是 1/2/3，实际是 %s（空会话占号了？）\n' "$ls_numbers" >&2
     printf '%s\n' "$ls_out" >&2
     exit 1
 }

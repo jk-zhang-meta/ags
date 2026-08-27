@@ -52,6 +52,80 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
   `ACTIVE` 仍然是"会话内最后一条消息时间"和"文件 mtime"取较大值，也仍然决定颜色
   深浅和 `--settled` 的判断——变的只是它不再决定顺序。
 
+### `ags ls` 改回按最后活动时间排，空会话不列也不留（v0.7.0）
+
+上一条的两个决定都改了。
+
+- **顺序改成按最后活动时间（`last_active_at`）降序**，推翻上一条。列表是「接着干」
+  的入口，要接的那条基本就是刚才在动的那条。
+
+  还有一个更硬的理由，上一条没看见：取会话清单的那一刀 `--limit`（默认 50）**本来
+  就是按最后活动时间切的**。所以按启动时间排的时候，表的下半截是「在最近活动的这
+  50 条里，开得最早的几条」——顺序看着稳定，成员其实一直在换。两个键换成同一个之
+  后就没有这个问题了。
+
+  `STARTED` 和 `ACTIVE` 两列都保留。
+
+- **四个描述来源全空的会话不再显示。** Codex 只要起来就落一个 rollout 文件，于是
+  误敲、开完就关、起来发现走错目录的窗口全都在列表里占一行——而那一行没有任何能
+  用来认它的东西，短号、时间、工作目录都指不出它是哪一条。置顶过的例外，那是明确
+  说过「这条我要」的。
+
+  短号也不发给它们。短号发出去就不收回（那正是它作为坐标的价值），给一条永远不
+  显示的会话发一个，等于把后面每一条可见会话的号往后推一格——而 Codex 每起一次就
+  落一条 rollout，用不了多久第一列就变成四位数了。
+
+- **`ags gc` 连带把它们删掉，不等保留期。** 一条一个字都没有的会话留三十天没有
+  意义。规矩和过期那条完全一样（pin 住的、存过档的、正在跑的都不动），另外加一道
+  `AGS_GC_EMPTY_IDLE_SECONDS`（默认 3600 秒）：你正开着、还没敲第一句话的那个窗口
+  此刻就是一条「空会话」，不能因为你还没说话就把它的文件删了。
+
+  计划和结果里都单独计数（`空会话 N 个`、`删了 N 个（其中空会话 M 个）`），dry-run
+  的清单里也标出来是哪几条——它们没有描述，不标的话看到的就是一串「这些是什么」。
+
+- **空会话也不再送去起名字。** 模型没有任何输入可读，只会回一句废话，而每一条都
+  要花钱。
+
+- **修了一个一直在的 gc bug。** `gc` 那份会话清单以前是 `@tsv` 的，而 tab 是 IFS
+  里的空白字符——bash 的 `read` 会把连着的两个 tab 当成一个分隔符。以前没有字段
+  可能为空所以没暴露；这次加了 `native_name` 就当场炸了：一条没有 `native_name`
+  的会话读出来整行右移一格，`path` 变成空的，于是 gc 一个文件都删不掉，还不报错。
+  改成 `\x1f`（`ags ls` 那条早就是了，同一个原因）。
+
+### 回车之前先选权限档位（v0.7.0）
+
+- **`ags ls` 里回车打开一个会话，会先问权限。** 忘记开 `--dangerously-bypass-…`
+  / `--dangerously-skip-permissions` 是这套工具里最常见的一次返工——会话起来了、
+  干到一半才发现是只读的，退出、翻文档想那个 flag 叫什么、重开。做成一个按键治不
+  好这件事，因为你不会去按一个你已经忘了的东西，所以它挂在回车这条路上。
+
+- **档位从大到小列全**，每一档下面直接显示它会往命令行上加什么：
+
+  | | Codex | Claude |
+  |---|---|---|
+  | 最大 | `--dangerously-bypass-approvals-and-sandbox` | `--dangerously-skip-permissions` |
+  | | `--sandbox workspace-write --ask-for-approval never` | `--permission-mode auto` |
+  | | `--sandbox workspace-write --ask-for-approval on-request` | `--permission-mode acceptEdits` |
+  | | `--sandbox read-only --ask-for-approval on-request` | `--permission-mode manual` |
+  | 最小 | `--sandbox read-only --ask-for-approval never` | `--permission-mode dontAsk` / `plan` |
+  | | `keep`：不改，沿用现在的参数 | 同左 |
+
+  说明是从两个 Agent 自己的文档里抄的，不是猜的。Claude 顶格那一档用
+  `--dangerously-skip-permissions` 而不是 `--permission-mode bypassPermissions`：
+  后者还要 `allowDangerouslySkipPermissions` 才生效，选了却不生效比没得选更糟。
+
+- **预选上次用的那一档**，所以老路径仍然是两次回车；认不出来就停在 `keep`。
+  `keep` 是**一个字都不改**，不是"不加权限参数"——一条记着 `--yolo` 的会话上，
+  后者会让"我什么都没选"变成一次降权。
+
+- **换掉，不是并排。** 选新的一档之前先把旧的权限 flag 剥掉（`-s/--sandbox`、
+  `-a/--ask-for-approval`、`--permission-mode`、`=` 形式、以及 `--yolo`/
+  `--full-auto` 这些老别名），两个权限 flag 同时在场谁赢不该由我们来赌。裸 `--`
+  之后不动：那是给模型的 prompt，里面出现 `--sandbox` 也只是个词。
+
+- Esc 退回列表，什么都不改。`AGS_PERMISSION_PROMPT=0` 整个关掉。
+  `ags resume N` 这条命令行路径不问——它不是交互式的入口。
+
 ### `ags cloud` 删除
 
 - **整套删掉，1207 行。** 它是 sftp 的旧版重复实现，而 `ags store add NAME
