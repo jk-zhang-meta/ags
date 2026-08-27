@@ -3221,484 +3221,6 @@ delete_move_done="$(
 )"
 grep -Fqx 'status=deleted' <<< "$delete_move_done"
 
-cloud_url='sftp://tester@127.0.0.1:2222/agent-sessions'
-if env "${source_env[@]}" "$tool" cloud set 'https://example.test/sessions' --key "$tmp/key" >/dev/null 2>&1; then
-    echo 'cloud set accepted a non-SFTP URL' >&2
-    exit 1
-fi
-cloud_config="$(env "${source_env[@]}" "$tool" cloud set "$cloud_url" --key "$tmp/key")"
-grep -Fqx 'status=configured' <<< "$cloud_config"
-grep -Fqx "url=$cloud_url" <<< "$cloud_config"
-grep -Fqx 'auth=key' <<< "$cloud_config"
-
-if (
-    cd "$tmp/work"
-    env "${source_env[@]}" FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE=1 \
-        "$tool" save-now cloud codex "$session_id" rollback-check 'Rollback check'
-) >/dev/null 2>&1; then
-    echo 'cloud save ignored a failed manifest commit' >&2
-    exit 1
-fi
-! find "$tmp/remote/agent-sessions/codex" -maxdepth 1 -type f \
-    -name '*@rollback-check.checkpoint.tar.gz.age' | grep -q .
-! find "$tmp/remote/agent-sessions/codex" -maxdepth 1 -type f \
-    -name '*@rollback-check.manifest.age' | grep -q .
-rollback_retry="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" rollback-check 'Rollback check'
-)"
-grep -Fqx 'status=saved' <<< "$rollback_retry"
-env "${source_env[@]}" "$tool" cloud delete rollback-check >/dev/null
-
-manifest_after_move_marker="$tmp/manifest-after-move.failed"
-manifest_after_move="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        FAKE_RCLONE_FAIL_MANIFEST_AFTER_MOVE_ONCE="$manifest_after_move_marker" \
-        "$tool" save-now cloud codex "$session_id" \
-            manifest-after-move 'Manifest committed before client error'
-)"
-manifest_after_move_record="$(
-    sed -n 's/^record_id=//p' <<< "$manifest_after_move"
-)"
-grep -Fqx 'status=saved' <<< "$manifest_after_move"
-[[ -f "$manifest_after_move_marker" ]]
-[[ -f "$tmp/remote/agent-sessions/codex/$manifest_after_move_record.checkpoint.tar.gz.age" ]]
-[[ -f "$tmp/remote/agent-sessions/codex/$manifest_after_move_record.manifest.age" ]]
-env "${source_env[@]}" "$tool" cloud delete "$manifest_after_move_record" >/dev/null
-
-retained_pending="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" AGENT_SESSION_AGENT=codex \
-        AGENT_SESSION_ID="$session_id" \
-        "$tool" cloud save retained-archive 'Retain reused archive'
-)"
-retained_record="$(sed -n 's/^record_id=//p' <<< "$retained_pending")"
-retained_archive="$tmp/remote/agent-sessions/codex/$retained_record.checkpoint.tar.gz.age"
-retained_manifest="$tmp/remote/agent-sessions/codex/$retained_record.manifest.age"
-printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
-    env "${source_env[@]}" \
-    FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE="$tmp/retained-manifest-first.failed" \
-    FAKE_RCLONE_FAIL_ARCHIVE_DELETE_ONCE="$tmp/retained-delete.failed" \
-    "$tool" hook >"$tmp/retained-first.out" 2>"$tmp/retained-first.err"
-grep -Fq "unconfirmed cloud checkpoint retained for safe recovery: codex/$retained_record" \
-    "$tmp/retained-first.err"
-[[ -f "$retained_archive" && ! -e "$retained_manifest" ]]
-printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
-    env "${source_env[@]}" \
-    FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE="$tmp/retained-manifest-second.failed" \
-    "$tool" hook >"$tmp/retained-second.out" 2>"$tmp/retained-second.err"
-grep -Fq "unconfirmed cloud checkpoint retained for safe recovery: codex/$retained_record" \
-    "$tmp/retained-second.err"
-[[ -f "$retained_archive" && ! -e "$retained_manifest" ]]
-printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
-    env "${source_env[@]}" "$tool" hook
-[[ -f "$retained_archive" && -f "$retained_manifest" ]]
-env "${source_env[@]}" "$tool" cloud delete "$retained_record" >/dev/null
-
-lsf_probe_counter="$tmp/rollback-lsf-probe.count"
-if (
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        FAKE_RCLONE_FAIL_MANIFEST_MOVE_ONCE="$tmp/rollback-lsf-manifest.failed" \
-        FAKE_RCLONE_FAIL_LSF_AT=2 \
-        FAKE_RCLONE_LSF_COUNTER_FILE="$lsf_probe_counter" \
-        "$tool" save-now cloud codex "$session_id" \
-            rollback-lsf-probe 'Unconfirmed rollback probe'
-) >"$tmp/rollback-lsf-probe.out" 2>"$tmp/rollback-lsf-probe.err"; then
-    echo 'cloud save ignored an unavailable rollback probe' >&2
-    exit 1
-fi
-grep -Fq 'unconfirmed cloud checkpoint retained for safe recovery: codex/' \
-    "$tmp/rollback-lsf-probe.err"
-mapfile -t rollback_lsf_archives < <(
-    find "$tmp/remote/agent-sessions/codex" -maxdepth 1 -type f \
-        -name '*@rollback-lsf-probe.checkpoint.tar.gz.age'
-)
-(( ${#rollback_lsf_archives[@]} == 1 ))
-rollback_lsf_record="${rollback_lsf_archives[0]##*/}"
-rollback_lsf_record="${rollback_lsf_record%.checkpoint.tar.gz.age}"
-[[ ! -e "$tmp/remote/agent-sessions/codex/$rollback_lsf_record.manifest.age" ]]
-env "${source_env[@]}" "$tool" cloud delete "$rollback_lsf_record" >/dev/null
-
-legacy_delete_retry="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" \
-            legacy-delete-retry 'Legacy delete retry'
-)"
-legacy_delete_record="$(
-    sed -n 's/^record_id=//p' <<< "$legacy_delete_retry"
-)"
-legacy_delete_archive="$tmp/remote/agent-sessions/codex/$legacy_delete_record.checkpoint.tar.gz.age"
-legacy_delete_manifest="$tmp/remote/agent-sessions/codex/$legacy_delete_record.manifest.age"
-legacy_delete_failure="$tmp/legacy-delete-trash-manifest.failed"
-if env "${source_env[@]}" \
-    FAKE_RCLONE_FAIL_LEGACY_TRASH_MANIFEST_ONCE="$legacy_delete_failure" \
-    "$tool" cloud delete legacy-delete-retry \
-    >"$tmp/legacy-delete-first.out" \
-    2>"$tmp/legacy-delete-first.err"; then
-    echo 'legacy cloud delete ignored a failed recoverable manifest move' >&2
-    exit 1
-fi
-[[ -f "$legacy_delete_failure" ]]
-[[ -f "$legacy_delete_archive" && -f "$legacy_delete_manifest" ]]
-legacy_delete_tombstone="$tmp/local-checkpoints/tombstones/codex/$legacy_delete_record.tombstone"
-[[ -f "$legacy_delete_tombstone" ]]
-legacy_delete_tombstone_digest="$(
-    sha256sum "$legacy_delete_tombstone" | cut -d' ' -f1
-)"
-legacy_delete_tombstone_marker="ags-v1/tombstones/codex/$legacy_delete_record.$legacy_delete_tombstone_digest.tombstone"
-[[ -f "$tmp/remote/agent-sessions/$legacy_delete_tombstone_marker" ]]
-
-# A new checkpoint may legitimately reuse the old logical ID after its
-# predecessor is tombstoned. Retrying cleanup of the exact legacy record must
-# not delete that newer, unrelated local checkpoint.
-legacy_delete_new="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
-        "$tool" save-now local codex "$session_id" \
-            legacy-delete-retry 'New checkpoint with reused logical ID'
-)"
-legacy_delete_new_record="$(
-    sed -n 's/^record_id=//p' <<< "$legacy_delete_new"
-)"
-legacy_delete_new_path="$(
-    sed -n 's/^path=//p' <<< "$legacy_delete_new"
-)"
-[[ "$legacy_delete_new_record" != "$legacy_delete_record" ]]
-legacy_delete_done="$(
-    env "${source_env[@]}" "$tool" cloud delete legacy-delete-retry
-)"
-grep -Fqx 'status=deleted' <<< "$legacy_delete_done"
-grep -Fqx 'target=cloud' <<< "$legacy_delete_done"
-grep -Fqx "record_id=$legacy_delete_record" <<< "$legacy_delete_done"
-[[ -f "$legacy_delete_new_path" ]]
-[[ ! -e "$legacy_delete_archive" && ! -e "$legacy_delete_manifest" ]]
-find "$tmp/remote/agent-sessions/trash/codex" -maxdepth 1 -type f \
-    -name "$legacy_delete_record.checkpoint.tar.gz.age.deleted.*" | grep -q .
-find "$tmp/remote/agent-sessions/trash/codex" -maxdepth 1 -type f \
-    -name "$legacy_delete_record.manifest.age.deleted.*" | grep -q .
-
-legacy_archive_retry="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" \
-            legacy-archive-retry 'Legacy archive move retry'
-)"
-legacy_archive_record="$(
-    sed -n 's/^record_id=//p' <<< "$legacy_archive_retry"
-)"
-legacy_archive_path="$tmp/remote/agent-sessions/codex/$legacy_archive_record.checkpoint.tar.gz.age"
-legacy_archive_manifest="$tmp/remote/agent-sessions/codex/$legacy_archive_record.manifest.age"
-legacy_archive_failure="$tmp/legacy-delete-trash-archive.failed"
-if env "${source_env[@]}" \
-    FAKE_RCLONE_FAIL_LEGACY_TRASH_ARCHIVE_ONCE="$legacy_archive_failure" \
-    "$tool" cloud delete legacy-archive-retry \
-    >"$tmp/legacy-archive-first.out" \
-    2>"$tmp/legacy-archive-first.err"; then
-    echo 'legacy cloud delete ignored a failed final archive move' >&2
-    exit 1
-fi
-[[ -f "$legacy_archive_failure" && -f "$legacy_archive_path" ]]
-[[ ! -e "$legacy_archive_manifest" ]]
-find "$tmp/remote/agent-sessions/trash/codex" -maxdepth 1 -type f \
-    -name "$legacy_archive_record.manifest.age.deleted.*" | grep -q .
-legacy_archive_done="$(
-    env "${source_env[@]}" "$tool" cloud delete legacy-archive-retry
-)"
-grep -Fqx 'status=deleted' <<< "$legacy_archive_done"
-grep -Fqx "record_id=$legacy_archive_record" <<< "$legacy_archive_done"
-[[ ! -e "$legacy_archive_path" ]]
-
-queue_publish_retry="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" \
-            queue-publish-retry 'Queue publication failure'
-)"
-queue_publish_record="$(
-    sed -n 's/^record_id=//p' <<< "$queue_publish_retry"
-)"
-queue_publish_archive="$tmp/remote/agent-sessions/codex/$queue_publish_record.checkpoint.tar.gz.age"
-queue_publish_manifest="$tmp/remote/agent-sessions/codex/$queue_publish_record.manifest.age"
-queue_publish_failure="$tmp/queue-publish-failure.injected"
-if queue_publish_first="$(
-    env "${source_env[@]}" \
-        FAKE_RCLONE_FAIL_LSF_AT=3 \
-        FAKE_RCLONE_LSF_COUNTER_FILE="$tmp/queue-publish-lsf.count" \
-        FAKE_MV_PENDING_SYNC_ONCE="$queue_publish_failure" \
-        "$tool" cloud delete queue-publish-retry \
-        2>"$tmp/queue-publish-first.err"
-)"; then
-    echo 'delete ignored failure to publish its remote retry' >&2
-    exit 1
-fi
-grep -Fqx 'status=deleted' <<< "$queue_publish_first"
-grep -Fqx 'target=cloud' <<< "$queue_publish_first"
-! grep -Fq 'sync_status=pending' <<< "$queue_publish_first"
-grep -Fq 'remote retry could not be recorded' \
-    "$tmp/queue-publish-first.err"
-[[ -f "$queue_publish_failure" ]]
-[[ -f "$queue_publish_archive" && -f "$queue_publish_manifest" ]]
-[[ ! -d "$tmp/state/pending-sync" ]] ||
-    ! find "$tmp/state/pending-sync" -type f -name '*.json' | grep -q .
-env "${source_env[@]}" "$tool" sync neburst >/dev/null
-queue_publish_done="$(
-    env "${source_env[@]}" "$tool" cloud delete queue-publish-retry
-)"
-grep -Fqx "record_id=$queue_publish_record" <<< "$queue_publish_done"
-[[ ! -e "$queue_publish_archive" && ! -e "$queue_publish_manifest" ]]
-
-legacy_pending_retry="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" \
-            legacy-pending-retry 'Legacy pending sync retry'
-)"
-legacy_pending_record="$(
-    sed -n 's/^record_id=//p' <<< "$legacy_pending_retry"
-)"
-legacy_pending_archive="$tmp/remote/agent-sessions/codex/$legacy_pending_record.checkpoint.tar.gz.age"
-legacy_pending_manifest="$tmp/remote/agent-sessions/codex/$legacy_pending_record.manifest.age"
-if legacy_pending_first="$(
-    env "${source_env[@]}" \
-        FAKE_RCLONE_FAIL_LSF_AT=3 \
-        FAKE_RCLONE_LSF_COUNTER_FILE="$tmp/legacy-pending-lsf.count" \
-        "$tool" cloud delete legacy-pending-retry \
-        2>"$tmp/legacy-pending-first.err"
-)"; then
-    echo 'legacy cloud delete ignored a failed tombstone synchronization' >&2
-    exit 1
-fi
-grep -Fqx 'status=deleted' <<< "$legacy_pending_first"
-grep -Fqx 'target=cloud' <<< "$legacy_pending_first"
-grep -Fqx 'sync_status=pending' <<< "$legacy_pending_first"
-[[ -f "$legacy_pending_archive" && -f "$legacy_pending_manifest" ]]
-legacy_pending_sync="$(
-    sed -n 's/^pending_sync=//p' <<< "$legacy_pending_first"
-)"
-[[ -f "$legacy_pending_sync" ]]
-
-flush_race_retry="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" \
-            flush-race-retry 'Flush retry replacement race'
-)"
-flush_race_record="$(
-    sed -n 's/^record_id=//p' <<< "$flush_race_retry"
-)"
-mkdir -p "$tmp/flush-retry-race/hold"
-env "${source_env[@]}" \
-    FAKE_RM_PENDING_HOLD_DIR="$tmp/flush-retry-race/hold" \
-    "$tool" flush \
-    >"$tmp/flush-retry-race/flush.out" \
-    2>"$tmp/flush-retry-race/flush.err" &
-flush_race_flush_pid=$!
-test_child_pids["$flush_race_flush_pid"]=1
-flush_race_remove_ready=0
-for _ in {1..1000}; do
-    if [[ -e "$tmp/flush-retry-race/hold/ready" ]]; then
-        flush_race_remove_ready=1
-        break
-    fi
-    test_process_running "$flush_race_flush_pid" || break
-    sleep 0.01
-done
-(( flush_race_remove_ready == 1 ))
-if ! test_process_has_fd_target "$flush_race_flush_pid" \
-    "$tmp/state/storage-consolidation.lock"; then
-    : > "$tmp/flush-retry-race/hold/release"
-    wait "$flush_race_flush_pid" 2>/dev/null || true
-    unset "test_child_pids[$flush_race_flush_pid]"
-    echo 'pending retry removal was not protected by the consolidation lock' >&2
-    exit 1
-fi
-env "${source_env[@]}" \
-    FAKE_RCLONE_FAIL_LSF_AT=3 \
-    FAKE_RCLONE_LSF_COUNTER_FILE="$tmp/flush-retry-race/delete-lsf.count" \
-    "$tool" cloud delete flush-race-retry \
-    >"$tmp/flush-retry-race/delete.out" \
-    2>"$tmp/flush-retry-race/delete.err" &
-flush_race_delete_pid=$!
-test_child_pids["$flush_race_delete_pid"]=1
-flush_race_delete_waiting=0
-for _ in {1..500}; do
-    if test_process_has_fd_target "$flush_race_delete_pid" \
-        "$tmp/state/storage-consolidation.lock"; then
-        flush_race_delete_waiting=1
-        break
-    fi
-    test_process_running "$flush_race_delete_pid" || break
-    sleep 0.01
-done
-(( flush_race_delete_waiting == 1 ))
-test_process_running "$flush_race_flush_pid"
-test_process_running "$flush_race_delete_pid"
-: > "$tmp/flush-retry-race/hold/release"
-wait "$flush_race_flush_pid"
-unset "test_child_pids[$flush_race_flush_pid]"
-if wait "$flush_race_delete_pid"; then
-    unset "test_child_pids[$flush_race_delete_pid]"
-    echo 'replacement retry delete unexpectedly synchronized' >&2
-    exit 1
-fi
-unset "test_child_pids[$flush_race_delete_pid]"
-grep -Fqx 'status=deleted' "$tmp/flush-retry-race/delete.out"
-grep -Fqx 'sync_status=pending' "$tmp/flush-retry-race/delete.out"
-flush_race_pending="$(
-    sed -n 's/^pending_sync=//p' "$tmp/flush-retry-race/delete.out"
-)"
-[[ "$flush_race_pending" == "$legacy_pending_sync" ]]
-[[ -f "$flush_race_pending" ]]
-jq -e --arg reason "delete:$flush_race_record" \
-    '.reason == $reason' "$flush_race_pending" >/dev/null
-env "${source_env[@]}" "$tool" flush
-[[ ! -e "$flush_race_pending" ]]
-flush_race_done="$(
-    env "${source_env[@]}" "$tool" cloud delete flush-race-retry
-)"
-grep -Fqx "record_id=$flush_race_record" <<< "$flush_race_done"
-
-legacy_pending_done="$(
-    env "${source_env[@]}" "$tool" cloud delete legacy-pending-retry
-)"
-grep -Fqx "record_id=$legacy_pending_record" <<< "$legacy_pending_done"
-[[ ! -e "$legacy_pending_archive" && ! -e "$legacy_pending_manifest" ]]
-
-cloud_delete_lock="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" \
-        "$tool" save-now cloud codex "$session_id" \
-            cloud-delete-lock 'Cloud delete lock'
-)"
-cloud_delete_lock_record="$(
-    sed -n 's/^record_id=//p' <<< "$cloud_delete_lock"
-)"
-mkdir -p "$tmp/cloud-delete-lock/hold"
-env "${source_env[@]}" \
-    FAKE_RCLONE_LSF_HOLD_DIR="$tmp/cloud-delete-lock/hold" \
-    "$tool" cloud delete "$cloud_delete_lock_record" \
-    >"$tmp/cloud-delete-lock/delete.out" \
-    2>"$tmp/cloud-delete-lock/delete.err" &
-cloud_delete_lock_pid=$!
-test_child_pids["$cloud_delete_lock_pid"]=1
-cloud_delete_hold_ready=0
-for _ in {1..500}; do
-    if [[ -e "$tmp/cloud-delete-lock/hold/ready" ]]; then
-        cloud_delete_hold_ready=1
-        break
-    fi
-    sleep 0.01
-done
-(( cloud_delete_hold_ready == 1 ))
-env "${source_env[@]}" "$tool" status neburst \
-    >"$tmp/cloud-delete-lock/status.out" \
-    2>"$tmp/cloud-delete-lock/status.err" &
-cloud_delete_status_pid=$!
-test_child_pids["$cloud_delete_status_pid"]=1
-cloud_delete_status_waiting=0
-for _ in {1..500}; do
-    if test_process_has_fd_target "$cloud_delete_status_pid" \
-        "$tmp/state/storage-consolidation.lock"; then
-        cloud_delete_status_waiting=1
-        break
-    fi
-    test_process_running "$cloud_delete_status_pid" || break
-    sleep 0.01
-done
-(( cloud_delete_status_waiting == 1 ))
-test_process_running "$cloud_delete_lock_pid"
-test_process_running "$cloud_delete_status_pid"
-: > "$tmp/cloud-delete-lock/hold/release"
-wait "$cloud_delete_lock_pid"
-unset "test_child_pids[$cloud_delete_lock_pid]"
-wait "$cloud_delete_status_pid"
-unset "test_child_pids[$cloud_delete_status_pid]"
-grep -Fqx 'status=deleted' "$tmp/cloud-delete-lock/delete.out"
-grep -Fqx 'remote=neburst' "$tmp/cloud-delete-lock/status.out"
-grep -Fqx 'type=sftp' "$tmp/cloud-delete-lock/status.out"
-
-mkdir -p "$tmp/cloud-race-state-a" "$tmp/cloud-race-state-b"
-cp -- "$tmp/state/storage.json" "$tmp/cloud-race-state-a/storage.json"
-cp -- "$tmp/state/storage.json" "$tmp/cloud-race-state-b/storage.json"
-(
-    cd "$tmp/work"
-    env "${source_env[@]}" AGENT_SESSION_STATE_DIR="$tmp/cloud-race-state-a" \
-        FAKE_RCLONE_LSF_BARRIER="$tmp/cloud-race-barrier" \
-        "$tool" save-now cloud codex "$session_id" cloud-race 'Cloud race A'
-) >"$tmp/cloud-race-a.out" 2>"$tmp/cloud-race-a.err" &
-cloud_race_a_pid=$!
-(
-    cd "$tmp/work"
-    env "${source_env[@]}" AGENT_SESSION_STATE_DIR="$tmp/cloud-race-state-b" \
-        FAKE_RCLONE_LSF_BARRIER="$tmp/cloud-race-barrier" \
-        "$tool" save-now cloud codex "$session_id" cloud-race 'Cloud race B'
-) >"$tmp/cloud-race-b.out" 2>"$tmp/cloud-race-b.err" &
-cloud_race_b_pid=$!
-if wait "$cloud_race_a_pid"; then cloud_race_a=0; else cloud_race_a=$?; fi
-if wait "$cloud_race_b_pid"; then cloud_race_b=0; else cloud_race_b=$?; fi
-if (( cloud_race_a != 0 || cloud_race_b != 0 )); then
-    echo "cloud race returned unexpected statuses: $cloud_race_a, $cloud_race_b" >&2
-    exit 1
-fi
-mapfile -t cloud_race_records < <(
-    sed -n 's/^record_id=//p' "$tmp/cloud-race-a.out" "$tmp/cloud-race-b.out"
-)
-(( ${#cloud_race_records[@]} == 2 ))
-[[ "${cloud_race_records[0]}" != "${cloud_race_records[1]}" ]]
-for record_id in "${cloud_race_records[@]}"; do
-    [[ "$record_id" =~ ^[0-9a-f]{24}@cloud-race$ ]]
-    [[ -f "$tmp/remote/agent-sessions/codex/$record_id.checkpoint.tar.gz.age" ]]
-    [[ -f "$tmp/remote/agent-sessions/codex/$record_id.manifest.age" ]]
-done
-cloud_race_list="$(env "${source_env[@]}" "$tool" cloud list)"
-cloud_race_rows="$(grep -Ec '^cloud-race +CODEX +' <<< "$cloud_race_list" || true)"
-[[ "$cloud_race_rows" == 2 ]]
-if env "${source_env[@]}" CODEX_HOME="$tmp/cloud-race-ambiguous/codex" \
-    "$tool" restore cloud cloud-race >"$tmp/cloud-race-ambiguous.out" \
-    2>"$tmp/cloud-race-ambiguous.err"; then
-    echo 'cloud restore accepted an ambiguous ID' >&2
-    exit 1
-fi
-grep -Fq 'matching RECORD_ID values:' "$tmp/cloud-race-ambiguous.err"
-grep -Fq 'expected one cloud checkpoint named cloud-race; found 2' \
-    "$tmp/cloud-race-ambiguous.err"
-for record_id in "${cloud_race_records[@]}"; do
-    grep -Fq "$record_id" "$tmp/cloud-race-ambiguous.err"
-done
-cloud_race_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/cloud-race-target/codex" \
-    "$tool" cloud resume "${cloud_race_records[0]}" -- --model race-model)"
-grep -Fqx "FAKE_CODEX <resume> <$session_id> <--model> <race-model>" <<< "$cloud_race_resume"
-cmp "$tmp/source/codex/$session_rel" "$tmp/cloud-race-target/codex/$session_rel"
-for record_id in "${cloud_race_records[@]}"; do
-    cloud_race_delete="$(env "${source_env[@]}" "$tool" cloud delete "$record_id")"
-    grep -Fqx "record_id=$record_id" <<< "$cloud_race_delete"
-done
-
-cloud_pending="$(
-    cd "$tmp/work"
-    env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-        "$tool" cloud save cloud-checkpoint '云端检查点'
-)"
-cloud_id="$(sed -n 's/^checkpoint_id=//p' <<< "$cloud_pending")"
-grep -Fqx 'status=pending' <<< "$cloud_pending"
-[[ "$cloud_id" == cloud-checkpoint ]]
-printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
-    env "${source_env[@]}" "$tool" hook
-cloud_list="$(env "${source_env[@]}" "$tool" cloud list)"
-grep -Fq "$cloud_id" <<< "$cloud_list"
-cloud_restore="$(env "${source_env[@]}" CODEX_HOME="$tmp/cloud-target/codex" \
-    CLAUDE_CONFIG_DIR="$tmp/cloud-target/claude" "$tool" restore cloud "$cloud_id")"
-grep -Fqx "saved_pwd=$tmp/work" <<< "$cloud_restore"
-cmp "$tmp/source/codex/$session_rel" "$tmp/cloud-target/codex/$session_rel"
-if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-    "$tool" cloud save cloud-checkpoint 'Duplicate cloud ID' >/dev/null 2>&1; then
-    echo 'cloud save accepted a duplicate ID' >&2
-    exit 1
-fi
 
 queued_output="$(
     cd "$tmp/work"
@@ -4598,40 +4120,45 @@ recoverable_path="$(sed -n 's/^recoverable_path=//p' <<< "$delete_output")"
 [[ -f "$recoverable_path" && ! -e "$startup_path" ]]
 ! env "${source_env[@]}" "$tool" archives | grep -Fq "$startup_id"
 
-cloud_delete="$(env "${source_env[@]}" "$tool" cloud delete "$cloud_id")"
-grep -Fqx 'status=deleted' <<< "$cloud_delete"
-grep -Fqx 'target=cloud' <<< "$cloud_delete"
-! env "${source_env[@]}" "$tool" cloud list | grep -Fq "$cloud_id"
+# 老的 `.cloud` 配置要自动变成一个具名 store。
+#
+# `ags cloud` 这套命令 2026-08-27 整个删掉了，所以这条不再走 `cloud set`——摆一份
+# 老配置在磁盘上，那正是升级时的真实样子。**它是升级的人不丢远端的唯一保障**，
+# 所以 cloud 命令没了之后这条反而更重要。
+legacy_cloud_home="$tmp/legacy-cloud-home"
+legacy_cloud_state="$tmp/legacy-cloud-state"
+legacy_cloud_vault="$tmp/legacy-cloud-vault"
+mkdir -p "$legacy_cloud_home/codex" "$legacy_cloud_home/claude" \
+    "$legacy_cloud_state" "$legacy_cloud_vault" "$tmp/legacy-known-hosts.d"
+: > "$tmp/legacy-known-hosts.d/known_hosts"
+jq -n --arg vault "$legacy_cloud_vault" \
+      --arg known "$tmp/legacy-known-hosts.d/known_hosts" '{
+    version:4,
+    local_path:$vault,
+    encryption:{type:"age-x25519", identity_file:"/nonexistent"},
+    cloud:{url:"sftp://tester@example.test:22/ags", auth:"agent",
+           known_hosts:$known}
+}' > "$legacy_cloud_state/storage.json"
+legacy_cloud_env=(
+    env
+    HOME="$legacy_cloud_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$legacy_cloud_home/codex"
+    CLAUDE_CONFIG_DIR="$legacy_cloud_home/claude"
+    AGENT_SESSION_STATE_DIR="$legacy_cloud_state"
+    AGENT_SESSION_LOCAL_DIR="$legacy_cloud_vault"
+)
+# 列一次 store 就会触发迁移。
+"${legacy_cloud_env[@]}" "$tool" store | grep -Eq '^ *\*? *remote:neburst +sftp' ||
+    "${legacy_cloud_env[@]}" "$tool" store | grep -Fq neburst
+[[ "$(jq -r '.remotes.neburst.type' "$legacy_cloud_state/storage.json")" == sftp ]]
+[[ "$(jq -r '.remotes.neburst.url' "$legacy_cloud_state/storage.json")" == \
+   'sftp://tester@example.test:22/ags' ]]
+[[ "$(jq -r '.remotes.neburst.legacy_cloud' "$legacy_cloud_state/storage.json")" == true ]]
 
-password_config="$(env "${source_env[@]}" AGENT_SESSION_CLOUD_PASSWORD='test password' \
-    "$tool" cloud set "$cloud_url" --password)"
-grep -Fqx 'auth=password' <<< "$password_config"
-if env "${source_env[@]}" AGENT_SESSION_CLOUD_PASSWORD=$'bad\npassword' \
-    "$tool" cloud set "$cloud_url" --password >/dev/null 2>&1; then
-    echo 'cloud set accepted a password containing a line break' >&2
-    exit 1
-fi
-cloud_secret="$(jq -er '.cloud.password_file' "$tmp/state/storage.json")"
-[[ "$cloud_secret" == "$tmp/state/remote-passwords/neburst."*.age ]]
-[[ -s "$cloud_secret" && ! -L "$cloud_secret" ]]
-[[ "$(jq -r '.remotes.neburst.password_file' "$tmp/state/storage.json")" == \
-   "$cloud_secret" ]]
-[[ ! -e "$tmp/state/cloud-password.age" ]]
-password_config_2="$(env "${source_env[@]}" \
-    AGENT_SESSION_CLOUD_PASSWORD='rotated test password' \
-    "$tool" cloud set "$cloud_url" --password)"
-grep -Fqx 'auth=password' <<< "$password_config_2"
-rotated_cloud_secret="$(jq -er '.cloud.password_file' "$tmp/state/storage.json")"
-[[ "$rotated_cloud_secret" != "$cloud_secret" ]]
-[[ -s "$rotated_cloud_secret" && ! -e "$cloud_secret" ]]
-[[ "$(age -d -i "$tmp/key" "$rotated_cloud_secret")" == \
-   'rotated test password' ]]
-find "$tmp/state/trash/passwords/neburst" -maxdepth 1 -type f \
-    -name "$(basename "$cloud_secret").retired.*" | grep -q .
-[[ "$(find "$tmp/state/remote-passwords" -maxdepth 1 -type f \
-    -name 'neburst.*.age' | wc -l)" == 1 ]]
-env "${source_env[@]}" "$tool" cloud list >/dev/null
-env "${source_env[@]}" "$tool" remote list | grep -Eq '^neburst +sftp +'
+# `ags cloud` 本身要给一句去哪儿，而不是让人对着 unknown command 猜。
+legacy_cloud_out="$("${legacy_cloud_env[@]}" "$tool" cloud list 2>&1)" && exit 1
+grep -Fq 'ags store add' <<< "$legacy_cloud_out"
 
 sync_common_env=(
     HOME="$tmp/home"
@@ -4690,9 +4217,11 @@ if env "${sync_a_env[@]}" "$tool" remote add neburst git \
     echo 'remote add accepted the SFTP-only neburst alias for Git' >&2
     exit 1
 fi
-if env "${sync_a_env[@]}" "$tool" remote add cloud git \
+# `cloud` 曾经是 sftp 专用的别名，现在整套命令都没了。名字仍然保留：老配置迁移出来
+# 的 store 叫 neburst，而 `cloud` 这个词在 storage.json 里还有含义（`.cloud`）。
+if env "${sync_a_env[@]}" "$tool" store add cloud git \
     "$tmp/git/records.git" --branch main >/dev/null 2>&1; then
-    echo 'remote add accepted the SFTP-only cloud alias for Git' >&2
+    echo 'store add accepted the reserved name cloud for Git' >&2
     exit 1
 fi
 git_add="$(env "${sync_a_env[@]}" "$tool" remote add backup git \
@@ -5199,9 +4728,15 @@ legacy_retire_env=(
     FAKE_SSH_LOG="$tmp/legacy-retire/ssh.log"
 )
 legacy_retire_url='sftp://tester@127.0.0.1:2222/legacy-only'
-env "${legacy_retire_env[@]}" "$tool" set "$legacy_retire_local" >/dev/null
-env "${legacy_retire_env[@]}" "$tool" cloud set \
-    "$legacy_retire_url" --key "$tmp/key" >/dev/null
+env "${legacy_retire_env[@]}" "$tool" store add local "$legacy_retire_local" >/dev/null
+# `cloud set` 没有了（2026-08-27 整个删掉），所以直接摆一份老配置——升级的人磁盘上
+# 就是这个样子。这条用例测的正是他们那条路：把老 cloud 存储退役进一个 git store。
+legacy_retire_config="$legacy_retire_state/storage.json"
+jq --arg url "$legacy_retire_url" --arg key "$tmp/key" \
+   --arg known "$tmp/home/.ssh/known_hosts" \
+   '.cloud = {url:$url, auth:"key", key_file:$key, known_hosts:$known}' \
+   "$legacy_retire_config" > "$legacy_retire_config.tmp"
+mv -- "$legacy_retire_config.tmp" "$legacy_retire_config"
 mkdir -p "$legacy_retire_remote/legacy-only/codex"
 cp -- "$long_legacy_archive" \
     "$legacy_retire_remote/legacy-only/codex/$long_legacy_id.checkpoint.tar.gz.age"

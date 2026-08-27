@@ -45,9 +45,11 @@ sync --dry-run [STORE]
 A store is where records live. The backend — a local directory, Git, or SFTP —
 is settled by `store add`; every command after that only ever names the store.
 
-`remote`, `storage`, `cloud`, and `set ABSOLUTE_DIR` are the old names for the
-same thing and still work, but do not use them: prefer `store`. `legacy
-history` only when the user explicitly asks for the old whole-history model.
+`remote`, `storage`, and `set ABSOLUTE_DIR` are the old names for the same
+thing and still work, but do not use them: prefer `store`. `ags cloud` was
+removed outright — an existing `.cloud` configuration migrates itself into a
+store named `neburst`. `legacy history` only when the user explicitly asks for
+the old whole-history model.
 
 ## Initialize
 
@@ -348,10 +350,9 @@ ags checkpoint store use github
 
 One configured mode is automatic. Several modes are listed in most-recently-
 used order, with the previous selection as the Enter default. A named remote
-is reconciled before checkpoint selection or restoration. `neburst` and
-`cloud` mean the named `neburst` SFTP remote or the only configured SFTP
-remote; `github` means the named `github` Git remote or the only configured Git
-remote. The Agent still runs on the current machine.
+is reconciled before checkpoint selection or restoration. `neburst` means the
+named `neburst` SFTP store or the only configured SFTP store; `github` means
+the named `github` Git store or the only configured Git store. The Agent still runs on the current machine.
 
 Merge replicas only with the explicit storage commands:
 
@@ -371,15 +372,10 @@ merged destination too.
 
 ## Legacy compatibility
 
-The direct SFTP repository remains available:
-
-```text
-cloud set SFTP_URL [--key ABSOLUTE_KEY|--agent|--password]
-cloud list
-cloud save ID DESCRIPTION
-cloud resume ID|AGENT/RECORD_ID [--cwd PATH] [-- CLIENT_ARGS...]
-cloud delete ID|AGENT/RECORD_ID
-```
+`ags cloud` was removed. A direct SFTP repository is now an ordinary store:
+`store add NAME sftp://USER@HOST:PORT/PATH`, then `store use NAME`. An existing
+on-disk `.cloud` configuration migrates itself into a store named `neburst`;
+nothing is lost and nothing needs to be run.
 
 Whole native-history backup remains available:
 

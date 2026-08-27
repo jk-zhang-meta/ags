@@ -34,6 +34,28 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
   fetches its `install.sh` from the tag it is installing, so an old install is
   never locked out.
 
+### `ags cloud` 删除
+
+- **整套删掉，1207 行。** 它是 sftp 的旧版重复实现，而 `ags store add NAME
+  sftp://…` 覆盖了它的全部能力：`cloud save`/`cloud resume` 本来就是 `save`/`resume`
+  换个目标，`cloud set`/`list`/`delete` 是 `store`+`sync` 那套的重复实现。
+
+  删的是命令（`cloud_command`）、配置（`configure_cloud_storage` 199 行）、上传链
+  （`cloud_upload_checkpoint` / `cloud_publish_immutable` / `verify_cloud_checkpoint_object`）、
+  下载与查找（`load_cloud_storage` / `find_cloud_checkpoint_archive` / `cloud_run`），
+  以及 `write_checkpoint_archive`、`restore_checkpoint`、`checkpoint_id_exists`、
+  `read_checkpoint_runtime_manifest`、`resolve_checkpoint_record_for_live` 里那些
+  `target == cloud` 的分支——去掉 `cloud_command` 之后**没有任何调用点再传 `cloud`
+  这个目标**，它们全是死代码。
+
+- **老配置不会丢。** `ensure_legacy_cloud_remote` 原样保留：磁盘上的 `.cloud` 照旧
+  自动迁移成一个叫 `neburst` 的具名 store。`ags cloud` 本身留了一句话告诉你去哪，
+  而不是让人对着 `unknown command` 猜。
+
+- 测试跟着改，不是跟着删：`cloud set` 没了之后，迁移用例改成**直接在磁盘上摆一份
+  老配置**——那正是升级时的真实样子，比原来经由 `cloud set` 更贴近现场。「把老 cloud
+  存储退役进 git store」那条（有老数据的人升级要走的路）也照此保住了。
+
 ### 命令收敛：一套 `ags store`，43 条降到 28 条
 
 - **`set DIR` / `remote *` / `storage *` / `cloud *` 并成 `ags store`。** 底下本来

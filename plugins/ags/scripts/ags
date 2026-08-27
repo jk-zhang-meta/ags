@@ -235,7 +235,7 @@ Usage:
   ags [--id NAME] [--account EMAIL|--pick-account] codex [-- CODEX_ARGS...]
                                        Start Codex; ags options go before
                                        the command, agent args after it.
-                                       They work on claude/resume/cloud too
+                                       They work on claude and resume too
   ags context review-codex             Open Codex's official hook review UI
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
@@ -914,7 +914,7 @@ parse_sftp_url() {
     local url="${1:-}" rest authority host_port
     [[ "$url" != *$'\n'* && "$url" != *$'\r'* && "$url" != *$'\t'* ]] ||
         die "SFTP URL cannot contain control characters"
-    [[ "$url" == sftp://* ]] || die "cloud URL must use sftp://"
+    [[ "$url" == sftp://* ]] || die "store URL must use sftp://"
     [[ "$url" != *'?'* && "$url" != *'#'* ]] ||
         die "SFTP URL cannot contain query strings or fragments"
     rest="${url#sftp://}"
@@ -937,296 +937,6 @@ parse_sftp_url() {
        "$cloud_path" != */../* && "$cloud_path" != */.. ]] ||
         die "SFTP path cannot traverse parent directories"
     cloud_url="sftp://$cloud_user@$cloud_host:$cloud_port$cloud_path"
-}
-
-build_cloud_fs() {
-    local options
-    options=":sftp,host=$cloud_host,user=$cloud_user,port=$cloud_port,known_hosts_file=$cloud_known_hosts"
-    case "$cloud_auth" in
-        key) options+=",key_file=$cloud_key_file" ;;
-        agent) options+=",key_use_agent=true" ;;
-        password) ;;
-        *) die "invalid cloud authentication mode" ;;
-    esac
-    cloud_fs="$options:$cloud_path"
-}
-
-cloud_run() {
-    local password obscured
-    if [[ "$cloud_auth" == password ]]; then
-        # Do not let a caller-supplied plaintext secret leak into any child
-        # process spawned while preparing the transport.
-        unset AGENT_SESSION_CLOUD_PASSWORD AGENT_SESSION_REMOTE_PASSWORD
-        if [[ -n "${cloud_password_value+x}" ]]; then
-            password="$cloud_password_value"
-        else
-            [[ -r "$cloud_password_source" ]] ||
-                die "encrypted cloud password is missing"
-            load_encryption_identity
-            password="$(age_decrypt "$cloud_password_source")" ||
-                die "cannot decrypt the cloud password"
-        fi
-        obscured="$(printf '%s\n' "$password" |
-            rclone --config /dev/null obscure -)" ||
-            die "cannot prepare the cloud password"
-        unset password
-        if env -u AGENT_SESSION_CLOUD_PASSWORD \
-            -u AGENT_SESSION_REMOTE_PASSWORD \
-            RCLONE_SFTP_PASS="$obscured" \
-            rclone --config /dev/null --ask-password=false \
-                --log-level ERROR "$@"; then
-            unset obscured
-        else
-            local status=$?
-            unset obscured
-            return "$status"
-        fi
-    else
-        env -u AGENT_SESSION_CLOUD_PASSWORD \
-            -u AGENT_SESSION_REMOTE_PASSWORD \
-            -u RCLONE_SFTP_PASS \
-            rclone --config /dev/null --ask-password=false \
-                --log-level ERROR "$@"
-    fi
-}
-
-load_cloud_storage() {
-    need age; need jq; need rclone
-    [[ -s "$storage_config" ]] || die "cloud is not configured; run ags cloud set SFTP_URL"
-    cloud_url="$(jq -er '.cloud.url | select(type == "string")' "$storage_config")" ||
-        die "cloud URL is missing in $storage_config"
-    cloud_auth="$(jq -er '.cloud.auth | select(. == "key" or . == "agent" or . == "password")' "$storage_config")" ||
-        die "cloud authentication is missing in $storage_config"
-    cloud_key_file="$(jq -r '.cloud.key_file // empty' "$storage_config")"
-    cloud_known_hosts="$(jq -r '.cloud.known_hosts // empty' "$storage_config")"
-    cloud_password_source="$(jq -r --arg legacy "$cloud_password_file" '
-        .cloud.password_file // $legacy
-    ' "$storage_config")"
-    parse_sftp_url "$cloud_url"
-    [[ -n "$cloud_known_hosts" ]] || cloud_known_hosts="$HOME/.ssh/known_hosts"
-    [[ -r "$cloud_known_hosts" ]] ||
-        die "known_hosts is not readable; verify the server once with OpenSSH: $cloud_known_hosts"
-    if [[ "$cloud_auth" == key ]]; then
-        [[ "$cloud_key_file" == /* && -r "$cloud_key_file" ]] ||
-            die "SFTP private key is not readable: $cloud_key_file"
-    elif [[ "$cloud_auth" == password ]]; then
-        validate_configured_password_file "$cloud_password_source" ||
-            die "encrypted cloud password path is unsafe or unavailable"
-    fi
-    build_cloud_fs
-}
-
-stage_cloud_password() {
-    local destination="$1" recipient
-    recipient="$destination.recipient"
-    write_age_recipient_file "$recipient"
-    if ! printf '%s' "$cloud_password_value" |
-        age -R "$recipient" -o "$destination"; then
-        rm -f -- "$recipient" "$destination"
-        die "cannot encrypt the cloud password"
-    fi
-    rm -f -- "$recipient"
-    chmod 600 "$destination"
-}
-
-configure_cloud_storage() {
-    local url="${1:-}" option="${2:-}" option_value="${3:-}" temporary
-    local tmp probe_name probe_partial probe_source probe_copy
-    local staged_secret= secret_reference= secret_existed=0
-    (( $# >= 1 && $# <= 3 )) ||
-        die "usage: ags cloud set SFTP_URL [--key ABSOLUTE_KEY|--agent|--password]"
-    parse_sftp_url "$url"
-    cloud_known_hosts="${AGENT_SESSION_KNOWN_HOSTS:-$HOME/.ssh/known_hosts}"
-    [[ -r "$cloud_known_hosts" ]] ||
-        die "known_hosts is not readable; verify the server once with OpenSSH: $cloud_known_hosts"
-    case "$option" in
-        '')
-            cloud_auth=key
-            cloud_key_file="$ssh_key"
-            ;;
-        --key)
-            [[ -n "$option_value" && $# == 3 ]] || die "--key requires an absolute key path"
-            cloud_auth=key
-            cloud_key_file="$option_value"
-            ;;
-        --agent)
-            (( $# == 2 )) || die "--agent takes no value"
-            cloud_auth=agent
-            cloud_key_file=
-            ;;
-        --password)
-            (( $# == 2 )) || die "--password takes no value"
-            cloud_auth=password
-            cloud_key_file=
-            if [[ -n "${AGENT_SESSION_CLOUD_PASSWORD:-}" ]]; then
-                cloud_password_value="$AGENT_SESSION_CLOUD_PASSWORD"
-                unset AGENT_SESSION_CLOUD_PASSWORD
-            else
-                [[ -t 0 ]] || die "--password requires a terminal or AGENT_SESSION_CLOUD_PASSWORD"
-                IFS= read -r -s -p 'SFTP password: ' cloud_password_value
-                printf '\n' >&2
-            fi
-            [[ -n "$cloud_password_value" ]] || die "SFTP password cannot be empty"
-            [[ "$cloud_password_value" != *$'\n'* &&
-               "$cloud_password_value" != *$'\r'* ]] ||
-                die "SFTP password cannot contain line breaks"
-            ;;
-        *) die "authentication must be --key, --agent, or --password" ;;
-    esac
-    if [[ "$cloud_auth" == key ]]; then
-        [[ "$cloud_key_file" == /* && -r "$cloud_key_file" ]] ||
-            die "SFTP private key is not readable: $cloud_key_file"
-        [[ "$cloud_key_file" != *','* ]] || die "SFTP key path cannot contain commas"
-    fi
-
-    need age; need cmp; need jq; need rclone; need sha256sum; need ssh-keygen
-    build_cloud_fs
-    tmp="$(mktemp -d /tmp/agent-session-cloud-set.XXXXXX)"
-    trap_cleanup_dirs "$tmp"
-    probe_name=".agent-session-probe.$(hostname -s).$$"
-    probe_partial="$probe_name.partial"
-    probe_source="$tmp/source"
-    probe_copy="$tmp/copy"
-    printf 'agent-session probe %s\n' "$(date -u +%FT%TZ)" > "$probe_source"
-    if ! cloud_run copyto "$probe_source" "$cloud_fs/$probe_partial"; then
-        cloud_run deletefile "$cloud_fs/$probe_partial" >/dev/null 2>&1 || true
-        die "SFTP write probe failed"
-    fi
-    if ! cloud_run moveto "$cloud_fs/$probe_partial" "$cloud_fs/$probe_name"; then
-        cloud_run deletefile "$cloud_fs/$probe_partial" >/dev/null 2>&1 || true
-        die "SFTP rename probe failed"
-    fi
-    if ! cloud_run copyto "$cloud_fs/$probe_name" "$probe_copy"; then
-        cloud_run deletefile "$cloud_fs/$probe_name" >/dev/null 2>&1 || true
-        die "SFTP read probe failed"
-    fi
-    if ! cmp "$probe_source" "$probe_copy"; then
-        cloud_run deletefile "$cloud_fs/$probe_name" >/dev/null 2>&1 || true
-        die "SFTP read-back verification failed"
-    fi
-    cloud_run deletefile "$cloud_fs/$probe_name"
-    sync_remote_name=neburst
-    sync_remote_url="$cloud_url"
-    sync_remote_user="$cloud_user"
-    sync_remote_host="$cloud_host"
-    sync_remote_port="$cloud_port"
-    sync_remote_path="$cloud_path"
-    sync_remote_auth="$cloud_auth"
-    sync_remote_known_hosts="$cloud_known_hosts"
-    sync_remote_key_file="$cloud_key_file"
-    if [[ "$cloud_auth" == password ]]; then
-        sync_remote_password_value="$cloud_password_value"
-    fi
-    build_sync_sftp_fs
-    sftp_server_capability_probe
-    assert_sftp_remote_not_retired
-
-    if [[ "$cloud_auth" == password ]]; then
-        staged_secret="$tmp/password.age"
-        stage_cloud_password "$staged_secret"
-        secret_reference="$remote_password_dir/neburst.$(
-            sha256sum "$staged_secret" | cut -d' ' -f1
-        ).age"
-    fi
-
-    lock_storage_consolidation
-    lock_remote_operation neburst
-    lock
-    if [[ -s "$storage_config" ]] &&
-       jq -e '
-           .remotes.neburst == null and (
-               (.retired_modes // {})["remote:neburst"] != null or
-               (.merged_modes // {})["remote:neburst"] != null
-           )
-       ' "$storage_config" >/dev/null; then
-        unlock
-        die "remote name neburst is reserved by storage consolidation and cannot be reused"
-    fi
-    if [[ -s "$storage_config" ]] &&
-       jq -e '.remotes.neburst.retiring != null' \
-           "$storage_config" >/dev/null; then
-        unlock
-        die "remote neburst has an interrupted retirement that must be resumed"
-    fi
-    if [[ "$cloud_auth" == password ]]; then
-        prepare_remote_password_directory
-        if [[ -e "$secret_reference" || -L "$secret_reference" ]]; then
-            [[ -f "$secret_reference" && ! -L "$secret_reference" ]] &&
-                cmp -s "$staged_secret" "$secret_reference" ||
-                die "cloud password generation path is unsafe"
-            secret_existed=1
-        else
-            install -m600 "$staged_secret" "$secret_reference"
-        fi
-    fi
-    temporary="$storage_config.tmp.$$"
-    if [[ -s "$storage_config" ]]; then
-        jq -e 'type == "object"' "$storage_config" >/dev/null ||
-            die "invalid storage configuration: $storage_config"
-        jq --arg url "$cloud_url" --arg auth "$cloud_auth" \
-            --arg key_file "$cloud_key_file" --arg known_hosts "$cloud_known_hosts" \
-            --arg password_file "$secret_reference" '
-            ({type:"sftp", url:$url, auth:$auth,
-              known_hosts:$known_hosts, legacy_cloud:true} |
-             if $key_file == "" then . else .key_file = $key_file end |
-             if $password_file == "" then . else
-                 .password_file = $password_file
-             end) as $remote |
-            if .remotes.neburst != null and
-               .remotes.neburst.legacy_cloud != true and
-               .remotes.neburst != $remote
-            then error("remote neburst already has different settings")
-            else . end |
-            .version = 4 |
-            .local_path = (.local_path // .paths.local) |
-            .cloud = {url:$url, auth:$auth, known_hosts:$known_hosts} |
-            if $password_file == "" then . else
-                .cloud.password_file = $password_file
-            end |
-            .remotes = (.remotes // {}) |
-            .remotes.neburst = $remote |
-            if $key_file == "" then . else .cloud.key_file = $key_file end |
-            del(.active, .paths)
-        ' "$storage_config" > "$temporary" || {
-            (( secret_existed == 1 )) || rm -f -- "$secret_reference"
-            unlock
-            die "remote neburst already has different settings"
-        }
-    else
-        jq -n --arg url "$cloud_url" --arg auth "$cloud_auth" \
-            --arg key_file "$cloud_key_file" --arg known_hosts "$cloud_known_hosts" \
-            --arg password_file "$secret_reference" '
-            ({type:"sftp", url:$url, auth:$auth,
-              known_hosts:$known_hosts, legacy_cloud:true} |
-             if $key_file == "" then . else .key_file = $key_file end |
-             if $password_file == "" then . else
-                 .password_file = $password_file
-             end) as $remote |
-            {
-              version:4,
-              cloud:{url:$url, auth:$auth, known_hosts:$known_hosts},
-              remotes:{neburst:$remote}
-            } |
-            if $password_file == "" then . else
-                .cloud.password_file = $password_file
-            end |
-            if $key_file == "" then . else .cloud.key_file = $key_file end
-        ' > "$temporary"
-    fi
-    chmod 600 "$temporary"
-    if ! mv -- "$temporary" "$storage_config"; then
-        (( secret_existed == 1 )) || rm -f -- "$secret_reference"
-        unlock
-        die "cannot publish cloud configuration"
-    fi
-    retire_unreferenced_neburst_passwords
-    unset cloud_password_value sync_remote_password_value
-    unlock
-    unlock_remote_operation
-    unlock_storage_consolidation
-    rm -rf -- "$tmp"
-    trap - EXIT
-    printf 'status=configured\nurl=%s\nauth=%s\n' "$cloud_url" "$cloud_auth"
 }
 
 ensure_legacy_cloud_remote() {
@@ -4486,33 +4196,15 @@ launch_managed_agent() {
 
 resolve_checkpoint_record_for_live() {
     local target="$1" checkpoint_id="$2"
-    if [[ "$target" == local ]]; then
-        load_local_storage
-        find_local_checkpoint_archive "$checkpoint_id"
-    else
-        load_cloud_storage
-        find_cloud_checkpoint_archive "$checkpoint_id"
-    fi
+    [[ "$target" == local ]] || die "target must be local"
+    load_local_storage
+    find_local_checkpoint_archive "$checkpoint_id"
 }
 
 read_checkpoint_runtime_manifest() {
-    local target="$1" tmp source
-    if [[ "$target" == local ]]; then
-        age_decrypt "$checkpoint_match" | tar -xzOf - manifest
-        return
-    fi
-
-    tmp="$(mktemp -d "$state/runtime-manifest.XXXXXX")"
-    trap_cleanup_dirs "$tmp"
-    if [[ -n "$cloud_checkpoint_manifest" ]]; then
-        source="$tmp/manifest.age"
-        cloud_run copyto "$cloud_fs/$cloud_checkpoint_manifest" "$source"
-        age_decrypt "$source"
-    else
-        source="$tmp/checkpoint.age"
-        cloud_run copyto "$cloud_fs/$cloud_checkpoint_match" "$source"
-        age_decrypt "$source" | tar -xzOf - manifest
-    fi
+    local target="$1"
+    [[ "$target" == local ]] || die "target must be local"
+    age_decrypt "$checkpoint_match" | tar -xzOf - manifest
 }
 
 start_managed_agent() {
@@ -5279,7 +4971,7 @@ local_checkpoint_selector_exists() {
 }
 
 checkpoint_id_exists() {
-    local target="$1" checkpoint_id="$2" pending listing remote_path base record_id
+    local target="$1" checkpoint_id="$2" pending
     if [[ -d "$state/pending" ]]; then
         while IFS= read -r -d '' pending; do
             if jq -e --arg target "$target" --arg id "$checkpoint_id" \
@@ -5288,19 +4980,7 @@ checkpoint_id_exists() {
             fi
         done < <(find "$state/pending" -type f -name '*.json' -print0)
     fi
-    if [[ "$target" == local ]]; then
-        local_checkpoint_id_exists "$local_checkpoints" "$checkpoint_id" && return 0
-    else
-        listing="$(cloud_run lsf --recursive --files-only "$cloud_fs")"
-        while IFS= read -r remote_path; do
-            case "$remote_path" in codex/*.checkpoint.tar.gz.age|claude/*.checkpoint.tar.gz.age|\
-                codex/*.manifest.age|claude/*.manifest.age) ;; *) continue ;; esac
-            base="${remote_path#*/}"
-            record_id="${base%.checkpoint.tar.gz.age}"
-            record_id="${record_id%.manifest.age}"
-            record_matches_checkpoint_id "$record_id" "$checkpoint_id" && return 0
-        done <<< "$listing"
-    fi
+    local_checkpoint_id_exists "$local_checkpoints" "$checkpoint_id" && return 0
     return 1
 }
 
@@ -5506,8 +5186,8 @@ prepare_checkpoint() {
     shift 4
     description="$*"
 
-    [[ "$target" == local || "$target" == cloud ]] || die "target must be local or cloud"
-    if [[ "$target" == local ]]; then load_local_storage; else load_cloud_storage; fi
+    [[ "$target" == local ]] || die "target must be local"
+    load_local_storage
     [[ "$agent" == codex || "$agent" == claude ]] || die "agent must be codex or claude"
     validate_session_id "$id"
     validate_new_checkpoint_id "$requested_id"
@@ -5549,112 +5229,6 @@ prepare_checkpoint() {
     if [[ "$target" == local ]]; then destination_root="$local_checkpoints"; else destination_root="$cloud_url"; fi
     checkpoint_destination_root="$destination_root"
     checkpoint_destination="$destination_root/$agent/$checkpoint_record_id.checkpoint.tar.gz.age"
-}
-
-verify_cloud_checkpoint_object() {
-    local remote="$1" kind="$2" expected_manifest="$3" downloaded plaintext
-    downloaded="$state/cloud-verify.$$.$RANDOM.age"
-    plaintext="$state/cloud-verify.$$.$RANDOM.manifest"
-    if ! cloud_run copyto "$remote" "$downloaded"; then
-        rm -f -- "$downloaded" "$plaintext"
-        return 1
-    fi
-    if [[ "$kind" == archive ]]; then
-        if ! age_decrypt "$downloaded" | tar -xzOf - manifest > "$plaintext"; then
-            rm -f -- "$downloaded" "$plaintext"
-            return 1
-        fi
-    elif ! age_decrypt -o "$plaintext" "$downloaded"; then
-        rm -f -- "$downloaded" "$plaintext"
-        return 1
-    fi
-    if ! cmp -s "$expected_manifest" "$plaintext"; then
-        rm -f -- "$downloaded" "$plaintext"
-        return 1
-    fi
-    rm -f -- "$downloaded" "$plaintext"
-}
-
-cloud_publish_immutable() {
-    local source="$1" partial="$2" final="$3" kind="$4" expected_manifest="$5"
-    cloud_publish_state=ambiguous
-    if verify_cloud_checkpoint_object "$final" "$kind" "$expected_manifest" \
-        2>/dev/null; then
-        cloud_publish_state=reused
-        return 0
-    fi
-    if ! cloud_run copyto "$source" "$partial"; then
-        cloud_run deletefile "$partial" >/dev/null 2>&1 || true
-        return 1
-    fi
-    if cloud_run moveto "$partial" "$final" --immutable; then
-        if verify_cloud_checkpoint_object "$final" "$kind" "$expected_manifest"; then
-            cloud_publish_state=created
-            return 0
-        fi
-        return 1
-    else
-        cloud_run deletefile "$partial" >/dev/null 2>&1 || true
-        if verify_cloud_checkpoint_object "$final" "$kind" "$expected_manifest"; then
-            cloud_publish_state=reused
-            return 0
-        fi
-        return 1
-    fi
-}
-
-cloud_checkpoint_object_absent() {
-    local remote="$1" parent name listing entry
-    parent="${remote%/*}"
-    name="${remote##*/}"
-    listing="$(cloud_run lsf --files-only "$parent")" || return 1
-    while IFS= read -r entry; do
-        [[ "$entry" != "$name" ]] || return 1
-    done <<< "$listing"
-    return 0
-}
-
-cloud_upload_checkpoint() {
-    local archive="$1" manifest="$2" plaintext_manifest="$3"
-    local archive_name manifest_name archive_partial manifest_partial
-    local archive_final manifest_final partial_suffix archive_publish_state retained=1
-    archive_name="$checkpoint_record_id.checkpoint.tar.gz.age"
-    manifest_name="$checkpoint_record_id.manifest.age"
-    archive_final="$cloud_fs/$checkpoint_agent/$archive_name"
-    manifest_final="$cloud_fs/$checkpoint_agent/$manifest_name"
-    partial_suffix="$(machine_id_fragment).$$.$RANDOM"
-    archive_partial="$cloud_fs/$checkpoint_agent/.$archive_name.partial.$partial_suffix"
-    manifest_partial="$cloud_fs/$checkpoint_agent/.$manifest_name.partial.$partial_suffix"
-    cloud_run mkdir "$cloud_fs/$checkpoint_agent"
-    # The archive is published first and the manifest remains the visibility
-    # marker. Both final names are immutable. A retry verifies and reuses a
-    # previously published object instead of overwriting or deleting it.
-    if ! cloud_publish_immutable "$archive" "$archive_partial" "$archive_final" \
-        archive "$plaintext_manifest"; then
-        cloud_run deletefile "$archive_partial" >/dev/null 2>&1 || true
-        cloud_run deletefile "$manifest_partial" >/dev/null 2>&1 || true
-        return 1
-    fi
-    archive_publish_state="$cloud_publish_state"
-    if ! cloud_publish_immutable "$manifest" "$manifest_partial" "$manifest_final" \
-        manifest "$plaintext_manifest"; then
-        cloud_run deletefile "$manifest_partial" >/dev/null 2>&1 || true
-        # The manifest is the commit marker. Without it, the archive is an
-        # invisible partial transaction that would still reserve the logical
-        # checkpoint ID and could be restored accidentally. Only roll back an
-        # archive proven to have been created by this invocation; a reused or
-        # ambiguous object may belong to a concurrent successful publisher.
-        if [[ "$archive_publish_state" == created ]] &&
-           cloud_checkpoint_object_absent "$manifest_final"; then
-            if cloud_run deletefile "$archive_final" >/dev/null 2>&1; then
-                retained=0
-            fi
-        fi
-        if [[ "$retained" == 1 ]]; then
-            log "warning: unconfirmed cloud checkpoint retained for safe recovery: $checkpoint_agent/$checkpoint_record_id"
-        fi
-        return 1
-    fi
 }
 
 write_checkpoint_archive() {
@@ -5751,23 +5325,15 @@ write_checkpoint_archive() {
     write_age_recipient_file "$recipient"
     archive="$tmp/checkpoint.age"
     tar -C "$payload" -czf - manifest artifacts.tsv artifacts | age -R "$recipient" -o "$archive"
-    if [[ "$checkpoint_target" == local ]]; then
-        mkdir -p "$(dirname "$checkpoint_destination")"
-        partial="$checkpoint_destination.partial.$(machine_id_fragment).$$.$RANDOM"
-        cp -- "$archive" "$partial"
-        if ! ln -- "$partial" "$checkpoint_destination"; then
-            rm -f -- "$partial"
-            die "checkpoint ID already exists for local storage: $checkpoint_id"
-        fi
+    mkdir -p "$(dirname "$checkpoint_destination")"
+    partial="$checkpoint_destination.partial.$(machine_id_fragment).$$.$RANDOM"
+    cp -- "$archive" "$partial"
+    if ! ln -- "$partial" "$checkpoint_destination"; then
         rm -f -- "$partial"
-    else
-        manifest_archive="$tmp/manifest.age"
-        age -R "$recipient" -o "$manifest_archive" "$payload/manifest"
-        cloud_upload_checkpoint "$archive" "$manifest_archive" "$payload/manifest"
+        die "checkpoint ID already exists for local storage: $checkpoint_id"
     fi
-    if [[ "$checkpoint_target" == local ]]; then
-        unlock_checkpoint_root
-    fi
+    rm -f -- "$partial"
+    unlock_checkpoint_root
     unlock
     rm -rf -- "$tmp"
     trap - EXIT
@@ -8574,40 +8140,6 @@ list_local_checkpoints() {
     } | render_checkpoint_table
 }
 
-list_cloud_checkpoints() {
-    local tmp paths rows remote_path agent base record_id manifest
-    (( $# == 0 )) || die "usage: ags cloud list"
-    load_cloud_storage
-    need column
-    load_encryption_identity
-    tmp="$(mktemp -d /tmp/agent-session-cloud-list.XXXXXX)"
-    trap_cleanup_dirs "$tmp"
-    paths="$tmp/paths"
-    rows="$tmp/rows"
-    cloud_run lsf --recursive --files-only "$cloud_fs" > "$paths"
-    : > "$rows"
-    while IFS= read -r remote_path; do
-        case "$remote_path" in codex/*.manifest.age|claude/*.manifest.age) ;; *) continue ;; esac
-        agent="${remote_path%%/*}"
-        base="${remote_path#*/}"
-        [[ "$base" != */* ]] || continue
-        record_id="${base%.manifest.age}"
-        cloud_run copyto "$cloud_fs/$remote_path" "$tmp/manifest.age"
-        if age_decrypt -o "$tmp/manifest" "$tmp/manifest.age" 2>/dev/null; then
-            manifest="$(<"$tmp/manifest")"
-            print_checkpoint_row cloud "$agent" "$record_id" "$manifest" >> "$rows"
-        else
-            print_checkpoint_row cloud "$agent" "$record_id" >> "$rows"
-        fi
-    done < "$paths"
-    {
-        printf 'ID\tAGENT\tSAVED\tDESCRIPTION\n'
-        LC_ALL=C sort -t $'\t' -k1,1 -k2,2 "$rows"
-    } | render_checkpoint_table
-    rm -rf -- "$tmp"
-    trap - EXIT
-}
-
 show_local_checkpoint() {
     local checkpoint_id="${1:-}" tmp unpack manifest format kind saved_id saved_record_id
     local agent session_id description created_utc saved_pwd relative fidelity artifact_metadata
@@ -8768,60 +8300,6 @@ show_local_checkpoint() {
 
     rm -rf -- "$tmp"
     trap - EXIT
-}
-
-find_cloud_checkpoint_archive() {
-    local checkpoint_id="${1:-}" listing remote_path agent base record_id manifest_path total
-    local selector_agent selector_record_id
-    local -a exact_matches=() id_matches=()
-    parse_checkpoint_selector "$checkpoint_id"
-    selector_agent="$checkpoint_selector_agent"
-    selector_record_id="$checkpoint_selector_record_id"
-    cloud_checkpoint_manifest=
-    listing="$(cloud_run lsf --recursive --files-only "$cloud_fs")"
-    while IFS= read -r remote_path; do
-        case "$remote_path" in codex/*.checkpoint.tar.gz.age|claude/*.checkpoint.tar.gz.age) ;; *) continue ;; esac
-        agent="${remote_path%%/*}"
-        base="${remote_path#*/}"
-        [[ "$base" != */* ]] || continue
-        record_id="${base%.checkpoint.tar.gz.age}"
-        if [[ -n "$selector_agent" ]]; then
-            if [[ "$agent" == "$selector_agent" && "$record_id" == "$selector_record_id" ]]; then
-                exact_matches+=("$remote_path")
-            fi
-        elif [[ "$record_id" == "$checkpoint_id" ]]; then
-            exact_matches+=("$remote_path")
-        elif record_matches_checkpoint_id "$record_id" "$checkpoint_id"; then
-            id_matches+=("$remote_path")
-        fi
-    done <<< "$listing"
-    total=$((${#exact_matches[@]} + ${#id_matches[@]}))
-    if (( total == 1 &&
-          ${#exact_matches[@]} == 1 )); then
-        cloud_checkpoint_match="${exact_matches[0]}"
-    else
-        if (( ${#exact_matches[@]} == 0 && ${#id_matches[@]} == 1 )); then
-            cloud_checkpoint_match="${id_matches[0]}"
-        else
-            if (( total > 1 )); then
-                log "matching RECORD_ID values:"
-                for remote_path in "${exact_matches[@]}" "${id_matches[@]}"; do
-                    log "  ${remote_path%.checkpoint.tar.gz.age}"
-                done
-            fi
-            die "expected one cloud checkpoint named $checkpoint_id; found $total"
-        fi
-    fi
-    cloud_checkpoint_agent="${cloud_checkpoint_match%%/*}"
-    base="${cloud_checkpoint_match#*/}"
-    checkpoint_record_id="${base%.checkpoint.tar.gz.age}"
-    manifest_path="$cloud_checkpoint_agent/$checkpoint_record_id.manifest.age"
-    while IFS= read -r remote_path; do
-        if [[ "$remote_path" == "$manifest_path" ]]; then
-            cloud_checkpoint_manifest="$manifest_path"
-            break
-        fi
-    done <<< "$listing"
 }
 
 validate_native_main_path() {
@@ -9481,25 +8959,14 @@ restore_checkpoint_file() {
 
 restore_checkpoint() {
     local target="${1:-}" checkpoint_id="${2:-}" cwd_hint="${3:-}"
-    local target_agent="${4:-}" profile="${5:-}" download_tmp
-    [[ "$target" == local || "$target" == cloud ]] || die "target must be local or cloud"
+    local target_agent="${4:-}" profile="${5:-}"
+    [[ "$target" == local ]] || die "target must be local"
     parse_checkpoint_selector "$checkpoint_id"
-    if [[ "$target" == local ]]; then
-        load_local_storage
-        find_local_checkpoint_archive "$checkpoint_id"
-        restore_checkpoint_file "$checkpoint_id" "$checkpoint_record_id" "$checkpoint_match" \
-            "" "$cwd_hint" "$(basename "$(dirname "$checkpoint_match")")" \
-            "$target_agent" "$profile"
-    else
-        load_cloud_storage
-        find_cloud_checkpoint_archive "$checkpoint_id"
-        download_tmp="$(mktemp -d /tmp/agent-session-cloud-resume.XXXXXX)"
-        trap_cleanup_dirs "$download_tmp"
-        cloud_run copyto "$cloud_fs/$cloud_checkpoint_match" "$download_tmp/checkpoint.age"
-        restore_checkpoint_file "$checkpoint_id" "$checkpoint_record_id" \
-            "$download_tmp/checkpoint.age" "$download_tmp" "$cwd_hint" "$cloud_checkpoint_agent" \
-            "$target_agent" "$profile"
-    fi
+    load_local_storage
+    find_local_checkpoint_archive "$checkpoint_id"
+    restore_checkpoint_file "$checkpoint_id" "$checkpoint_record_id" "$checkpoint_match" \
+        "" "$cwd_hint" "$(basename "$(dirname "$checkpoint_match")")" \
+        "$target_agent" "$profile"
 }
 
 # Which directory the resumed session works in, into `resolved_resume_cwd`.
@@ -11594,119 +11061,6 @@ delete_local_checkpoint() {
     unlock_storage_consolidation
 }
 
-move_selected_cloud_checkpoint_to_trash() {
-    local timestamp archive_name manifest_name trash_root
-    timestamp="$(date -u +%Y%m%dT%H%M%S.%NZ)" || return
-    archive_name="${cloud_checkpoint_match##*/}"
-    trash_root="$cloud_fs/trash/$cloud_checkpoint_agent"
-    cloud_run mkdir "$trash_root" || return
-    # Keep the encrypted archive at its active path until every optional
-    # sidecar has moved. If the sidecar move fails, retry can still select the
-    # archive; if the final archive move fails, retry works without a sidecar.
-    if [[ -n "$cloud_checkpoint_manifest" ]]; then
-        manifest_name="${cloud_checkpoint_manifest##*/}"
-        cloud_run moveto "$cloud_fs/$cloud_checkpoint_manifest" \
-            "$trash_root/$manifest_name.deleted.$timestamp" || return
-    fi
-    cloud_run moveto "$cloud_fs/$cloud_checkpoint_match" \
-        "$trash_root/$archive_name.deleted.$timestamp" || return
-    printf '%s/trash/%s/%s.deleted.%s\n' \
-        "$cloud_url" "$cloud_checkpoint_agent" "$archive_name" "$timestamp"
-}
-
-delete_cloud_checkpoint() {
-    local checkpoint_id="${1:-}" delete_output delete_status=0 recoverable
-    local selected_agent selected_record local_archive tombstone
-    local tomb_tag tomb_record tomb_agent tomb_record_digest tomb_extra
-    local -a tombstone_lines=()
-    (( $# == 1 )) || die "usage: ags cloud delete ID|AGENT/RECORD_ID"
-    lock_storage_consolidation
-    ensure_legacy_cloud_remote
-    lock_remote_operation neburst
-    load_cloud_storage
-    find_cloud_checkpoint_archive "$checkpoint_id"
-    selected_agent="$cloud_checkpoint_agent"
-    selected_record="$checkpoint_record_id"
-    if ! jq -e '
-        .remotes.neburst |
-        .type == "sftp" and .legacy_cloud == true
-    ' "$storage_config" >/dev/null; then
-        die "legacy cloud deletion cannot be reconciled with named storage"
-    fi
-
-    # First import the legacy record into the unified vault, then publish a
-    # tombstone through the normal named-remote path. Only after that durable
-    # delete is committed do we hide the legacy direct-SFTP copy.
-    sync_records sync neburst >/dev/null
-    load_local_storage
-    local_archive="$local_checkpoints/$selected_agent/$selected_record.checkpoint.tar.gz.age"
-    tombstone="$local_checkpoints/tombstones/$selected_agent/$selected_record.tombstone"
-    if [[ -f "$local_archive" && ! -L "$local_archive" ]]; then
-        if delete_output="$(
-            AGENT_SESSION_STORAGE_MODE=remote:neburst \
-                delete_local_checkpoint "$selected_agent/$selected_record"
-        )"; then
-            delete_status=0
-        else
-            delete_status=$?
-        fi
-    elif [[ -f "$tombstone" && ! -L "$tombstone" ]]; then
-        mapfile -t tombstone_lines < "$tombstone"
-        (( ${#tombstone_lines[@]} == 1 )) ||
-            die "invalid tombstone: $tombstone"
-        IFS=$'\t' read -r tomb_tag tomb_record tomb_agent \
-            tomb_record_digest tomb_extra <<< "${tombstone_lines[0]}"
-        [[ "$tomb_tag" == ags-tombstone-v1 &&
-           "$tomb_record" == "$selected_record" &&
-           "$tomb_agent" == "$selected_agent" &&
-           -z "${tomb_extra:-}" ]] ||
-            die "tombstone does not match legacy cloud record: $selected_record"
-        validate_sync_digest "$tomb_record_digest"
-        [[ ${remote_record_digest[$selected_record]+present} &&
-           "${remote_record_agent[$selected_record]}" == "$selected_agent" &&
-           "${remote_record_digest[$selected_record]}" == "$tomb_record_digest" ]] ||
-            die "E_SYNC_CONFLICT: legacy cloud tombstone does not match record content: $selected_record"
-        delete_output="$(
-            printf 'status=deleted\ntarget=local\ncheckpoint_id=%s\nrecord_id=%s\n' \
-                "$checkpoint_id" "$selected_record"
-            printf 'tombstone=%s\nsync_status=synchronized\nstorage_mode=remote:neburst\n' \
-                "$tombstone"
-        )"
-    else
-        die "legacy cloud record was not imported or tombstoned: $selected_record"
-    fi
-
-    if ! grep -Fqx 'status=deleted' <<< "$delete_output"; then
-        unlock_remote_operation
-        unlock_storage_consolidation
-        return "$delete_status"
-    fi
-    if (( delete_status != 0 )) ||
-       ! grep -Fqx 'sync_status=synchronized' <<< "$delete_output"; then
-        sed 's/^target=local$/target=cloud/' <<< "$delete_output"
-        unlock_remote_operation
-        unlock_storage_consolidation
-        return "$delete_status"
-    fi
-
-    # The selector and legacy paths were loaded before synchronization. Confirm
-    # that the still-active direct-SFTP record is the same record immediately
-    # before the recoverable move.
-    load_cloud_storage
-    find_cloud_checkpoint_archive "$selected_agent/$selected_record"
-    [[ "$cloud_checkpoint_agent" == "$selected_agent" &&
-       "$checkpoint_record_id" == "$selected_record" ]] ||
-        die "legacy cloud checkpoint changed during deletion"
-    if ! recoverable="$(move_selected_cloud_checkpoint_to_trash)"; then
-        die "legacy cloud cleanup was interrupted; the active archive remains retryable"
-    fi
-    unlock_remote_operation
-    unlock_storage_consolidation
-    sed 's/^target=local$/target=cloud/' <<< "$delete_output"
-    printf 'legacy_recoverable_path=%s\n' "$recoverable"
-    return "$delete_status"
-}
-
 status_sessions() {
     [[ -d "$store" ]] || { log "no snapshots: $store"; return; }
     find "$store" -maxdepth 1 -type f -name '*.sessions.tar.gz.age' \
@@ -11727,20 +11081,6 @@ rehome_claude() {
     (( ${#matches[@]} == 1 )) || die "expected one local copy of $id; found ${#matches[@]}"
     replace_file "${matches[0]}" "$destination"
     log "mapped $id to $cwd; now run: claude --resume $id"
-}
-
-cloud_command() {
-    local command="${1:-}"
-    shift || true
-    case "$command" in
-        set) configure_cloud_storage "$@" ;;
-        list|ls) list_cloud_checkpoints "$@" ;;
-        save) save_active_checkpoint cloud "$@" ;;
-        resume) resume_checkpoint cloud "$@" ;;
-        delete) delete_cloud_checkpoint "$@" ;;
-        -h|--help|help|'') usage ;;
-        *) usage >&2; exit 2 ;;
-    esac
 }
 
 # 记录存放的地方，一套命令。
@@ -12734,11 +12074,15 @@ case "${1:-}" in
         ;;
     gc) shift; ags_gc "$@" ;;
     store) shift; store_command "$@" ;;
-    # 并进 `ags store` 之前的三个名字。还认，但帮助里没有了。
-    cloud) shift
-        deprecated_store_alias cloud 'ags store add NAME sftp://…；存/取用 ags store use 选目标'
-        cloud_command "$@"
+    # `ags cloud` 整个删掉了（2026-08-27）。它是 sftp 的旧版重复实现，而
+    # `ags store add NAME sftp://…` 覆盖了它的全部能力。老的 `.cloud` 配置**不会
+    # 丢**：`ensure_legacy_cloud_remote` 照旧把它迁成一个具名 store。
+    #
+    # 留一条说清楚去哪，比让人对着 `unknown command` 猜要好。
+    cloud)
+        die "ags cloud 没有了；用 ags store add NAME sftp://USER@HOST:PORT/PATH，然后 ags store use NAME。老的 cloud 配置会自动迁成一个 store"
         ;;
+    # 并进 `ags store` 之前的两个名字。还认，但帮助里没有了。
     remote) shift
         deprecated_store_alias remote 'ags store add|list|show|use|remove'
         remote_command "$@"
