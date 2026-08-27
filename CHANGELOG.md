@@ -34,6 +34,24 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
   fetches its `install.sh` from the tag it is installing, so an old install is
   never locked out.
 
+### `ags ls` 按启动时间排，两个时间都列
+
+- **顺序改成按启动时间（`started_at`）降序。** 原来按最后活动时间排，而那个值每被
+  碰一次就变——同一批会话每次 `ags ls` 的顺序都不一样。人是靠"我大概什么时候开的
+  这个"去找会话的，那个坐标必须稳定。
+
+- **两个时间各占一列**：`STARTED` 和 `ACTIVE`。按前者找，看后者判断它还活不活着。
+
+  ```
+  #   KIND  AGENT  STARTED      ACTIVE       WORKSPACE  DESCRIPTION
+   1  live  codex  08-27 13:12  08-27 13:12  /w         会话 C
+   2  live  codex  08-25 14:12  08-25 14:12  /w         会话 B
+   3  live  codex  08-24 14:12  08-27 14:10  /w         会话 A   ← 开得最早，但刚动过
+  ```
+
+  `ACTIVE` 仍然是"会话内最后一条消息时间"和"文件 mtime"取较大值，也仍然决定颜色
+  深浅和 `--settled` 的判断——变的只是它不再决定顺序。
+
 ### `ags cloud` 删除
 
 - **整套删掉，1207 行。** 它是 sftp 的旧版重复实现，而 `ags store add NAME

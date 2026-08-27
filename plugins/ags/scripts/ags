@@ -6908,12 +6908,20 @@ native_session_rows() {
                 | (human_line as $line
                    | if ($line | length) > 0 then $line else (gsub("\n"; " ")) end)
                 | gsub("\n"; " ");
+            # **按启动时间排，不按最后活动时间。**
+            #
+            # 最后活动时间每被碰一次就变，于是同一批会话每次 `ags ls` 的顺序都不一样
+            # ——而人是靠"我大概什么时候开的这个"去找会话的，那个坐标必须稳定。
+            # 最后活动时间照旧显示（ACTIVE 列），只是不再决定顺序。
             (.items // [])
-            | map(. + {_when: ((.last_active_at // .started_at // 0) | floor)})
-            | sort_by(-._when)
+            | map(. + {_when:    ((.last_active_at // .started_at // 0) | floor),
+                       _started: ((.started_at // .last_active_at // 0) | floor)})
+            | sort_by(-._started)
             | .[]
             | [ .provider,
                 .session_id,
+                (if ._started > 0 then (._started / 1000 | floor | strflocaltime("%m-%d %H:%M")) else "" end),
+                ((._started / 1000) | floor | tostring),
                 (if ._when > 0 then (._when / 1000 | floor | strflocaltime("%m-%d %H:%M")) else "" end),
                 ((._when / 1000) | floor | tostring),
                 ((.workspace // .workspace_name // "") | tostring | gsub("[\t\r\n]"; " ")),
@@ -6995,7 +7003,8 @@ workspace_cell() {
 
 load_native_session_menu() {
     local include_archives="${1:-0}" for_menu="${2:-1}" table_width
-    local provider session_id when when_epoch workspace native_name title path
+    local provider session_id started started_epoch when when_epoch
+    local workspace native_name title path
     local now
     table_width="$(terminal_width)"
     local checkpoint_id agent saved_date description selector args
@@ -7015,14 +7024,17 @@ load_native_session_menu() {
     # 要等这一批都在手里才定得下来。
     local -a live_provider=() live_id=() live_when=() live_workspace=() live_title=()
     local -a live_path=() live_key=() live_native=() live_when_epoch=()
+    local -a live_started=()
     local -A annotation_map=() ordinal_map=()
     local annotations_batched=1
-    while IFS=$'\x1f' read -r provider session_id when when_epoch workspace \
+    while IFS=$'\x1f' read -r provider session_id started started_epoch \
+                              when when_epoch workspace \
                               native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
         live_provider+=("$provider")
         live_when_epoch+=("$when_epoch")
         live_id+=("$session_id")
+        live_started+=("$started")
         live_when+=("$when")
         live_workspace+=("$workspace")
         live_native+=("$native_name")
@@ -7042,10 +7054,11 @@ load_native_session_menu() {
     done < <(jq -r '.ids | to_entries[] | "\(.key)\t\(.value)"' \
         <<< "$session_ordinals_json" 2>/dev/null || true)
 
-    local index ordinal
+    local index ordinal started
     for index in "${!live_id[@]}"; do
         provider="${live_provider[$index]}"
         session_id="${live_id[$index]}"
+        started="${live_started[$index]}"
         when="${live_when[$index]}"
         workspace="${live_workspace[$index]}"
         native_name="${live_native[$index]}"
@@ -7074,7 +7087,7 @@ load_native_session_menu() {
            [[ -z "$annotation_summary_stamp" ]]; then
             native_menu_missing=$((native_menu_missing + 1))
         fi
-        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${native_name:-${annotation_summary:-$title}}}")
+        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$started"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"${annotation_description:-${native_name:-${annotation_summary:-$title}}}")
     done
 
     if (( include_archives == 1 )); then
@@ -7098,16 +7111,16 @@ load_native_session_menu() {
     if (( for_menu == 1 )); then
         mapfile -t rendered < <(
             {
-                printf '#\tKIND\tAGENT\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
+                printf '#\tKIND\tAGENT\tSTARTED\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
                 printf '%s\n' "${rows[@]}"
-            } | render_checkpoint_table 2 1 6
+            } | render_checkpoint_table 2 1 7
         )
     else
         mapfile -t rendered < <(
             {
-                printf '#\tKIND\tAGENT\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
+                printf '#\tKIND\tAGENT\tSTARTED\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
                 printf '%s\n' "${rows[@]}"
-            } | render_checkpoint_table 0 0 6
+            } | render_checkpoint_table 0 0 7
         )
     fi
     if (( ${#rendered[@]} == ${#rows[@]} + 1 )); then
@@ -7401,14 +7414,18 @@ start_background_summary() {
 # 继续用标题而已。
 summarize_native_sessions() {
     local force="${1:-0}" settled_only="${2:-0}"
-    local provider session_id when when_epoch workspace native_name title path
+    local provider session_id started started_epoch when when_epoch
+    local workspace native_name title path
     local made=0 kept=0 failed=0 busy=0 now
     local -a queue_provider=() queue_id=() queue_path=() queue_title=() queue_native=()
     local -a queue_when=()
     need jq
-    while IFS=$'\x1f' read -r provider session_id when when_epoch workspace \
+    while IFS=$'\x1f' read -r provider session_id started started_epoch \
+                              when when_epoch workspace \
                               native_name title path; do
         [[ -n "$provider" && -n "$session_id" ]] || continue
+        # 这里要的是**最后活动**时间，不是启动时间：`--settled` 判的是"这条会话安静
+        # 了多久"，拿启动时间去判会把一条开了三天、五分钟前还在写的会话当成静止的。
         queue_when+=("$when_epoch")
         queue_provider+=("$provider")
         queue_id+=("$session_id")

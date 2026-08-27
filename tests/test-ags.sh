@@ -5474,4 +5474,66 @@ store_out="$("${store_env[@]}" "$tool" sync --dry-run 2>&1)" || true
 store_ref="$("${store_env[@]}" "$tool" status 2>&1)" || true
 [[ "$store_out" == "$store_ref" ]]
 
+# ---------------------------------------------------------------------------
+# `ags ls` 按启动时间排，两个时间都列
+#
+# 按最后活动时间排的问题是：那个值每被碰一次就变，同一批会话每次 `ags ls` 的顺序
+# 都不一样。而人是靠"我大概什么时候开的这个"去找会话的，那个坐标必须稳定。
+# ---------------------------------------------------------------------------
+ls_home="$tmp/ls-sort-home"
+ls_state="$tmp/ls-sort-state"
+ls_items="$tmp/ls-sort-items.json"
+mkdir -p "$ls_home/codex" "$ls_home/claude" "$ls_state"
+ls_now_ms="$(( $(date +%s) * 1000 ))"
+ls_day_ms=86400000
+# 故意让启动顺序和最后活动顺序**相反**：早开的那条刚刚还在动。
+jq -n --argjson now "$ls_now_ms" --argjson day "$ls_day_ms" '[
+  {provider:"codex", session_id:"aaaaaaaa-1111-4111-8111-111111111111",
+   started_at:($now - 3*$day), last_active_at:($now - 60000),
+   workspace:"/w", title:"最早开的但刚动过", path:"/w/a.jsonl"},
+  {provider:"codex", session_id:"bbbbbbbb-2222-4222-8222-222222222222",
+   started_at:($now - 2*$day), last_active_at:($now - 2*$day),
+   workspace:"/w", title:"中间开的", path:"/w/b.jsonl"},
+  {provider:"codex", session_id:"cccccccc-3333-4333-8333-333333333333",
+   started_at:($now - 3600000), last_active_at:($now - 3600000),
+   workspace:"/w", title:"最晚开的", path:"/w/c.jsonl"}
+]' > "$ls_items"
+ls_env=(
+    env
+    HOME="$ls_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$ls_home/codex"
+    CLAUDE_CONFIG_DIR="$ls_home/claude"
+    XDG_CONFIG_HOME="$ls_home/.config"
+    XDG_DATA_HOME="$ls_home/.local/share"
+    XDG_STATE_HOME="$ls_home/.local/state"
+    AGENT_SESSION_STATE_DIR="$ls_state"
+    AGS_CONVERTER_BINARY="$tmp/home/.local/bin/ags"
+    AGS_CONVERTER_VERSION=0.3.0-test
+    FAKE_LIST_ITEMS="$ls_items"
+    AGS_AUTO_SUMMARY=0
+    COLUMNS=160
+)
+"${ls_env[@]}" "$tool" init >/dev/null
+ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+
+# 两个时间都要有自己的一列。
+grep -Eq 'STARTED[[:space:]]+ACTIVE' <<< "$ls_out"
+
+# 顺序：最晚开的在最上面，最早开的在最下面——哪怕它刚刚还在动。
+ls_order="$(grep -oE '最早开的但刚动过|中间开的|最晚开的' <<< "$ls_out" | tr '\n' ' ')"
+[[ "$ls_order" == '最晚开的 中间开的 最早开的但刚动过 ' ]] || {
+    printf 'ags ls: 应该按启动时间排，实际顺序是 %s\n' "$ls_order" >&2
+    printf '%s\n' "$ls_out" >&2
+    exit 1
+}
+
+# 那条"早开但刚动过"的行里，两个时间必须**不一样**——否则等于只显示了一个。
+ls_row="$(grep -F '最早开的但刚动过' <<< "$ls_out")"
+ls_times="$(grep -oE '[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<< "$ls_row" | tr '\n' '|')"
+[[ "$(cut -d'|' -f1 <<< "$ls_times")" != "$(cut -d'|' -f2 <<< "$ls_times")" ]] || {
+    printf 'ags ls: STARTED 和 ACTIVE 显示成了同一个值：%s\n' "$ls_times" >&2
+    exit 1
+}
+
 printf 'ags self-check passed\n'
