@@ -244,9 +244,13 @@ Usage:
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
   ags ls | ags list [-a]               Pick one of this machine's Agent sessions
-                                       and carry on with it. Newest first, every
-                                       workspace. -a also lists the archives
-                                       `ags save` wrote, in the same view.
+                                       and carry on with it. Every workspace,
+                                       ordered by the day it was last active,
+                                       and within one day by when it started —
+                                       a minute-level ACTIVE order would reshuffle
+                                       today's rows on every run.
+                                       -a also lists the archives `ags save`
+                                       wrote, in the same view.
                                        The leading `#` is this machine's short
                                        number for that session: `ags resume 7`.
                                        It is stable, so a number stays with the
@@ -7140,7 +7144,7 @@ native_session_rows() {
                 | (human_line as $line
                    | if ($line | length) > 0 then $line else (gsub("\n"; " ")) end)
                 | gsub("\n"; " ");
-            # **按最后活动时间排。**
+            # **按最后活动的日期排；同一天里按启动时间排。**
             #
             # 列表是「接着干」的入口，而要接的那条基本上就是刚才在动的那条，所以最
             # 近动过的排在最上面。
@@ -7150,11 +7154,26 @@ native_session_rows() {
             # 表的下半截是「在最近活动的这 N 条里，开得最早的几条」——那个集合本身
             # 是按另一个键截出来的，排出来的顺序看着稳定，其实成员一直在换。
             #
-            # 启动时间照旧显示（STARTED 列），只是不再决定顺序。
+            # **同一天之内改用启动时间排，不再看几点几分。**
+            #
+            # 「哪天动过」是找会话真正用得上的粒度——你记得的是"今天还在弄的"和"前
+            # 天那条"，不是"17:42 那条在 17:05 那条前面"。而在一天之内，分钟级的最后
+            # 活动时间反而是有害的：它每被碰一次就变，同一天的几条会话每次 `ags ls`
+            # 的相对位置都不一样，眼睛得重新找。启动时间在一天之内是固定的。
+            #
+            # 所以两级：先按最后活动的**日期**降序，同一天里按启动时间降序。
+            #
+            # 日期用本地时区的 `YYYYMMDD` 整数（`strflocaltime`），不是 `_when/86400`
+            # ——后者切的是 UTC 的午夜，在东八区就是早上八点，于是"今天早上七点动
+            # 过"的会话会被算进昨天。跨月跨年靠 `YYYYMMDD` 本身单调，不用另外处理。
             (.items // [])
             | map(. + {_when:    ((.last_active_at // .started_at // 0) | floor),
                        _started: ((.started_at // .last_active_at // 0) | floor)})
-            | sort_by(-._when)
+            | map(. + {_day: (if ._when > 0
+                              then ((._when / 1000) | floor
+                                    | strflocaltime("%Y%m%d") | tonumber)
+                              else 0 end)})
+            | sort_by([-._day, -._started])
             | .[]
             | [ .provider,
                 .session_id,

@@ -5633,11 +5633,12 @@ store_ref="$("${store_env[@]}" "$tool" status 2>&1)" || true
 [[ "$store_out" == "$store_ref" ]]
 
 # ---------------------------------------------------------------------------
-# `ags ls` 按最后活动时间排，两个时间都列，一个字都没有的会话不列
+# `ags ls`：按最后活动的**日期**排，同一天里按启动时间排；两个时间都列；一个字都
+# 没有的会话不列
 #
-# 列表是「接着干」的入口，要接的那条基本就是刚才在动的那条。而且上游那一刀
-# `--limit` 本来就是按最后活动时间切的，按启动时间排等于给一个按另一个键截出来的
-# 集合排序——顺序看着稳，成员一直在换。
+# 「哪天动过」是找会话真正用得上的粒度。而在一天之内，分钟级的最后活动时间反而有
+# 害：它每被碰一次就变，同一天那几条每次 `ags ls` 的相对位置都不一样。启动时间在
+# 一天之内是固定的。
 #
 # 第二件事：Codex 只要起来就落一个 rollout 文件，误敲和开完就关的窗口于是都在列表
 # 里占一行，而那一行没有任何能用来认它的东西。四个描述来源全空就不显示。
@@ -5646,23 +5647,35 @@ ls_home="$tmp/ls-sort-home"
 ls_state="$tmp/ls-sort-state"
 ls_items="$tmp/ls-sort-items.json"
 mkdir -p "$ls_home/codex" "$ls_home/claude" "$ls_state"
-ls_now_ms="$(( $(date +%s) * 1000 ))"
+# 时间锚在**昨天中午**，不是 `now`。
+#
+# 用 `now - 1小时` 这种相对量的话，这一段在本地时间 00:00–01:00 之间跑就会把"今天"
+# 算成"昨天"，而分日期排序恰恰是对这条边界敏感的——那是一个每天只红一小时、在 CI
+# 上随机出现的用例。锚到某一天的正午，离两侧的午夜都有 12 小时，跑在哪个时刻都一样。
+#
+# 一次 `date` 取全四个字段：分两次取，正好跨过午夜就会算出差一天的午夜。
+read -r ls_epoch ls_hh ls_mm ls_ss < <(date +'%s %H %M %S')
+ls_midnight=$(( ls_epoch - (10#$ls_hh * 3600 + 10#$ls_mm * 60 + 10#$ls_ss) ))
+ls_base_ms=$(( (ls_midnight - 12 * 3600) * 1000 ))   # 昨天中午
+ls_hour_ms=3600000
 ls_day_ms=86400000
-# 故意让启动顺序和最后活动顺序**相反**：早开的那条刚刚还在动。
-# 最后那条是空会话：`started_at` 最新，`title` 和 `native_name` 都是空的——按时间
-# 它该排第一，按「有没有名字」它一行都不该出现。
-jq -n --argjson now "$ls_now_ms" --argjson day "$ls_day_ms" '[
+# 甲和乙**同一天**动过，而乙动得更晚——但甲今天才开、乙是四天前开的。按分钟排的
+# 话乙在上面；按"同一天里看启动时间"排，甲在上面。这一条就是用来把两种排法分开的。
+#
+# 丁是空会话：`title` 和 `native_name` 都是空的，而它的时间最新——按时间它该排第
+# 一，按「有没有名字」它一行都不该出现。
+jq -n --argjson base "$ls_base_ms" --argjson h "$ls_hour_ms" --argjson day "$ls_day_ms" '[
   {provider:"codex", session_id:"aaaaaaaa-1111-4111-8111-111111111111",
-   started_at:($now - 3*$day), last_active_at:($now - 60000),
-   workspace:"/w", title:"最早开的但刚动过", path:"/w/a.jsonl"},
+   started_at:($base + 2*$h), last_active_at:($base + 3*$h),
+   workspace:"/w", title:"当天开的", path:"/w/a.jsonl"},
   {provider:"codex", session_id:"bbbbbbbb-2222-4222-8222-222222222222",
-   started_at:($now - 2*$day), last_active_at:($now - 2*$day),
-   workspace:"/w", title:"中间开的", path:"/w/b.jsonl"},
+   started_at:($base - 3*$day), last_active_at:($base + 5*$h),
+   workspace:"/w", title:"同一天动过但四天前开的", path:"/w/b.jsonl"},
   {provider:"codex", session_id:"cccccccc-3333-4333-8333-333333333333",
-   started_at:($now - 3600000), last_active_at:($now - 3600000),
-   workspace:"/w", title:"最晚开的", path:"/w/c.jsonl"},
+   started_at:($base - $day - $h), last_active_at:($base - $day),
+   workspace:"/w", title:"前一天的", path:"/w/c.jsonl"},
   {provider:"codex", session_id:"dddddddd-4444-4444-8444-444444444444",
-   started_at:($now - 30000), last_active_at:($now - 30000),
+   started_at:($base + 6*$h), last_active_at:($base + 6*$h),
    workspace:"/w", title:"", native_name:"", path:"/w/d.jsonl"}
 ]' > "$ls_items"
 ls_env=(
@@ -5687,11 +5700,11 @@ ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 # 两个时间都要有自己的一列。
 grep -Eq 'STARTED[[:space:]]+ACTIVE' <<< "$ls_out"
 
-# 顺序：刚动过的在最上面，哪怕它是三天前开的；两天没动的在最下面，哪怕它比一小时
-# 前那条开得早。
-ls_order="$(grep -oE '最早开的但刚动过|中间开的|最晚开的' <<< "$ls_out" | tr '\n' ' ')"
-[[ "$ls_order" == '最早开的但刚动过 最晚开的 中间开的 ' ]] || {
-    printf 'ags ls: 应该按最后活动时间排，实际顺序是 %s\n' "$ls_order" >&2
+# 顺序：同一天动过的两条排在前一天那条上面（按日期）；这两条之间按**启动时间**，
+# 所以当天开的在上、四天前开的在下——哪怕后者的最后活动时间还更晚两小时。
+ls_order="$(grep -oE '当天开的|同一天动过但四天前开的|前一天的' <<< "$ls_out" | tr '\n' ' ')"
+[[ "$ls_order" == '当天开的 同一天动过但四天前开的 前一天的 ' ]] || {
+    printf 'ags ls: 应该按「活动日期 → 启动时间」排，实际顺序是 %s\n' "$ls_order" >&2
     printf '%s\n' "$ls_out" >&2
     exit 1
 }
@@ -5711,7 +5724,7 @@ fi
 
 # 空会话也不该**占掉一个短号**。短号发出去就不收回，给一条永远不显示的会话发一个，
 # 等于把后面每一条的号往后推——Codex 每起一次就落一条 rollout，第一列很快就四位数。
-ls_numbers="$(grep -E '最早开的但刚动过|中间开的|最晚开的' <<< "$ls_out" |
+ls_numbers="$(grep -E '当天开的|同一天动过但四天前开的|前一天的' <<< "$ls_out" |
     grep -oE '^[[:space:]]*[0-9]+' | tr -d ' \n')"
 [[ "$ls_numbers" == 123 ]] || {
     printf 'ags ls: 短号应该是 1/2/3，实际是 %s（空会话占号了？）\n' "$ls_numbers" >&2
@@ -5719,8 +5732,8 @@ ls_numbers="$(grep -E '最早开的但刚动过|中间开的|最晚开的' <<< "
     exit 1
 }
 
-# 那条"早开但刚动过"的行里，两个时间必须**不一样**——否则等于只显示了一个。
-ls_row="$(grep -F '最早开的但刚动过' <<< "$ls_out")"
+# 那条"四天前开的"行里，两个时间必须**不一样**——否则等于只显示了一个。
+ls_row="$(grep -F '同一天动过但四天前开的' <<< "$ls_out")"
 ls_times="$(grep -oE '[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<< "$ls_row" | tr '\n' '|')"
 [[ "$(cut -d'|' -f1 <<< "$ls_times")" != "$(cut -d'|' -f2 <<< "$ls_times")" ]] || {
     printf 'ags ls: STARTED 和 ACTIVE 显示成了同一个值：%s\n' "$ls_times" >&2
