@@ -41,12 +41,23 @@ declare -a terminal_menu_ids=() terminal_menu_labels=()
 # JSON array the manifest stores, plus the one-line form the menu draws. Bash has
 # no array of arrays, so the argv stays encoded until the row is actually chosen.
 declare -a terminal_menu_args=() terminal_menu_details=()
+# 还是并列的一条：每行**人自己写过**的名字（没写过就是空）。给重命名做预填用。
+# 存的不是屏幕上显示的那个名字——那个可能来自 Agent 或者模型，预填它等于一按回车
+# 就把一个自动名字冻成手写的，此后再也不会自动更新。
+declare -a terminal_menu_names=()
+terminal_menu_input=
 terminal_menu_selected=
 terminal_menu_selected_agent=
 terminal_menu_selected_args='[]'
 terminal_menu_agents=()
 terminal_menu_header=
 terminal_menu_notice=
+# `ags ls` 眼下按哪个 Agent 过滤（空 = 全都列），以及这一批里真出现过哪些 Agent。
+#
+# 后者是菜单里 `f` 那个循环的取值来源。写死 `codex claude-code` 两档不行：装了新
+# Agent 之后循环不到它，而一台只用 Codex 的机器上又会多出一档永远空的。
+native_list_agent_filter=
+declare -a native_list_agents=()
 ags_state_lock_depth=0
 ags_consolidation_lock_depth=0
 ags_remote_operation_lock_depth=0
@@ -243,7 +254,7 @@ Usage:
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
-  ags ls | ags list [-a]               Pick one of this machine's Agent sessions
+  ags ls | ags list [-a] [AGENT]       Pick one of this machine's Agent sessions
                                        and carry on with it. Every workspace,
                                        newest ACTIVE first; rows sharing one
                                        ACTIVE minute go by when they started,
@@ -254,14 +265,27 @@ Usage:
                                        number for that session: `ags resume 7`.
                                        It is stable, so a number stays with the
                                        session it was handed to.
+                                       Name an agent (`ags ls codex`) to see
+                                       only its sessions; f cycles the same
+                                       filter inside the list. Filtering changes
+                                       the view only — the `#` a session was
+                                       handed stays what it was.
+                                       n names a session yourself; that name
+                                       wins over every automatic one and stays
+                                       until you clear it (empty restores the
+                                       automatic name).
                                        (Up/Down or j/k, Enter open, a edit the
-                                       Agent arguments, p pin, s save, Del
-                                       delete, Esc quit)
-                                       Rows are named by a model in the
-                                       background so the list reads as prose,
-                                       not hex. Claude Code names its own
-                                       sessions and those are left alone; Codex
-                                       names none. Nothing to run: `ags ls`
+                                       Agent arguments, f filter by agent,
+                                       n name, p pin, s save, Del delete,
+                                       Esc quit)
+                                       Rows you have not named are named by a
+                                       model in the background so the list reads
+                                       as prose, not hex. Claude Code names its
+                                       own sessions and those are left alone;
+                                       Codex names none. The model is asked what
+                                       the session was doing *last*, because a
+                                       long one drifts and the name that helps
+                                       you resume it is the recent one. Nothing to run: `ags ls`
                                        starts it when rows are unnamed, at most
                                        once every AGS_AUTO_SUMMARY_INTERVAL
                                        (900s). AGS_AUTO_SUMMARY=0 turns it off,
@@ -4267,7 +4291,7 @@ terminal_menu() {
         fi
         hint="$style_hint_move$style_separator$style_hint_page$style_separator$style_hint_open"
         (( ${#terminal_menu_details[@]} == 0 )) || hint+="${style_separator}a args"
-        [[ "$allow_actions" != 1 ]] || hint+="${style_separator}p pin${style_separator}s save"
+        [[ "$allow_actions" != 1 ]] || hint+="${style_separator}f agent${style_separator}n name${style_separator}p pin${style_separator}s save"
         [[ "$allow_delete" != 1 ]] || hint+="${style_separator}del delete"
         hint+="${style_separator}esc quit"
         printf '\n  %s%s%s\n' "$style_dim" "$hint" "$style_reset"
@@ -4309,6 +4333,41 @@ terminal_menu() {
                 terminal_menu_selected_agent="${terminal_menu_agents[$index]:-}"
                 terminal_menu_leave
                 return 4
+                ;;
+            f|F)
+                # 只有会话列表有这一档（`allow_actions`）。存档菜单里"按 Agent 过滤"
+                # 没有意义：那一屏本来就是按检查点列的。
+                [[ "$allow_actions" == 1 ]] || continue
+                terminal_menu_leave
+                return 5
+                ;;
+            n|N)
+                # 手写一个名字。四级回退里它是第一级，在此之前**没有任何入口能写**
+                # ——描述全靠 Agent 自己起的名字和我们后台算的总结，两个都可能不对，
+                # 而不对的时候用户唯一能做的是眼睁睁看着。
+                #
+                # 就地问、不切屏：列表还在上面，你正对着那一行输名字。
+                #
+                # 预填人自己写过的那份（没写过就是空），而不是屏幕上显示的那个。回车
+                # 直接确认一个自动名字的话，那份名字就被冻成手写的了，此后总结再也
+                # 更新不了它。
+                [[ "$allow_actions" == 1 ]] || continue
+                terminal_menu_input=
+                printf '\033[?25h'
+                printf '\n  %sName for this session%s — empty restores the automatic one\n' \
+                    "$style_dim" "$style_reset"
+                if ! IFS= read -r -e -p '  ' -i "${terminal_menu_names[$index]:-}" \
+                        terminal_menu_input; then
+                    printf '\033[?25l'
+                    terminal_menu_input=
+                    continue
+                fi
+                printf '\033[?25l'
+                terminal_menu_selected="${terminal_menu_ids[$index]}"
+                terminal_menu_selected_args="${terminal_menu_args[$index]:-[]}"
+                terminal_menu_selected_agent="${terminal_menu_agents[$index]:-}"
+                terminal_menu_leave
+                return 6
                 ;;
             q|Q)
                 terminal_menu_leave
@@ -6602,6 +6661,7 @@ load_local_checkpoint_menu() {
     terminal_menu_args=()
     terminal_menu_details=()
     terminal_menu_agents=()
+    terminal_menu_names=()
     terminal_menu_header=
     while IFS=$'\t' read -r checkpoint_id agent saved_date description selector args; do
         [[ -n "$selector" ]] || continue
@@ -6873,14 +6933,17 @@ ags_summary_store_limit() {
 summary_prompt() {
     local limit="$1" digest="$2"
     cat <<PROMPT
-下面是一段编码会话里**用户**说过的话（掐头去尾，中间省略）。
+下面是一段编码会话里**用户**说过的话，按时间先后排列（掐头去尾，中间省略）。
 
-请用一句话概括这段会话在做什么，好让人在会话列表里一眼认出它。
+请用一句话概括这段会话**最近在做什么**，好让人在会话列表里一眼认出它。
 
 要求：
 - 不超过 ${limit} 个字符，宁可更短
+- **以靠后的几条为准**。长会话的主题会漂，而这一句要回答的是"我上次停在哪儿"；
+  靠前的几条只用来看清这是哪个项目、哪个仓库
 - 只说做的事，不要"用户要求""这段会话"之类的开头，不要结尾标点
 - 用和原文相同的语言
+- 实在没有可概括的内容，就**只输出一个减号** \`-\`，不要写"暂无可概括内容"之类的话
 - 只输出这一句，不要解释、不要引号
 
 ---
@@ -6927,6 +6990,16 @@ ensure_session_summary() {
     fi
     limit="$(ags_summary_max_chars)"
     answer="$(run_summary_model "$(summary_prompt "$limit" "$digest")")" || return 1
+    # "没什么可概括的"必须表达成空，不能表达成一句话。
+    #
+    # 一份敷衍的答复（实测拿到过"暂无可概括内容"）是**非空**的，于是它在四级回退里
+    # 排在原话第一行前面，把一个还算能认的标题换成了一句废话——而且此后指纹不变就
+    # 再也不会重算。所以让模型用一个约定的记号说"没有"，判断留在有信息的那一侧，
+    # 而不是在这里维护一张中英文废话黑名单。
+    if [[ "${answer//[[:space:]]/}" == - ]]; then
+        write_session_summary "$provider" "$session_id" "" "$stamp" || true
+        return 1
+    fi
     # 只在模型答了一整段时兜底截一刀，**不按显示宽度砍**——存下来的东西要能在更宽
     # 的终端里显示得更全。用 bash 的子串而不是 `cut -c` 或 `awk substr`：那两个在
     # 这台机器上按字节算，一刀会切在一个汉字中间。
@@ -7195,6 +7268,48 @@ managed_agent_for_provider() {
     esac
 }
 
+# 这一行过不过得了当前的 Agent 过滤。
+#
+# 两套名字都认：ags 那边的 provider slug（`claude-code`）和 AGS 启动它时用的名字
+# （`claude`）。存档那一半只有后者，活会话那一半只有前者，而 `-a` 会把两种并排列
+# 出来——只认一套的话，`ags ls -a claude` 就会莫名其妙地只剩存档或者只剩活会话。
+#
+# 不调 `managed_agent_for_provider`：那是一次子 shell，而这个判断每行都要做一次，
+# 一百条会话就是一百次进程启动。
+agent_filter_matches() {
+    [[ -n "$native_list_agent_filter" ]] || return 0
+    [[ "$1" != "$native_list_agent_filter" ]] || return 0
+    case "$1/$native_list_agent_filter" in
+        codex/codex|claude-code/claude|claude/claude-code) return 0 ;;
+    esac
+    return 1
+}
+
+# 过滤循环的下一档：全部 → 第一个 Agent → … → 最后一个 → 全部。
+#
+# "全部"留在循环里而不是做成一个单独的按键：`f` 按到底会回到原样，不用记第二个键，
+# 也不会出现"我把列表过滤没了、退不回去"。
+next_agent_filter() {
+    local index
+    (( ${#native_list_agents[@]} > 0 )) || { printf '\n'; return 0; }
+    if [[ -z "$native_list_agent_filter" ]]; then
+        printf '%s\n' "${native_list_agents[0]}"
+        return 0
+    fi
+    for index in "${!native_list_agents[@]}"; do
+        [[ "${native_list_agents[$index]}" == "$native_list_agent_filter" ]] || continue
+        if (( index + 1 < ${#native_list_agents[@]} )); then
+            printf '%s\n' "${native_list_agents[$((index + 1))]}"
+        else
+            printf '\n'
+        fi
+        return 0
+    done
+    # 命令行上给的名字不在这一批里（打错了，或者那个 Agent 今天没有会话）：
+    # 下一档回到全部，而不是卡在一个匹配不到任何东西的值上。
+    printf '\n'
+}
+
 # 显示用的短 ID 要几位，放进 `short_id_length`。
 #
 # 8 位不够。Codex 的会话 ID 是 UUIDv7，前 8 个十六进制位是**毫秒时间戳**，所以同
@@ -7265,6 +7380,7 @@ load_native_session_menu() {
     terminal_menu_args=()
     terminal_menu_details=()
     terminal_menu_agents=()
+    terminal_menu_names=()
     terminal_menu_header=
     # 这一屏里有多少条只能显示"原话第一行"——也就是还没有任何像样的名字。自动补
     # 描述看的就是这个数，为零就不起后台进程。
@@ -7324,6 +7440,8 @@ load_native_session_menu() {
         <<< "$session_ordinals_json" 2>/dev/null || true)
 
     local index ordinal started
+    local -A agent_seen=()
+    native_list_agents=()
     for index in "${!live_id[@]}"; do
         provider="${live_provider[$index]}"
         session_id="${live_id[$index]}"
@@ -7353,10 +7471,17 @@ load_native_session_menu() {
         #
         # 置顶过的留着：那是明确说过「这条我要」的，藏起来就再也没有入口了。
         [[ -n "$description" ]] || (( annotation_pinned == 1 )) || continue
+        # 这一批里出现过哪些 Agent。**在过滤之前收集**：过滤之后收集的话，一旦切到
+        # codex，可选项就只剩 codex，`f` 再也回不到 claude。
+        agent_seen["$provider"]=1
+        # 过滤只管**显示**，不管发号——短号是这台机器给会话的坐标，它不该因为你此刻
+        # 正好在看哪个 Agent 而变。所以这一刀落在发号之后。
+        agent_filter_matches "$provider" || continue
         ordinal="${ordinal_map[${live_key[$index]}]:--}"
         [[ -n "$ordinal" ]] || ordinal='-'
         terminal_menu_ids+=("live:$provider/$session_id")
         terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
+        terminal_menu_names+=("$annotation_description")
         terminal_menu_args+=("$annotation_args")
         terminal_menu_details+=("$(format_launch_args "$annotation_args")")
         if [[ -z "$annotation_description" && -z "$native_name" &&
@@ -7367,13 +7492,19 @@ load_native_session_menu() {
         rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$started"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"$description")
     done
 
+    if (( ${#agent_seen[@]} > 0 )); then
+        mapfile -t native_list_agents < <(printf '%s\n' "${!agent_seen[@]}" | LC_ALL=C sort)
+    fi
+
     if (( include_archives == 1 )); then
         while IFS=$'\t' read -r checkpoint_id agent saved_date description selector args; do
             [[ -n "$selector" ]] || continue
             [[ -n "$args" ]] || args='[]'
             archive_agent="${selector%%/*}"
+            agent_filter_matches "$archive_agent" || continue
             terminal_menu_ids+=("saved:$selector")
             terminal_menu_agents+=("$archive_agent")
+            terminal_menu_names+=("")
             terminal_menu_args+=("$args")
             terminal_menu_details+=("$(format_launch_args "$args")")
             # 存档没有短号：那一列的含义是"敲这个数字能打开它"，而存档要用它自己
@@ -7857,12 +7988,23 @@ native_session_name() {
 
 list_native_sessions() {
     local include_archives=0 menu_status selector action_output summarize=0
-    local selected_provider selected_session_id
+    local selected_provider selected_session_id rename_input rename_limit
     while (( $# > 0 )); do
         case "$1" in
             -a|--all) include_archives=1; shift ;;
             -s|--summarize) summarize=1; shift ;;
-            *) die "usage: ags ls [-a] [--summarize]" ;;
+            -*) die "usage: ags ls [-a] [--summarize] [AGENT]" ;;
+            # 位置参数就是要看哪个 Agent：`ags ls codex`。做成位置参数而不是
+            # `--agent codex`，因为这是每天都要敲的东西，而 `-a` 已经被存档占了。
+            #
+            # 不在这里校验名字：合不合法要看这台机器**此刻**有哪些会话，而那要等
+            # 列表加载完才知道。空结果那条路上会把可选的名字一起报出来。
+            *)
+                [[ -z "$native_list_agent_filter" ]] ||
+                    die "usage: ags ls [-a] [--summarize] [AGENT]"
+                native_list_agent_filter="${1,,}"
+                shift
+                ;;
         esac
     done
     need column; need jq
@@ -7875,7 +8017,10 @@ list_native_sessions() {
 
     if [[ ! -t 0 || ! -t 1 ]]; then
         load_native_session_menu "$include_archives" 0
-        (( ${#terminal_menu_labels[@]} > 0 )) || return 0
+        if (( ${#terminal_menu_labels[@]} == 0 )); then
+            report_empty_session_list
+            return 0
+        fi
         printf '%s\n' "$terminal_menu_header" "${terminal_menu_labels[@]}"
         maybe_start_background_summary
         return 0
@@ -7885,11 +8030,11 @@ list_native_sessions() {
     load_native_session_menu "$include_archives" 1
     maybe_start_background_summary
     if (( ${#terminal_menu_ids[@]} == 0 )); then
-        log "no sessions"
+        report_empty_session_list
         return 0
     fi
     while (( ${#terminal_menu_ids[@]} > 0 )); do
-        if terminal_menu "Sessions" 1 1; then
+        if terminal_menu "Sessions${native_list_agent_filter:+ · $native_list_agent_filter}" 1 1; then
             selector="$terminal_menu_selected"
             # 回车之后先问权限。忘记开 yolo / bypass 是这套工具里最常见的一次返工，
             # 而它只在**这个时刻**还来得及修——进程一交出去就晚了。
@@ -7984,15 +8129,70 @@ list_native_sessions() {
                     *) terminal_menu_notice='That one is already an archive.' ;;
                 esac
                 ;;
+            6)
+                selector="$terminal_menu_selected"
+                case "$selector" in
+                    live:*)
+                        split_live_selector "$selector"
+                        # 制表符会把整行撕开（表格就是按制表符切列的），换行会把一行
+                        # 变成两行。名字是人手敲的，这两样都进得来。
+                        rename_input="${terminal_menu_input//[$'\t\r\n']/ }"
+                        rename_limit="$(ags_summary_store_limit)"
+                        if (( ${#rename_input} > rename_limit )); then
+                            rename_input="${rename_input:0:${rename_limit}}"
+                        fi
+                        read_session_annotation "$selected_provider" "$selected_session_id"
+                        write_session_annotation "$selected_provider" "$selected_session_id" \
+                            "$rename_input" "$annotation_args" "$annotation_pinned"
+                        if [[ -n "$rename_input" ]]; then
+                            terminal_menu_notice="Named ${selected_session_id:0:8}."
+                        else
+                            terminal_menu_notice="Cleared the name for ${selected_session_id:0:8}; back to the automatic one."
+                        fi
+                        ;;
+                    *) terminal_menu_notice='Only a live session can be named.' ;;
+                esac
+                ;;
+            5)
+                native_list_agent_filter="$(next_agent_filter)"
+                if [[ -n "$native_list_agent_filter" ]]; then
+                    terminal_menu_notice="Showing $native_list_agent_filter only; f cycles."
+                else
+                    terminal_menu_notice='Showing every agent.'
+                fi
+                ;;
             *) die "session selector failed" ;;
         esac
         load_native_session_menu "$include_archives" 1
+        # 过滤把这一屏滤空了不该等于"退出"——那会让 `f` 变成一个偶尔把你踢出列表的
+        # 键。退回全部再画一次，并说清楚刚才发生了什么。
+        if (( ${#terminal_menu_ids[@]} == 0 )) && [[ -n "$native_list_agent_filter" ]]; then
+            terminal_menu_notice="No $native_list_agent_filter sessions; showing every agent."
+            native_list_agent_filter=
+            load_native_session_menu "$include_archives" 1
+        fi
         if (( ${#terminal_menu_ids[@]} == 0 )); then
             printf '%s\n' "$terminal_menu_notice"
             return 0
         fi
     done
     return 0
+}
+
+# 一条会话都没列出来时说清楚为什么。
+#
+# 过滤器打错一个字（`ags ls cladue`）和"这台机器真的没有会话"在屏幕上长得一模一样，
+# 而前者是每次都会犯的错。所以带上这一批里实际有哪些名字——那个列表本来就在手里。
+report_empty_session_list() {
+    if [[ -z "$native_list_agent_filter" ]]; then
+        log "no sessions"
+        return 0
+    fi
+    if (( ${#native_list_agents[@]} > 0 )); then
+        log "no $native_list_agent_filter sessions (have: $(printf '%s, ' "${native_list_agents[@]}" | sed 's/, $//'))"
+    else
+        log "no $native_list_agent_filter sessions"
+    fi
 }
 
 

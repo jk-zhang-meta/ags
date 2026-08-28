@@ -5679,6 +5679,9 @@ jq -n --argjson base "$ls_base_ms" --argjson h "$ls_hour_ms" --argjson day "$ls_
   {provider:"codex", session_id:"bbbbbbbb-2222-4222-8222-222222222222",
    started_at:($base - 3*$day), last_active_at:($base + 5*$h),
    workspace:"/w", title:"动得最晚的", path:"/w/b.jsonl"},
+  {provider:"claude-code", session_id:"ffffffff-6666-4666-8666-666666666666",
+   started_at:($base + 4*$h), last_active_at:($base + 4*$h),
+   workspace:"/w", title:"claude那条", path:"/w/f.jsonl"},
   {provider:"codex", session_id:"cccccccc-3333-4333-8333-333333333333",
    started_at:($base - $day - $h), last_active_at:($base - $day),
    workspace:"/w", title:"前一天的", path:"/w/c.jsonl"},
@@ -5709,8 +5712,8 @@ ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
 grep -Eq 'STARTED[[:space:]]+ACTIVE' <<< "$ls_out"
 
 # 顺序：ACTIVE 降序；显示成同一分钟的那两条之间看启动时间，后开的在上。
-ls_want='动得最晚的 同一分钟后开的 同一分钟先开的 前一天的 '
-ls_order="$(grep -oE '动得最晚的|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_out" | tr '\n' ' ')"
+ls_want='动得最晚的 claude那条 同一分钟后开的 同一分钟先开的 前一天的 '
+ls_order="$(grep -oE '动得最晚的|claude那条|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_out" | tr '\n' ' ')"
 [[ "$ls_order" == "$ls_want" ]] || {
     printf 'ags ls: 应该按「活动时间 → 同一分钟看启动时间」排，实际顺序是 %s\n' "$ls_order" >&2
     printf '%s\n' "$ls_out" >&2
@@ -5732,10 +5735,10 @@ fi
 
 # 空会话也不该**占掉一个短号**。短号发出去就不收回，给一条永远不显示的会话发一个，
 # 等于把后面每一条的号往后推——Codex 每起一次就落一条 rollout，第一列很快就四位数。
-ls_numbers="$(grep -E '动得最晚的|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_out" |
+ls_numbers="$(grep -E '动得最晚的|claude那条|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_out" |
     grep -oE '^[[:space:]]*[0-9]+' | tr -d ' \n')"
-[[ "$ls_numbers" == 1234 ]] || {
-    printf 'ags ls: 短号应该是 1/2/3/4，实际是 %s（空会话占号了？）\n' "$ls_numbers" >&2
+[[ "$ls_numbers" == 12345 ]] || {
+    printf 'ags ls: 短号应该是 1..5，实际是 %s（空会话占号了？）\n' "$ls_numbers" >&2
     printf '%s\n' "$ls_out" >&2
     exit 1
 }
@@ -5747,5 +5750,129 @@ ls_times="$(grep -oE '[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<< "$ls_row" | tr '\
     printf 'ags ls: STARTED 和 ACTIVE 显示成了同一个值：%s\n' "$ls_times" >&2
     exit 1
 }
+
+# ---------------------------------------------------------------------------
+# `ags ls AGENT`：只看一个 Agent 的会话
+#
+# 最要紧的一条是**短号不跟着过滤变**。短号是这台机器给会话的坐标，`ags resume 3`
+# 得永远指同一条；按当前这一屏重新编号的话，先 `ags ls codex` 再敲 `ags resume 3`
+# 打开的就不是刚看的那条了。
+# ---------------------------------------------------------------------------
+ls_codex="$("${ls_env[@]}" "$tool" ls codex </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+if grep -q 'claude那条' <<< "$ls_codex"; then
+    printf 'ags ls codex: 不该列出 claude 的会话\n' >&2
+    printf '%s\n' "$ls_codex" >&2
+    exit 1
+fi
+ls_codex_numbers="$(grep -E '动得最晚的|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_codex" |
+    grep -oE '^[[:space:]]*[0-9]+' | tr -d ' \n')"
+[[ "$ls_codex_numbers" == 1345 ]] || {
+    printf 'ags ls codex: 短号该保持 1/3/4/5，实际是 %s（过滤把号重排了？）\n' \
+        "$ls_codex_numbers" >&2
+    printf '%s\n' "$ls_codex" >&2
+    exit 1
+}
+
+# `claude` 和 `claude-code` 是同一个东西的两种拼法：provider 的 slug 和 AGS 启动它
+# 时用的名字。两个都得认，否则 `-a` 那一屏里存档和活会话会各自消失一半。
+for ls_alias in claude claude-code; do
+    ls_claude="$("${ls_env[@]}" "$tool" ls "$ls_alias" </dev/null 2>&1 |
+        sed 's/\x1b\[[0-9;]*m//g')"
+    grep -Fq 'claude那条' <<< "$ls_claude" || {
+        printf 'ags ls %s: 应该列出 claude 的会话\n' "$ls_alias" >&2
+        printf '%s\n' "$ls_claude" >&2
+        exit 1
+    }
+    ! grep -q '动得最晚的' <<< "$ls_claude" || {
+        printf 'ags ls %s: 不该列出 codex 的会话\n' "$ls_alias" >&2
+        exit 1
+    }
+done
+
+# 名字打错了要说清楚，而且要把可选的名字一起报出来——打错和"真的没有会话"在屏幕上
+# 长得一模一样，而前者是每天都会犯的错。
+ls_typo="$("${ls_env[@]}" "$tool" ls cladue </dev/null 2>&1)"
+grep -Fq 'no cladue sessions' <<< "$ls_typo" || {
+    printf 'ags ls cladue: 应该说清楚这个名字一条都没匹配上，实际是 %s\n' "$ls_typo" >&2
+    exit 1
+}
+grep -Fq 'claude-code, codex' <<< "$ls_typo" || {
+    printf 'ags ls cladue: 应该把可选的 Agent 名字列出来，实际是 %s\n' "$ls_typo" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 菜单里的 f（切 Agent）和 n（手写名字）
+# ---------------------------------------------------------------------------
+if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
+    run_ls_pty() {
+        local input="$1" output="$2" pty_command
+        shift 2
+        ags_suite_last_pty_out="$output"
+        ags_suite_last_pty_input="$input"
+        printf -v pty_command '%q ' \
+            "${ls_env[@]}" TERM=xterm-256color AGS_PERMISSION_PROMPT=0 "$@" \
+            "$tmp/stty-guard" "$tool" ls
+        feed_keys "$input" "$output" | \
+            SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
+                > "$output" 2>&1
+    }
+
+    # f 切到第一个 Agent（按名字排序，claude-code 在前），q 退出。
+    #
+    # 每个 PTY 用例都必须以**程序自己退出**收尾：`script` 的 stdin 走到头并不会关掉
+    # 那个伪终端，停在菜单里的话整套测试就挂在这儿，而不是失败。
+    run_ls_pty $'fq' "$tmp/ls-filter-key.out"
+    ls_pty_out="$(strip_terminal_control < "$tmp/ls-filter-key.out")"
+    grep -Fq 'Showing claude-code only' <<< "$ls_pty_out" || {
+        printf 'ags ls: f 该切到只看 claude-code\n' >&2
+        printf '%s\n' "$ls_pty_out" >&2
+        exit 1
+    }
+
+    # n 给光标那一行（第一行 = 动得最晚的）手写一个名字。\025 是 Ctrl-U，先把
+    # 预填清掉——预填的是**人自己写过**的那份，这里本来就是空的，但清一下才是
+    # 用户真会做的动作。
+    run_ls_pty $'n\025手写的名字\nq' "$tmp/ls-rename.out"
+    ls_pty_out="$(strip_terminal_control < "$tmp/ls-rename.out")"
+    grep -Fq 'Named bbbbbbbb' <<< "$ls_pty_out" || {
+        printf 'ags ls: n 该把名字写下来\n' >&2
+        printf '%s\n' "$ls_pty_out" >&2
+        exit 1
+    }
+    # 真的落盘了，而不只是屏幕上显示了一下。
+    ls_named="$(jq -r '.description' \
+        "$ls_state/annotations/codex/bbbbbbbb-2222-4222-8222-222222222222.json" 2>/dev/null)"
+    [[ "$ls_named" == 手写的名字 ]] || {
+        printf 'ags ls: 手写的名字没存进注解，读到的是 %s\n' "$ls_named" >&2
+        exit 1
+    }
+    # 而且它压在原话第一行前面——这一级是四级回退里的第一级。
+    ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+    grep -Fq '手写的名字' <<< "$ls_out" || {
+        printf 'ags ls: 手写的名字该顶替掉自动来的那个\n' >&2
+        printf '%s\n' "$ls_out" >&2
+        exit 1
+    }
+    ! grep -q '动得最晚的' <<< "$ls_out" || {
+        printf 'ags ls: 手写名字之后不该还显示原来那个标题\n' >&2
+        exit 1
+    }
+
+    # 留空 = 交回自动命名。没有这条路的话，手写一次就再也回不去了。
+    run_ls_pty $'n\025\nq' "$tmp/ls-rename-clear.out"
+    ls_pty_out="$(strip_terminal_control < "$tmp/ls-rename-clear.out")"
+    grep -Fq 'Cleared the name' <<< "$ls_pty_out" || {
+        printf 'ags ls: 留空该把名字交回自动命名\n' >&2
+        printf '%s\n' "$ls_pty_out" >&2
+        exit 1
+    }
+    ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+    grep -Fq '动得最晚的' <<< "$ls_out" || {
+        printf 'ags ls: 清掉名字之后该回到自动来的那个\n' >&2
+        printf '%s\n' "$ls_out" >&2
+        exit 1
+    }
+fi
 
 printf 'ags self-check passed\n'

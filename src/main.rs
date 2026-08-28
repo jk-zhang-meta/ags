@@ -2931,12 +2931,21 @@ fn cmd_info(
         let n = peek_lines.unwrap_or(DEFAULT_PEEK_LINES);
         ags::model::transcript_tail(&session.messages, n, PEEK_SNIPPET_MAX_CHARS)
     });
-    // Head and tail of what the user typed. Three opening turns are enough to
-    // say what the session is for — the first is often a one-line "look at X"
-    // and the substance lands in the next two — and two closing turns say where
-    // it ended up. Everything between is overwhelmingly tool traffic.
-    const DIGEST_HEAD_TURNS: usize = 3;
-    const DIGEST_TAIL_TURNS: usize = 2;
+    // Head and tail of what the user typed. Everything between is overwhelmingly
+    // tool traffic.
+    //
+    // Weighted toward the tail, because the digest's caller asks what the session
+    // is *now* doing. A long session drifts — it opens on one task and ends three
+    // tasks later — and the name that helps someone resume it is the last one. A
+    // head-weighted sample also cannot change: the opening turns are frozen, so
+    // every recomputation re-derives the same head-anchored sentence and bills a
+    // model call to do it.
+    //
+    // Two opening turns still earn their place. They are what says *which project*
+    // this is, and the first one alone often does not — it is a one-line "look at
+    // X" whose substance lands in the next turn.
+    const DIGEST_HEAD_TURNS: usize = 2;
+    const DIGEST_TAIL_TURNS: usize = 4;
     const DIGEST_TURN_MAX_CHARS: usize = 600;
     let digest = digest.then(|| {
         ags::model::session_digest(

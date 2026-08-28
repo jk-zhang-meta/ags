@@ -208,6 +208,31 @@ under.
 after it replace the saved ones, and `--` with nothing after it starts the
 session with none. `ags show ID` prints what a checkpoint carries.
 
+### One agent at a time
+
+`ags ls codex` lists only Codex sessions; `ags ls claude` only Claude Code's.
+Inside the list, `f` cycles the same filter — all agents, then each agent that
+actually has sessions on this machine, then all again. Both spellings of a name
+work, the provider slug (`claude-code`) and the name AGS launches it under
+(`claude`), because `ags ls -a` puts archives and live sessions in one view and
+each half carries only one of them.
+
+Filtering changes the view, never the numbers. The `#` column is this machine's
+coordinate for a session — `ags resume 3` has to keep meaning the same session —
+so the filter is applied after numbers are handed out, not before.
+
+### Naming a session yourself
+
+`n` in the list renames the row under the cursor. That name outranks every
+automatic one and stays until you clear it; an empty name hands the row back to
+automatic naming.
+
+Rows you have not named are named for you: Claude Code titles its own sessions
+and those are used as-is, and for the rest a model is asked, in the background,
+what the session was doing. It is asked about the *recent* turns rather than the
+opening ones — a long session drifts through three tasks, and the name that
+helps you pick it back up is the last one, not the first.
+
 ### Enter asks which permission level
 
 Forgetting to turn permissions up is the most common thing you have to redo:
