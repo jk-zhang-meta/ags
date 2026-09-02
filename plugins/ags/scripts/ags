@@ -342,11 +342,14 @@ Usage:
              [-- --to codex|claude --cwd PATH --profile NAME --no-agent-args]
                                        Restore and launch a local archive
   ags resume live:PROVIDER/SESSION_ID [AGENT_ARGS...]
-                                       Carry on with a session that still
-                                       exists, by handing it to the Agent's own
-                                       resume. Nothing is restored and nothing
-                                       in the Agent's home is written. This is
-                                       what Enter does in `ags ls`.
+                                      Carry on with a session that still
+                                      exists, by handing it to the Agent's own
+                                      resume. Nothing is restored and nothing
+                                      in the Agent's home is written. This is
+                                      what Enter does in `ags ls`.
+                                       With --to codex|claude, AGS takes a
+                                       temporary snapshot and converts it;
+                                       no persistent checkpoint is saved.
   ags delete ID|AGENT/RECORD_ID        Move a local checkpoint to recoverable trash
   ags update [--check]                 Update to the latest release (--check only reports)
                                        Launching an Agent reports a pending update once a
@@ -5050,7 +5053,7 @@ prepare_cross_agent_restore() {
         "$conversion_result_session_id" "$conversion_result_main" "$codex_provider"
     readback="$sandbox/readback.json"
     if ! run_ags_isolated "$binary" "$sandbox" \
-        --json info "$conversion_result_main" --from "$target_alias" \
+        convert --json info "$conversion_result_main" --from "$target_alias" \
         > "$readback" 2> "$stderr"; then
         die "ags cannot read back the normalized $target_agent transcript"
     fi
@@ -7605,6 +7608,117 @@ resume_live_session() {
     esac
 }
 
+# Convert a live Codex/Claude session through a private temporary checkpoint.
+# The source session is not changed and no persistent AGS archive is created.
+resume_live_cross_agent() {
+    local provider="$1" session_id="$2" source_agent target_agent
+    local source_home workspace description archive_id temporary_root
+    local profile="${ags_profile_option:-}" effective_profile=agent_profile=
+    local target_cwd launch_binary
+    local -a client_args=()
+
+    source_agent="$(managed_agent_for_provider "$provider")"
+    target_agent="${ags_to:-}"
+    [[ "$source_agent" == codex || "$source_agent" == claude ]] ||
+        die "live session provider cannot be converted by AGS: $provider"
+    [[ "$target_agent" == codex || "$target_agent" == claude ]] ||
+        die "--to requires codex or claude"
+    [[ "$target_agent" != "$source_agent" ]] ||
+        die "live session already belongs to $target_agent; omit --to"
+
+    if [[ "$source_agent" == codex ]]; then
+        source_home="$codex_home"
+    else
+        source_home="$claude_home"
+    fi
+    if active_native_session_pid "$source_agent" "$source_home" "$session_id" >/dev/null; then
+        die "cannot convert live $source_agent session $session_id while it is running; exit it and retry"
+    fi
+
+    if (( ${ags_no_agent_args:-0} == 1 )); then
+        client_args=()
+    elif (( ${ags_agent_args_given:-0} == 1 )); then
+        client_args=("${ags_agent_args[@]}")
+    else
+        # Source-Agent arguments are not replayed into another provider.
+        client_args=()
+    fi
+    strip_session_selection_args "$target_agent" "${client_args[@]}"
+    if (( ${#client_args[@]} != ${#stripped_launch_args[@]} )); then
+        client_args=("${stripped_launch_args[@]}")
+        log "dropped native session selection from $target_agent arguments"
+    fi
+
+    if [[ "$target_agent" == codex ]]; then
+        validate_codex_context_args "${client_args[@]}"
+        agent_profile="$codex_audit_profile"
+        [[ -z "$profile" || -z "$agent_profile" ]] ||
+            die "do not combine AGS --profile with Codex -p/--profile after --"
+        effective_profile="${profile:-$agent_profile}"
+        validate_cross_codex_client_args "${client_args[@]}"
+    else
+        effective_profile="$profile"
+        validate_claude_context_args "${client_args[@]}"
+    fi
+
+    workspace="$(native_session_workspace "$provider" "$session_id")"
+    [[ "$workspace" == /* && -d "$workspace" ]] || workspace="$(pwd -P)"
+    resolve_resume_cwd "${ags_cwd_option:-}" "$workspace"
+    target_cwd="$resolved_resume_cwd"
+    [[ "$target_cwd" == /* && -d "$target_cwd" ]] ||
+        die "live session needs an existing cwd; use --cwd PATH"
+    target_cwd="$(cd -- "$target_cwd" && pwd -P)"
+
+    temporary_root="$(mktemp -d "$state/convert-live.XXXXXX")"
+    trap_cleanup_dirs "$temporary_root"
+    description="${annotation_description:-live conversion ${session_id:0:8}}"
+    archive_id="${session_id:0:8}-live-$(date +%y%m%d-%H%M%S)"
+
+    AGENT_SESSION_LOCAL_DIR="$temporary_root" \
+    AGENT_SESSION_CWD="$workspace" \
+        prepare_checkpoint local "$source_agent" "$session_id" "$archive_id" "$description"
+    write_checkpoint_archive
+
+    launch_binary="$(resolve_agent_binary "$target_agent")"
+    restore_checkpoint_file \
+        "$archive_id" "$checkpoint_record_id" "$checkpoint_destination" \
+        "$temporary_root" "$target_cwd" "$source_agent" "$target_agent" \
+        "$effective_profile"
+    [[ "$restored_pwd" != unknown && -d "$restored_pwd" ]] ||
+        die "converted live session has no usable cwd: $restored_pwd"
+    cd -- "$restored_pwd"
+    compare_binary_provenance "$restored_agent" "$launch_binary" \
+        "${restored_binary_invoked:-}" "${restored_binary_real:-}" \
+        "${restored_binary_version:-}" "${restored_binary_sha256:-}" \
+        "${restored_binary_os:-}" "${restored_binary_arch:-}"
+    assert_native_session_inactive \
+        "$restored_agent" "$restored_native_home" "$restored_session_id"
+    export_launch_args "${client_args[@]}"
+    launch_terminal_title_mode=resume
+    launch_terminal_title="$archive_id"
+    case "$restored_agent" in
+        codex)
+            if [[ -n "$profile" ]]; then
+                launch_managed_agent "$launch_binary" "$restored_agent" \
+                    resume "$restored_session_id" --profile "$profile" \
+                    "${client_args[@]}"
+            fi
+            launch_managed_agent "$launch_binary" "$restored_agent" \
+                resume "$restored_session_id" "${client_args[@]}"
+            ;;
+        claude)
+            if [[ -n "$profile" ]]; then
+                launch_managed_agent "$launch_binary" "$restored_agent" \
+                    --resume "$restored_session_id" --settings "$restored_claude_settings" \
+                    "${client_args[@]}"
+            fi
+            launch_managed_agent "$launch_binary" "$restored_agent" \
+                --resume "$restored_session_id" "${client_args[@]}"
+            ;;
+        *) die "unsupported converted live Agent: $restored_agent" ;;
+    esac
+}
+
 # 这个会话的工作目录。
 #
 # 从 ags 现读一次而不是在列表里带着走：列表那行是给人看的（可能只有仓库名），
@@ -9636,6 +9750,14 @@ resume_checkpoint() {
         shift
         (( $# == 0 )) ||
             die "ags resume 只接受一个会话标识：$1（给 Agent 的参数写在 -- 之后）"
+        if [[ -n "${ags_to:-}" ]]; then
+            managed_agent_for_provider "$selected_provider" >/dev/null ||
+                die "live session provider cannot be converted by AGS: $selected_provider"
+            if [[ "${ags_to}" != "$(managed_agent_for_provider "$selected_provider")" ]]; then
+                resume_live_cross_agent "$selected_provider" "$selected_session_id"
+                return
+            fi
+        fi
         # 给 Agent 的参数在顶层就被 `--` 摘进 `ags_agent_args` 了，不会以位置参数
         # 的形式走到这里。和存档那条路取的是同一个来源，两条入口才不会一个认
         # `--model o3`、另一个不认。

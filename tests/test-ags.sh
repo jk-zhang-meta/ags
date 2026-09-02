@@ -1110,8 +1110,10 @@ fi
 
 
 # 转换那套收在 `ags convert` 底下，真二进制就是这么被调的，假的也得认。
+invoked_convert=0
 if [[ "${1:-}" == convert ]]; then
     shift
+    invoked_convert=1
 fi
 
 [[ "${1:-}" == --json ]]
@@ -1192,6 +1194,7 @@ case "${1:-}" in
         fi
         ;;
     info)
+        [[ "$invoked_convert" == 1 ]] || exit 64
         path="${2:-}"
         shift 2
         [[ "${1:-}" == --from && -f "$path" ]]
@@ -3948,6 +3951,28 @@ jq -e '
     echo 'converted Codex transcript did not use the default provider' >&2
     exit 1
 }
+
+live_session_id=cccccccc-dddd-4eee-8fff-000000000000
+live_session_key=live-project
+mkdir -p "$tmp/source/claude/projects/$live_session_key"
+printf '%s\n' \
+    '{"type":"user","sessionId":"cccccccc-dddd-4eee-8fff-000000000000","cwd":"'$claude_hook_work'"}' \
+    '{"type":"assistant","sessionId":"cccccccc-dddd-4eee-8fff-000000000000","cwd":"'$claude_hook_work'"}' \
+    > "$tmp/source/claude/projects/$live_session_key/$live_session_id.jsonl"
+live_items="$tmp/live-claude-items.json"
+jq -n --arg id "$live_session_id" --arg workspace "$claude_hook_work" \
+    '[{provider:"claude-code",session_id:$id,workspace:$workspace}]' > "$live_items"
+live_cross_home="$tmp/live-cross-target/codex"
+persistent_archives_before="$(find "$tmp/local-checkpoints" -type f -name '*.checkpoint.tar.gz.age' | wc -l)"
+live_cross="$(env "${source_env[@]}" FAKE_LIST_ITEMS="$live_items" \
+    CODEX_HOME="$live_cross_home" \
+    "$tool" resume "live:claude-code/$live_session_id" --to codex -- \
+        --dangerously-bypass-approvals-and-sandbox)"
+grep -Fqx "FAKE_CODEX <resume> <$converted_codex_id> <--dangerously-bypass-approvals-and-sandbox>" \
+    <<< "$live_cross"
+[[ "$persistent_archives_before" == "$(find "$tmp/local-checkpoints" -type f -name '*.checkpoint.tar.gz.age' | wc -l)" ]]
+! find "$tmp/state" -maxdepth 1 -type d -name 'convert-live.*' -print -quit | grep -q .
+[[ -f "$live_cross_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl" ]]
 
 claude_to_base_codex_home="$tmp/claude-to-base-codex-target/codex"
 mkdir -p "$claude_to_base_codex_home"

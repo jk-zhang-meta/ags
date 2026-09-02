@@ -154,6 +154,8 @@ ags checkpoint resume "ID" --to claude --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
 ags checkpoint resume "ID" --to claude --profile "PROFILE" -- CLIENT_ARGS...
 ags checkpoint resume "ID" --to codex -- CLIENT_ARGS...
 ags checkpoint resume "ID" --to codex --profile "PROFILE" -- CLIENT_ARGS...
+ags resume "live:claude-code/SESSION_ID" --to codex -- CLIENT_ARGS...
+ags resume "live:codex/SESSION_ID" --to claude -- CLIENT_ARGS...
 ```
 
 Use `--` before client arguments so AGS options and native client options
@@ -240,6 +242,10 @@ restores only the converted target main transcript. Report the fidelity and
 loss details printed by ags. Provider-signed thinking, encrypted reasoning,
 and native sidecars cannot cross provider trust boundaries; never describe a
 cross-Agent conversion as lossless unless its reported fidelity says so.
+
+For a `live:PROVIDER/SESSION_ID` source, AGS takes a private temporary snapshot
+for conversion and removes it after launch. It does not create a persistent
+checkpoint; use `ags save` when you want an archive.
 
 Claude Code has no provider field in its native transcript. Its selected
 settings file or environment must configure the Anthropic-compatible endpoint
