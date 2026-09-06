@@ -224,6 +224,8 @@ usage() {
   ags                          接上最近还活着的会话
   ags codex [--id 名字]        起一个 Codex 会话
   ags claude [--id 名字]       起一个 Claude 会话
+  ags env-use NAME|PATH        选一个环境 profile，之后启动的 Agent 会看到它
+  ags env-show                 看当前环境 overlay 能藏什么、藏不了什么
   ags ls [-a]                  列出会话，挑一个接着干（-a 连存档一起列）
                                名字是模型在后台起的，不用管；AGS_AUTO_SUMMARY=0 关掉
                                回车之后先选权限档位（yolo/bypass 在最上面），
@@ -251,6 +253,12 @@ Usage:
                                        the command, agent args after it.
                                        They work on claude and resume too
   ags context review-codex             Open Codex's official hook review UI
+  ags env-use PATH|NAME                Select the environment profile later
+                                       launches apply (bundled: tokyo-macos,
+                                       tokyo-linux, chicago-macos)
+  ags env-show | env-list | env-clear  Inspect or drop that selection
+  ags [--environment-profile PATH] codex|claude
+                                       One-shot overlay for this launch
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
   ags codex-init                       Configure the codext credential pool
   ags codex-pool                       Show the credential pool this machine uses
@@ -3311,6 +3319,27 @@ scrub_transport_password_environment() {
     unset RCLONE_SFTP_PASS
 }
 
+# Rewrite the Agent's inherited environment from the selected AGS profile.
+# The converter owns classification, overlay homes, and hook materialisation;
+# this only eval's the shell fragment it prints.  A converter too old to
+# recognise `env-apply` is skipped so a mixed install still launches.
+apply_environment_overlay() {
+    local agent="$1" binary output
+    binary="$(resolve_ags_converter_binary)" || return 1
+    if [[ -n "${ags_environment_profile:-}" ]]; then
+        export AGS_ENV_PROFILE="$ags_environment_profile"
+    fi
+    if ! output="$("$binary" env-apply --provider "$agent" --format shell 2>&1)"; then
+        case "$output" in
+            *'unrecognized subcommand'*|*'unexpected argument'*|*'unrecognised subcommand'*)
+                return 0
+                ;;
+        esac
+        die "environment overlay: $output"
+    fi
+    eval "$output"
+}
+
 text_has_no_control_characters() {
     local value="${1-}"
     printf '%s' "$value" | jq -eRsr '
@@ -3630,6 +3659,16 @@ ags_consume_option() {
             ags_consumed=2
             ;;
         --profile=*) ags_profile_option="${1#--profile=}"; ags_consumed=1 ;;
+        --environment-profile)
+            (( $# >= 2 )) || die "--environment-profile requires a JSON path"
+            ags_environment_profile="$2"
+            ags_consumed=2
+            ;;
+        --environment-profile=*)
+            ags_environment_profile="${1#--environment-profile=}"
+            [[ -n "$ags_environment_profile" ]] || die "--environment-profile requires a JSON path"
+            ags_consumed=1
+            ;;
     esac
 }
 
@@ -4488,6 +4527,7 @@ launch_managed_agent() {
     # 提示绝不该是一次拒绝之前的最后一句话，那读起来像是拒绝的一部分。
     announce_auto_gc || true
     maybe_start_background_gc || true
+    apply_environment_overlay "$agent"
     exec "$launch_binary" "$@"
 }
 
@@ -12586,6 +12626,7 @@ ags_no_agent_args=0
 ags_to=
 ags_cwd_option=
 ags_profile_option=
+ags_environment_profile=
 ags_id_option=
 ags_consumed=0
 
@@ -12607,6 +12648,7 @@ ags_no_agent_args=0
 ags_to=
 ags_cwd_option=
 ags_profile_option=
+ags_environment_profile=
 ags_consumed=0
 ags_id_option=
 ags_agent_args=()
@@ -12695,6 +12737,12 @@ case "${1:-}" in
             die "--no-agent-args 只对 resume / cloud resume 有意义"
         ;;
 esac
+if [[ -n "${ags_environment_profile:-}" ]]; then
+    case "${1:-}" in
+        codex|claude|resume) ;;
+        *) die "--environment-profile 只对启动 Agent 的命令有意义（codex、claude、resume）" ;;
+    esac
+fi
 
 case "${1:-}" in
     update|update-check-refresh|codext-update|codex-name) ;;

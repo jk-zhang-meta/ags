@@ -1,0 +1,43 @@
+{
+  "contract": "environment-contract-v1",
+  "id": "tokyo-linux",
+  "target": {
+    "os": "linux",
+    "distribution": "ubuntu",
+    "version": "24.04",
+    "architecture": "x86_64",
+    "abi": "linux-gnu"
+  },
+  "backend": { "kind": "linux-native" },
+  "identity": {
+    "hostname": "tokyo-build",
+    "username": "agent",
+    "uid": 1000,
+    "gid": 1000,
+    "groups": ["agent", "sudo"],
+    "shell": "/bin/bash",
+    "capabilities": []
+  },
+  "clock": {
+    "timezone": "Asia/Tokyo",
+    "tzdata": "2026a",
+    "anchor_epoch_seconds": 0,
+    "rate": 1.0,
+    "offset_seconds": 32400,
+    "follow_realtime": true
+  },
+  "locale": {
+    "lang": "en_US.UTF-8",
+    "lc_all": "en_US.UTF-8",
+    "lc_time": "en_US.UTF-8",
+    "charset": "UTF-8"
+  },
+  "paths": {
+    "cwd": "/home/agent/work",
+    "home": "/home/agent",
+    "tmp": "/tmp",
+    "workspace": "/home/agent/work",
+    "hidden_host_markers": ["/mnt/c", "/mnt/wsl", "WSL_DISTRO_NAME", "microsoft"]
+  },
+  "tty": { "enabled": true, "term": "xterm-256color", "columns": 120, "rows": 40, "kind": "pty", "signals": true }
+}

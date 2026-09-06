@@ -73,6 +73,14 @@ pub struct LaunchSpec {
     pub cwd: Option<PathBuf>,
     /// Environment overrides layered on top of the inherited environment.
     pub env: Vec<(String, String)>,
+    /// Names removed from the inherited environment after [`Self::env`] is
+    /// applied.  Used to drop carrier identity (`WSL_*`) without clearing
+    /// `HOME`/`PATH`/credentials the agent needs to start.
+    unset_env: Vec<String>,
+    /// Clear inherited variables before applying [`Self::env`].  This is used
+    /// by the environment contract so provider processes cannot observe the
+    /// carrier's identity through an unrelated inherited variable.
+    clear_env: bool,
     /// The session this command actually names, when it names one.
     ///
     /// See [`SessionTargeting`]. Set by [`LaunchSpec::targeting_session`]
@@ -109,6 +117,8 @@ impl LaunchSpec {
             args: args.into_iter().collect(),
             cwd: None,
             env: Vec::new(),
+            unset_env: Vec::new(),
+            clear_env: false,
             targets: None,
         }
     }
@@ -176,6 +186,26 @@ impl LaunchSpec {
         self
     }
 
+    /// Remove an inherited environment variable from the child.
+    pub fn without_env(mut self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        if !self.unset_env.iter().any(|existing| existing == &key) {
+            self.unset_env.push(key);
+        }
+        self
+    }
+
+    /// Names that will be removed from the inherited environment.
+    pub fn env_removals(&self) -> &[String] {
+        &self.unset_env
+    }
+
+    /// Start with an empty environment and apply only explicit overrides.
+    pub fn clear_environment(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
     /// Append user-supplied agent flags.
     ///
     /// Appended rather than merged: the resume arguments identify *which*
@@ -222,11 +252,17 @@ impl LaunchSpec {
     pub fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
+        if self.clear_env {
+            command.env_clear();
+        }
         if let Some(cwd) = &self.cwd {
             command.current_dir(cwd);
         }
         for (key, value) in &self.env {
             command.env(key, value);
+        }
+        for key in &self.unset_env {
+            command.env_remove(key);
         }
         command
     }
@@ -366,10 +402,16 @@ mod tests {
     fn command_carries_cwd_and_env() {
         let spec = LaunchSpec::new("codex", ["resume".into(), "x".into()])
             .in_dir("/work")
-            .with_env("CODEX_HOME", "/tmp/home");
+            .with_env("CODEX_HOME", "/tmp/home")
+            .without_env("WSL_DISTRO_NAME");
         let command = spec.command();
         assert_eq!(command.get_current_dir(), Some(Path::new("/work")));
         let envs: Vec<_> = command.get_envs().collect();
-        assert_eq!(envs.len(), 1);
+        assert!(envs.iter().any(|(key, value)| {
+            key.to_str() == Some("CODEX_HOME") && value.map(|v| v.to_str()) == Some(Some("/tmp/home"))
+        }));
+        assert!(envs.iter().any(|(key, value)| {
+            key.to_str() == Some("WSL_DISTRO_NAME") && value.is_none()
+        }));
     }
 }

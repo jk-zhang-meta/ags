@@ -1,0 +1,14 @@
+{
+  "contract": "environment-contract-v1",
+  "id": "macos-native-arm64",
+  "target": { "os": "macos", "distribution": "macos", "version": "15.6", "architecture": "arm64", "abi": "darwin" },
+  "backend": { "kind": "macos-native" },
+  "identity": { "hostname": "target-mac", "username": "agent", "uid": 501, "gid": 20, "groups": ["staff"], "shell": "/bin/zsh", "capabilities": [] },
+  "clock": { "timezone": "America/Chicago", "tzdata": "2026a", "tzdata_sha256": "sha256:tzdata", "anchor_epoch_seconds": 0, "rate": 1.0 },
+  "locale": { "lang": "en_US.UTF-8", "lc_all": "en_US.UTF-8", "lc_time": "en_US.UTF-8", "charset": "UTF-8", "icu_version": "76.1" },
+  "paths": { "cwd": "/Users/agent/workspace", "home": "/Users/agent", "tmp": "/tmp", "workspace": "/Users/agent/workspace", "hidden_host_markers": ["/Volumes/Host"] },
+  "network": { "dns_servers": ["192.0.2.53"], "addresses": ["192.0.2.40/24"], "routes": ["default via 192.0.2.1"], "block_metadata": true },
+  "tty": { "enabled": true, "term": "xterm-256color", "columns": 120, "rows": 40, "kind": "pty", "signals": true },
+  "process": { "init": "launchd", "cgroup": "target", "namespace": "target" },
+  "resources": { "cpu_count": 8, "memory_bytes": 17179869184 }
+}

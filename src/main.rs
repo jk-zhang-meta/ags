@@ -5,7 +5,7 @@
 //! CLI entry point: parses arguments, dispatches subcommands, renders output.
 
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 
 use ags::budget::ContextBudget;
 use ags::discovery::ProviderRegistry;
+use ags::environment_runtime::{self, CommandClassification, RuntimeProfile};
 use ags::ir::Fidelity;
 use ags::launch::{LaunchSpec, SessionTargeting};
 use ags::listing_cache::{LoadedRows, Stamp};
@@ -61,6 +62,64 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Command {
+    /// Audit or answer an agent-facing OS observation from an environment profile.
+    #[command(name = "env")]
+    Environment {
+        /// JSON environment profile.
+        #[arg(long)]
+        profile: PathBuf,
+        /// Agent adapter name used for audit metadata (codex, claude, gemini).
+        #[arg(long, default_value = "generic")]
+        agent: String,
+        /// Execute a classified passthrough command. Unknown commands remain blocked.
+        #[arg(long)]
+        run: bool,
+        /// Command argv; shell strings are intentionally not accepted.
+        #[arg(value_name = "COMMAND", num_args = 1.., allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+
+    /// Serve the versioned environment broker over JSONL stdin/stdout.
+    #[command(name = "env-broker", hide = true)]
+    EnvironmentBroker {
+        /// JSON environment profile.
+        #[arg(long)]
+        profile: PathBuf,
+        /// Provider adapter label carried in audit responses.
+        #[arg(long, default_value = "generic")]
+        agent: String,
+    },
+
+    /// Select the environment profile later `ags codex` / `ags claude` launches use.
+    #[command(name = "env-use")]
+    EnvUse {
+        /// JSON path, `~/.config/ags/environments/NAME.json`, or bundled name
+        /// (`tokyo-macos`, `tokyo-linux`, `chicago-macos`).
+        profile: String,
+    },
+
+    /// Show the selected environment profile and what it can and cannot hide.
+    #[command(name = "env-show")]
+    EnvShow,
+
+    /// Stop applying an environment profile to launched agents.
+    #[command(name = "env-clear")]
+    EnvClear,
+
+    /// List bundled, configured, and selected environment profiles.
+    #[command(name = "env-list")]
+    EnvList,
+
+    /// Materialise the overlay and print shell or JSON for the launcher.
+    #[command(name = "env-apply", hide = true)]
+    EnvApply {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long, default_value = "shell")]
+        format: String,
+    },
     /// Manage encrypted, portable session checkpoints.
     ///
     /// Intercepted before clap sees it (see `main`); listed here only so the
@@ -162,6 +221,16 @@ enum Command {
         /// The session is still written; only the agent is not started.
         #[arg(long, conflicts_with = "dry_run")]
         launch_dry_run: bool,
+
+        /// Load an environment-contract profile for the launched provider.
+        /// The profile is validated and applied only to the child process.
+        #[arg(long, requires = "launching")]
+        environment_profile: Option<PathBuf>,
+
+        /// Permit ordinary host commands through the environment broker.
+        /// Observation commands remain virtual; unknown/dynamic commands stay blocked.
+        #[arg(long, requires = "environment_profile", requires = "launching")]
+        environment_host_passthrough: bool,
 
         /// Launch even when the conversion could not carry part of the
         /// conversation across.
@@ -485,7 +554,17 @@ fn main() -> ExitCode {
         // to; routing that into the runtime would have it ask itself.
         Some("--version" | "-V") => raw,
         // Hidden helpers the installer and the runtime call by name.
-        Some("checkpoint-register-codex" | "checkpoint-asset") => raw,
+        Some(
+            "checkpoint-register-codex"
+            | "checkpoint-asset"
+            | "env"
+            | "env-broker"
+            | "env-use"
+            | "env-show"
+            | "env-clear"
+            | "env-list"
+            | "env-apply",
+        ) => raw,
         // `checkpoint` was how the old `ags` wrapper reached the runtime. Kept
         // so a machine still holding that wrapper can run long enough to
         // replace itself.
@@ -496,6 +575,24 @@ fn main() -> ExitCode {
     init_tracing(&cli);
 
     let result = match cli.command {
+        Command::Environment {
+            profile,
+            agent,
+            run,
+            command,
+        } => cmd_environment(&profile, &agent, run, &command, cli.json).map(|()| ExitCode::SUCCESS),
+        Command::EnvironmentBroker { profile, agent } => {
+            cmd_environment_broker(&profile, &agent).map(|()| ExitCode::SUCCESS)
+        }
+        Command::EnvUse { profile } => cmd_env_use(&profile, cli.json).map(|()| ExitCode::SUCCESS),
+        Command::EnvShow => cmd_env_show(cli.json).map(|()| ExitCode::SUCCESS),
+        Command::EnvClear => cmd_env_clear(cli.json).map(|()| ExitCode::SUCCESS),
+        Command::EnvList => cmd_env_list(cli.json).map(|()| ExitCode::SUCCESS),
+        Command::EnvApply {
+            provider,
+            profile,
+            format,
+        } => cmd_env_apply(&provider, profile.as_deref(), &format).map(|()| ExitCode::SUCCESS),
         Command::Checkpoint { args } => return cmd_checkpoint(&args),
         Command::CheckpointRegisterCodex {
             session_id,
@@ -526,6 +623,8 @@ fn main() -> ExitCode {
             keep_reasoning: _,
             launch,
             launch_dry_run,
+            environment_profile,
+            environment_host_passthrough,
             launch_anyway,
             account,
             pick_account,
@@ -552,6 +651,8 @@ fn main() -> ExitCode {
                 agent_args,
                 account,
                 pick_account,
+                environment_profile,
+                environment_host_passthrough,
             },
         ),
         Command::List {
@@ -613,6 +714,203 @@ fn main() -> ExitCode {
     }
 }
 
+fn cmd_environment(
+    profile_path: &Path,
+    agent: &str,
+    run: bool,
+    argv: &[String],
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    if argv.is_empty() {
+        anyhow::bail!("env requires a command argv")
+    }
+    let profile = RuntimeProfile::from_json(&std::fs::read_to_string(profile_path)?)?;
+    let classification = environment_runtime::classify_command(argv);
+    match classification {
+        CommandClassification::VirtualObservation(audit) => {
+            let result =
+                environment_runtime::virtual_observation(&profile.profile, audit.kind, argv);
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                print!("{}", result.stdout);
+                if !result.stderr.is_empty() {
+                    eprint!("{}", result.stderr);
+                }
+            }
+        }
+        CommandClassification::Unknown(audit) => {
+            anyhow::bail!(
+                "environment command blocked (unknown/dynamic argv): {:?}",
+                audit.argv
+            )
+        }
+        CommandClassification::Passthrough(audit) => {
+            if !run {
+                if json_mode {
+                    println!("{}", serde_json::to_string_pretty(&audit)?);
+                } else {
+                    println!("host-visible command requires --run: {:?}", audit.argv);
+                }
+                return Ok(());
+            }
+            let host: Vec<(String, String)> = std::env::vars().collect();
+            let env = environment_runtime::AgentEnvironment::from_host(&profile.profile, host);
+            let status = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .env_clear()
+                .envs(env.as_map())
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("passthrough command exited with {status}");
+            }
+        }
+    }
+    let _ = agent;
+    Ok(())
+}
+
+fn cmd_environment_broker(profile_path: &Path, agent: &str) -> anyhow::Result<()> {
+    let profile = RuntimeProfile::from_json(&std::fs::read_to_string(profile_path)?)?;
+    let broker = environment_runtime::EnvironmentBroker::new(profile.profile)?
+        .with_config(environment_runtime::BrokerConfig::default().deny_host_passthrough());
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut input = std::io::BufReader::new(stdin.lock());
+    let mut output = stdout.lock();
+    // Attach the adapter identity without trusting a caller-supplied value.
+    // Each request still carries its own id for correlation.
+    let mut requests = String::new();
+    input.read_to_string(&mut requests)?;
+    let requests = requests
+        .lines()
+        .map(|line| {
+            let Ok(mut request) = serde_json::from_str::<environment_runtime::BrokerRequest>(line)
+            else {
+                return line.to_string();
+            };
+            request.agent = Some(agent.to_string());
+            serde_json::to_string(&request).unwrap_or_else(|_| line.to_string())
+        })
+        .collect::<Vec<_>>();
+    broker.serve_jsonl(std::io::Cursor::new(requests.join("\n")), &mut output)?;
+    Ok(())
+}
+
+fn cmd_env_use(spec: &str, json_mode: bool) -> anyhow::Result<()> {
+    let paths = ags::environment_launch::OverlayPaths::from_env();
+    let selection = ags::environment_launch::save_selection(&paths, spec)?;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&selection)?);
+    } else {
+        println!(
+            "environment profile {} -> {}",
+            selection.profile_id,
+            selection.profile_path.display()
+        );
+        println!("later `ags codex` / `ags claude` launches use this overlay");
+    }
+    Ok(())
+}
+
+fn cmd_env_show(json_mode: bool) -> anyhow::Result<()> {
+    let paths = ags::environment_launch::OverlayPaths::from_env();
+    let Some(selection) = ags::environment_launch::load_selection(&paths)? else {
+        if json_mode {
+            println!("{{\"selected\":false}}");
+        } else {
+            println!("no environment profile selected (ags env-use PATH|NAME)");
+        }
+        return Ok(());
+    };
+    let raw = std::fs::read_to_string(&selection.profile_path)?;
+    let runtime = RuntimeProfile::from_json(&raw)?;
+    let view = runtime.profile.agent_view();
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "selected": true,
+                "selection": selection,
+                "view": view,
+            }))?
+        );
+        return Ok(());
+    }
+    println!("selected {}", selection.profile_id);
+    println!("  path      {}", selection.profile_path.display());
+    println!(
+        "  identity  {}@{}",
+        view.identity.username, view.identity.hostname
+    );
+    println!(
+        "  os        {:?} {}",
+        view.target.os,
+        view.target.architecture.as_deref().unwrap_or("-")
+    );
+    println!("  timezone  {}", view.clock.timezone);
+    println!("  locale    {}", view.locale.lc_all);
+    println!("  cwd       {} (display only; real workspace is kept)", view.paths.cwd);
+    println!("virtual: USER/HOSTNAME/TZ/LANG and hook-rewritten hostname/uname/date/pwd");
+    println!("host-visible: kernel, /proc, gethostname(2), real HOME/PATH/cwd");
+    Ok(())
+}
+
+fn cmd_env_clear(json_mode: bool) -> anyhow::Result<()> {
+    let paths = ags::environment_launch::OverlayPaths::from_env();
+    let cleared = ags::environment_launch::clear_selection(&paths)?;
+    if json_mode {
+        println!("{{\"cleared\":{cleared}}}");
+    } else if cleared {
+        println!("environment profile selection cleared");
+    } else {
+        println!("no environment profile was selected");
+    }
+    Ok(())
+}
+
+fn cmd_env_list(json_mode: bool) -> anyhow::Result<()> {
+    let paths = ags::environment_launch::OverlayPaths::from_env();
+    let rows = ags::environment_launch::list_profiles(&paths)?;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no environment profiles");
+        return Ok(());
+    }
+    for row in rows {
+        let mark = if row.selected { "*" } else { " " };
+        match row.path {
+            Some(path) => println!("{mark} {:<16} {:<8} {path}", row.id, row.source),
+            None => println!("{mark} {:<16} {:<8}", row.id, row.source),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_env_apply(provider: &str, profile: Option<&Path>, format: &str) -> anyhow::Result<()> {
+    let paths = ags::environment_launch::OverlayPaths::from_env();
+    let host = ags::environment_launch::LaunchHost::from_process();
+    let format = ags::environment_launch::ApplyFormat::parse(format)?;
+    let plan = match ags::environment_launch::resolve_profile(&paths, profile)? {
+        Some((path, runtime)) => Some(ags::environment_launch::materialize(
+            &paths,
+            &path,
+            &runtime.profile,
+            provider,
+            &host,
+        )?),
+        None => None,
+    };
+    print!(
+        "{}",
+        ags::environment_launch::render_apply(plan.as_ref(), format)?
+    );
+    Ok(())
+}
+
 fn cmd_checkpoint(args: &[OsString]) -> ExitCode {
     match ags::checkpoint_runtime::run(args) {
         Ok(status) => status
@@ -660,6 +958,10 @@ struct LaunchRequest {
     account: Option<String>,
     /// `--pick-account`：不直接给名字，列出来现挑（可多选，组成一个队列）。
     pick_account: bool,
+    /// Optional environment contract applied to the provider child.
+    environment_profile: Option<PathBuf>,
+    /// Whether the provider adapter may execute commands classified as host-visible.
+    environment_host_passthrough: bool,
 }
 
 impl LaunchRequest {
@@ -993,7 +1295,16 @@ fn prepare_launch(
             )
         })?
         .try_passthrough(launch.agent_args.iter().cloned())?;
-    Ok(with_pool_account(spec, account.as_deref()))
+    let spec = with_pool_account(spec, account.as_deref());
+    let paths = ags::environment_launch::OverlayPaths::from_env();
+    let host = ags::environment_launch::LaunchHost::from_process();
+    Ok(ags::environment_launch::apply_to_spec(
+        spec,
+        &paths,
+        launch.environment_profile.as_deref(),
+        provider.slug(),
+        &host,
+    )?)
 }
 
 /// 一个号在挑号界面上的名字。

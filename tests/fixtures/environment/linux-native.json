@@ -1,0 +1,64 @@
+{
+  "contract": "environment-contract-v1",
+  "id": "linux-native-ubuntu-24",
+  "target": {
+    "os": "linux",
+    "distribution": "ubuntu",
+    "version": "24.04",
+    "architecture": "x86_64",
+    "abi": "linux-gnu",
+    "kernel": { "release": "6.8.0-target", "architecture": "x86_64", "abi": "linux-gnu" },
+    "image": { "reference": "oci://registry.example/ubuntu@sha256:target", "sha256": "sha256:target" }
+  },
+  "backend": { "kind": "linux-native" },
+  "identity": {
+    "hostname": "target-linux",
+    "username": "agent",
+    "uid": 1000,
+    "gid": 1000,
+    "groups": ["agent"],
+    "shell": "/bin/bash",
+    "umask": 18,
+    "capabilities": []
+  },
+  "clock": {
+    "timezone": "Asia/Shanghai",
+    "tzdata": "2026a",
+    "tzdata_sha256": "sha256:tzdata",
+    "anchor_epoch_seconds": 1788652800,
+    "rate": 1.0,
+    "monotonic_anchor_ns": 1000000000,
+    "boottime_anchor_ns": 1000000000
+  },
+  "locale": {
+    "lang": "en_US.UTF-8",
+    "lc_all": "en_US.UTF-8",
+    "lc_time": "en_US.UTF-8",
+    "charset": "UTF-8",
+    "icu_version": "76.1",
+    "artifact": { "reference": "locale/en_US.UTF-8", "sha256": "sha256:locale" }
+  },
+  "paths": {
+    "cwd": "/workspace/project",
+    "home": "/home/agent",
+    "tmp": "/tmp",
+    "workspace": "/workspace/project",
+    "proc": "/proc",
+    "sys": "/sys",
+    "mounts": "/proc/self/mountinfo",
+    "self_exe": "/proc/self/exe",
+    "hidden_host_markers": ["/mnt/c", "C:\\Users"]
+  },
+  "network": {
+    "dns_servers": ["192.0.2.53"],
+    "dns_search": ["target.example"],
+    "addresses": ["192.0.2.10/24"],
+    "routes": ["default via 192.0.2.1"],
+    "proxy": null,
+    "block_metadata": true,
+    "hostname_resolution": "target-linux"
+  },
+  "tty": { "enabled": true, "term": "xterm-256color", "columns": 120, "rows": 40, "kind": "pty", "signals": true },
+  "process": { "init": "systemd", "cgroup": "target.slice", "namespace": "host", "cpu_count": 8, "memory_bytes": 17179869184 },
+  "resources": { "cpu_count": 8, "memory_bytes": 17179869184, "disk_bytes": 107374182400 }
+}

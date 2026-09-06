@@ -8,6 +8,11 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
 
 ## [Unreleased] (after v0.1.1)
 
+### Environment overlay on launch
+
+- **`ags env-use` / `env-show` / `env-list` / `env-clear` select a profile that later `ags codex` and `ags claude` launches apply.** `--environment-profile` remains a one-shot override for `ags convert resume --launch` and for a single managed launch. The overlay sets `TZ`/`LANG`/`USER`/`HOSTNAME`, unsets `WSL_*`, and installs Codex/Claude hooks from the profile. Real `HOME`/`PATH`/cwd and credential files are kept so the agent can start. Kernel, `/proc`, and `gethostname(2)` stay host-visible.
+
+
 > Commits on `main` since the v0.1.1 tag (`be1ce19`, 2026-03-03). No GitHub Release yet.
 
 ### Renamed to `ags` (breaking, v0.5.0)

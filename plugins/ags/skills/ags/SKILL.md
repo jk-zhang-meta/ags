@@ -19,6 +19,10 @@ archives directly.
 ```text
 claude [CLAUDE_ARGS...]
 codex [CODEX_ARGS...]
+env-use PATH|NAME
+env-show
+env-list
+env-clear
 init [--identity ABSOLUTE_AGE_IDENTITY]
 save ID DESCRIPTION
 list
@@ -81,6 +85,26 @@ ags checkpoint store add local "ABSOLUTE_DIR"
 ```
 
 Complete only on `status=configured`.
+
+## Environment overlay
+
+Select a profile so later `ags codex` / `ags claude` launches present that
+identity, timezone, and locale to the agent:
+
+```bash
+ags env-use tokyo-macos
+ags env-show
+ags env-list
+ags env-clear
+ags --environment-profile /ABS/profile.json codex
+```
+
+Bundled names are `tokyo-macos`, `tokyo-linux`, and `chicago-macos`. A JSON
+path or `~/.config/ags/environments/NAME.json` also works. This is an
+observation overlay (environment variables plus provider hooks). It does not
+hide the kernel, `/proc`, or `gethostname(2)`. Do not set a fake `HOME` or
+`PATH` in the profile expecting the agent process itself to use them; AGS keeps
+the real home, path, and cwd so the agent can start.
 
 ## Save
 

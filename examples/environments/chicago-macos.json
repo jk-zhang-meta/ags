@@ -1,0 +1,43 @@
+{
+  "contract": "environment-contract-v1",
+  "id": "chicago-macos",
+  "target": {
+    "os": "macos",
+    "distribution": "macos",
+    "version": "15.6",
+    "architecture": "arm64",
+    "abi": "darwin"
+  },
+  "backend": { "kind": "macos-native" },
+  "identity": {
+    "hostname": "chicago-node",
+    "username": "builder",
+    "uid": 501,
+    "gid": 20,
+    "groups": ["staff"],
+    "shell": "/bin/zsh",
+    "capabilities": []
+  },
+  "clock": {
+    "timezone": "America/Chicago",
+    "tzdata": "2026a",
+    "anchor_epoch_seconds": 0,
+    "rate": 1.0,
+    "offset_seconds": -21600,
+    "follow_realtime": true
+  },
+  "locale": {
+    "lang": "en_US.UTF-8",
+    "lc_all": "en_US.UTF-8",
+    "lc_time": "en_US.UTF-8",
+    "charset": "UTF-8"
+  },
+  "paths": {
+    "cwd": "/Users/builder/work",
+    "home": "/Users/builder",
+    "tmp": "/tmp",
+    "workspace": "/Users/builder/work",
+    "hidden_host_markers": ["/mnt/c", "/mnt/wsl", "WSL_DISTRO_NAME"]
+  },
+  "tty": { "enabled": true, "term": "xterm-256color", "columns": 120, "rows": 40, "kind": "pty", "signals": true }
+}

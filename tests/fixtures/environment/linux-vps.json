@@ -1,0 +1,14 @@
+{
+  "contract": "environment-contract-v1",
+  "id": "linux-vps-target",
+  "target": { "os": "linux", "distribution": "debian", "version": "13", "architecture": "x86_64", "abi": "linux-gnu", "image": { "reference": "remote://target-vps", "sha256": "sha256:target" } },
+  "backend": { "kind": "linux-vps", "endpoint": "ssh://target.example" },
+  "identity": { "hostname": "target-vps", "username": "agent", "uid": 1000, "gid": 1000, "groups": ["agent"], "shell": "/bin/bash", "capabilities": [] },
+  "clock": { "timezone": "Europe/Berlin", "tzdata": "2026a", "tzdata_sha256": "sha256:tzdata", "anchor_epoch_seconds": 0, "rate": 1.0 },
+  "locale": { "lang": "en_US.UTF-8", "lc_all": "en_US.UTF-8", "lc_time": "en_US.UTF-8", "charset": "UTF-8" },
+  "paths": { "cwd": "/workspace", "home": "/home/agent", "tmp": "/tmp", "workspace": "/workspace", "proc": "/proc", "sys": "/sys", "mounts": "/proc/self/mountinfo", "self_exe": "/proc/self/exe", "hidden_host_markers": ["169.254.169.254", "cloud-init", "virtio"] },
+  "network": { "dns_servers": ["192.0.2.53"], "addresses": ["192.0.2.30/24"], "routes": ["default via 192.0.2.1"], "block_metadata": true },
+  "tty": { "enabled": true, "term": "xterm-256color", "columns": 120, "rows": 40, "kind": "pty", "signals": true },
+  "process": { "init": "systemd", "cgroup": "target.slice", "namespace": "target" },
+  "resources": { "cpu_count": 8, "memory_bytes": 17179869184 }
+}
