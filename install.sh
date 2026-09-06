@@ -798,6 +798,96 @@ checkpoint_dependencies_ready() {
   return 0
 }
 
+# AGS checkpoints are encrypted with age.  Keep the normal curl installer
+# self-sufficient on supported platforms instead of merely warning that
+# age-keygen is missing and silently skipping initialization.
+ensure_age_dependency() {
+  if command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ -n "$OFFLINE_TARBALL" ]; then
+    warn "age/age-keygen is missing; offline installation cannot install packages"
+    return 1
+  fi
+
+  local -a package_cmd=()
+  local needs_privilege=0
+  case "${OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}" in
+    linux)
+      if command -v apt-get >/dev/null 2>&1; then
+        package_cmd=(apt-get install -y age)
+        needs_privilege=1
+      elif command -v dnf >/dev/null 2>&1; then
+        package_cmd=(dnf install -y age)
+        needs_privilege=1
+      elif command -v yum >/dev/null 2>&1; then
+        package_cmd=(yum install -y age)
+        needs_privilege=1
+      elif command -v pacman >/dev/null 2>&1; then
+        package_cmd=(pacman -Sy --noconfirm age)
+        needs_privilege=1
+      elif command -v apk >/dev/null 2>&1; then
+        package_cmd=(apk add age)
+        needs_privilege=1
+      elif command -v zypper >/dev/null 2>&1; then
+        package_cmd=(zypper --non-interactive install age)
+        needs_privilege=1
+      elif command -v xbps-install >/dev/null 2>&1; then
+        package_cmd=(xbps-install -Sy age)
+        needs_privilege=1
+      fi
+      ;;
+    darwin)
+      if command -v brew >/dev/null 2>&1; then
+        package_cmd=(brew install age)
+      elif command -v port >/dev/null 2>&1; then
+        package_cmd=(port install age)
+        needs_privilege=1
+      fi
+      ;;
+    msys*|mingw*|cygwin*)
+      if command -v winget >/dev/null 2>&1; then
+        package_cmd=(winget install --id FiloSottile.age --exact
+          --accept-source-agreements --accept-package-agreements)
+      elif command -v choco >/dev/null 2>&1; then
+        package_cmd=(choco install age.portable -y)
+      elif command -v scoop >/dev/null 2>&1; then
+        package_cmd=(scoop install age)
+      fi
+      ;;
+  esac
+
+  if [ "${#package_cmd[@]}" -eq 0 ]; then
+    warn "Cannot install age automatically on ${OS:-unknown}; install age manually"
+    warn "See https://github.com/FiloSottile/age#installation"
+    return 1
+  fi
+
+  if [ "$needs_privilege" -eq 1 ] && [ "$EUID" -ne 0 ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      warn "Installing age requires sudo, but sudo is not available"
+      warn "Run: ${package_cmd[*]}"
+      return 1
+    fi
+    package_cmd=(sudo "${package_cmd[@]}")
+  fi
+
+  info "Installing age (provides age-keygen)"
+  if ! "${package_cmd[@]}"; then
+    warn "Automatic age installation failed"
+    warn "Run manually: ${package_cmd[*]}"
+    return 1
+  fi
+
+  if command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1; then
+    ok "age and age-keygen are available"
+    return 0
+  fi
+  warn "age installation completed, but age-keygen is still not on PATH"
+  return 1
+}
+
 run_checkpoint_runtime() {
   "$DEST/$BINARY_NAME" "$@"
 }
@@ -864,6 +954,7 @@ configure_checkpoints() {
     AGS_HOOK_STATUS="partial; see warnings"
   fi
 
+  ensure_age_dependency || true
   if ! checkpoint_dependencies_ready; then
     AGS_INIT_STATUS="skipped (missing dependencies)"
     return 0

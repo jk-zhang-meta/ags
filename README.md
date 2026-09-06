@@ -17,6 +17,9 @@ curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?
 ```
 
 That installer is the primary distribution path. It handles platform detection, secure artifact verification, fallback source builds, shell completions, and agent-oriented local setup in one step.
+It also installs the `age` package when checkpoint setup needs the missing
+`age`/`age-keygen` commands (offline installs report the dependency instead of
+accessing the network).
 
 ## TL;DR
 
