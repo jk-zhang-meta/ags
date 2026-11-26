@@ -220,7 +220,11 @@ struct AgentLaunchArgs {
     #[arg(long)]
     auto_rebind: bool,
     /// Arguments forwarded verbatim to the stock CLI.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, value_name = "AGENT_ARGS")]
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "AGENT_ARGS"
+    )]
     agent_args: Vec<String>,
 }
 
@@ -294,6 +298,16 @@ enum Command {
     /// Remove the saved Berth gateway configuration.
     #[command(name = "clear")]
     Clear,
+    /// Check for and install the latest signed `berth` (`bh`) CLI release.
+    #[command(name = "update", alias = "self-update")]
+    Update {
+        /// Check for a newer version without modifying the binary.
+        #[arg(long)]
+        check: bool,
+        /// Re-download and reinstall even if already on the latest version.
+        #[arg(long)]
+        force: bool,
+    },
     /// Launch unmodified official Codex CLI through Berth Cage Shim.
     #[command(name = "codex")]
     Codex(AgentLaunchArgs),
@@ -879,6 +893,8 @@ fn main() -> ExitCode {
             | "key"
             | "status"
             | "clear"
+            | "update"
+            | "self-update"
             | "codex"
             | "claude"
             | "agy"
@@ -906,6 +922,18 @@ fn main() -> ExitCode {
     };
     let cli = Cli::parse_from(argv);
     init_tracing(&cli);
+
+    if matches!(
+        cli.command,
+        Command::Login { .. }
+            | Command::Status
+            | Command::Codex(_)
+            | Command::Claude(_)
+            | Command::Agy(_)
+            | Command::Grok(_)
+    ) {
+        berth::self_update::maybe_auto_update_on_startup(cli.json);
+    }
 
     let result = match cli.command {
         Command::Login {
@@ -952,6 +980,7 @@ fn main() -> ExitCode {
         ),
         Command::Status => cmd_berth(BerthCommand::Status, cli.json),
         Command::Clear => cmd_berth(BerthCommand::Clear, cli.json),
+        Command::Update { check, force } => cmd_berth_update(check, force, cli.json),
         Command::Codex(args) => cmd_top_level_launch("codex", args, cli.json),
         Command::Claude(args) => cmd_top_level_launch("claude", args, cli.json),
         Command::Agy(args) => cmd_top_level_launch("agy", args, cli.json),
@@ -1015,21 +1044,14 @@ fn main() -> ExitCode {
             profile,
             format,
         } => cmd_env_apply(&provider, profile.as_deref(), &format).map(|()| ExitCode::SUCCESS),
-        Command::Runtime { command } => {
-            cmd_runtime(command, cli.json).map(|()| ExitCode::SUCCESS)
-        }
+        Command::Runtime { command } => cmd_runtime(command, cli.json).map(|()| ExitCode::SUCCESS),
         Command::RuntimeApply {
             name,
             command,
             intent,
             format,
-        } => cmd_runtime_apply(
-            name.as_deref(),
-            command.as_deref(),
-            &intent,
-            &format,
-        )
-        .map(|()| ExitCode::SUCCESS),
+        } => cmd_runtime_apply(name.as_deref(), command.as_deref(), &intent, &format)
+            .map(|()| ExitCode::SUCCESS),
         Command::Checkpoint { args } => return cmd_checkpoint(&args),
         Command::CheckpointRegisterCodex {
             session_id,
@@ -1287,7 +1309,10 @@ fn cmd_env_show(json_mode: bool) -> anyhow::Result<()> {
     );
     println!("  timezone  {}", view.clock.timezone);
     println!("  locale    {}", view.locale.lc_all);
-    println!("  cwd       {} (display only; real workspace is kept)", view.paths.cwd);
+    println!(
+        "  cwd       {} (display only; real workspace is kept)",
+        view.paths.cwd
+    );
     println!("virtual: USER/HOSTNAME/TZ/LANG and hook-rewritten hostname/uname/date/pwd");
     println!("host-visible: kernel, /proc, gethostname(2), real HOME/PATH/cwd");
     Ok(())
@@ -1333,10 +1358,7 @@ fn cmd_runtime(command: RuntimeCommand, json_mode: bool) -> anyhow::Result<()> {
         RuntimeCommand::Use { name } => {
             berth::agent_runtime::save_selection(&paths, &name)?;
             if json_mode {
-                println!(
-                    "{}",
-                    serde_json::json!({ "selected": true, "name": name })
-                );
+                println!("{}", serde_json::json!({ "selected": true, "name": name }));
             } else {
                 println!("runtime {name} selected for later ags launches, list, save, and restore");
                 println!("this does not hide server IP geolocation");
@@ -1559,9 +1581,7 @@ fn cmd_berth_login(
         if target == "default" {
             config.api_key = trimmed_key;
         } else {
-            config
-                .platform_keys
-                .insert(target.to_string(), trimmed_key);
+            config.platform_keys.insert(target.to_string(), trimmed_key);
         }
         berth::berth::save_config(&paths, &config)?;
         if json_mode {
@@ -1593,7 +1613,10 @@ fn cmd_berth_login(
     }
 
     // Account login mode (email + password + optional 2FA).
-    let email = match email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty()) {
+    let email = match email
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+    {
         Some(e) => e,
         None => {
             if let Ok(env_email) = std::env::var("BERTH_EMAIL")
@@ -1629,7 +1652,8 @@ fn cmd_berth_login(
     config.user_session = Some(session.clone());
     berth::berth::save_config(&paths, &config)?;
 
-    let remote_keys = berth::berth::list_user_api_keys(&config, &session.access_token).unwrap_or_default();
+    let remote_keys =
+        berth::berth::list_user_api_keys(&config, &session.access_token).unwrap_or_default();
     let redacted_remote: Vec<serde_json::Value> = remote_keys
         .iter()
         .map(|k| {
@@ -1669,16 +1693,17 @@ fn cmd_berth_login(
         );
         println!("  config      {}", paths.config_file.display());
         if remote_keys.is_empty() {
-            println!("  api_keys    none yet (create platform keys on Berth Web; `bh` will auto-pick them per agent)");
+            println!(
+                "  api_keys    none yet (create platform keys on Berth Web; `bh` will auto-pick them per agent)"
+            );
         } else {
-            println!("  api_keys    {} active key(s) detected:", remote_keys.len());
+            println!(
+                "  api_keys    {} active key(s) detected:",
+                remote_keys.len()
+            );
             for k in &remote_keys {
                 let plat = k.platform().unwrap_or("ungrouped");
-                let grp = k
-                    .group
-                    .as_ref()
-                    .map(|g| g.name.as_str())
-                    .unwrap_or("-");
+                let grp = k.group.as_ref().map(|g| g.name.as_str()).unwrap_or("-");
                 println!(
                     "    - [{plat}] {} (id={}, group={}, {})",
                     k.name,
@@ -1810,19 +1835,46 @@ fn cmd_berth_logout(json_mode: bool) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_berth_update(check_only: bool, force: bool, json_mode: bool) -> anyhow::Result<ExitCode> {
+    let res = berth::self_update::run_update(check_only, force)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&res)?);
+    } else if res.updated {
+        println!(
+            "updated berth v{} -> v{} ({}, sha256={})",
+            res.current_version,
+            res.latest_version,
+            res.target,
+            res.sha256.as_deref().unwrap_or("-")
+        );
+    } else if res.update_available {
+        println!(
+            "update available: berth v{} -> v{} ({}); run `bh update` to install",
+            res.current_version, res.latest_version, res.target
+        );
+    } else {
+        println!(
+            "berth v{} ({}) is already up to date",
+            res.current_version, res.target
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_berth_key(command: KeyCommand, json_mode: bool) -> anyhow::Result<ExitCode> {
     let paths = berth::berth::BerthPaths::from_env();
     match command {
         KeyCommand::List => {
             let mut config = berth::berth::load_config(&paths)?
                 .ok_or(berth::berth::BerthError::NotConfigured)?;
-            let remote_keys =
-                if let Some(session) = berth::berth::ensure_fresh_user_session(&paths, &mut config)?
-                {
-                    berth::berth::list_user_api_keys(&config, &session.access_token)?
-                } else {
-                    Vec::new()
-                };
+            let remote_keys = if let Some(session) =
+                berth::berth::ensure_fresh_user_session(&paths, &mut config)?
+            {
+                berth::berth::list_user_api_keys(&config, &session.access_token)?
+            } else {
+                Vec::new()
+            };
 
             let redacted_remote: Vec<serde_json::Value> = remote_keys
                 .iter()
@@ -1871,11 +1923,7 @@ fn cmd_berth_key(command: KeyCommand, json_mode: bool) -> anyhow::Result<ExitCod
                         println!("  account keys (auto-selected by agent platform):");
                         for k in &remote_keys {
                             let plat = k.platform().unwrap_or("ungrouped");
-                            let grp = k
-                                .group
-                                .as_ref()
-                                .map(|g| g.name.as_str())
-                                .unwrap_or("-");
+                            let grp = k.group.as_ref().map(|g| g.name.as_str()).unwrap_or("-");
                             println!(
                                 "    - id={:<4} [{:<11}] {:<20} group={:<16} {}",
                                 k.id,
@@ -1896,8 +1944,8 @@ fn cmd_berth_key(command: KeyCommand, json_mode: bool) -> anyhow::Result<ExitCod
             if trimmed_key.is_empty() {
                 anyhow::bail!("API key must not be empty");
             }
-            let mut config = berth::berth::load_config(&paths)?.unwrap_or_else(|| {
-                berth::berth::BerthConfig {
+            let mut config =
+                berth::berth::load_config(&paths)?.unwrap_or_else(|| berth::berth::BerthConfig {
                     schema: berth::berth::BERTH_CONFIG_SCHEMA.to_string(),
                     central_url: berth::berth::DEFAULT_BERTH_URL.to_string(),
                     api_key: String::new(),
@@ -1907,8 +1955,7 @@ fn cmd_berth_key(command: KeyCommand, json_mode: bool) -> anyhow::Result<ExitCod
                     zone_preference: "auto".to_string(),
                     isolation_mode: berth::berth::IsolationMode::TzOverlay,
                     allow_insecure_http_for_tests: false,
-                }
-            });
+                });
             if canonical == "default" {
                 config.api_key = trimmed_key;
             } else {
@@ -2158,11 +2205,8 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                 rebind_ref: None,
                 ags_version: berth::berth::AGS_VERSION_HEADER_VALUE.to_string(),
             };
-            let lease = berth::berth::acquire_lease_with_token(
-                &config,
-                &resolved_auth.bearer_token,
-                &req,
-            )?;
+            let lease =
+                berth::berth::acquire_lease_with_token(&config, &resolved_auth.bearer_token, &req)?;
             let selected_ingress =
                 berth::berth::select_best_ingress(&lease.zone.ingress_candidates)?;
             match format.as_str() {
@@ -2217,7 +2261,11 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                     );
                     println!(
                         "export AGS_BERTH_CAGE_STRICT={}",
-                        if lease.cage.strict_mode { "true" } else { "false" }
+                        if lease.cage.strict_mode {
+                            "true"
+                        } else {
+                            "false"
+                        }
                     );
                 }
                 other => anyhow::bail!("lease format must be `json` or `shell`; got `{other}`"),
@@ -2406,11 +2454,8 @@ fn cmd_berth_launch(
             rebind_ref: next_rebind_ref.clone(),
             ags_version: berth::berth::AGS_VERSION_HEADER_VALUE.to_string(),
         };
-        let lease = berth::berth::acquire_lease_with_token(
-            &config,
-            &resolved_auth.bearer_token,
-            &req,
-        )?;
+        let lease =
+            berth::berth::acquire_lease_with_token(&config, &resolved_auth.bearer_token, &req)?;
         current_session_id = Some(lease.work_session_id.clone());
 
         let selected = berth::berth::select_best_ingress(&lease.zone.ingress_candidates)?;
@@ -2538,7 +2583,10 @@ fn cmd_berth_launch(
                     resolved_auth.token_fingerprint()
                 );
                 println!("  lease_id    {}", lease.lease_id);
-                println!("  ingress     {} ({})", selected.candidate.node_id, selected.candidate.url);
+                println!(
+                    "  ingress     {} ({})",
+                    selected.candidate.node_id, selected.candidate.url
+                );
                 println!(
                     "  cage        {} / {} / {}",
                     lease.cage.timezone, lease.cage.country_code, lease.cage.locale
@@ -2613,7 +2661,11 @@ fn cmd_berth_launch(
                 next_rebind_ref = Some(signal.rebind_ref);
                 next_cohort_hint = Some(signal.recommended_cohort_tz);
                 // Preserve resume semantics on auto-rebind when not already passing resume.
-                if canonical_agent == "claude" && !current_args.iter().any(|a| a == "--resume" || a == "-r" || a == "--continue" || a == "-c") {
+                if canonical_agent == "claude"
+                    && !current_args
+                        .iter()
+                        .any(|a| a == "--resume" || a == "-r" || a == "--continue" || a == "-c")
+                {
                     current_args.push("--continue".to_string());
                 }
                 continue;
@@ -2746,7 +2798,8 @@ fn open_store(no_store: bool, dry_run: bool) -> Option<berth::store::Store> {
     if no_store {
         return None;
     }
-    if dry_run && !berth::store::default_root().is_ok_and(|root| root.join("store.json").is_file()) {
+    if dry_run && !berth::store::default_root().is_ok_and(|root| root.join("store.json").is_file())
+    {
         return None;
     }
     match berth::store::Store::open() {
@@ -3065,19 +3118,12 @@ fn prepare_launch(
     if let Some(resolved) = &resolved {
         berth::agent_runtime::provider_matches_command(resolved, Some(provider.slug()))?;
     }
-    let intent = berth::agent_runtime::intent_for_agent_args(
-        provider.slug(),
-        &launch.agent_args,
-    );
+    let intent = berth::agent_runtime::intent_for_agent_args(provider.slug(), &launch.agent_args);
     let proxy_mode = resolved
         .as_ref()
         .map(|resolved| resolved.runtime.proxy_mode)
         .unwrap_or(berth::agent_runtime::ProxyMode::Auto);
-    let mut spec = berth::agent_runtime::apply_to_spec(
-        spec,
-        resolved.as_ref(),
-        intent,
-    )?;
+    let mut spec = berth::agent_runtime::apply_to_spec(spec, resolved.as_ref(), intent)?;
     let has_proxy = spec.env.iter().any(|(key, _)| key == "HTTPS_PROXY");
     if !has_proxy
         && provider.slug() == "codex"
@@ -3745,7 +3791,10 @@ fn cmd_list(
             .and_then(system_time_to_epoch_millis)
     }
 
-    fn session_activity_millis(session: &berth::model::CanonicalSession, path: &Path) -> Option<i64> {
+    fn session_activity_millis(
+        session: &berth::model::CanonicalSession,
+        path: &Path,
+    ) -> Option<i64> {
         let conversation_activity = session
             .ended_at
             .or_else(|| {
@@ -4180,10 +4229,9 @@ fn cmd_list(
                 // testing for a 64-hex directory here reported `Unknown` for
                 // every session a current Gemini writes, because 0.52.0 names
                 // the directory with a registry slug.
-                let by_directory = path
-                    .parent()
-                    .and_then(|p| p.parent())
-                    .and_then(|dir| berth::providers::gemini::project_dir_matches(dir, ws.as_path()));
+                let by_directory = path.parent().and_then(|p| p.parent()).and_then(|dir| {
+                    berth::providers::gemini::project_dir_matches(dir, ws.as_path())
+                });
                 // Neither marked nor hashed — but the file itself is a second
                 // witness, and an independent one: Gemini stamps
                 // `SHA256(projectRoot)` into every session header it writes
@@ -4198,8 +4246,9 @@ fn cmd_list(
                 // *sessions* end up in the "workspace could not be determined"
                 // count, which before this was every session in any project
                 // directory whose marker was missing or unreadable.
-                let resolved = by_directory
-                    .or_else(|| berth::providers::gemini::session_workspace_hint(path, ws.as_path()));
+                let resolved = by_directory.or_else(|| {
+                    berth::providers::gemini::session_workspace_hint(path, ws.as_path())
+                });
                 match resolved {
                     Some(true) => WorkspaceHint::Matches,
                     Some(false) => WorkspaceHint::Differs,
