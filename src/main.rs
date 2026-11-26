@@ -61,7 +61,128 @@ struct Cli {
 }
 
 #[derive(clap::Subcommand, Debug)]
+enum RuntimeCommand {
+    /// Persist the runtime later launches, list, save, and restore use.
+    Use { name: String },
+    /// Show the selected runtime.
+    Show,
+    /// List configured runtimes.
+    List,
+    /// Stop using a named runtime.
+    Clear,
+    /// Create or replace a named runtime.
+    Add {
+        name: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        home: PathBuf,
+        /// `http://127.0.0.1:port` (local Clash), `pool`, `none`, or `auto`.
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum BerthCommand {
+    /// Configure Berth v2 Central gateway and isolation defaults.
+    Init {
+        /// Berth Central base URL (e.g. https://berth.example.com).
+        #[arg(long)]
+        url: String,
+        /// Berth API key (Bearer token).
+        #[arg(long)]
+        key: String,
+        /// Optional BHE1 management entry addresses (HOST:PORT). Repeatable.
+        #[arg(long = "mgmt-entry")]
+        mgmt_entry: Vec<String>,
+        /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
+        #[arg(long, default_value = "auto")]
+        zone: String,
+        /// Client isolation mode (tz-overlay|strict).
+        #[arg(long, default_value = "tz-overlay")]
+        isolation: String,
+        /// Allow plaintext http:// central URL for local tests only.
+        #[arg(long)]
+        allow_insecure_http_for_tests: bool,
+    },
+    /// Show redacted Berth v2 config and host isolation capabilities.
+    Status,
+    /// Remove the saved Berth v2 configuration.
+    Clear,
+    /// Acquire a Berth v2 Cage Session Lease for a stock CLI.
+    Lease {
+        /// Target stock CLI (codex|claude|agy|grok).
+        #[arg(long)]
+        agent: String,
+        /// Optional comma-separated account preference queue.
+        #[arg(long)]
+        account: Option<String>,
+        /// Optional work session ID.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Output format (json|shell).
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
+    /// Run the authenticated loopback HTTP/SSE/WS Cage Shim.
+    ///
+    /// Reads the Berth Ed25519 lease token from stdin or AGS_BERTH_LEASE_TOKEN
+    /// so it never appears in process argv (`ps aux`).
+    Shim {
+        #[arg(long)]
+        ingress_url: String,
+        #[arg(long)]
+        lease_id: String,
+        #[arg(long)]
+        work_session_id: String,
+        #[arg(long)]
+        cage_tz: String,
+        #[arg(long)]
+        cage_country: String,
+        #[arg(long)]
+        cage_strict: bool,
+        #[arg(long, default_value = "127.0.0.1:0")]
+        bind: String,
+        #[arg(long)]
+        rebind_file: Option<PathBuf>,
+        #[arg(long)]
+        ready_file: Option<PathBuf>,
+    },
+    /// Acquire a Berth v2 lease, start an in-process Cage Shim, and launch a stock CLI.
+    Launch {
+        /// Target stock CLI (codex|claude|agy|grok).
+        #[arg(long)]
+        agent: String,
+        /// Optional comma-separated account preference queue.
+        #[arg(long)]
+        account: Option<String>,
+        /// Override isolation mode (tz-overlay|strict).
+        #[arg(long)]
+        isolation: Option<String>,
+        /// Optional work session ID.
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Print the launch plan without executing the stock CLI.
+        #[arg(long)]
+        dry_run: bool,
+        /// Automatically rebind and relaunch if upstream signals 409 cage_rebind_required.
+        #[arg(long)]
+        auto_rebind: bool,
+        /// Arguments forwarded verbatim to the stock CLI.
+        #[arg(last = true, value_name = "AGENT_ARGS")]
+        agent_args: Vec<String>,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
 enum Command {
+    /// Berth v2 Cage launcher, lease management, and authenticated loopback shim.
+    #[command(name = "berth")]
+    Berth {
+        #[command(subcommand)]
+        command: BerthCommand,
+    },
     /// Audit or answer an agent-facing OS observation from an environment profile.
     #[command(name = "env")]
     Environment {
@@ -117,6 +238,26 @@ enum Command {
         provider: String,
         #[arg(long)]
         profile: Option<PathBuf>,
+        #[arg(long, default_value = "shell")]
+        format: String,
+    },
+
+    /// Named Codex/Claude homes and split HTTP proxies.
+    #[command(name = "runtime")]
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
+
+    /// Print shell that rebinds provider homes and optional HTTP proxies.
+    #[command(name = "runtime-apply", hide = true)]
+    RuntimeApply {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        command: Option<String>,
+        #[arg(long, default_value = "homes")]
+        intent: String,
         #[arg(long, default_value = "shell")]
         format: String,
     },
@@ -555,7 +696,8 @@ fn main() -> ExitCode {
         Some("--version" | "-V") => raw,
         // Hidden helpers the installer and the runtime call by name.
         Some(
-            "checkpoint-register-codex"
+            "berth"
+            | "checkpoint-register-codex"
             | "checkpoint-asset"
             | "env"
             | "env-broker"
@@ -563,7 +705,9 @@ fn main() -> ExitCode {
             | "env-show"
             | "env-clear"
             | "env-list"
-            | "env-apply",
+            | "env-apply"
+            | "runtime"
+            | "runtime-apply",
         ) => raw,
         // `checkpoint` was how the old `ags` wrapper reached the runtime. Kept
         // so a machine still holding that wrapper can run long enough to
@@ -575,6 +719,7 @@ fn main() -> ExitCode {
     init_tracing(&cli);
 
     let result = match cli.command {
+        Command::Berth { command } => cmd_berth(command, cli.json),
         Command::Environment {
             profile,
             agent,
@@ -593,6 +738,21 @@ fn main() -> ExitCode {
             profile,
             format,
         } => cmd_env_apply(&provider, profile.as_deref(), &format).map(|()| ExitCode::SUCCESS),
+        Command::Runtime { command } => {
+            cmd_runtime(command, cli.json).map(|()| ExitCode::SUCCESS)
+        }
+        Command::RuntimeApply {
+            name,
+            command,
+            intent,
+            format,
+        } => cmd_runtime_apply(
+            name.as_deref(),
+            command.as_deref(),
+            &intent,
+            &format,
+        )
+        .map(|()| ExitCode::SUCCESS),
         Command::Checkpoint { args } => return cmd_checkpoint(&args),
         Command::CheckpointRegisterCodex {
             session_id,
@@ -890,25 +1050,738 @@ fn cmd_env_list(json_mode: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_runtime(command: RuntimeCommand, json_mode: bool) -> anyhow::Result<()> {
+    let paths = ags::agent_runtime::RuntimePaths::from_env();
+    match command {
+        RuntimeCommand::Use { name } => {
+            ags::agent_runtime::save_selection(&paths, &name)?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "selected": true, "name": name })
+                );
+            } else {
+                println!("runtime {name} selected for later ags launches, list, save, and restore");
+                println!("this does not hide server IP geolocation");
+            }
+        }
+        RuntimeCommand::Show => {
+            let resolved = ags::agent_runtime::resolve(&paths, None)?;
+            if json_mode {
+                match resolved {
+                    Some(resolved) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "selected": true,
+                            "name": resolved.name,
+                            "provider": resolved.runtime.provider,
+                            "home": resolved.runtime.home,
+                            "proxy_mode": resolved.runtime.proxy_mode,
+                            "proxy": resolved.runtime.proxy,
+                        }))?
+                    ),
+                    None => println!("{{\"selected\":false}}"),
+                }
+                return Ok(());
+            }
+            let Some(resolved) = resolved else {
+                println!("no runtime selected (ags runtime use NAME)");
+                return Ok(());
+            };
+            println!("selected {}", resolved.name);
+            println!("  provider     {}", resolved.runtime.provider);
+            println!("  home         {}", resolved.runtime.home.display());
+            println!("  proxy_mode   {:?}", resolved.runtime.proxy_mode);
+            println!(
+                "  proxy        {}",
+                resolved
+                    .runtime
+                    .proxy
+                    .as_deref()
+                    .unwrap_or(match resolved.runtime.proxy_mode {
+                        ags::agent_runtime::ProxyMode::Pool => "(pool)",
+                        ags::agent_runtime::ProxyMode::Direct => "(direct)",
+                        _ => "(auto: pool if configured, else direct)",
+                    })
+            );
+            println!("timezone follows the current egress IP; ambient HTTP(S)_PROXY is stripped");
+            println!("does not hide WSL, cwd, device_id, or vendor region policy");
+        }
+        RuntimeCommand::List => {
+            let catalog = ags::agent_runtime::load_catalog(&paths)?;
+            let selected = ags::agent_runtime::load_selection(&paths)?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "selected": selected,
+                        "runtimes": catalog.runtimes,
+                    }))?
+                );
+                return Ok(());
+            }
+            if catalog.runtimes.is_empty() {
+                println!("no runtimes (ags runtime add NAME --provider codex --home PATH)");
+                return Ok(());
+            }
+            for (name, runtime) in catalog.runtimes {
+                let mark = if selected.as_deref() == Some(name.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                println!(
+                    "{mark} {:<16} {:<7} {}",
+                    name,
+                    runtime.provider,
+                    runtime.home.display()
+                );
+            }
+        }
+        RuntimeCommand::Clear => {
+            ags::agent_runtime::clear_selection(&paths)?;
+            if json_mode {
+                println!("{{\"cleared\":true}}");
+            } else {
+                println!("runtime selection cleared");
+            }
+        }
+        RuntimeCommand::Add {
+            name,
+            provider,
+            home,
+            proxy,
+        } => {
+            let (proxy_mode, proxy) = match proxy.as_deref() {
+                Some(value) => ags::agent_runtime::parse_proxy_flag(value)?,
+                None => (ags::agent_runtime::ProxyMode::Auto, None),
+            };
+            let runtime = ags::agent_runtime::AgentRuntime {
+                provider,
+                home: home.clone(),
+                proxy_mode,
+                proxy,
+                login_proxy: None,
+                egress_proxy: None,
+                login_timezone: None,
+                egress_timezone: None,
+            };
+            ags::agent_runtime::add_runtime(&paths, &name, runtime)?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::json!({ "added": true, "name": name, "home": home })
+                );
+            } else {
+                println!("runtime {name} -> {}", home.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_runtime_apply(
+    name: Option<&str>,
+    command: Option<&str>,
+    intent: &str,
+    format: &str,
+) -> anyhow::Result<()> {
+    if format != "shell" {
+        anyhow::bail!("runtime-apply format must be shell");
+    }
+    let paths = ags::agent_runtime::RuntimePaths::from_env();
+    let resolved = ags::agent_runtime::resolve(&paths, name)?;
+    let intent = ags::agent_runtime::RuntimeIntent::parse(intent)?;
+    print!(
+        "{}",
+        ags::agent_runtime::render_apply(resolved.as_ref(), intent, command)?
+    );
+    Ok(())
+}
+
 fn cmd_env_apply(provider: &str, profile: Option<&Path>, format: &str) -> anyhow::Result<()> {
     let paths = ags::environment_launch::OverlayPaths::from_env();
     let host = ags::environment_launch::LaunchHost::from_process();
     let format = ags::environment_launch::ApplyFormat::parse(format)?;
-    let plan = match ags::environment_launch::resolve_profile(&paths, profile)? {
-        Some((path, runtime)) => Some(ags::environment_launch::materialize(
-            &paths,
-            &path,
-            &runtime.profile,
-            provider,
-            &host,
-        )?),
-        None => None,
-    };
+    let plan = ags::environment_launch::plan_for_provider(&paths, profile, provider, &host)?;
     print!(
         "{}",
-        ags::environment_launch::render_apply(plan.as_ref(), format)?
+        ags::environment_launch::render_apply(Some(&plan), format)?
     );
     Ok(())
+}
+
+fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode> {
+    let paths = ags::berth::BerthPaths::from_env();
+    match command {
+        BerthCommand::Init {
+            url,
+            key,
+            mgmt_entry,
+            zone,
+            isolation,
+            allow_insecure_http_for_tests,
+        } => {
+            let isolation_mode = ags::berth::IsolationMode::parse(&isolation)?;
+            let config = ags::berth::BerthConfig {
+                schema: ags::berth::BERTH_CONFIG_SCHEMA.to_string(),
+                central_url: url.trim_end_matches('/').to_string(),
+                api_key: key,
+                mgmt_entries: mgmt_entry,
+                zone_preference: zone,
+                isolation_mode,
+                allow_insecure_http_for_tests,
+            };
+            ags::berth::save_config(&paths, &config)?;
+            if json_mode {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "configured": true,
+                        "path": paths.config_file,
+                        "central_url": config.central_url,
+                        "api_key": config.redacted_api_key(),
+                        "mgmt_entries": config.mgmt_entries,
+                        "zone_preference": config.zone_preference,
+                        "isolation_mode": config.isolation_mode,
+                    }))?
+                );
+            } else {
+                println!("berth v2 configured at {}", paths.config_file.display());
+                println!("  central_url  {}", config.central_url);
+                println!("  api_key      {}", config.redacted_api_key());
+                println!("  zone         {}", config.zone_preference);
+                println!("  isolation    {}", config.isolation_mode);
+                if !config.mgmt_entries.is_empty() {
+                    println!("  mgmt_entries {}", config.mgmt_entries.join(", "));
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        BerthCommand::Status => {
+            let config = ags::berth::load_config(&paths)?;
+            let caps = ags::berth::probe_host_isolation_capabilities(None);
+            let tz_report = ags::berth::evaluate_isolation(
+                ags::berth::IsolationMode::TzOverlay,
+                "UTC",
+                &caps,
+            )?;
+            if json_mode {
+                let cfg_json = config.as_ref().map(|c| {
+                    serde_json::json!({
+                        "schema": c.schema,
+                        "central_url": c.central_url,
+                        "api_key": c.redacted_api_key(),
+                        "mgmt_entries": c.mgmt_entries,
+                        "zone_preference": c.zone_preference,
+                        "isolation_mode": c.isolation_mode,
+                        "allow_insecure_http_for_tests": c.allow_insecure_http_for_tests,
+                    })
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "configured": config.is_some(),
+                        "config_path": paths.config_file,
+                        "config": cfg_json,
+                        "host_capabilities": caps,
+                        "isolation": tz_report,
+                    }))?
+                );
+            } else {
+                match config {
+                    Some(c) => {
+                        println!("berth v2 configured ({})", paths.config_file.display());
+                        println!("  central_url     {}", c.central_url);
+                        println!("  api_key         {}", c.redacted_api_key());
+                        println!("  zone_preference {}", c.zone_preference);
+                        println!("  isolation_mode  {}", c.isolation_mode);
+                        if !c.mgmt_entries.is_empty() {
+                            println!("  mgmt_entries    {}", c.mgmt_entries.join(", "));
+                        }
+                    }
+                    None => {
+                        println!(
+                            "berth v2 not configured (run `ags berth init --url URL --key KEY`)"
+                        );
+                    }
+                }
+                println!("host isolation:");
+                println!("  os              {}", caps.os);
+                println!("  wsl             {}", caps.is_wsl);
+                println!("  wsl_interop     {}", caps.wsl_interop_active);
+                println!("  unshare_ur_m    {}", caps.unshare_user_mount_works);
+                println!("  strict_eligible {}", tz_report.strict_eligible);
+                if !tz_report.strict_blockers.is_empty() {
+                    println!("  strict_blockers {}", tz_report.strict_blockers.join("; "));
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        BerthCommand::Clear => {
+            let cleared = ags::berth::clear_config(&paths)?;
+            if json_mode {
+                println!("{{\"cleared\":{cleared}}}");
+            } else if cleared {
+                println!("berth v2 configuration removed");
+            } else {
+                println!("no berth v2 configuration found");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        BerthCommand::Lease {
+            agent,
+            account,
+            session_id,
+            format,
+        } => {
+            let config = ags::berth::load_config(&paths)?
+                .ok_or(ags::berth::BerthError::NotConfigured)?;
+            let canonical_agent = ags::berth::validate_agent_name(&agent)?;
+            let accounts: Vec<String> = account
+                .as_deref()
+                .map(|csv| {
+                    csv.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let req = ags::berth::LeaseRequest {
+                agent: canonical_agent.to_string(),
+                work_session_id: session_id,
+                account_preference: accounts,
+                zone_preference: config.zone_preference.clone(),
+                isolation_mode: config.isolation_mode,
+                cohort_hint: None,
+                rebind_ref: None,
+                ags_version: ags::berth::AGS_VERSION_HEADER_VALUE.to_string(),
+            };
+            let lease = ags::berth::acquire_lease(&config, &req)?;
+            let selected_ingress =
+                ags::berth::select_best_ingress(&lease.zone.ingress_candidates)?;
+            match format.as_str() {
+                "json" => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "lease_id": lease.lease_id,
+                            "lease_token": lease.lease_token,
+                            "work_session_id": lease.work_session_id,
+                            "account_id": lease.account_id,
+                            "expires_at": lease.expires_at,
+                            "cage": lease.cage,
+                            "zone": lease.zone,
+                            "selected_ingress": selected_ingress,
+                        }))?
+                    );
+                }
+                "shell" => {
+                    println!("# ags-berth-lease-v2");
+                    println!(
+                        "export AGS_BERTH_LEASE_ID={}",
+                        ags::berth::posix_single_quote(&lease.lease_id)
+                    );
+                    println!(
+                        "export AGS_BERTH_WORK_SESSION_ID={}",
+                        ags::berth::posix_single_quote(&lease.work_session_id)
+                    );
+                    println!(
+                        "export AGS_BERTH_INGRESS_URL={}",
+                        ags::berth::posix_single_quote(&selected_ingress.candidate.url)
+                    );
+                    println!(
+                        "export AGS_BERTH_CAGE_TZ={}",
+                        ags::berth::posix_single_quote(&lease.cage.timezone)
+                    );
+                    println!(
+                        "export AGS_BERTH_CAGE_COUNTRY={}",
+                        ags::berth::posix_single_quote(&lease.cage.country_code)
+                    );
+                    println!(
+                        "export AGS_BERTH_CAGE_LOCALE={}",
+                        ags::berth::posix_single_quote(&lease.cage.locale)
+                    );
+                    println!(
+                        "export AGS_BERTH_CAGE_STRICT={}",
+                        if lease.cage.strict_mode { "true" } else { "false" }
+                    );
+                }
+                other => anyhow::bail!("lease format must be `json` or `shell`; got `{other}`"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        BerthCommand::Shim {
+            ingress_url,
+            lease_id,
+            work_session_id,
+            cage_tz,
+            cage_country,
+            cage_strict,
+            bind,
+            rebind_file,
+            ready_file,
+        } => {
+            let lease_token = read_lease_token_from_stdin_or_env()?;
+            let mut handle = ags::cage_shim::CageShim::start(ags::cage_shim::CageShimConfig {
+                bind_addr: bind,
+                ingress_url,
+                lease_id,
+                lease_token,
+                work_session_id,
+                cage_tz,
+                cage_country,
+                cage_strict,
+                rebind_file,
+                ready_file: ready_file.clone(),
+                upstream_timeout: std::time::Duration::from_secs(30),
+            })?;
+
+            if ready_file.is_none() {
+                let payload = ags::cage_shim::ReadyFilePayload {
+                    listen_url: handle.listen_url(),
+                    shim_token: handle.shim_token().to_string(),
+                };
+                println!("{}", serde_json::to_string(&payload)?);
+                let _ = std::io::stdout().flush();
+            }
+
+            let term_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            #[cfg(unix)]
+            {
+                let _ = signal_hook::flag::register(
+                    signal_hook::consts::SIGTERM,
+                    std::sync::Arc::clone(&term_flag),
+                );
+                let _ = signal_hook::flag::register(
+                    signal_hook::consts::SIGINT,
+                    std::sync::Arc::clone(&term_flag),
+                );
+            }
+            while !term_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            handle.shutdown();
+            Ok(ExitCode::SUCCESS)
+        }
+        BerthCommand::Launch {
+            agent,
+            account,
+            isolation,
+            session_id,
+            dry_run,
+            auto_rebind,
+            agent_args,
+        } => cmd_berth_launch(
+            &paths,
+            &agent,
+            account.as_deref(),
+            isolation.as_deref(),
+            session_id.as_deref(),
+            dry_run,
+            auto_rebind,
+            &agent_args,
+            json_mode,
+        ),
+    }
+}
+
+fn read_lease_token_from_stdin_or_env() -> anyhow::Result<String> {
+    if !std::io::stdin().is_terminal() {
+        let mut raw = String::new();
+        std::io::stdin().read_to_string(&mut raw)?;
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    if let Ok(env_val) = std::env::var("AGS_BERTH_LEASE_TOKEN") {
+        let trimmed = env_val.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+    anyhow::bail!(
+        "missing Berth lease token: pipe it via stdin or set AGS_BERTH_LEASE_TOKEN (argv flags are intentionally unsupported)"
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_berth_launch(
+    paths: &ags::berth::BerthPaths,
+    agent: &str,
+    account: Option<&str>,
+    isolation_override: Option<&str>,
+    session_id: Option<&str>,
+    dry_run: bool,
+    auto_rebind: bool,
+    agent_args: &[String],
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let config =
+        ags::berth::load_config(paths)?.ok_or(ags::berth::BerthError::NotConfigured)?;
+    let canonical_agent = ags::berth::validate_agent_name(agent)?;
+    let isolation_mode = match isolation_override {
+        Some(raw) => ags::berth::IsolationMode::parse(raw)?,
+        None => config.isolation_mode,
+    };
+
+    // Fail closed immediately on strict isolation BEFORE leasing if host is ineligible.
+    if isolation_mode == ags::berth::IsolationMode::Strict {
+        let caps = ags::berth::probe_host_isolation_capabilities(None);
+        ags::berth::evaluate_isolation(isolation_mode, "UTC", &caps)?;
+    }
+
+    let accounts: Vec<String> = account
+        .map(|csv| {
+            csv.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut next_rebind_ref: Option<String> = None;
+    let mut next_cohort_hint: Option<String> = None;
+    let mut current_session_id = session_id.map(String::from);
+    let mut current_args = agent_args.to_vec();
+    let max_rebinds = if auto_rebind { 3usize } else { 0usize };
+
+    for attempt in 0..=max_rebinds {
+        let req = ags::berth::LeaseRequest {
+            agent: canonical_agent.to_string(),
+            work_session_id: current_session_id.clone(),
+            account_preference: accounts.clone(),
+            zone_preference: config.zone_preference.clone(),
+            isolation_mode,
+            cohort_hint: next_cohort_hint.clone(),
+            rebind_ref: next_rebind_ref.clone(),
+            ags_version: ags::berth::AGS_VERSION_HEADER_VALUE.to_string(),
+        };
+        let lease = ags::berth::acquire_lease(&config, &req)?;
+        current_session_id = Some(lease.work_session_id.clone());
+
+        let selected = ags::berth::select_best_ingress(&lease.zone.ingress_candidates)?;
+        let rebind_dir = tempfile::Builder::new()
+            .prefix("ags-berth-rebind-")
+            .tempdir()?;
+        let rebind_file = rebind_dir.path().join("rebind.json");
+
+        let mut shim = ags::cage_shim::CageShim::start(ags::cage_shim::CageShimConfig {
+            bind_addr: "127.0.0.1:0".to_string(),
+            ingress_url: selected.candidate.url.clone(),
+            lease_id: lease.lease_id.clone(),
+            lease_token: lease.lease_token.clone(),
+            work_session_id: lease.work_session_id.clone(),
+            cage_tz: lease.cage.timezone.clone(),
+            cage_country: lease.cage.country_code.clone(),
+            cage_strict: lease.cage.strict_mode
+                || isolation_mode == ags::berth::IsolationMode::Strict,
+            rebind_file: Some(rebind_file.clone()),
+            ready_file: None,
+            upstream_timeout: std::time::Duration::from_secs(30),
+        })?;
+
+        let launch_env = ags::berth::build_cli_launch_env(
+            canonical_agent,
+            &shim.listen_url(),
+            shim.shim_token(),
+            &lease.cage,
+            isolation_mode,
+        );
+        let launch_env = match launch_env {
+            Ok(env) => env,
+            Err(err) => {
+                shim.shutdown();
+                let _ = ags::berth::release_lease(&config, &lease.lease_id);
+                return Err(err.into());
+            }
+        };
+
+        // Best-effort env-apply overlay synced to the authoritative Cage TZ & country.
+        let overlay_paths = ags::environment_launch::OverlayPaths::from_env();
+        let launch_host = ags::environment_launch::LaunchHost::from_process();
+        let overlay_provider = match canonical_agent {
+            "agy" => "gemini",
+            other => other,
+        };
+        let overlay_plan = ags::environment_launch::plan_for_provider(
+            &overlay_paths,
+            None,
+            overlay_provider,
+            &launch_host,
+        )
+        .ok();
+        if let Some(plan) = &overlay_plan {
+            let _ = ags::environment_launch::sync_overlay_region(
+                &plan.overlay_root,
+                &lease.cage.timezone,
+                Some(&lease.cage.country_code),
+            );
+            if canonical_agent == "codex"
+                && let Some(snippet) = &launch_env.codex_shell_env_policy_toml
+            {
+                let _ = ags::berth::write_codex_overlay_config_toml(
+                    &plan.overlay_root.join("home"),
+                    snippet,
+                );
+            }
+        }
+
+        if dry_run {
+            let mut redacted_env = launch_env.set_env.clone();
+            for secret_key in [
+                "OPENAI_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "GEMINI_API_KEY",
+                "XAI_API_KEY",
+                "GROK_API_KEY",
+            ] {
+                if redacted_env.contains_key(secret_key) {
+                    redacted_env.insert(secret_key.to_string(), "<ephemeral-shim-token>".into());
+                }
+            }
+            let summary = serde_json::json!({
+                "dry_run": true,
+                "agent": canonical_agent,
+                "lease_id": lease.lease_id,
+                "work_session_id": lease.work_session_id,
+                "selected_ingress": selected,
+                "shim_url": shim.listen_url(),
+                "cage": lease.cage,
+                "isolation": launch_env.isolation,
+                "set_env": redacted_env,
+                "unset_env": launch_env.unset_env,
+                "codex_shell_env_policy_toml": launch_env.codex_shell_env_policy_toml,
+                "overlay_root": overlay_plan.as_ref().map(|p| &p.overlay_root),
+                "agent_args": current_args,
+            });
+            shim.shutdown();
+            let _ = ags::berth::release_lease(&config, &lease.lease_id);
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("berth v2 dry-run ({canonical_agent})");
+                println!("  lease_id    {}", lease.lease_id);
+                println!("  ingress     {} ({})", selected.candidate.node_id, selected.candidate.url);
+                println!(
+                    "  cage        {} / {} / {}",
+                    lease.cage.timezone, lease.cage.country_code, lease.cage.locale
+                );
+                println!("  isolation   {}", launch_env.isolation.mode);
+                println!("  shim_url    {}", shim.listen_url());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let stock_bin = match ags::berth::resolve_stock_cli_binary(canonical_agent) {
+            Ok(bin) => bin,
+            Err(err) => {
+                shim.shutdown();
+                let _ = ags::berth::release_lease(&config, &lease.lease_id);
+                return Err(err.into());
+            }
+        };
+
+        let mut cmd = if isolation_mode == ags::berth::IsolationMode::Strict {
+            if let Some(plan) = &overlay_plan {
+                build_strict_unshare_command(&plan.overlay_root, &stock_bin, &current_args)
+            } else {
+                let mut c = std::process::Command::new(&stock_bin);
+                c.args(&current_args);
+                c
+            }
+        } else {
+            let mut c = std::process::Command::new(&stock_bin);
+            c.args(&current_args);
+            c
+        };
+
+        if let Some(plan) = &overlay_plan {
+            for key in &plan.unset_env {
+                cmd.env_remove(key);
+            }
+            for (key, value) in &plan.set_env {
+                cmd.env(key, value);
+            }
+            cmd.env("AGS_FS_OVERLAY", plan.overlay_root.join("fs").join("etc"));
+        }
+        // Authoritative Berth Cage env & loopback shim URLs override overlay defaults.
+        launch_env.apply_to_command(&mut cmd);
+
+        let status = cmd.status();
+        let rebind_signal: Option<ags::berth::RebindSignal> = if rebind_file.is_file() {
+            std::fs::read_to_string(&rebind_file)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+        } else {
+            shim.metrics().last_rebind
+        };
+
+        shim.shutdown();
+        let _ = ags::berth::release_lease(&config, &lease.lease_id);
+
+        if let Some(signal) = rebind_signal {
+            if attempt < max_rebinds {
+                eprintln!(
+                    "[ags] cage rebind required ({} -> {}, ref={}); rebinding and relaunching...",
+                    signal.current_cohort_tz, signal.recommended_cohort_tz, signal.rebind_ref
+                );
+                next_rebind_ref = Some(signal.rebind_ref);
+                next_cohort_hint = Some(signal.recommended_cohort_tz);
+                // Preserve resume semantics on auto-rebind when not already passing resume.
+                if canonical_agent == "claude" && !current_args.iter().any(|a| a == "--resume" || a == "-r" || a == "--continue" || a == "-c") {
+                    current_args.push("--continue".to_string());
+                }
+                continue;
+            }
+            eprintln!(
+                "[ags] Berth returned 409 cage_rebind_required (current TZ: {} -> recommended: {} / {} / {}, rebind_ref={})",
+                signal.current_cohort_tz,
+                signal.recommended_cohort_tz,
+                signal.recommended_country_code,
+                signal.recommended_locale,
+                signal.rebind_ref
+            );
+            eprintln!(
+                "[ags] To continue in the new Cage without timezone split, re-run:\n  ags berth launch --agent {canonical_agent} --session-id {} -- --resume",
+                lease.work_session_id
+            );
+            return Ok(ExitCode::from(75));
+        }
+
+        let exit_status = status?;
+        return Ok(exit_status
+            .code()
+            .and_then(|c| u8::try_from(c).ok())
+            .map_or(ExitCode::FAILURE, ExitCode::from));
+    }
+
+    Ok(ExitCode::from(75))
+}
+
+fn build_strict_unshare_command(
+    overlay_root: &Path,
+    stock_bin: &Path,
+    agent_args: &[String],
+) -> std::process::Command {
+    let fs_etc = overlay_root.join("fs").join("etc");
+    let mut cmd = std::process::Command::new("unshare");
+    cmd.args(["-Ur", "-m", "--propagation", "private", "--", "sh", "-c"]);
+    cmd.arg(
+        "etc=\"$1\"; bin=\"$2\"; shift 2; \
+         [ -f \"$etc/localtime\" ] && mount --bind \"$etc/localtime\" /etc/localtime 2>/dev/null || true; \
+         [ -f \"$etc/timezone\" ] && mount --bind \"$etc/timezone\" /etc/timezone 2>/dev/null || true; \
+         [ -f \"$etc/hostname\" ] && mount --bind \"$etc/hostname\" /etc/hostname 2>/dev/null || true; \
+         exec \"$bin\" \"$@\"",
+    );
+    cmd.arg("ags-strict-cage");
+    cmd.arg(fs_etc);
+    cmd.arg(stock_bin);
+    cmd.args(agent_args);
+    cmd
 }
 
 fn cmd_checkpoint(args: &[OsString]) -> ExitCode {
@@ -1298,13 +2171,73 @@ fn prepare_launch(
     let spec = with_pool_account(spec, account.as_deref());
     let paths = ags::environment_launch::OverlayPaths::from_env();
     let host = ags::environment_launch::LaunchHost::from_process();
-    Ok(ags::environment_launch::apply_to_spec(
+    let (spec, overlay_root) = ags::environment_launch::apply_to_spec(
         spec,
         &paths,
         launch.environment_profile.as_deref(),
         provider.slug(),
         &host,
-    )?)
+    )?;
+    let runtime_paths = ags::agent_runtime::RuntimePaths::from_env();
+    let explicit = std::env::var("AGS_RUNTIME").ok();
+    let resolved = ags::agent_runtime::resolve(&runtime_paths, explicit.as_deref())?;
+    if let Some(resolved) = &resolved {
+        ags::agent_runtime::provider_matches_command(resolved, Some(provider.slug()))?;
+    }
+    let intent = ags::agent_runtime::intent_for_agent_args(
+        provider.slug(),
+        &launch.agent_args,
+    );
+    let proxy_mode = resolved
+        .as_ref()
+        .map(|resolved| resolved.runtime.proxy_mode)
+        .unwrap_or(ags::agent_runtime::ProxyMode::Auto);
+    let mut spec = ags::agent_runtime::apply_to_spec(
+        spec,
+        resolved.as_ref(),
+        intent,
+    )?;
+    let has_proxy = spec.env.iter().any(|(key, _)| key == "HTTPS_PROXY");
+    if !has_proxy
+        && provider.slug() == "codex"
+        && proxy_mode != ags::agent_runtime::ProxyMode::Direct
+    {
+        if let Some(url) = fetch_pool_issued_proxy() {
+            spec = spec
+                .with_env("HTTPS_PROXY", &url)
+                .with_env("HTTP_PROXY", &url)
+                .with_env("https_proxy", &url)
+                .with_env("http_proxy", &url);
+        }
+    }
+    let proxy = spec
+        .env
+        .iter()
+        .find(|(key, _)| key == "HTTPS_PROXY")
+        .map(|(_, value)| value.clone());
+    match ags::agent_runtime::probe_region(proxy.as_deref()) {
+        Ok(region) => {
+            spec = spec.with_env("TZ", &region.timezone);
+            if let Some(code) = region.country_code.as_deref() {
+                let lang = ags::agent_runtime::locale_for_country(code);
+                spec = spec
+                    .with_env("LANG", &lang)
+                    .with_env("LC_ALL", &lang)
+                    .with_env("LC_TIME", &lang);
+            }
+            if let Some(overlay_root) = overlay_root.as_ref() {
+                ags::environment_launch::sync_overlay_region(
+                    overlay_root,
+                    &region.timezone,
+                    region.country_code.as_deref(),
+                )?;
+            }
+        }
+        Err(_) => {
+            spec = spec.without_env("TZ");
+        }
+    }
+    Ok(spec)
 }
 
 /// 一个号在挑号界面上的名字。
@@ -1481,6 +2414,33 @@ fn pick_pool_account() -> anyhow::Result<String> {
         }
         return Ok(chosen.join(","));
     }
+}
+
+fn fetch_pool_issued_proxy() -> Option<String> {
+    let (base_url, key) = pool_config().ok()?;
+    let output = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "8",
+            "-L",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "3",
+        ])
+        .arg("-H")
+        .arg(format!("X-Codex-Pool-Token: {key}"))
+        .arg(format!(
+            "{}/x8Rk3Nq6Vd2/ping",
+            base_url.trim_end_matches('/')
+        ))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    ags::agent_runtime::pool_issued_proxy_from_json(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// 池子的地址和密钥，来源和 codext 一致：环境变量优先，其次

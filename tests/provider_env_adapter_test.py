@@ -104,7 +104,7 @@ class ProviderEnvAdapterTests(unittest.TestCase):
         self.assertIn("Linux", output["updatedInput"]["command"])
 
     def test_claude_pretool_denies_shell_operators_and_carrier_paths(self) -> None:
-        for command in ("uname -a && whoami", "cat /proc/version"):
+        for command in ("uname -a && whoami", "cat /proc/cpuinfo"):
             request = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": command}}
             code, lines = run(HOOK, "--provider", "claude", *self.profile_args(), stdin=request)
             self.assertEqual(code, 0)
@@ -422,6 +422,87 @@ class ProviderEnvAdapterTests(unittest.TestCase):
         self.assertIn("UTC+08:00 +0800 2025-01-01 08:00", replacement)
         self.assertNotIn("UTC +0000", replacement)
 
+    def test_cross_platform_observation_commands_use_profile(self) -> None:
+        cases = (
+            # Windows cmdlets and wrappers, including WSL absolute paths.
+            ("powershell.exe Get-TimeZone", "UTC+08:00"),
+            ("powershell.exe -NoProfile -NonInteractive -Command Get-TimeZone", "UTC+08:00"),
+            ("pwsh -Command Get-WinHomeLocation", "United States"),
+            ("Get-TimeZone | Format-List", "UTC+08:00"),
+            ("cmd.exe /c echo %TZ%", "UTC+08:00"),
+            ("cmd.exe /c echo %USERNAME%", "target-user"),
+            ("cmd.exe /c ver", "Microsoft Windows"),
+            ("tzutil /g", "UTC+08:00"),
+            ("/mnt/c/Windows/System32/tzutil.exe /g", "UTC+08:00"),
+            ("Get-Culture", "zh-CN"),
+            ("Get-UICulture", "zh-CN"),
+            ("Get-CimInstance Win32_TimeZone", "UTC+08:00"),
+            ("Get-WmiObject -Class Win32_TimeZone", "UTC+08:00"),
+            ("wmic timezone", "UTC+08:00"),
+            ("wmic os get csname", "target-host"),
+            ("systeminfo", "target-host"),
+            ("Get-ComputerInfo", "target-user"),
+            (
+                r"Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control\TimeZoneInformation",
+                "UTC+08:00",
+            ),
+            (r"Get-ItemProperty 'HKCU:\Control Panel\International\Geo'", "United States"),
+            (r"reg query HKCU\Control Panel\International\Geo", "United States"),
+            ("[TimeZoneInfo]::Local.Id", "UTC+08:00"),
+            ("[System.Environment]::UserName", "target-user"),
+            ("echo $env:COMPUTERNAME", "target-host"),
+            # Linux identity, locale, timezone, os-release, WSL /proc/version.
+            ("timedatectl", "Time zone: UTC+08:00"),
+            ("hostnamectl", "target-host"),
+            ("cat /etc/timezone", "UTC+08:00"),
+            ("cat /etc/hostname", "target-host"),
+            ("cat /etc/os-release", "Ubuntu"),
+            ("cat /etc/default/locale", "zh_CN.UTF-8"),
+            ("readlink -f /etc/localtime", "/usr/share/zoneinfo/UTC+08:00"),
+            ("ls -l /etc/localtime", "/usr/share/zoneinfo/UTC+08:00"),
+            ("cat /proc/version", "Linux version 6.8.0-target"),
+            ("cat /proc/sys/kernel/hostname", "target-host"),
+            ("localectl", "LANG=zh_CN.UTF-8"),
+            ("lsb_release -a", "Ubuntu"),
+            ("hostname -s", "target-host"),
+            ("id -un", "target-user"),
+            ("whoami /user", "target-user"),
+            ("ipconfig", "target-host"),
+            ("echo $TZ", "UTC+08:00"),
+            ("echo $LANG", "zh_CN.UTF-8"),
+            ("arch", "x86_64"),
+            # macOS identity, locale, timezone.
+            ("sw_vers", "6.8.0-target"),
+            ("sw_vers -productVersion", "6.8.0-target"),
+            ("scutil --get HostName", "target-host"),
+            ("scutil --get ComputerName", "target-host"),
+            ("scutil --get LocalHostName", "target-host"),
+            ("defaults read -g AppleLocale", "zh_CN"),
+            ("defaults read NSGlobalDomain AppleLanguages", "zh-CN"),
+            ("systemsetup -gettimezone", "UTC+08:00"),
+            ("systemsetup -getcomputername", "target-host"),
+            ("system_profiler SPSoftwareDataType", "target-host"),
+            ("networksetup -getcomputername", "target-host"),
+        )
+        for command, needle in cases:
+            request = {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            }
+            code, lines = run(HOOK, "--provider", "codex", *self.profile_args(), stdin=request)
+            self.assertEqual(code, 0, command)
+            self.assertEqual(
+                lines[0]["hookSpecificOutput"]["permissionDecision"],
+                "allow",
+                command,
+            )
+            replacement = lines[0]["hookSpecificOutput"]["updatedInput"]["command"]
+            self.assertIn(needle, replacement, command)
+            if command == "cat /proc/version":
+                self.assertNotIn("microsoft", replacement.lower(), command)
+                self.assertNotIn("wsl", replacement.lower(), command)
+
     def test_non_unit_clock_rate_requires_explicit_real_anchor(self) -> None:
         profile = copy.deepcopy(self.profile)
         profile["clock"]["rate"] = 2.0
@@ -443,10 +524,13 @@ class ProviderEnvAdapterTests(unittest.TestCase):
         profile_path.write_text(json.dumps(profile), encoding="utf-8")
         for command in (
             "cat /proc/cpuinfo",
-            "cat /etc/os-release",
             "python3 -c 'print(1)'",
             "sysctl -a",
             "curl http://169.254.169.254/",
+            "powershell.exe Get-ItemProperty HKLM:\\SOFTWARE",
+            "cmd.exe /c ipconfig /all",
+            "Get-CimInstance Win32_Process",
+            "system_profiler SPHardwareDataType",
         ):
             request = {
                 "hook_event_name": "PreToolUse",

@@ -1,6 +1,6 @@
 ---
 name: ags
-description: Save, inspect, restore, resume, delete, and synchronize encrypted local Codex or Claude Code session records. Use when the user explicitly invokes AGS or asks to manage AGS records or the stores they live in (local directory, Git, or SFTP).
+description: Save, list, restore, resume, and synchronize encrypted Codex or Claude Code session records. Use when the user invokes AGS, asks to save the current session, resume provider/session-id, list sessions in a folder, or manage AGS stores.
 ---
 
 # AGS
@@ -23,11 +23,17 @@ env-use PATH|NAME
 env-show
 env-list
 env-clear
+runtime add NAME --provider codex|claude --home PATH
+  [--proxy http://127.0.0.1:PORT|pool|none|auto]
+runtime use|show|list|clear
 init [--identity ABSOLUTE_AGE_IDENTITY]
-save ID DESCRIPTION
-list
+info
+save DESCRIPTION
+ls [-a] [DIR]
 show ID|AGENT/RECORD_ID
-resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH]
+resume PROVIDER/SESSION_ID [--to codex|claude] [--cwd PATH]
+  [--profile PROFILE] [-- CLIENT_ARGS...]
+restore ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH]
   [--profile PROFILE] [-- CLIENT_ARGS...]
 delete ID|AGENT/RECORD_ID
 
@@ -100,33 +106,62 @@ ags --environment-profile /ABS/profile.json codex
 ```
 
 Bundled names are `tokyo-macos`, `tokyo-linux`, and `chicago-macos`. A JSON
-path or `~/.config/ags/environments/NAME.json` also works. This is an
-observation overlay (environment variables plus provider hooks). It does not
-hide the kernel, `/proc`, or `gethostname(2)`. Do not set a fake `HOME` or
-`PATH` in the profile expecting the agent process itself to use them; AGS keeps
-the real home, path, and cwd so the agent can start.
+path or `~/.config/ags/environments/NAME.json` also works. The region the
+agent should observe is the region of the current egress IP: AGS sets `TZ`
+from that IP and the hooks rewrite timezone/Geo commands on Windows, Linux,
+and macOS from it. They do not rewrite `ipconfig` and they do not intercept
+native syscalls. Do not set a fake `HOME` or `PATH` in the profile expecting
+the agent process itself to use them; AGS keeps the real home, path, and cwd
+so the agent can start.
+
+## Named runtimes (multiple accounts)
+
+Use a distinct home per logged-in Codex or Claude account. Do not reuse
+`env-use` or `--profile` for this.
+
+```bash
+ags runtime add work-codex --provider codex --home "$HOME/.codex-work" \
+    --proxy "http://127.0.0.1:7890"
+ags runtime add pool-codex --provider codex --home "$HOME/.codex-work" --proxy pool
+ags runtime add direct-codex --provider codex --home "$HOME/.codex-work" --proxy none
+ags runtime use work-codex
+ags --runtime work-codex codex
+ags --runtime work-codex codex -- login
+```
+
+`--proxy http://127.0.0.1:port` is a local Clash (or similar) HTTP CONNECT
+listener; non-loopback custom URLs are errors. `--proxy pool` uses the
+credential-pool issued URL from `/ping` `data.proxy` (remote HTTP CONNECT is
+allowed there). `--proxy none` is direct. `--proxy auto` (the default) uses
+the pool proxy when Codex has one, otherwise direct. AGS always unsets
+terminal/global `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` before the agent
+starts. The agent timezone is only the IANA zone of the current egress IP.
+This does not hide server IP geolocation, WSL, cwd, or device ids. Do not put
+OneDrive paths or proxy userinfo in the runtime.
+
+A Claude runtime sets `CLAUDE_CONFIG_DIR` only; do not also set `CLAUDE_HOME`
+for the child. `--account` still only pins a Codex pool lease inside that home.
 
 ## Save
 
-Require a separate ID and non-empty description. IDs use 1-64 letters, numbers,
-dots, underscores, or hyphens. Never invent, combine, slugify, or translate
-either value. `save` takes exactly those two arguments. Pass no client arguments
-after `DESCRIPTION`, including `resume`, `--resume`, or a native session ID.
-AGS gets the active session and its original client arguments from the managed
-environment — without the part of them that selected a native session — then
-supplies the native resume selector when the checkpoint is resumed.
+`ags save "DESCRIPTION"` is a skill for the invoking session. Do not run it from
+a local human terminal. There is no `--id`; the identity is `provider/session-id`
+from the active Codex or Claude session. Pass only a non-empty description.
+Never invent, slugify, or translate it. Pass no client arguments after
+`DESCRIPTION`, including `resume`, `--resume`, or a native session ID.
 
-Queue the active native session:
+A configured backend key is required (`ags codex-init`). Queue the active
+native session:
 
 ```bash
 if [[ -n "${CODEX_THREAD_ID:-}" ]]; then
     AGENT_SESSION_AGENT=codex \
     AGENT_SESSION_ID="$CODEX_THREAD_ID" \
-        ags checkpoint save "ID" "DESCRIPTION"
+        ags save "DESCRIPTION"
 elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
     AGENT_SESSION_AGENT=claude \
     AGENT_SESSION_ID="$CLAUDE_CODE_SESSION_ID" \
-        ags checkpoint save "ID" "DESCRIPTION"
+        ags save "DESCRIPTION"
 else
     printf 'AGS must run inside an active Codex or Claude Code session.\n' >&2
     return 1
@@ -135,8 +170,8 @@ fi
 
 For Claude, use `CLAUDE_CODE_SESSION_ID`, never `CLAUDE_SESSION_ID`.
 
-Complete the command only on `status=pending`. Report the checkpoint ID,
-record ID, description, Agent, binary resolution source, target, working
+Complete the command only on `status=pending`. Report the checkpoint id,
+record id, description, Agent, binary resolution source, target, working
 directory, and path. The Stop hook supplies Claude's authoritative
 `session_id`, `transcript_path`, and `cwd`, then writes the encrypted format 4
 record. Format 4 preserves each native artifact's safe mode and mtime.
@@ -151,14 +186,17 @@ without rebuilding it.
 Run:
 
 ```bash
-ags checkpoint list
-ags checkpoint show "ID"
+ags ls
+ags ls -a
+ags ls "ABSOLUTE_DIR"
+ags show "ID"
 ```
 
-`list` is the compact scanning view: `ID`, `AGENT`, `SAVED`, and
-`DESCRIPTION`. `show` verifies and displays the selected record's native UUID,
-record ID, completeness, artifacts, working directory, binary provenance,
-archive checksum, local integrity, remotes, and path.
+`ags ls` lists the current directory. `ags ls -a` lists every workspace. A
+positional directory overrides the folder when `-a` is not set. Do not use
+`ags list`. The first column is 1, 2, 3 in the current view; SESSION is the
+agent's own session id. Resume with `ags resume provider/SESSION`. `show`
+verifies an archive record.
 
 If a logical ID is ambiguous, do not choose a record silently. Report the
 matching `AGENT/RECORD_ID` selectors printed by AGS and ask the user which
@@ -166,20 +204,20 @@ exact record to use. Pass the selected value unchanged.
 
 ## Resume
 
-Require one exact ID or `AGENT/RECORD_ID` selector. Other Codex and Claude
-sessions may remain open. If AGS reports that the target native session UUID is
-active in a PID, the user must exit only that session before retrying.
+Require `provider/session-id` (aliases: `claude` and `claude-code`). Do not use
+a checkpoint id, a list ordinal, or a `live:` prefix. Restore an archive with
+`ags restore`. Other Codex and Claude sessions may remain open. If AGS reports
+that the target native session UUID is active in a PID, the user must exit only
+that session before retrying. save and resume require a configured backend key.
 
 ```bash
-ags checkpoint resume "ID"
-ags checkpoint resume "ID" --cwd "ABSOLUTE_DIR"
-ags checkpoint resume "ID" --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
-ags checkpoint resume "ID" --to claude --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
-ags checkpoint resume "ID" --to claude --profile "PROFILE" -- CLIENT_ARGS...
-ags checkpoint resume "ID" --to codex -- CLIENT_ARGS...
-ags checkpoint resume "ID" --to codex --profile "PROFILE" -- CLIENT_ARGS...
-ags resume "live:claude-code/SESSION_ID" --to codex -- CLIENT_ARGS...
-ags resume "live:codex/SESSION_ID" --to claude -- CLIENT_ARGS...
+ags resume "codex/SESSION_ID"
+ags resume "claude/SESSION_ID" --cwd "ABSOLUTE_DIR"
+ags resume "claude-code/SESSION_ID" --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
+ags resume "codex/SESSION_ID" --to claude --cwd "ABSOLUTE_DIR" -- CLIENT_ARGS...
+ags resume "claude/SESSION_ID" --to codex --profile "PROFILE" -- CLIENT_ARGS...
+ags restore "ID"
+ags restore "ID" --to claude -- CLIENT_ARGS...
 ```
 
 Use `--` before client arguments so AGS options and native client options
@@ -267,9 +305,9 @@ loss details printed by ags. Provider-signed thinking, encrypted reasoning,
 and native sidecars cannot cross provider trust boundaries; never describe a
 cross-Agent conversion as lossless unless its reported fidelity says so.
 
-For a `live:PROVIDER/SESSION_ID` source, AGS takes a private temporary snapshot
-for conversion and removes it after launch. It does not create a persistent
-checkpoint; use `ags save` when you want an archive.
+For a `provider/session-id` source with `--to`, AGS takes a private temporary
+snapshot for conversion and removes it after launch. It does not create a
+persistent checkpoint; use `ags save` when you want an archive.
 
 Claude Code has no provider field in its native transcript. Its selected
 settings file or environment must configure the Anthropic-compatible endpoint

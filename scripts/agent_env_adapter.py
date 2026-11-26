@@ -67,8 +67,58 @@ SAFE_ENV_KEYS = {
     "TEMP",
 }
 
-VIRTUAL_COMMANDS = {"date", "env", "hostname", "id", "locale", "printenv", "pwd", "uname", "whoami"}
+VIRTUAL_COMMANDS = {
+    "arch",
+    "cat",
+    "date",
+    "defaults",
+    "env",
+    "file",
+    "get-ciminstance",
+    "get-computerinfo",
+    "get-content",
+    "get-culture",
+    "get-date",
+    "get-itemproperty",
+    "get-timezone",
+    "get-uiculture",
+    "get-winhomelocation",
+    "get-winsystemlocale",
+    "get-wintimezone",
+    "get-winuserlanguagelist",
+    "get-wmiobject",
+    "groups",
+    "hostname",
+    "hostnamectl",
+    "id",
+    "ipconfig",
+    "ipconfig.exe",
+    "localectl",
+    "locale",
+    "logname",
+    "lsb_release",
+    "networksetup",
+    "printenv",
+    "pwd",
+    "readlink",
+    "realpath",
+    "reg",
+    "scutil",
+    "stat",
+    "sw_vers",
+    "systeminfo",
+    "systemsetup",
+    "system_profiler",
+    "timedatectl",
+    "tzutil",
+    "tzutil.exe",
+    "uname",
+    "ver",
+    "whoami",
+    "wmic",
+}
 SHELL_NAMES = {"bash", "dash", "fish", "ksh", "pwsh", "powershell", "sh", "zsh"}
+WINDOWS_SHELL_NAMES = {"powershell", "powershell.exe", "pwsh", "pwsh.exe", "cmd", "cmd.exe"}
 SHELL_OPERATORS = {";", "&&", "||", "|", ">", ">>", "<", "<<", "&", "\n", "\r"}
 COMMAND_FIELDS = ("command", "cmd", "shell_command", "shellCommand")
 TOOL_FIELDS = ("tool_name", "toolName", "name")
@@ -104,7 +154,6 @@ CARRIER_PROBE_COMMANDS = {
     "dmidecode",
     "dmesg",
     "findmnt",
-    "hostnamectl",
     "ioreg",
     "ip",
     "ifconfig",
@@ -113,12 +162,47 @@ CARRIER_PROBE_COMMANDS = {
     "lshw",
     "mount",
     "route",
-    "sw_vers",
     "sysctl",
     "system_profiler",
     "systemd-detect-virt",
     "virt-what",
     "wslpath",
+    "wsl",
+    "wsl.exe",
+    "clip",
+    "clip.exe",
+    "reg",
+    "reg.exe",
+    "rundll32",
+    "rundll32.exe",
+    "explorer",
+    "explorer.exe",
+    "conhost",
+    "conhost.exe",
+    "ipconfig",
+    "ipconfig.exe",
+    "systeminfo",
+    "systeminfo.exe",
+    "wmic",
+    "wmic.exe",
+    "netsh",
+    "netsh.exe",
+    "get-itemproperty",
+    "gp",
+    "get-childitem",
+    "gci",
+    "get-computerinfo",
+    "get-ciminstance",
+    "gcim",
+    "get-wmiobject",
+    "gwmi",
+    "get-netipaddress",
+    "get-netadapter",
+    "get-winevent",
+    "get-item",
+    "gi",
+    "invoke-webrequest",
+    "invoke-restmethod",
 }
 
 # Interpreters can perform arbitrary OS observations even when their command
@@ -158,7 +242,15 @@ CARRIER_PROBE_PATH_MARKERS = (
     "169.254.169.254",
     "powershell",
     "cmd.exe",
+    "pwsh",
     "wsl_interop",
+    "/windows/system32",
+    "/windows/syswow64",
+    "windowspowershell",
+    "get-timezone",
+    "get-winhomelocation",
+    "get-winculture",
+    "get-winuserlanguagelist",
 )
 
 MAX_UINT32 = (1 << 32) - 1
@@ -515,7 +607,11 @@ def virtual_env(profile: dict[str, Any], inherited: Iterable[tuple[str, str]] = 
 
 
 def _basename(value: str) -> str:
-    return Path(value).name or value
+    # Split on both separators so a Windows path parsed on POSIX still yields
+    # ``powershell.exe`` rather than the whole ``C:\Windows\...\powershell.exe``.
+    normalized = value.replace("\\", "/").rstrip("/")
+    name = normalized.split("/")[-1] if normalized else value
+    return name or value
 
 
 def _has_unquoted_shell_operator(command: str) -> bool:
@@ -547,26 +643,166 @@ def _has_unquoted_shell_operator(command: str) -> bool:
     return False
 
 
+def _simple_dollar_len(text: str) -> int | None:
+    """Length of ``$VAR`` / ``${VAR}`` / ``$env:VAR`` at the start of text."""
+    if not text.startswith("$") or text.startswith("$("):
+        return None
+    if text.startswith("${"):
+        index = 2
+        if index >= len(text) or not (text[index].isalpha() or text[index] == "_"):
+            return None
+        index += 1
+        while index < len(text) and (text[index].isalnum() or text[index] == "_"):
+            index += 1
+        if index < len(text) and text[index] == "}":
+            return index + 1
+        return None
+    index = 1
+    if index >= len(text) or not (text[index].isalpha() or text[index] == "_"):
+        return None
+    while index < len(text) and (text[index].isalnum() or text[index] == "_"):
+        index += 1
+    if index < len(text) and text[index] == ":" and text[1:index].lower() == "env":
+        index += 1
+        if index >= len(text) or not (text[index].isalpha() or text[index] == "_"):
+            return None
+        while index < len(text) and (text[index].isalnum() or text[index] == "_"):
+            index += 1
+    return index
+
+
 def _has_unquoted_dynamic_expansion(command: str) -> bool:
-    """Return whether ``$`` or backticks occur outside shell quotes."""
+    """Reject command substitution; allow profile env tokens such as ``$TZ``."""
     quote: str | None = None
     escaped = False
-    for character in command:
+    index = 0
+    length = len(command)
+    while index < length:
+        character = command[index]
         if escaped:
             escaped = False
+            index += 1
             continue
-        if character == "\\":
+        if quote is None and character == "\\":
             escaped = True
+            index += 1
             continue
         if quote is not None:
             if character == quote:
                 quote = None
+            index += 1
             continue
         if character in {"'", '"'}:
             quote = character
-        elif character in {"$", "`"}:
+            index += 1
+            continue
+        if character == "`":
             return True
+        if character == "$":
+            matched = _simple_dollar_len(command[index:])
+            if matched is None:
+                return True
+            index += matched
+            continue
+        index += 1
     return False
+
+
+def _uses_windows_lexing(command: str) -> bool:
+    lowered = command.lower()
+    if ".exe" in lowered or ".ps1" in lowered:
+        return True
+    if "\\" in command and any(marker in lowered for marker in ("hkcu", "hklm", "hkey_", "reg ", "system32")):
+        return True
+    return len(command) >= 3 and command[0].isalpha() and command[1] == ":" and command[2] in "\\/"
+
+
+def _split_observation_pipes(command: str) -> list[str] | None:
+    """Split unquoted ``|`` pipelines.  Other shell operators return None."""
+    quote: str | None = None
+    escaped = False
+    buf: list[str] = []
+    segments: list[str] = []
+    index = 0
+    length = len(command)
+    while index < length:
+        character = command[index]
+        nxt = command[index + 1] if index + 1 < length else ""
+        if escaped:
+            buf.append(character)
+            escaped = False
+            index += 1
+            continue
+        if quote is None and character == "\\" and index + 1 < length:
+            escaped = True
+            buf.append(character)
+            index += 1
+            continue
+        if quote is not None:
+            if character == quote:
+                quote = None
+            buf.append(character)
+            index += 1
+            continue
+        if character in {"'", '"'}:
+            quote = character
+            buf.append(character)
+            index += 1
+            continue
+        if character == "&" and nxt == "&":
+            return None
+        if character == "|" and nxt == "|":
+            return None
+        if character in {";", ">", "<", "&", "\n", "\r"}:
+            return None
+        if character == "|":
+            segments.append("".join(buf).strip())
+            buf = []
+            index += 1
+            continue
+        buf.append(character)
+        index += 1
+    if quote is not None:
+        return None
+    segments.append("".join(buf).strip())
+    if len(segments) <= 1 or any(not item for item in segments):
+        return None
+    return segments
+
+
+_FORMATTER_NAMES = {
+    "cat",
+    "convertto-csv",
+    "convertto-json",
+    "echo",
+    "fc",
+    "fl",
+    "format-custom",
+    "format-list",
+    "format-table",
+    "format-wide",
+    "ft",
+    "fw",
+    "measure-object",
+    "more",
+    "out-default",
+    "out-host",
+    "out-null",
+    "out-string",
+    "select",
+    "select-object",
+    "sort",
+    "sort-object",
+    "where",
+    "where-object",
+    "write-error",
+    "write-host",
+    "write-output",
+}
+
+
+def _is_formatter_argv(argv: list[str]) -> bool:
+    return _probe_command_name(argv) in _FORMATTER_NAMES
 
 
 def parse_argv(command: str | list[str]) -> list[str]:
@@ -581,7 +817,7 @@ def parse_argv(command: str | list[str]) -> list[str]:
         if _has_unquoted_dynamic_expansion(command):
             raise AdapterError("dynamic_expansion")
         try:
-            argv = shlex.split(command, posix=True)
+            argv = shlex.split(command, posix=not _uses_windows_lexing(command))
         except ValueError as exc:
             raise AdapterError("command_parse_error") from exc
     else:
@@ -595,7 +831,10 @@ def parse_argv(command: str | list[str]) -> list[str]:
         or any(any(operator in token for operator in (";", "&", "|", ">", "<", "\n", "\r")) for token in argv)
     ):
         raise AdapterError("shell_operator")
-    if from_list and any("$" in token or "`" in token for token in argv):
+    if from_list and any(
+        ("`" in token) or ("$" in token and _simple_dollar_len(token) != len(token) and _env_key_from_token(token) is None)
+        for token in argv
+    ):
         raise AdapterError("dynamic_expansion")
     return argv
 
@@ -797,6 +1036,366 @@ def _format_profile_date(instant: _datetime.datetime, fmt: str, locale_name: str
     )
 
 
+# IANA -> Windows TimeZone Id, DisplayName, DST, GeoId.
+# Used only to answer Windows observation cmdlets from the profile, never the host.
+_WINDOWS_TZ = {
+    "UTC": ("UTC", "(UTC) Coordinated Universal Time", False, "244"),
+    "GMT": ("GMT Standard Time", "(UTC+00:00) Dublin, Edinburgh, Lisbon, London", True, "242"),
+    "Etc/UTC": ("UTC", "(UTC) Coordinated Universal Time", False, "244"),
+    "Asia/Tokyo": ("Tokyo Standard Time", "(UTC+09:00) Osaka, Sapporo, Tokyo", False, "122"),
+    "Asia/Shanghai": ("China Standard Time", "(UTC+08:00) Beijing, Chongqing, Hong Kong, Urumqi", False, "45"),
+    "America/Chicago": ("Central Standard Time", "(UTC-06:00) Central Time (US & Canada)", True, "244"),
+    "America/New_York": ("Eastern Standard Time", "(UTC-05:00) Eastern Time (US & Canada)", True, "244"),
+    "America/Los_Angeles": ("Pacific Standard Time", "(UTC-08:00) Pacific Time (US & Canada)", True, "244"),
+    "Europe/London": ("GMT Standard Time", "(UTC+00:00) Dublin, Edinburgh, Lisbon, London", True, "242"),
+}
+
+_GEO_NAMES = {
+    "45": "China",
+    "122": "Japan",
+    "242": "United Kingdom",
+    "244": "United States",
+}
+_GEO_COUNTRY = {
+    "45": "CN",
+    "122": "JP",
+    "242": "GB",
+    "244": "US",
+}
+_LCID = {
+    "zh-cn": "2052",
+    "zh-tw": "1028",
+    "ja-jp": "1041",
+    "en-us": "1033",
+    "en-gb": "2057",
+    "en-au": "3081",
+}
+
+_ENV_TOKEN_ALIASES = {
+    "computername": "HOSTNAME",
+    "home": "HOME",
+    "host": "HOSTNAME",
+    "hostname": "HOSTNAME",
+    "lang": "LANG",
+    "lc_all": "LC_ALL",
+    "lc_time": "LC_TIME",
+    "logname": "LOGNAME",
+    "logonserver": "HOSTNAME",
+    "path": "PATH",
+    "pwd": "PWD",
+    "shell": "SHELL",
+    "temp": "TMPDIR",
+    "tmp": "TMPDIR",
+    "tmpdir": "TMPDIR",
+    "tz": "TZ",
+    "user": "USER",
+    "userdomain": "HOSTNAME",
+    "username": "USER",
+}
+
+_IDENTITY_FILES = {
+    "/etc/default/locale": "locale_file",
+    "/etc/hostname": "hostname",
+    "/etc/locale.conf": "locale_file",
+    "/etc/localtime": "localtime",
+    "/etc/lsb-release": "lsb_release",
+    "/etc/os-release": "os_release",
+    "/etc/timezone": "timezone",
+    "/proc/sys/kernel/hostname": "hostname",
+    "/proc/sys/kernel/osrelease": "osrelease",
+    "/proc/version": "proc_version",
+    "/usr/lib/os-release": "os_release",
+}
+
+_PS_SKIP_FLAGS = {
+    "-nol",
+    "-nologo",
+    "-noni",
+    "-noninteractive",
+    "-nop",
+    "-noprofile",
+    "-sta",
+    "-mta",
+}
+_PS_SKIP_WITH_VALUE = {
+    "-ep",
+    "-executionpolicy",
+    "-inputformat",
+    "-outputformat",
+    "-wd",
+    "-windowstyle",
+    "-workingdirectory",
+}
+
+
+def _env_key_from_token(token: str) -> str | None:
+    raw = token.strip().strip("\"'")
+    if not raw:
+        return None
+    name: str | None = None
+    lower = raw.lower()
+    if lower.startswith("%") and lower.endswith("%") and len(raw) > 2:
+        name = raw[1:-1]
+    elif lower.startswith("$env:"):
+        name = raw[5:]
+    elif lower.startswith("${") and raw.endswith("}"):
+        name = raw[2:-1]
+    elif raw.startswith("$"):
+        name = raw[1:]
+        if name.lower().startswith("env:"):
+            name = name[4:]
+    elif lower.startswith("env:"):
+        name = raw.split(":", 1)[1].lstrip("\\/")
+    else:
+        return None
+    name = name.strip().strip("\\/")
+    if not name:
+        return None
+    alias = _ENV_TOKEN_ALIASES.get(name.lower())
+    if alias:
+        return alias
+    upper = name.upper()
+    return upper if upper in SAFE_ENV_KEYS else None
+
+
+def _file_kind(path: str) -> str | None:
+    norm = path.replace("\\", "/").rstrip("/")
+    return _IDENTITY_FILES.get(norm)
+
+
+def _flag_value(argv: list[str], names: set[str]) -> str | None:
+    for index, arg in enumerate(argv):
+        key = arg.lower()
+        if key in names and index + 1 < len(argv):
+            return argv[index + 1]
+        for name in names:
+            prefix = name + ":"
+            if key.startswith(prefix) and len(key) > len(prefix):
+                return arg.split(":", 1)[1]
+    return None
+
+
+def _norm_reg(path: str) -> str:
+    value = path.strip().strip("\"'").replace("/", "\\").lower()
+    value = value.replace("hkey_local_machine", "hklm").replace("hkey_current_user", "hkcu")
+    value = value.replace("hkcu:", "hkcu\\").replace("hklm:", "hklm\\")
+    while "\\\\" in value:
+        value = value.replace("\\\\", "\\")
+    return value.strip("\\")
+
+
+def _registry_fact(path: str | None) -> str | None:
+    if not path:
+        return None
+    norm = _norm_reg(path)
+    if norm.endswith("timezoneinformation") or "timezoneinformation" in norm:
+        return "timezone"
+    if norm.endswith("international\\geo") or norm.endswith("international/geo"):
+        return "geo"
+    if norm.endswith("control panel\\international"):
+        return "locale"
+    return None
+
+
+def _lcid_for(tag: str) -> str:
+    return _LCID.get(tag.lower(), "1033")
+
+
+def _os_release_text(profile: dict[str, Any]) -> str:
+    target = _section(profile, "target")
+    distro = str(target.get("distribution") or ("macOS" if _target_os(profile) == "macos" else "Linux"))
+    version = str(target.get("version") or "ags-virtual")
+    ident = distro.lower().split()[0]
+    return (
+        f"PRETTY_NAME=\"{distro} {version}\"\n"
+        f"NAME=\"{distro}\"\n"
+        f"VERSION=\"{version}\"\n"
+        f"ID=\"{ident}\"\n"
+        f"VERSION_ID=\"{version}\"\n"
+        "HOME_URL=\"\"\n"
+    )
+
+
+def _lsb_release_text(profile: dict[str, Any]) -> str:
+    target = _section(profile, "target")
+    distro = str(target.get("distribution") or "Linux")
+    version = str(target.get("version") or "ags-virtual")
+    return (
+        f"Distributor ID:\t{distro}\n"
+        f"Description:\t{distro} {version}\n"
+        f"Release:\t{version}\n"
+        "Codename:\tags\n"
+    )
+
+
+def _proc_version_text(profile: dict[str, Any]) -> str:
+    target = _section(profile, "target")
+    identity = _identity(profile)
+    version = str(target.get("version") or "ags-virtual")
+    os_name = "Linux" if _target_os(profile) == "linux" else "Darwin"
+    return (
+        f"{os_name} version {version} (ags@{identity['hostname']}) "
+        "(gcc (AGS) 1.0) #1 SMP PREEMPT\n"
+    )
+
+
+def _identity_file_output(profile: dict[str, Any], path: str) -> tuple[str, int, str | None]:
+    kind = _file_kind(path)
+    identity = _identity(profile)
+    clock = _clock(profile)
+    locale = _locale(profile)
+    target = _section(profile, "target")
+    if kind == "timezone":
+        return clock["timezone"] + "\n", 0, None
+    if kind == "hostname":
+        return identity["hostname"] + "\n", 0, None
+    if kind == "localtime":
+        return clock["timezone"] + "\n", 0, None
+    if kind == "os_release":
+        return _os_release_text(profile), 0, None
+    if kind == "lsb_release":
+        return _lsb_release_text(profile), 0, None
+    if kind == "locale_file":
+        return f"LANG={locale['lang']}\nLC_ALL={locale['lc_all']}\n", 0, None
+    if kind == "osrelease":
+        return str(target.get("version") or "ags-virtual") + "\n", 0, None
+    if kind == "proc_version":
+        return _proc_version_text(profile), 0, None
+    return "", 2, "path is not pinned by the profile"
+
+
+def _localtime_link(clock: dict[str, Any]) -> str:
+    return f"/usr/share/zoneinfo/{clock['timezone']}"
+
+
+def _windows_culture_table(tag: str) -> str:
+    return f"LCID             Name             DisplayName\n{_lcid_for(tag):>16} {tag:<16} {tag}\n"
+
+
+def _windows_registry_output(profile: dict[str, Any], fact: str) -> tuple[str, int, str | None]:
+    clock = _clock(profile)
+    locale = _locale(profile)
+    win_id, display, _dst, geo = _windows_tzinfo(clock)
+    tag = _locale_tag(locale)
+    if fact == "timezone":
+        offset = int(clock.get("offset_seconds") or 0)
+        bias = -offset // 60
+        return (
+            f"TimeZoneKeyName : {win_id}\n"
+            f"StandardName    : {win_id}\n"
+            f"Display         : {display}\n"
+            f"Bias            : {bias}\n",
+            0,
+            None,
+        )
+    if fact == "geo":
+        place = _GEO_NAMES.get(geo, "United States")
+        nation = _GEO_COUNTRY.get(geo, "US")
+        return f"Nation : {nation}\nName   : {place}\nGeoId  : {geo}\n", 0, None
+    if fact == "locale":
+        return (
+            f"LocaleName : {tag}\n"
+            f"sLanguage  : {tag}\n"
+            f"sCountry   : {_GEO_NAMES.get(geo, 'United States')}\n"
+            f"sTimeZone  : {win_id}\n",
+            0,
+            None,
+        )
+    return "", 2, "registry path is not pinned by the profile"
+
+
+def _synthetic_systeminfo(profile: dict[str, Any]) -> str:
+    identity = _identity(profile)
+    clock = _clock(profile)
+    locale = _locale(profile)
+    target = _section(profile, "target")
+    win_id, display, _dst, _geo = _windows_tzinfo(clock)
+    tag = _locale_tag(locale)
+    version = str(target.get("version") or "ags-virtual")
+    arch = str(target.get("architecture") or "x86_64")
+    return (
+        f"Host Name:                 {identity['hostname']}\n"
+        f"OS Name:                   Microsoft Windows\n"
+        f"OS Version:                {version}\n"
+        f"OS Manufacturer:           AGS\n"
+        f"Registered Owner:          {identity['username']}\n"
+        f"System Manufacturer:       AGS\n"
+        f"System Model:              Virtual\n"
+        f"System Type:               {arch}-based PC\n"
+        f"System Locale:             {tag}\n"
+        f"Input Locale:              {tag}\n"
+        f"Time Zone:                 {display}\n"
+        f"Domain:                    WORKGROUP\n"
+        f"Logon Server:              \\\\{identity['hostname']}\n"
+        f"TimeZoneId:                {win_id}\n"
+    )
+
+
+def _synthetic_computerinfo(profile: dict[str, Any]) -> str:
+    identity = _identity(profile)
+    clock = _clock(profile)
+    locale = _locale(profile)
+    target = _section(profile, "target")
+    win_id, display, _dst, geo = _windows_tzinfo(clock)
+    tag = _locale_tag(locale)
+    return (
+        f"WindowsProductName      : Microsoft Windows\n"
+        f"OsVersion               : {target.get('version', 'ags-virtual')}\n"
+        f"CsName                  : {identity['hostname']}\n"
+        f"CsUserName              : {identity['username']}\n"
+        f"TimeZone                : {win_id}\n"
+        f"TimeZoneDisplay         : {display}\n"
+        f"OsLocale                : {tag}\n"
+        f"OsLanguage              : {tag}\n"
+        f"WinHomeLocation         : {_GEO_NAMES.get(geo, 'United States')}\n"
+    )
+
+
+def _cim_class(argv: list[str]) -> str | None:
+    blob = " ".join(argv[1:]).lower()
+    for cls in ("win32_timezone", "win32_operatingsystem", "win32_computersystem"):
+        if cls in blob:
+            return cls
+    return None
+
+
+def _reader_paths(argv: list[str]) -> list[str]:
+    paths: list[str] = []
+    skip_next = False
+    for index, arg in enumerate(argv[1:], 1):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith("-"):
+            key = arg.lower().split("=", 1)[0]
+            if key in {"-n", "-c", "-path", "-literalpath", "--lines", "--bytes"} and "=" not in arg:
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-"):
+                    candidate = argv[index + 1]
+                    if _file_kind(candidate) or _env_key_from_token(candidate) or _registry_fact(candidate):
+                        continue
+                    skip_next = True
+            continue
+        paths.append(arg)
+    return paths
+
+
+def _windows_tzinfo(clock: dict[str, Any]) -> tuple[str, str, bool, str]:
+    iana = str(clock.get("timezone") or "UTC")
+    if iana in _WINDOWS_TZ:
+        return _WINDOWS_TZ[iana]
+    offset = int(clock.get("offset_seconds") or 0)
+    sign = "+" if offset >= 0 else "-"
+    hours, remainder = divmod(abs(offset), 3600)
+    minutes = remainder // 60
+    label = f"UTC{sign}{hours:02d}:{minutes:02d}"
+    return (label, f"({label}) {iana}", False, "244")
+
+
+def _locale_tag(locale: dict[str, Any]) -> str:
+    lang = str(locale.get("lang") or "en_US").split(".")[0].replace("_", "-")
+    return lang or "en-US"
+
+
 def _date_format(profile: dict[str, Any], argv: list[str]) -> str:
     for arg in argv[1:]:
         if arg.startswith("+"):
@@ -806,25 +1405,70 @@ def _date_format(profile: dict[str, Any], argv: list[str]) -> str:
 
 def _virtual_output(profile: dict[str, Any], argv: list[str]) -> tuple[str, int, str | None]:
     """Return (stdout, exit_code, failure_reason)."""
-    name = _command_name(argv)
+    inner = _unwrap_windows_shell(argv)
+    if inner is None:
+        return "", 2, "encoded_or_interactive_windows_shell"
+    if inner is not argv and any(
+        token in SHELL_OPERATORS or "|" in token or ";" in token for token in inner
+    ):
+        return "", 2, "windows_observation_pipeline_not_pinned"
+    argv = inner
+    name = _probe_command_name(argv)
     identity = _identity(profile)
     paths = _paths(profile)
     locale = _locale(profile)
     clock = _clock(profile)
     target = _section(profile, "target")
     target_os = _target_os(profile)
-    if name == "hostname":
-        if len(argv) != 1:
-            return "", 2, "hostname options are not pinned by the profile"
+    if len(argv) == 1:
+        env_key = _env_key_from_token(argv[0])
+        if env_key:
+            env = virtual_env(profile)
+            if env_key in env:
+                return env[env_key] + "\n", 0, None
+    blob = "".join(argv).lower().replace(" ", "")
+    if "environment]::username" in blob:
+        return identity["username"] + "\n", 0, None
+    if "environment]::machinename" in blob:
         return identity["hostname"] + "\n", 0, None
-    if name == "whoami":
-        if len(argv) != 1:
+    if "environment]::osversion" in blob or "environment]::version" in blob:
+        return str(_section(profile, "target").get("version") or "ags-virtual") + "\n", 0, None
+    if "cultureinfo]::" in blob:
+        return _windows_culture_table(_locale_tag(locale)), 0, None
+    if name == "hostname":
+        flags = argv[1:]
+        allowed = {"-s", "--short", "-f", "--fqdn", "--static", "--domain"}
+        if any(not arg.startswith("-") or arg not in allowed for arg in flags):
+            return "", 2, "hostname options are not pinned by the profile"
+        host = identity["hostname"]
+        if "-s" in flags or "--short" in flags:
+            host = host.split(".")[0]
+        return host + "\n", 0, None
+    if name in {"whoami", "logname"}:
+        flags = tuple(arg.lower() for arg in argv[1:])
+        if flags and flags not in {("/user",), ("-user",), ("/upn",)}:
             return "", 2, "whoami options are not pinned by the profile"
         return identity["username"] + "\n", 0, None
+    if name == "groups":
+        if len(argv) != 1:
+            return "", 2, "groups arguments are not pinned by the profile"
+        groups = identity["groups"] or [identity["username"]]
+        return " ".join(str(group) for group in groups) + "\n", 0, None
+    if name == "arch":
+        if len(argv) != 1:
+            return "", 2, "arch arguments are not pinned by the profile"
+        return str(target.get("architecture") or "x86_64") + "\n", 0, None
+    if name == "ver":
+        version = str(target.get("version") or "ags-virtual")
+        return f"Microsoft Windows [Version {version}]\n", 0, None
     if name == "id":
         flags = "".join(arg.lstrip("-") for arg in argv[1:] if arg.startswith("-"))
         if any(flag not in "ugnG" for flag in flags) or any(not arg.startswith("-") for arg in argv[1:]):
             return "", 2, "id arguments are not pinned by the profile"
+        if "n" in flags and "u" in flags and "g" not in flags and "G" not in flags:
+            return f"{identity['username']}\n", 0, None
+        if "n" in flags and "g" in flags and "u" not in flags and "G" not in flags:
+            return f"{identity['username']}\n", 0, None
         if "u" in flags and "g" not in flags and "G" not in flags:
             return f"{identity['uid']}\n", 0, None
         if "g" in flags and "u" not in flags and "G" not in flags:
@@ -875,12 +1519,26 @@ def _virtual_output(profile: dict[str, Any], argv: list[str]) -> tuple[str, int,
             selected = [os_name]
         return " ".join(selected) + "\n", 0, None
     if name == "date":
-        if any(arg not in {"-u", "--utc"} and not arg.startswith("+") for arg in argv[1:]):
-            return "", 2, "date option is not pinned by the profile"
+        iso = False
+        fmt = None
+        utc = False
+        for arg in argv[1:]:
+            if arg in {"-u", "--utc"}:
+                utc = True
+            elif arg.startswith("+"):
+                fmt = arg[1:]
+            elif arg in {"-I", "--iso-8601"} or arg.startswith("--iso-8601=") or arg.startswith("-I"):
+                iso = True
+            else:
+                return "", 2, "date option is not pinned by the profile"
+        if iso and fmt is None:
+            fmt = "%Y-%m-%dT%H:%M:%S%z"
+        if fmt is None:
+            fmt = _date_format(profile, argv)
         anchor = _effective_anchor_seconds(clock)
         if anchor is None:
             return "", 2, "profile clock rate requires real_anchor_epoch_seconds"
-        if any(arg in {"-u", "--utc"} for arg in argv[1:]):
+        if utc:
             tzinfo: _datetime.tzinfo = _datetime.timezone.utc
         else:
             tzinfo = _timezone_for_profile(clock["timezone"], clock)
@@ -888,12 +1546,292 @@ def _virtual_output(profile: dict[str, Any], argv: list[str]) -> tuple[str, int,
                 return "", 2, "profile timezone requires pinned tzdata or offset_seconds"
         try:
             instant = _datetime.datetime.fromtimestamp(anchor, _datetime.timezone.utc).astimezone(tzinfo)
-            rendered = _format_profile_date(instant, _date_format(profile, argv), locale["lc_time"])
+            rendered = _format_profile_date(instant, fmt, locale["lc_time"])
             if rendered is None:
                 return "", 2, "profile locale or date format is not pinned"
             return rendered + "\n", 0, None
         except (OverflowError, OSError, ValueError):
             return "", 2, "profile clock anchor is outside the supported range"
+    if name == "sw_vers":
+        version = str(target.get("version", "15.6"))
+        product = "macOS" if target_os == "macos" else str(target.get("distribution") or "macOS")
+        flags = argv[1:]
+        if flags == ["-productName"] or flags == ["--productName"]:
+            return product + "\n", 0, None
+        if flags == ["-productVersion"] or flags == ["--productVersion"]:
+            return version + "\n", 0, None
+        if flags == ["-buildVersion"] or flags == ["--buildVersion"]:
+            return "ags-virtual\n", 0, None
+        if flags:
+            return "", 2, "sw_vers arguments are not pinned by the profile"
+        return (
+            f"ProductName:\t{product}\nProductVersion:\t{version}\nBuildVersion:\tags-virtual\n",
+            0,
+            None,
+        )
+    if name == "timedatectl":
+        tzinfo = _timezone_for_profile(clock["timezone"], clock)
+        if tzinfo is None:
+            return "", 2, "profile timezone requires pinned tzdata or offset_seconds"
+        anchor = _effective_anchor_seconds(clock)
+        if anchor is None:
+            return "", 2, "profile clock rate requires real_anchor_epoch_seconds"
+        instant = _datetime.datetime.fromtimestamp(anchor, _datetime.timezone.utc).astimezone(tzinfo)
+        offset = instant.utcoffset() or _datetime.timedelta(0)
+        total = int(offset.total_seconds())
+        sign = "+" if total >= 0 else "-"
+        total = abs(total)
+        zone = instant.tzname() or clock["timezone"]
+        return (
+            f"               Local time: {instant.strftime('%a %Y-%m-%d %H:%M:%S')} {zone}\n"
+            f"           Universal time: {instant.astimezone(_datetime.timezone.utc).strftime('%a %Y-%m-%d %H:%M:%S')} UTC\n"
+            f"                Time zone: {clock['timezone']} ({zone}, {sign}{total // 3600:02d}{(total % 3600) // 60:02d})\n"
+            "System clock synchronized: yes\n"
+            "              NTP service: active\n"
+            "          RTC in local TZ: no\n",
+            0,
+            None,
+        )
+    if name == "hostnamectl":
+        return f"Static hostname: {identity['hostname']}\n", 0, None
+    if name == "systemsetup":
+        if argv[1:] == ["-gettimezone"]:
+            return f"Time Zone:{clock['timezone']}\n", 0, None
+        if argv[1:] == ["-getcomputername"]:
+            return f"Computer Name: {identity['hostname']}\n", 0, None
+        return "", 2, "systemsetup arguments are not pinned by the profile"
+    if name == "networksetup":
+        if argv[1:] != ["-getcomputername"]:
+            return "", 2, "networksetup arguments are not pinned by the profile"
+        return identity["hostname"] + "\n", 0, None
+    if name == "scutil":
+        if argv[1:] not in (["--get", "ComputerName"], ["--get", "HostName"], ["--get", "LocalHostName"]):
+            return "", 2, "scutil arguments are not pinned by the profile"
+        host = identity["hostname"]
+        if argv[2] == "LocalHostName":
+            host = host.split(".")[0].replace("_", "-")
+        return host + "\n", 0, None
+    if name == "defaults":
+        args = [arg for arg in argv[1:] if arg != "--"]
+        if args[:2] in (["read", "-g"], ["read", "NSGlobalDomain"]) and len(args) == 3:
+            key = args[2]
+            tag = _locale_tag(locale)
+            if key == "AppleLocale":
+                return tag.replace("-", "_") + "\n", 0, None
+            if key == "AppleLanguages":
+                return f"({tag})\n", 0, None
+            if key in {"AppleMeasurementUnits", "AppleMetricUnits"}:
+                return "Centimeters\n", 0, None
+            if key == "AppleICUForce24HourTime":
+                return "1\n", 0, None
+            if key == "Country":
+                _win_id, _display, _dst, geo = _windows_tzinfo(clock)
+                return _GEO_COUNTRY.get(geo, "US") + "\n", 0, None
+        return "", 2, "defaults arguments are not pinned by the profile"
+    if name == "tzutil":
+        if argv[1:] != ["/g"] and argv[1:] != ["-g"]:
+            return "", 2, "tzutil arguments are not pinned by the profile"
+        return _windows_tzinfo(clock)[0] + "\n", 0, None
+    if name in {"get-timezone", "get-wintimezone"} or "timezoneinfo" in "".join(argv).lower():
+        win_id, display, dst, _geo = _windows_tzinfo(clock)
+        if any(token.lower().endswith(".id") or token.lower() == "id" for token in argv):
+            return win_id + "\n", 0, None
+        hours, remainder = divmod(abs(int(clock.get("offset_seconds") or 0)), 3600)
+        minutes = remainder // 60
+        return (
+            f"Id                         : {win_id}\n"
+            f"DisplayName                : {display}\n"
+            f"StandardName               : {win_id}\n"
+            f"DaylightName               : {win_id}\n"
+            f"BaseUtcOffset              : {hours:02d}:{minutes:02d}:00\n"
+            f"SupportsDaylightSavingTime : {dst}\n",
+            0,
+            None,
+        )
+    if name == "get-date":
+        fmt = _flag_value(argv, {"-format", "-uformat"})
+        utc = any(arg.lower() in {"-asutc", "-u"} for arg in argv[1:])
+        extra = [
+            arg
+            for arg in argv[1:]
+            if arg.startswith("-")
+            and arg.lower() not in {"-format", "-uformat", "-asutc", "-u"}
+            and not arg.lower().startswith("-format:")
+            and not arg.lower().startswith("-uformat:")
+        ]
+        if extra:
+            return "", 2, "Get-Date options are not pinned by the profile"
+        tzinfo = _datetime.timezone.utc if utc else _timezone_for_profile(clock["timezone"], clock)
+        if tzinfo is None:
+            return "", 2, "profile timezone requires pinned tzdata or offset_seconds"
+        anchor = _effective_anchor_seconds(clock)
+        if anchor is None:
+            return "", 2, "profile clock rate requires real_anchor_epoch_seconds"
+        instant = _datetime.datetime.fromtimestamp(anchor, _datetime.timezone.utc).astimezone(tzinfo)
+        if fmt in {"o", "u", "s", "yyyy-MM-dd", "yyyy-MM-ddTHH:mm:ss"}:
+            return instant.strftime("%Y-%m-%dT%H:%M:%S") + instant.strftime("%z") + "\n", 0, None
+        if fmt:
+            rendered = _format_profile_date(instant, fmt if "%" in fmt else "%Y-%m-%d %H:%M:%S", locale["lc_time"])
+            if rendered is None:
+                return "", 2, "Get-Date format is not pinned by the profile"
+            return rendered + "\n", 0, None
+        return instant.strftime("%A, %B %d, %Y %I:%M:%S %p") + "\n", 0, None
+    if name in {"get-culture", "get-winsystemlocale", "get-uiculture"}:
+        tag = _locale_tag(locale)
+        return f"LCID             Name             DisplayName\n{0:>16} {tag:<16} {tag}\n", 0, None
+    if name == "get-winhomelocation":
+        _win_id, _display, _dst, geo = _windows_tzinfo(clock)
+        place = _GEO_NAMES.get(geo, "United States")
+        return f"GeoId HomeLocation\n{geo:>5} {place}\n", 0, None
+    if name == "get-winuserlanguagelist":
+        tag = _locale_tag(locale)
+        return f"LanguageTag : {tag}\n", 0, None
+    if name in {"cat", "head", "tail", "more", "less", "type", "get-content", "gc"}:
+        paths = _reader_paths(argv)
+        if len(paths) == 1:
+            env_key = _env_key_from_token(paths[0])
+            if env_key:
+                env = virtual_env(profile)
+                if env_key in env:
+                    return env[env_key] + "\n", 0, None
+            fact = _registry_fact(paths[0])
+            if fact:
+                return _windows_registry_output(profile, fact)
+            if _file_kind(paths[0]):
+                return _identity_file_output(profile, paths[0])
+        return "", 2, "cat path is not pinned by the profile"
+    if name in {"readlink", "realpath"}:
+        flags = [arg for arg in argv[1:] if arg.startswith("-")]
+        paths = [arg for arg in argv[1:] if not arg.startswith("-")]
+        if (
+            len(paths) == 1
+            and _file_kind(paths[0]) == "localtime"
+            and all(flag in {"-f", "-n", "-e", "-m"} for flag in flags)
+        ):
+            suffix = "" if "-n" in flags else "\n"
+            return f"{_localtime_link(clock)}{suffix}", 0, None
+        return "", 2, "readlink path is not pinned by the profile"
+    if name in {"ls", "dir", "stat", "file", "get-item", "gi", "get-childitem", "gci"}:
+        paths = [arg for arg in argv[1:] if not arg.startswith("-")]
+        if len(paths) == 1 and _file_kind(paths[0]) == "localtime":
+            link = _localtime_link(clock)
+            if name == "file":
+                return f"{paths[0]}: symbolic link to {link}\n", 0, None
+            if name == "stat":
+                return f"File: {paths[0]} -> {link}\n", 0, None
+            return f"lrwxrwxrwx 1 root root {len(link)} Jan  1 00:00 {paths[0]} -> {link}\n", 0, None
+        env_key = _env_key_from_token(paths[0]) if len(paths) == 1 else None
+        if env_key:
+            env = virtual_env(profile)
+            if env_key in env:
+                return f"{env_key} : {env[env_key]}\n", 0, None
+        return "", 2, "ls path is not pinned by the profile"
+    if name in {"echo", "write-output", "write-host"}:
+        args = [arg for arg in argv[1:] if arg.lower() not in {"-n", "-nonewline"}]
+        if args and all(_env_key_from_token(arg) for arg in args):
+            env = virtual_env(profile)
+            parts: list[str] = []
+            for arg in args:
+                key = _env_key_from_token(arg)
+                if key not in env:
+                    return "", 2, "echo arguments are not pinned by the profile"
+                parts.append(env[key])
+            return " ".join(parts) + "\n", 0, None
+        return "", 2, "echo arguments are not pinned by the profile"
+    if name in {"get-itemproperty", "gp", "reg"}:
+        if name == "reg":
+            if not argv[1:] or argv[1].lower() != "query" or len(argv) < 3:
+                return "", 2, "reg arguments are not pinned by the profile"
+            parts: list[str] = []
+            skip_next = False
+            for arg in argv[2:]:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg.lower() in {"/v", "/t", "/f", "/k", "/d"}:
+                    skip_next = True
+                    continue
+                if arg.startswith("/") or arg.startswith("-"):
+                    continue
+                parts.append(arg)
+            fact = _registry_fact(" ".join(parts))
+        else:
+            path = _flag_value(argv, {"-path", "-literalpath"}) or " ".join(
+                arg for arg in argv[1:] if not arg.startswith("-")
+            ) or None
+            fact = _registry_fact(path)
+        if fact:
+            return _windows_registry_output(profile, fact)
+        return "", 2, "registry path is not pinned by the profile"
+    if name in {"get-ciminstance", "gcim", "get-wmiobject", "gwmi"}:
+        cls = _cim_class(argv)
+        if cls == "win32_timezone":
+            win_id, display, dst, _geo = _windows_tzinfo(clock)
+            return f"StandardName={win_id}\nCaption={display}\nDaylight={dst}\n", 0, None
+        if cls == "win32_operatingsystem":
+            tag = _locale_tag(locale)
+            return (
+                f"CSName={identity['hostname']}\n"
+                f"Caption=Microsoft Windows\n"
+                f"Version={target.get('version', 'ags-virtual')}\n"
+                f"Locale={_lcid_for(tag)}\n"
+                f"RegisteredUser={identity['username']}\n"
+            ), 0, None
+        if cls == "win32_computersystem":
+            return (
+                f"Name={identity['hostname']}\n"
+                f"UserName={identity['username']}\n"
+                f"DNSHostName={identity['hostname']}\n"
+            ), 0, None
+        return "", 2, "WMI class is not pinned by the profile"
+    if name == "wmic":
+        rest = [arg.lower() for arg in argv[1:] if not arg.startswith("/")]
+        if rest and rest[0] == "timezone":
+            win_id, display, _dst, _geo = _windows_tzinfo(clock)
+            return f"Caption={display}\nStandardName={win_id}\n", 0, None
+        if rest and rest[0] == "os":
+            return (
+                f"CSName={identity['hostname']}\n"
+                f"Caption=Microsoft Windows\n"
+                f"Version={target.get('version', 'ags-virtual')}\n"
+            ), 0, None
+        if rest and rest[0] in {"computersystem", "csproduct"}:
+            return f"Name={identity['hostname']}\nUserName={identity['username']}\n", 0, None
+        return "", 2, "wmic arguments are not pinned by the profile"
+    if name in {"ipconfig", "ipconfig.exe"}:
+        if any(arg.lower() in {"/all", "-all", "/release", "/renew"} for arg in argv[1:]):
+            return "", 2, "ipconfig arguments are not pinned by the profile"
+        return (
+            "Windows IP Configuration\n\n"
+            f"   Host Name . . . . . . . . . . . . : {identity['hostname']}\n"
+            "   Primary Dns Suffix  . . . . . . . : \n"
+        ), 0, None
+    if name == "systeminfo":
+        if any(arg.lower() in {"/s", "-s"} for arg in argv[1:]):
+            return "", 2, "systeminfo arguments are not pinned by the profile"
+        return _synthetic_systeminfo(profile), 0, None
+    if name == "get-computerinfo":
+        return _synthetic_computerinfo(profile), 0, None
+    if name == "localectl":
+        return (
+            f"   System Locale: LANG={locale['lang']}\n"
+            f"       VC Keymap: us\n"
+            f"      X11 Layout: n/a\n"
+        ), 0, None
+    if name == "lsb_release":
+        return _lsb_release_text(profile), 0, None
+    if name == "system_profiler":
+        if argv[1:] and argv[1:] != ["SPSoftwareDataType"]:
+            return "", 2, "system_profiler arguments are not pinned by the profile"
+        version = str(target.get("version") or "ags-virtual")
+        product = "macOS" if target_os == "macos" else str(target.get("distribution") or "macOS")
+        return (
+            "Software:\n\n    System Software Overview:\n\n"
+            f"      System Version: {product} {version} (ags-virtual)\n"
+            f"      Kernel Version: Darwin {version}\n"
+            f"      Computer Name: {identity['hostname']}\n"
+            f"      User Name: {identity['username']}\n"
+        ), 0, None
     return "", 2, "not_a_virtual_command"
 
 
@@ -926,14 +1864,60 @@ def _profile_has_host_wildcard(profile: dict[str, Any]) -> bool:
 
 
 def classify(profile: dict[str, Any], command: str | list[str]) -> dict[str, Any]:
+    argv: list[str] | None = None
+    if isinstance(command, str):
+        segments = _split_observation_pipes(command)
+        if segments is not None:
+            try:
+                parsed = [parse_argv(segment) for segment in segments]
+            except AdapterError as exc:
+                return {
+                    "status": "unknown",
+                    "decision": "deny",
+                    "reason": str(exc),
+                    "command_sha256": _command_digest(command),
+                }
+            if parsed and all(_is_formatter_argv(item) for item in parsed[1:]):
+                argv = parsed[0]
+            else:
+                return {
+                    "status": "unknown",
+                    "decision": "deny",
+                    "reason": "shell_operator",
+                    "command_sha256": _command_digest(command),
+                }
+    if argv is None:
+        try:
+            argv = parse_argv(command)
+        except AdapterError as exc:
+            return {
+                "status": "unknown",
+                "decision": "deny",
+                "reason": str(exc),
+                "command_sha256": _command_digest(command),
+            }
     try:
-        argv = parse_argv(command)
-    except AdapterError as exc:
+        stdout, exit_code, failure = _virtual_output(profile, argv)
+    except (AdapterError, TypeError, ValueError, OverflowError):
+        stdout, exit_code, failure = "", 2, "profile_invalid"
+    if failure is None:
+        if len(stdout.encode("utf-8", "surrogatepass")) > MAX_OUTPUT:
+            return {
+                "status": "unknown",
+                "decision": "deny",
+                "reason": "virtual_output_too_large",
+                "command_name": _command_name(argv),
+                "command_sha256": _sha256("\0".join(argv)),
+            }
         return {
-            "status": "unknown",
-            "decision": "deny",
-            "reason": str(exc),
-            "command_sha256": _command_digest(command),
+            "status": "virtual",
+            "decision": "allow",
+            "reason": "profile_observation",
+            "command_name": _command_name(argv),
+            "command_sha256": _sha256("\0".join(argv)),
+            "stdout": stdout,
+            "exit_code": exit_code,
+            "replacement": "printf '%s' " + shlex.quote(stdout),
         }
     if _contains_hidden_path(argv, _hidden_markers(profile)):
         return {
@@ -943,9 +1927,11 @@ def classify(profile: dict[str, Any], command: str | list[str]) -> dict[str, Any
             "command_name": _command_name(argv),
             "command_sha256": _sha256("\0".join(argv)),
         }
-    if _is_carrier_probe(argv) or (
+    inner = _unwrap_windows_shell(argv)
+    probe_argv = inner if inner else argv
+    if _is_carrier_probe(argv) or _is_carrier_probe(probe_argv) or (
         _profile_has_host_wildcard(profile)
-        and _command_name(argv).lower() in CARRIER_PROBE_INTERPRETERS
+        and _probe_command_name(probe_argv) in CARRIER_PROBE_INTERPRETERS
     ):
         return {
             "status": "unknown",
@@ -955,33 +1941,8 @@ def classify(profile: dict[str, Any], command: str | list[str]) -> dict[str, Any
             "command_sha256": _sha256("\0".join(argv)),
         }
     name = _command_name(argv)
-    if name in SHELL_NAMES:
+    if name in SHELL_NAMES or name.lower() in WINDOWS_SHELL_NAMES:
         return {"status": "unknown", "decision": "deny", "reason": "nested_shell_or_script", "command_sha256": _sha256("\0".join(argv))}
-    if name in VIRTUAL_COMMANDS:
-        try:
-            stdout, exit_code, failure = _virtual_output(profile, argv)
-        except (AdapterError, TypeError, ValueError, OverflowError):
-            return {
-                "status": "unknown",
-                "decision": "deny",
-                "reason": "profile_invalid",
-                "command_name": name,
-                "command_sha256": _sha256("\0".join(argv)),
-            }
-        if failure:
-            return {"status": "unknown", "decision": "deny", "reason": failure, "command_name": name, "command_sha256": _sha256("\0".join(argv))}
-        if len(stdout.encode("utf-8", "surrogatepass")) > MAX_OUTPUT:
-            return {"status": "unknown", "decision": "deny", "reason": "virtual_output_too_large", "command_name": name, "command_sha256": _sha256("\0".join(argv))}
-        return {
-            "status": "virtual",
-            "decision": "allow",
-            "reason": "profile_observation",
-            "command_name": name,
-            "command_sha256": _sha256("\0".join(argv)),
-            "stdout": stdout,
-            "exit_code": exit_code,
-            "replacement": "printf '%s' " + shlex.quote(stdout),
-        }
     if _profile_allowed_host_visible(profile, name):
         return {
             "status": "host_visible",
@@ -1081,6 +2042,83 @@ def _contains_hidden_path(value: Any, markers: tuple[str, ...]) -> bool:
     return False
 
 
+def _probe_command_name(argv: list[str]) -> str:
+    name = _command_name(argv).lower()
+    if name.endswith(".exe"):
+        return name[:-4]
+    return name
+
+
+def _parse_maybe_command_string(value: str) -> list[str]:
+    return parse_argv(value) if any(ch.isspace() for ch in value) or value[:1] in "\"'" else [value]
+
+
+def _inner_observation_argv(value: str) -> list[str] | None:
+    """Parse a powershell/cmd -Command body, stripping observation formatters."""
+    try:
+        segments = _split_observation_pipes(value)
+        if segments is not None:
+            parsed = [parse_argv(segment) for segment in segments]
+            if parsed and all(_is_formatter_argv(item) for item in parsed[1:]):
+                return parsed[0]
+            return None
+        return parse_argv(value)
+    except AdapterError:
+        return None
+
+
+def _unwrap_windows_shell(argv: list[str]) -> list[str] | None:
+    """Inner argv for powershell/cmd wrappers. None means encoded or interactive."""
+    name = _probe_command_name(argv)
+    lowered = [arg.lower() for arg in argv]
+    if name in {"powershell", "pwsh"}:
+        if any(
+            arg in {"-encodedcommand", "-ec", "-file", "-f"} or arg.startswith("-encodedcommand")
+            for arg in lowered[1:]
+        ):
+            return None
+        args = argv[1:]
+        index = 0
+        while index < len(args):
+            key = args[index].lower()
+            key_base = key.split(":", 1)[0]
+            if key.startswith("-command:") and len(key) > 9:
+                return _inner_observation_argv(args[index].split(":", 1)[1])
+            if key in {"-command", "-c", "-com"}:
+                rest = args[index + 1 :]
+                if not rest:
+                    return None
+                if len(rest) == 1:
+                    return _inner_observation_argv(rest[0])
+                if any("|" in token or token in SHELL_OPERATORS for token in rest):
+                    joined = " ".join(rest)
+                    return _inner_observation_argv(joined)
+                return rest
+            if key_base in _PS_SKIP_FLAGS or key in _PS_SKIP_FLAGS:
+                index += 1
+                continue
+            if key_base in _PS_SKIP_WITH_VALUE:
+                index += 2
+                continue
+            if key.startswith("-"):
+                return None
+            return args[index:]
+        return None
+    if name == "cmd":
+        for index, arg in enumerate(argv[1:], 1):
+            if arg.lower() in {"/c", "/k", "-c"}:
+                rest = argv[index + 1 :]
+                if not rest:
+                    return None
+                if len(rest) == 1:
+                    return _inner_observation_argv(rest[0])
+                if any("|" in token or token in SHELL_OPERATORS for token in rest):
+                    return _inner_observation_argv(" ".join(rest))
+                return rest
+        return None
+    return argv
+
+
 def _is_carrier_probe(argv: list[str]) -> bool:
     """Return whether argv asks the host for an untranslatable fact.
 
@@ -1090,12 +2128,12 @@ def _is_carrier_probe(argv: list[str]) -> bool:
     """
     if not argv:
         return False
-    name = _command_name(argv).lower()
-    if name in CARRIER_PROBE_COMMANDS:
+    name = _probe_command_name(argv)
+    if name in CARRIER_PROBE_COMMANDS or f"{name}.exe" in CARRIER_PROBE_COMMANDS:
         return True
     return any(
-        marker in token.lower()
-        for token in argv[1:]
+        marker in token.lower().replace("\\", "/")
+        for token in argv
         for marker in CARRIER_PROBE_PATH_MARKERS
     )
 

@@ -71,20 +71,26 @@ claude --resume <new-session-id>
 tombstone, transactional restore runtime, and RMUX-managed live terminals:
 
 ```bash
-ags                         # attach the most recently active live session
+ags                         # help; a subcommand is required
+ags info                    # account and space for the configured key (reserved)
 ags claude                  # start Claude Code in an AGS terminal
 ags codex                   # start Codex in an AGS terminal
 ags claude -- --model opus  # everything after "--" belongs to Claude Code
 ags codex -- --model o3     # everything after "--" belongs to Codex
+ags runtime add work-codex --provider codex --home "$HOME/.codex-work"
+ags runtime use work-codex
+ags --runtime work-codex codex         # one-shot home + proxies; not a region cloak
 ags --account me@example.com codex     # everything before "--" belongs to AGS
 ags codex --account me@example.com     # AGS options read either side of it
 ags --account a@x.com,b@y.com codex    # a queue: the pool schedules within it
 ags --pick-account codex               # choose interactively; select several
-ags save "Continue the release fix"    # saved under the session's own ID
-ags list                    # pick a saved session and open it
-ags show release-fix
-ags resume release-fix
-ags resume release-fix --to claude -- --model sonnet
+ags ls                      # sessions in the current directory
+ags ls -a                   # sessions in every directory
+ags ls /path/to/project     # sessions in that folder
+ags save "Continue the release fix"    # skill-only; id is provider/session-id
+ags resume codex/SESSION_ID
+ags resume claude/SESSION_ID --to codex -- --model o3
+ags restore release-fix     # launch a saved archive
 ags delete release-fix
 ```
 
@@ -101,11 +107,34 @@ after `--` reaches the Agent verbatim, so a token named `--to`, `--profile` or
 even `--account` after `--` is an Agent token and is never consumed by AGS —
 which is what keeps a future Agent flag from colliding with an AGS one. This is
 the convention `cargo run --`, `npm run x --` and `kubectl exec pod --` use, and
-the one `ags resume ID [-- CLIENT_ARGS...]` already used.
+the one `ags resume provider/ID [-- CLIENT_ARGS...]` already used.
 
 A direct launch therefore needs the separator for Agent flags:
 `ags codex -- --model o3`, not `ags codex --model o3`. AGS refuses the second
 form rather than guessing.
+
+`--runtime NAME` selects a named Codex or Claude home (a real directory with
+its own `auth.json` / credentials). `--proxy` is one of: a local HTTP CONNECT
+listener (`http://127.0.0.1:port` / `localhost`, Clash and similar), `pool`
+(the credential-pool issued proxy from `/ping` `data.proxy`), `none`, or
+`auto` (pool if the Codex home has a pool proxy, otherwise direct). SOCKS,
+`https://` proxy URLs, proxy userinfo, and non-loopback custom URLs are
+refused. AGS always strips terminal and global `HTTP(S)_PROXY` / `ALL_PROXY` /
+`NO_PROXY` before the agent starts, including launches with no named runtime.
+On WSL it also drops `/mnt/<drive>/...` from `PATH` so the model cannot find
+`powershell.exe` / `cmd.exe` by name and read the Windows host timezone or
+GeoID. The region the agent should believe is the region of the current
+egress IP: launch probes `ipwho.is` through that same proxy and sets `TZ`
+and `LANG` from the IP's timezone and country. Overlay hooks are installed
+even without `ags env-use`. They rewrite Windows, Linux, and macOS timezone,
+locale, Geo, and identity commands (`Get-TimeZone`, `tzutil`, `timedatectl`,
+`cat /etc/timezone`, Geo registry, `Get-WinHomeLocation`, `hostname`,
+`whoami`, `id -un`, `systeminfo`, …) from that profile. On Linux, when
+`unshare` works, overlay files are bind-mounted over `/etc/localtime`,
+`/etc/timezone`, and `/etc/hostname` so libc and Python see the same zone.
+Encoded PowerShell still cannot be rewritten. `gethostname(2)`, vendor
+region policy, WSL, cwd, and `device_id` stay host-visible.
+`--account` remains a pool lease inside that home.
 
 `--account EMAIL` asks the credential pool for that account for this launch
 only, and `--pick-account` lists what the configured key may ask for. Both work on
@@ -135,35 +164,16 @@ starts, because a Plus account can be taken during the seconds you spend typing
 — without that check the launch would fall back to the shared pool silently
 while you believed the account was pinned.
 
-`ags ls` is `ags list`; `ags --help` shows the handful of commands you use daily
-and `ags help all` shows everything.
+`ags --help` shows the handful of commands you use daily and `ags help all`
+shows everything.
 
-Every session has an **AGS ID**, chosen when it starts. It is the terminal tab
-name, the ID `ags save` writes the checkpoint under, and — for Codex — the name
-the credential pool records for the session, so all three finally agree. Press
-Nothing is asked for at launch: `--id NAME` names the session, and without it
-one is generated, which names the directory and the moment
-(`05_MyWork-2026.08.21-03.17.45`) rather than a random string you cannot
-recognise a week later. Either way the launch prints the ID once, because that
-name is what `ags resume`, `ags save --id` and the admin console all address the
-session by. It carries the year because checkpoints are kept
-indefinitely, and separates with `.` because an ID becomes a filename — `/`
-would be a path separator, and the character set is `[A-Za-z0-9._-]`.
-
-The ID identifies a *work line*, not a process: it lives permanently in the
-local checkpoint store, while the pool only requires it to be unique among a
-key's **live** sessions, so ending a session frees the name for the same work
-line to reclaim on its next resume. Launching under an ID that already has a
-local checkpoint is refused — continuing that work line is `ags resume <ID>`,
-and allowing it would mean an hour of work that `ags save` then has nowhere to
-go.
-
-Because the ID is fixed up front, `ags save "description"` needs no ID, and
-`ags save --id <ID> "description"` branches a new work line. `ags save <ID>
-"description"` remains the form for a session AGS did not start, which has no ID
-of its own. Which argument is which is never guessed: an earlier attempt treated
-anything ID-shaped as an ID, so `ags save "fixed"` filed the checkpoint under
-`fixed` with no description at all.
+`--id NAME` still names a new `ags claude` / `ags codex` launch (terminal tab
+and, for Codex, the pool session name). Daily save/resume no longer use that
+value. `ags save "description"` is skill-only inside an Agent session; the
+identity is `provider/session-id`. `ags resume provider/session-id` continues
+that live session (`claude` and `claude-code` are the same provider). `--to`
+rotates to the other Agent. Archives launch with `ags restore ID`. save and
+resume require a configured backend key (`ags codex-init`).
 
 `--account` seeds the session's queue on the pool the first time it is heard, and
 after that the **pool owns the queue**: it can be extended, trimmed, and
@@ -207,22 +217,16 @@ session started as `ags codex --dangerously-bypass-approvals-and-sandbox` comes
 back with that flag rather than under different permissions than it was working
 under.
 
-`ags resume ID` replays them. Passing `--` is how you decide instead: arguments
+`ags restore ID` replays them. Passing `--` is how you decide instead: arguments
 after it replace the saved ones, and `--` with nothing after it starts the
 session with none. `ags show ID` prints what a checkpoint carries.
 
-### One agent at a time
+### Sessions by folder
 
-`ags ls codex` lists only Codex sessions; `ags ls claude` only Claude Code's.
-Inside the list, `f` cycles the same filter — all agents, then each agent that
-actually has sessions on this machine, then all again. Both spellings of a name
-work, the provider slug (`claude-code`) and the name AGS launches it under
-(`claude`), because `ags ls -a` puts archives and live sessions in one view and
-each half carries only one of them.
-
-Filtering changes the view, never the numbers. The `#` column is this machine's
-coordinate for a session — `ags resume 3` has to keep meaning the same session —
-so the filter is applied after numbers are handed out, not before.
+`ags ls` lists the current directory. `ags ls -a` lists every folder. Codex and
+Claude resume are folder-based. Inside the list, `f` cycles an agent filter.
+The `#` column is 1, 2, 3 in the current view. SESSION is the agent's own
+session id; continue with `ags resume provider/SESSION`.
 
 ### Naming a session yourself
 
@@ -286,7 +290,7 @@ all: the recorded path usually does not exist there, and that used to be fatal.
 `--cwd PATH` answers the question in advance. Without a terminal to ask on — a
 script, a pipe — the recorded directory is used, unchanged.
 
-`ags list` opens a picker — Up/Down or `j`/`k` to move, Enter to open, `a` to
+`ags ls` opens a picker — Up/Down or `j`/`k` to move, Enter to open, `a` to
 edit the arguments for this launch, Del to delete, Esc to quit. The arguments
 for the highlighted session are always shown, because checkpoints synchronize
 between machines and a replayed command line is another machine's decision

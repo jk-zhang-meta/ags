@@ -57,6 +57,7 @@ terminal_menu_notice=
 # 后者是菜单里 `f` 那个循环的取值来源。写死 `codex claude-code` 两档不行：装了新
 # Agent 之后循环不到它，而一台只用 Codex 的机器上又会多出一档永远空的。
 native_list_agent_filter=
+native_list_workspace=
 declare -a native_list_agents=()
 ags_state_lock_depth=0
 ags_consolidation_lock_depth=0
@@ -221,23 +222,18 @@ usage() {
     fi
     cat <<'EOF'
 用法:
-  ags                          接上最近还活着的会话
-  ags codex [--id 名字]        起一个 Codex 会话
-  ags claude [--id 名字]       起一个 Claude 会话
-  ags env-use NAME|PATH        选一个环境 profile，之后启动的 Agent 会看到它
-  ags env-show                 看当前环境 overlay 能藏什么、藏不了什么
-  ags ls [-a]                  列出会话，挑一个接着干（-a 连存档一起列）
-                               名字是模型在后台起的，不用管；AGS_AUTO_SUMMARY=0 关掉
-                               回车之后先选权限档位（yolo/bypass 在最上面），
-                               预选上次用的那一档；AGS_PERMISSION_PROMPT=0 关掉
-  ags save "描述"              把这个会话导出成一份存档
-  ags resume N|ID              接着第 N 号会话干，或者打开一份存档
+  ags <命令>                   必须带后续命令；单独运行显示本帮助
+  ags ls [-a]                  列当前目录的会话；-a 列出全部目录
+  ags save "描述"              仅在 Agent 会话内保存当前会话（skill）
+  ags resume provider/ID       接着该会话；--to 换 Agent
+  ags info                     当前密钥的账户与空间（预留）
+  ags codex|claude [--id 名字] 起一个会话（使用官方原版 CLI）
+  ags berth init|status|launch 配置并通过 Berth v2 网关 + Cage 启动官方 CLI
   ags store                    记录存在哪：本机目录 / git / sftp
-  ags sync                     和当前那个 store 对一遍
+  ags sync                     和当前 store 对一遍
   ags update                   更新到最新版
 
   给 Agent 的参数写在 -- 之后：ags codex -- --model o3
-  不写 --id 就自动起一个（<目录>-<年.月.日>-<时.分.秒>），启动时会印出来
   全部命令： ags help all
 EOF
 }
@@ -245,7 +241,9 @@ EOF
 usage_all() {
     cat <<'EOF' 
 Usage:
-  ags                                  Choose an Agent and start it
+  ags                                  Show this help; a subcommand is required
+  ags info                             Account and space for the configured key
+                                       (placeholders until the backend fills them)
   ags [--id NAME] claude [-- CLAUDE_ARGS...]
                                        Start Claude
   ags [--id NAME] [--account EMAIL|--pick-account] codex [-- CODEX_ARGS...]
@@ -259,25 +257,36 @@ Usage:
   ags env-show | env-list | env-clear  Inspect or drop that selection
   ags [--environment-profile PATH] codex|claude
                                        One-shot overlay for this launch
+  ags runtime add NAME --provider codex|claude --home PATH
+      [--proxy http://127.0.0.1:PORT|pool|none]
+                                       Distinct login tree. Proxy is local Clash,
+                                       the credential-pool issued proxy, or none.
+                                       Ambient HTTP(S)_PROXY is stripped. TZ
+                                       follows the current egress IP.
+  ags runtime use|show|list|clear      Select or inspect that tree
+  ags --runtime NAME codex|claude|ls   One-shot runtime for this command
+                                       Does not hide vendor region policy
   ags init [--identity ABSOLUTE_FILE]  Initialize storage and encryption identity
-  ags codex-init                       Configure the codext credential pool
-  ags codex-pool                       Show the credential pool this machine uses
-  ags ls | ags list [-a] [AGENT]       Pick one of this machine's Agent sessions
-                                       and carry on with it. Every workspace,
-                                       newest ACTIVE first; rows sharing one
+  ags berth init --url URL --key KEY   Configure Berth v2 gateway + Cage launcher
+  ags berth status | clear             Inspect or clear Berth v2 configuration
+  ags berth launch --agent codex|claude|agy|grok [-- ARGS...]
+                                       Launch unmodified official CLI through
+                                       Berth v2 Cage Shim
+  ags berth lease --agent AGENT        Acquire a Berth v2 Cage Session Lease
+  ags ls [-a] [DIR]                    Pick one of this machine's Agent sessions
+                                       and carry on with it. Default is the
+                                       current directory (Codex and Claude
+                                       resume are folder-based). -a lists every
+                                       workspace. DIR overrides the folder
+                                       when -a is not set.
+                                       Newest ACTIVE first; rows sharing one
                                        ACTIVE minute go by when they started,
                                        newest first.
-                                       -a also lists the archives `ags save`
-                                       wrote, in the same view.
-                                       The leading `#` is this machine's short
-                                       number for that session: `ags resume 7`.
-                                       It is stable, so a number stays with the
-                                       session it was handed to.
-                                       Name an agent (`ags ls codex`) to see
-                                       only its sessions; f cycles the same
-                                       filter inside the list. Filtering changes
-                                       the view only — the `#` a session was
-                                       handed stays what it was.
+                                       The leading `#` is 1, 2, 3… in the
+                                       current view. SESSION is the agent's
+                                       own session id; resume with
+                                       `ags resume provider/SESSION`.
+                                       f cycles an agent filter inside the list.
                                        n names a session yourself; that name
                                        wins over every automatic one and stays
                                        until you clear it (empty restores the
@@ -339,25 +348,28 @@ Usage:
                                        it deleted. AGS_AUTO_GC=0 turns that off;
                                        no retention period means it never runs.
   ags show ID|AGENT/RECORD_ID          Show complete local archive details
-  ags save [--id ID] DESCRIPTION       Export this active Codex or Claude session
-                                       The ID is fixed when the session starts;
-                                       --id only to branch a new work line
+  ags save DESCRIPTION                 Queue the invoking Agent session. Only
+                                       from inside Codex/Claude (the skill);
+                                       a local terminal is refused. The id is
+                                       provider/session-id; there is no --id.
   ags save --session PROVIDER/SESSION_ID [DESCRIPTION]
                                        Export any session `ags ls` lists, whether
                                        or not AGS started it and whether or not
                                        it is still running
-  ags resume ID|AGENT/RECORD_ID [AGENT_ARGS...]
+  ags resume PROVIDER/SESSION_ID [AGENT_ARGS...]
              [-- --to codex|claude --cwd PATH --profile NAME --no-agent-args]
-                                       Restore and launch a local archive
-  ags resume live:PROVIDER/SESSION_ID [AGENT_ARGS...]
-                                      Carry on with a session that still
-                                      exists, by handing it to the Agent's own
-                                      resume. Nothing is restored and nothing
-                                      in the Agent's home is written. This is
-                                      what Enter does in `ags ls`.
+                                       Carry on with a live session by handing
+                                       it to the Agent's own resume. `claude`
+                                       and `claude-code` are the same provider.
+                                       This is what Enter does in `ags ls`.
                                        With --to codex|claude, AGS takes a
                                        temporary snapshot and converts it;
                                        no persistent checkpoint is saved.
+                                       save and resume require a configured
+                                       backend key (`ags berth init`).
+  ags restore ID|AGENT/RECORD_ID [AGENT_ARGS...]
+             [-- --to codex|claude --cwd PATH --profile NAME --no-agent-args]
+                                       Restore and launch a local archive
   ags delete ID|AGENT/RECORD_ID        Move a local checkpoint to recoverable trash
   ags update [--check]                 Update to the latest release (--check only reports)
                                        Launching an Agent reports a pending update once a
@@ -389,14 +401,13 @@ language. IDs use letters, numbers, dots, underscores, and hyphens.
 When an ID is ambiguous, copy an AGENT/RECORD_ID selector printed by AGS.
 Public-IP location is best effort and is stored only inside the encrypted checkpoint.
 After `ags claude` or `ags codex`, every argument belongs to that Agent. For
-`ags resume`, AGS options go before `--`; every argument after `--` belongs to
-the restored Agent. AGS rejects Agent options that would disable its own tooling.
-A checkpoint remembers the Agent arguments its session was started with, and
-`ags resume` replays them. Pass `--` to decide instead: with arguments after it
-they replace the saved ones, and with nothing after it the session starts with
-none. `ags show` prints what a checkpoint carries.
+`ags resume` and `ags restore`, AGS options go before `--`; every argument
+after `--` belongs to the Agent. AGS rejects Agent options that would disable
+its own tooling. A checkpoint remembers the Agent arguments its session was
+started with, and `ags restore` replays them. Pass `--` to decide instead.
+`ags show` prints what a checkpoint carries.
 A checkpoint also remembers the directory its session was working in. When that
-is not the directory you are resuming from, `ags resume` shows both and asks
+is not the directory you are restoring from, `ags restore` shows both and asks
 which to open in; `--cwd PATH` answers it in advance. Without a terminal to ask
 on, the recorded directory is used.
 Claude `--settings` may contain only provider authentication and model fields.
@@ -2903,14 +2914,11 @@ valid_local_binary_path() {
 
 valid_agent_binary_path() {
     local agent="$1" path="$2"
-    [[ "$agent" == codex || "$agent" == claude ]] &&
-        valid_binary_provenance_path "$path" &&
-        { [[ "${path##*/}" == "$agent" ]] ||
-          # codext is Codex with the credential pool wired in. It is the same
-          # CLI, the same session format, the same everything AGS reads — the
-          # fork adds one auth provider. Refusing it here would mean AGS could
-          # never launch the build this machine is configured to use.
-          [[ "$agent" == codex && "${path##*/}" == codext ]]; }
+    case "$agent" in
+        codex|claude|agy|grok) ;;
+        *) return 1 ;;
+    esac
+    valid_binary_provenance_path "$path" && [[ "${path##*/}" == "$agent" ]]
 }
 
 find_agent_ancestor_binary() {
@@ -2953,10 +2961,12 @@ find_agent_ancestor_binary() {
 
 resolve_agent_binary() {
     local agent="$1" mode="${2:-resume}" binary registry
-    [[ "$agent" == codex || "$agent" == claude ]] || die "agent must be codex or claude"
     case "$agent" in
         codex) binary="${AGENT_SESSION_CODEX_BINARY:-}" ;;
         claude) binary="${AGENT_SESSION_CLAUDE_BINARY:-}" ;;
+        agy) binary="${AGENT_SESSION_AGY_BINARY:-}" ;;
+        grok) binary="${AGENT_SESSION_GROK_BINARY:-}" ;;
+        *) die "agent must be codex, claude, agy, or grok" ;;
     esac
     if [[ -n "$binary" ]]; then
         valid_local_binary_path "$binary" ||
@@ -2964,26 +2974,12 @@ resolve_agent_binary() {
         printf '%s\n' "$binary"
         return
     fi
-    # Ahead of the registry below, which is only a cache of whichever binary
-    # AGS launched last, not a declared preference — it gets rewritten on the
-    # next launch anyway.
-    #
-    # Prefer codext when it is installed. It is a superset: with a pool
-    # configured it leases an account, and without one it falls back to the
-    # same local auth.json plain codex uses. Preferring it here is what makes
-    # `ags codex`, the launcher menu and every resume path go through the pool
-    # without any of them having to know the pool exists.
-    if [[ "$agent" == codex ]]; then
-        binary="$(command -v codext 2>/dev/null || true)"
-        if valid_agent_binary_path codex "$binary" && [[ -f "$binary" && -x "$binary" ]]; then
-            printf '%s\n' "$binary"
-            return
-        fi
-    fi
+    # AGS v2 retires `codext` and always resolves unmodified official binaries
+    # (`codex`, `claude`, `agy`, `grok`).
     registry="$trusted_binary_dir/$agent"
     if [[ "$mode" != save && -f "$registry" ]]; then
         IFS= read -r binary < "$registry" || true
-        if valid_local_binary_path "$binary"; then
+        if [[ "${binary##*/}" != codext ]] && valid_local_binary_path "$binary"; then
             printf '%s\n' "$binary"
             return
         fi
@@ -3121,6 +3117,42 @@ codex_pool_write() {
     mv -- "$temporary" "$target"
 }
 
+# save / resume 对着后台，必须先有一把配置好的密钥。只看本地 pool.json 是否
+# 同时有地址和密钥，不在这里打 /ping——测试和离线机器不该被一次探活挡住。
+require_ags_backend_key() {
+    local config url key
+    config="$(codex_pool_config_path)"
+    if [[ ! -s "$config" ]]; then
+        config="$HOME/.codex/pool.json"
+    fi
+    [[ -s "$config" ]] ||
+        die "ags save / resume 需要先配置密钥：跑 ags codex-init"
+    need jq
+    url="$(jq -er '.base_url | select(type == "string" and length > 0)' "$config" 2>/dev/null)" ||
+        die "密钥配置没有地址：${config}（跑 ags codex-init）"
+    key="$(jq -er '.key | select(type == "string" and length > 0)' "$config" 2>/dev/null)" ||
+        die "密钥配置没有密钥：${config}（跑 ags codex-init）"
+}
+
+# 当前密钥对应的账户 / 分配空间。字段先占位，后台协议定了再填。
+show_ags_info() {
+    local config url key fingerprint
+    (( $# == 0 )) || die "usage: ags info"
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || die "未配置密钥；跑 ags codex-init"
+    need jq; need sha256sum
+    url="$(jq -er '.base_url | select(type == "string" and length > 0)' "$config" 2>/dev/null)" ||
+        die "配置文件读不出来：$config"
+    key="$(jq -er '.key | select(type == "string" and length > 0)' "$config" 2>/dev/null)" ||
+        die "配置文件里没有密钥：$config"
+    fingerprint="$(printf '%s' "$key" | sha256sum | awk '{print substr($1,1,12)}')"
+    printf 'account    (reserved)\n'
+    printf 'space      (reserved)\n'
+    printf 'pool       %s\n' "$url"
+    printf 'key        sha256:%s…\n' "$fingerprint"
+    printf 'CODEX_HOME %s\n' "$(codex_home_dir)"
+}
+
 codex_name_decision_file() { printf '%s/codex-name\n' "$state"; }
 codex_pool_disabled_file() { printf '%s/codex-pool-disabled\n' "$state"; }
 
@@ -3160,78 +3192,15 @@ link_codext_as_codex() {
 #                     的事，哪怕只发生一次。
 #   install           完整决定：发现外来 codex 就问，允许时把它挪开。只有安装
 #                     器调这一支。
+# Retired in AGS v2: unmodified official `codex` is used directly with
+# Berth v2 (`ags berth init` / `ags berth launch`). Never symlink `codext`
+# over `codex`.
 reconcile_codex_binary_name() {
     local mode="${1:-maintain}"
-    local codext_path codex_path resolved_codex resolved_codext
-    local decision reply directory backup decision_file
-    codext_path="$(command -v codext 2>/dev/null || true)"
-    [[ -n "$codext_path" ]] || return 0
-    codex_path="$(command -v codex 2>/dev/null || true)"
-
-    if [[ -z "$codex_path" ]]; then
-        # 没有人占着这个名字，给它一个主人不会动到任何既有文件，所以两种模式
-        # 都做——这正是那个死循环的解。
-        link_codext_as_codex "$codext_path" || true
-        return 0
+    if [[ "$mode" == install ]]; then
+        log "codext takeover is retired in AGS v2; keeping official codex binary (use \`ags berth init\`)"
     fi
-
-    resolved_codex="$(realpath -e -- "$codex_path" 2>/dev/null || printf '%s' "$codex_path")"
-    resolved_codext="$(realpath -e -- "$codext_path" 2>/dev/null || printf '%s' "$codext_path")"
-    # 已经是同一个文件，没什么可决定的。
-    [[ "$resolved_codex" != "$resolved_codext" ]] || return 0
-
-    # 到这里说明有一个外来的 codex。取代它是安装期的决定。
-    [[ "$mode" == install ]] || return 0
-
-    decision_file="$(codex_name_decision_file)"
-    decision=
-    [[ ! -s "$decision_file" ]] || IFS= read -r decision < "$decision_file" || decision=
-    [[ "$decision" == replace || "$decision" == keep ]] || decision=
-
-    if [[ -z "$decision" ]]; then
-        if [[ ! -t 0 || ! -t 1 ]]; then
-            # 非交互式选不破坏的那一边。移动别人的二进制不是能替人默认的事。
-            decision=keep
-            log "检测到另一个 codex（${resolved_codex}）；非交互式运行按保留处理"
-        else
-            printf '\n检测到已安装的 codex：%s\n' "$resolved_codex"
-            printf 'codext 是它的超集：配了凭据池就在线租号，没配就退回同一份本地 auth.json。\n'
-            printf '用 codext 接管 codex 这个名字？\n'
-            printf '  y = 把现有的挪到一边（保留备份，可还原），codex 指向 codext\n'
-            printf '  N = 保留现有的；本机不配置凭据池，原生 codex 读不到它\n[y/N]: '
-            IFS= read -r reply || reply=n
-            case "${reply:-n}" in
-                [Yy]*) decision=replace ;;
-                *) decision=keep ;;
-            esac
-        fi
-    fi
-
-    if [[ "$decision" == replace ]]; then
-        directory="$(dirname -- "$codex_path")"
-        if [[ ! -w "$directory" ]]; then
-            log "警告：$directory 不可写，改为保留现有 codex"
-            decision=keep
-        else
-            backup="$codex_path.stock.$(date -u +%Y%m%dT%H%M%SZ)"
-            mv -- "$codex_path" "$backup" || return 1
-            # 挪开而不是删除：这是可还原的，而删除不是。包管理器装的那种
-            # （npm、brew）仍然认为自己装着，下次升级可能把它放回来——真要
-            # 永久移除，得用装它的那个包管理器卸载。
-            log "原 codex 已挪到 ${backup}（若由包管理器安装，升级时可能被放回）"
-            link_codext_as_codex "$codext_path" || return 1
-            rm -f -- "$(codex_pool_disabled_file)"
-        fi
-    fi
-
-    if [[ "$decision" == keep ]]; then
-        # 原生 codex 读不到池配置，问了也用不上，所以这里直接记为禁用而不是
-        # 每次 init 再问一遍。
-        : > "$(codex_pool_disabled_file)"
-        log "保留现有 codex；本机不配置凭据池（原生 codex 用不到）"
-    fi
-    printf '%s\n' "$decision" > "$decision_file"
-    log "要改这个决定：删掉 $decision_file 再跑 ags init"
+    return 0
 }
 
 # Ask at init time whether this machine should use the pool at all.
@@ -3331,13 +3300,263 @@ apply_environment_overlay() {
     fi
     if ! output="$("$binary" env-apply --provider "$agent" --format shell 2>&1)"; then
         case "$output" in
-            *'unrecognized subcommand'*|*'unexpected argument'*|*'unrecognised subcommand'*)
+            *'unrecognized subcommand'*|*'unexpected argument'*|*'unrecognised subcommand'*|*'用法:'*|*'Usage:'*)
                 return 0
                 ;;
         esac
         die "environment overlay: $output"
     fi
     eval "$output"
+}
+
+# Named Codex/Claude home + split HTTP proxy.  Not a region overlay.
+#
+# `--runtime NAME` and `ags runtime use` write/read the same catalog.  Homes are
+# rebound before list/save/restore so those commands do not land in ~/.codex
+# while the child logs into another tree.  Login and egress proxies are
+# separate; empty means direct, and one is never copied onto the other.
+agent_runtime_eval() {
+    local intent="$1" command="${2:-}" binary output
+    local -a args
+    # Default path must not talk to the converter.  `ags list` / zone tests
+    # otherwise die because PATH's `ags` still prints usage for runtime-apply.
+    if [[ -z "${ags_runtime:-}" && ! -f "$state/runtime-selection.json" ]]; then
+        return 0
+    fi
+    binary="$( (resolve_ags_converter_binary) 2>/dev/null )" || {
+        [[ -z "${ags_runtime:-}" ]] ||
+            die "cannot apply --runtime: ags converter is missing"
+        [[ ! -f "$state/runtime-selection.json" ]] ||
+            die "a runtime is selected but the ags converter is missing; reinstall ags"
+        return 0
+    }
+    args=(runtime-apply --format shell --intent "$intent")
+    [[ -z "${ags_runtime:-}" ]] || args+=(--name "$ags_runtime")
+    [[ -z "$command" ]] || args+=(--command "$command")
+    if ! output="$("$binary" "${args[@]}" 2>&1)"; then
+        case "$output" in
+            *'unrecognized subcommand'*|*'unexpected argument'*|*'unrecognised subcommand'*|*'用法:'*|*'Usage:'*)
+                [[ -z "${ags_runtime:-}" ]] ||
+                    die "this ags build cannot apply --runtime; reinstall ags"
+                return 0
+                ;;
+        esac
+        die "runtime: $output"
+    fi
+    eval "$output"
+}
+
+apply_agent_runtime_bind() {
+    local command="${1:-}"
+    case "$command" in
+        berth|runtime|env-use|env-show|env-list|env-clear|help|-h|--help|update|init) return 0 ;;
+    esac
+    agent_runtime_eval homes "$command"
+}
+
+scrub_agent_proxy_environment() {
+    unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy
+    unset NO_PROXY no_proxy FTP_PROXY ftp_proxy
+}
+
+# Drop DrvFs Windows directories from PATH so the model cannot exec
+# powershell.exe / cmd.exe by name and read the host timezone or GeoID.
+# Absolute Windows paths still exist; overlay hooks rewrite timezone/Geo
+# observations from the egress-IP zone. ipconfig is not a region channel.
+scrub_windows_interop_path() {
+    local part
+    local -a kept=()
+    local IFS=':'
+    for part in $PATH; do
+        case "$part" in
+            /mnt/[a-zA-Z]|/mnt/[a-zA-Z]/*) continue ;;
+        esac
+        [[ -n "$part" ]] || continue
+        kept+=("$part")
+    done
+    if ((${#kept[@]} > 0)); then
+        IFS=':'
+        export PATH="${kept[*]}"
+    else
+        export PATH='/usr/local/bin:/usr/bin:/bin'
+    fi
+    unset WT_SESSION WT_PROFILE_ID
+}
+
+apply_agent_runtime_proxy() {
+    local agent="$1" intent=egress-proxy
+    shift
+    case "${1:-}" in
+        login|setup-token) intent=login-proxy ;;
+    esac
+    agent_runtime_eval "$intent" "$agent"
+}
+
+# AGS owns agent HTTP traffic: strip terminal/global proxies, then apply at
+# most one source (local loopback listener, pool-issued, or none). Timezone
+# is always the IANA zone of the current egress IP.
+apply_agent_traffic_policy() {
+    local agent="$1"
+    shift
+    scrub_agent_proxy_environment
+    scrub_windows_interop_path
+    apply_agent_runtime_proxy "$agent" "$@" || true
+    maybe_apply_pool_proxy "$agent"
+    align_runtime_timezone
+}
+
+maybe_apply_pool_proxy() {
+    local agent="$1" mode="${AGS_RUNTIME_PROXY_MODE:-auto}" config url key payload proxy
+    unset AGS_RUNTIME_PROXY_MODE
+    [[ "$agent" == codex ]] || return 0
+    [[ -z "${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}" ]] || return 0
+    case "$mode" in
+        direct|local) return 0 ;;
+    esac
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    command -v curl >/dev/null && command -v jq >/dev/null || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    payload="$(curl -sS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 \
+        -H "X-Codex-Pool-Token: $key" \
+        "$url$codex_pool_prefix/ping" 2>/dev/null)" || return 0
+    proxy="$(jq -er '.data.proxy // .data.egress_proxy // empty' <<< "$payload" 2>/dev/null)" ||
+        return 0
+    [[ -n "$proxy" ]] || return 0
+    case "$proxy" in
+        http://*) ;;
+        *) return 0 ;;
+    esac
+    [[ "$proxy" != *@* ]] || return 0
+    export HTTPS_PROXY="$proxy" HTTP_PROXY="$proxy" https_proxy="$proxy" http_proxy="$proxy"
+}
+
+align_runtime_timezone() {
+    local overlay="${AGS_ENV_OVERLAY:-}" tz json proxy country lang
+    unset AGS_ENV_OVERLAY AGS_RUNTIME_TZ_PROBE
+    export AGS_FS_OVERLAY="${overlay:+$overlay/fs/etc}"
+    # Authoritative Berth v2 Lease timezone: never call external ipwho.is.
+    if [[ -n "${AGS_BERTH_CAGE_TZ:-}" && "${AGS_BERTH_CAGE_TZ}" =~ ^[A-Za-z][A-Za-z0-9/_+-]*$ ]]; then
+        tz="$AGS_BERTH_CAGE_TZ"
+        export TZ="$tz"
+        country="${AGS_BERTH_CAGE_COUNTRY:-}"
+        country="${country^^}"
+        if [[ ! "$country" =~ ^[A-Z]{2}$ ]]; then
+            country=""
+        fi
+        lang="${AGS_BERTH_CAGE_LOCALE:-}"
+        if [[ -z "$lang" && -n "$country" ]]; then
+            lang="$(locale_for_country "$country")"
+        fi
+        if [[ -n "$lang" ]]; then
+            export LANG="$lang" LC_ALL="$lang" LC_TIME="$lang"
+        fi
+        sync_overlay_timezone "$tz" "$overlay" "$country"
+        return 0
+    fi
+    if [[ "${AGENT_SESSION_DISABLE_GEO:-0}" == 1 ]]; then
+        unset TZ LANG LC_ALL LC_TIME
+        return 0
+    fi
+    command -v curl >/dev/null && command -v jq >/dev/null || { unset TZ; return 0; }
+    proxy="${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}"
+    if [[ -n "$proxy" ]]; then
+        json="$(curl -fsS --connect-timeout 1 --max-time 3 --max-filesize 65536 -x "$proxy" \
+            'https://ipwho.is/?fields=success,ip,timezone,country_code' 2>/dev/null)" || { unset TZ; return 0; }
+    else
+        json="$(curl -fsS --connect-timeout 1 --max-time 3 --max-filesize 65536 \
+            'https://ipwho.is/?fields=success,ip,timezone,country_code' 2>/dev/null)" || { unset TZ; return 0; }
+    fi
+    tz="$(jq -er '
+        select(.success == true) |
+        (if (.timezone | type) == "string" then .timezone
+         elif (.timezone.id | type) == "string" then .timezone.id
+         elif (.timezone.time_zone | type) == "string" then .timezone.time_zone
+         else empty end) |
+        select(test("^[A-Za-z][A-Za-z0-9/_+-]*$"))
+    ' <<< "$json" 2>/dev/null)" || { unset TZ; return 0; }
+    [[ -n "$tz" ]] || { unset TZ; return 0; }
+    export TZ="$tz"
+    country="$(jq -er '
+        select(.success == true) |
+        .country_code // empty |
+        ascii_upcase |
+        select(test("^[A-Z]{2}$"))
+    ' <<< "$json" 2>/dev/null)" || country=""
+    lang="$(locale_for_country "$country")"
+    if [[ -n "$lang" ]]; then
+        export LANG="$lang" LC_ALL="$lang" LC_TIME="$lang"
+    fi
+    sync_overlay_timezone "$tz" "$overlay" "$country"
+}
+
+locale_for_country() {
+    case "${1:-}" in
+        JP) printf '%s\n' 'ja_JP.UTF-8' ;;
+        CN) printf '%s\n' 'zh_CN.UTF-8' ;;
+        HK) printf '%s\n' 'zh_HK.UTF-8' ;;
+        MO) printf '%s\n' 'zh_MO.UTF-8' ;;
+        TW) printf '%s\n' 'zh_TW.UTF-8' ;;
+        KR) printf '%s\n' 'ko_KR.UTF-8' ;;
+        DE) printf '%s\n' 'de_DE.UTF-8' ;;
+        FR) printf '%s\n' 'fr_FR.UTF-8' ;;
+        GB) printf '%s\n' 'en_GB.UTF-8' ;;
+        AU) printf '%s\n' 'en_AU.UTF-8' ;;
+        SG) printf '%s\n' 'en_SG.UTF-8' ;;
+        US|CA) printf '%s\n' 'en_US.UTF-8' ;;
+        BR) printf '%s\n' 'pt_BR.UTF-8' ;;
+        ES) printf '%s\n' 'es_ES.UTF-8' ;;
+        IT) printf '%s\n' 'it_IT.UTF-8' ;;
+        NL) printf '%s\n' 'nl_NL.UTF-8' ;;
+        IN) printf '%s\n' 'en_IN.UTF-8' ;;
+        '') printf '%s\n' '' ;;
+        *) printf '%s\n' 'en_US.UTF-8' ;;
+    esac
+}
+
+sync_overlay_timezone() {
+    local tz="$1" overlay="$2" country="${3:-}" profile tmp
+    [[ -n "$overlay" && -f "$overlay/profile.json" ]] || return 0
+    command -v python3 >/dev/null || return 0
+    profile="$overlay/profile.json"
+    tmp="$profile.tmp"
+    python3 -c '
+import json, sys
+path, timezone, country, dest = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(path, encoding="utf-8") as handle:
+    data = json.load(handle)
+clock = data.get("clock")
+if isinstance(clock, dict):
+    clock["timezone"] = timezone
+    clock.pop("offset_seconds", None)
+locale = data.get("locale")
+if country and isinstance(locale, dict):
+    table = {
+        "JP": "ja_JP.UTF-8", "CN": "zh_CN.UTF-8", "HK": "zh_HK.UTF-8",
+        "TW": "zh_TW.UTF-8", "KR": "ko_KR.UTF-8", "US": "en_US.UTF-8",
+        "GB": "en_GB.UTF-8", "AU": "en_AU.UTF-8", "SG": "en_SG.UTF-8",
+        "DE": "de_DE.UTF-8", "FR": "fr_FR.UTF-8",
+    }
+    lang = table.get(country, "en_US.UTF-8")
+    locale["lang"] = lang
+    locale["lc_all"] = lang
+    locale["lc_time"] = lang
+with open(dest, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+' "$profile" "$tz" "$country" "$tmp" || { rm -f "$tmp"; return 0; }
+    mv "$tmp" "$profile" || { rm -f "$tmp"; return 0; }
+    if [[ -n "$tz" ]]; then
+        mkdir -p "$overlay/fs/etc"
+        printf '%s\n' "$tz" > "$overlay/fs/etc/timezone"
+        for root in /usr/share/zoneinfo /var/db/timezone/zoneinfo; do
+            if [[ -f "$root/$tz" ]]; then
+                cp "$root/$tz" "$overlay/fs/etc/localtime"
+                break
+            fi
+        done
+    fi
 }
 
 text_has_no_control_characters() {
@@ -3522,9 +3741,12 @@ fetch_pool_accounts() {
         die "配置文件读不出来：$config"
     key="$(jq -er '.key' "$config" 2>/dev/null)" ||
         die "配置文件里没有密钥：$config"
-    payload="$(curl -sS $codex_pool_curl_redirect --connect-timeout 8 --max-time 20 -X POST \
-        -H "X-Codex-Pool-Token: $key" \
-        "$url$codex_pool_prefix/accounts" 2>/dev/null)" ||
+    payload="$(
+        agent_runtime_eval login-proxy codex
+        curl -sS $codex_pool_curl_redirect --connect-timeout 8 --max-time 20 -X POST \
+            -H "X-Codex-Pool-Token: $key" \
+            "$url$codex_pool_prefix/accounts" 2>/dev/null
+    )" ||
         die "问不到凭据池：$url"
     jq -e '.data.accounts | type == "array"' <<< "$payload" >/dev/null 2>&1 ||
         die "凭据池回的不是预期的 JSON"
@@ -3667,6 +3889,17 @@ ags_consume_option() {
         --environment-profile=*)
             ags_environment_profile="${1#--environment-profile=}"
             [[ -n "$ags_environment_profile" ]] || die "--environment-profile requires a JSON path"
+            ags_consumed=1
+            ;;
+        --runtime)
+            (( $# >= 2 )) || die "--runtime 需要一个 runtime 名"
+            ags_runtime="$2"
+            [[ -n "$ags_runtime" ]] || die "--runtime 需要一个 runtime 名"
+            ags_consumed=2
+            ;;
+        --runtime=*)
+            ags_runtime="${1#--runtime=}"
+            [[ -n "$ags_runtime" ]] || die "--runtime 需要一个 runtime 名"
             ags_consumed=1
             ;;
     esac
@@ -3872,6 +4105,7 @@ check_pool_account_names() {
 # 意味着再发一版 codext。
 report_pool_session() {
     local agent="$1" launch_cwd="$2" config url key
+    ags_pool_session_reported=0
     [[ "$agent" == codex ]] || return 0
     [[ -n "${ags_session_id:-}" ]] || return 0
     [[ -n "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
@@ -3889,7 +4123,7 @@ report_pool_session() {
     #
     # 没写 `--account` 时发空数组，意思是"这次不点名"，和"没提这件事"不同——后者
     # 会让上一轮的队列莫名其妙地留着。
-    curl -sS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
+    if curl -fsS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
         -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
         -d "$(jq -nc \
               --arg d "$CODEXT_POOL_DEVICE_ID" --arg i "$ags_session_id" \
@@ -3898,7 +4132,120 @@ report_pool_session() {
               --arg a "${ags_account:-}" \
               '{device_id:$d, ags_id:$i, cwd:$c, host:$h, started_at:$s,
                 accounts:($a | if . == "" then [] else split(",") end)}')" \
-        "$url$codex_pool_prefix/session" >/dev/null 2>&1 || true
+        "$url$codex_pool_prefix/session" >/dev/null 2>&1; then
+        ags_pool_session_reported=1
+        ags_pool_session_started_epoch="$(date +%s)"
+    fi
+}
+
+report_pool_session_end() {
+    local agent="$1" config url key
+    [[ "$agent" == codex ]] || return 0
+    [[ "${ags_pool_session_reported:-0}" == 1 ]] || return 0
+    [[ -n "${CODEXT_POOL_DEVICE_ID:-}" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    curl -fsS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
+        -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg d "$CODEXT_POOL_DEVICE_ID" \
+              --arg e "$(date +%Y-%m-%dT%H:%M:%S%z)" \
+              '{device_id:$d, ended_at:$e}')" \
+        "$url$codex_pool_prefix/session/end" >/dev/null 2>&1 || true
+}
+
+report_pool_session_description() {
+    local description="$1" config url key
+    [[ "${ags_pool_session_reported:-0}" == 1 ]] || return 0
+    [[ -n "${CODEXT_POOL_DEVICE_ID:-}" && -n "$description" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    config="$(codex_pool_config_path)"
+    [[ -s "$config" ]] || return 0
+    url="$(jq -er '.base_url' "$config" 2>/dev/null)" || return 0
+    key="$(jq -er '.key' "$config" 2>/dev/null)" || return 0
+    curl -fsS $codex_pool_curl_redirect --connect-timeout 4 --max-time 8 -X POST \
+        -H "X-Codex-Pool-Token: $key" -H 'Content-Type: application/json' \
+        -d "$(jq -nc --arg d "$CODEXT_POOL_DEVICE_ID" --arg t "$description" \
+              '{device_id:$d, description:$t}')" \
+        "$url$codex_pool_prefix/session/description" >/dev/null 2>&1 || true
+}
+
+# Resolve only the Codex rollout belonging to the process AGS just launched.
+# Prefer the exact AGS/session id; generated AGS ids fall back to the same
+# workspace and a narrow launch-time window, matching the server-side pairing
+# rule used by push_pool_descriptions.
+live_pool_local_session_row() {
+    local launch_cwd="$1" launch_epoch="$2"
+    local provider session_id started started_epoch when when_epoch workspace native_name title path
+    local best_row= best_delta=999999 delta
+    local native_list_workspace=
+    while IFS=$'\x1f' read -r provider session_id started started_epoch \
+                                  when when_epoch workspace native_name title path; do
+        [[ "$provider" == codex && -n "$session_id" ]] || continue
+        if [[ "$session_id" == "${ags_session_id:-}" ]]; then
+            printf '%s\x1f%s\x1f%s\n' "$session_id" "$native_name" "$path"
+            return 0
+        fi
+        [[ "$workspace" == "$launch_cwd" && "$started_epoch" =~ ^[0-9]+$ ]] || continue
+        (( started_epoch >= launch_epoch - 5 && started_epoch <= launch_epoch + 180 )) || continue
+        delta=$(( started_epoch - launch_epoch )); (( delta < 0 )) && delta=$(( -delta ))
+        if (( delta < best_delta )); then
+            best_delta=$delta
+            best_row="${session_id}"$'\x1f'"${native_name}"$'\x1f'"${path}"
+        fi
+    done < <(native_session_rows)
+    [[ -n "$best_row" ]] || return 1
+    printf '%s\n' "$best_row"
+}
+
+update_live_pool_description_once() {
+    local launch_cwd="$1" launch_epoch="$2" row session_id native_name path description
+    row="$(live_pool_local_session_row "$launch_cwd" "$launch_epoch" 2>/dev/null)" || return 0
+    IFS=$'\x1f' read -r session_id native_name path <<< "$row"
+    [[ -n "$session_id" && -n "$path" ]] || return 0
+    # A server-side topic summary is useful even when Codex has a native title.
+    # Passing an empty native name keeps the normal fingerprint/refresh guards
+    # while allowing the summary cache to track the conversation as it changes.
+    AGS_SUMMARY_REFRESH_SECONDS="${AGS_LIVE_SUMMARY_REFRESH_SECONDS:-600}" \
+        ensure_session_summary codex "$session_id" "$path" "" 0 >/dev/null 2>&1 || true
+    read_session_annotation codex "$session_id"
+    description="${annotation_description:-${annotation_summary:-}}"
+    [[ -n "$description" ]] || return 0
+    report_pool_session_description "$description"
+}
+
+# Watch the process that AGS is about to replace with Codex. This preserves the
+# original exec/PID/signal/TTY behavior while still giving AGS a tiny detached
+# observer that can refresh the live topic and mark the server session ended.
+watch_pool_session_lifecycle() {
+    local agent="$1" launch_cwd="$2" launch_epoch="$3" managed_pid="$4"
+    local elapsed=0 poll="${AGS_LIVE_SUMMARY_POLL_SECONDS:-60}" parent_pid
+    [[ "$poll" =~ ^[0-9]{1,6}$ ]] || poll=60
+    (( poll < 15 )) && poll=15
+    while kill -0 "$managed_pid" 2>/dev/null; do
+        parent_pid="$(ps -o ppid= -p "$BASHPID" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$parent_pid" == "$managed_pid" ]] || break
+        sleep 5
+        elapsed=$((elapsed + 5))
+        if (( elapsed >= 15 && elapsed % poll < 5 )); then
+            update_live_pool_description_once "$launch_cwd" "$launch_epoch" || true
+        fi
+    done
+    report_pool_session_end "$agent" || true
+    update_live_pool_description_once "$launch_cwd" "$launch_epoch" || true
+}
+
+start_pool_session_watcher() {
+    local agent="$1" launch_cwd="$2"
+    [[ "${ags_pool_session_reported:-0}" == 1 ]] || return 0
+    [[ "$agent" == codex ]] || return 0
+    ( trap '' HUP INT TERM
+      watch_pool_session_lifecycle "$agent" "$launch_cwd" \
+          "${ags_pool_session_started_epoch:-$(date +%s)}" "$$"
+    ) >/dev/null 2>&1 </dev/null &
+    disown 2>/dev/null || true
 }
 
 
@@ -4516,6 +4863,7 @@ launch_managed_agent() {
     prepare_session_identity "$launch_cwd" "$agent"
     export_pool_device_id "$agent"
     report_pool_session "$agent" "$launch_cwd"
+    start_pool_session_watcher "$agent" "$launch_cwd"
     # After every check that can refuse this launch, so a pending update is
     # never the last thing printed before a refusal — and never mistaken for
     # part of one. `|| true` states the contract where it matters: an update
@@ -4527,8 +4875,34 @@ launch_managed_agent() {
     # 提示绝不该是一次拒绝之前的最后一句话，那读起来像是拒绝的一部分。
     announce_auto_gc || true
     maybe_start_background_gc || true
-    apply_environment_overlay "$agent"
-    exec "$launch_binary" "$@"
+    apply_environment_overlay "$agent" || true
+    apply_agent_traffic_policy "$agent" "$@" || true
+    exec_agent_with_observational_fs "$launch_binary" "$@"
+}
+
+# Bind overlay /etc/localtime, /etc/timezone, /etc/hostname over the host
+# files in a user+mount namespace so libc and Python see the egress zone
+# even when they ignore TZ. Falls back to a plain exec when unshare cannot.
+exec_agent_with_observational_fs() {
+    local launch_binary="$1" etc="${AGS_FS_OVERLAY:-}"
+    shift
+    unset AGS_FS_OVERLAY
+    if [[ -z "$etc" || ! -d "$etc" ]] || ! command -v unshare >/dev/null; then
+        exec "$launch_binary" "$@"
+    fi
+    if ! unshare --user --map-root-user --mount true >/dev/null 2>&1; then
+        exec "$launch_binary" "$@"
+    fi
+    exec unshare --user --map-root-user --mount /bin/bash -c '
+        set -e
+        etc="$1"
+        launch="$2"
+        shift 2
+        [[ -f "$etc/localtime" ]] && mount --bind "$etc/localtime" /etc/localtime
+        [[ -f "$etc/timezone" ]] && mount --bind "$etc/timezone" /etc/timezone 2>/dev/null || true
+        [[ -f "$etc/hostname" ]] && mount --bind "$etc/hostname" /etc/hostname 2>/dev/null || true
+        exec "$launch" "$@"
+    ' bash "$etc" "$launch_binary" "$@"
 }
 
 resolve_checkpoint_record_for_live() {
@@ -5985,14 +6359,21 @@ finalize_pending_file() {
     unlock_storage_consolidation
 }
 
+# 存档文件名里不能有 `/`，公开身份仍是 provider/session-id。
+session_archive_id() {
+    local agent="$1" session_id="$2" provider
+    case "$agent" in
+        claude) provider=claude-code ;;
+        *) provider="$agent" ;;
+    esac
+    printf '%s--%s--%s-%s\n' "$provider" "${session_id:0:8}" "$(date +%y%m%d-%H%M%S)" "$$"
+}
+
 save_active_checkpoint() {
     local target="${1:-}" agent="${AGENT_SESSION_AGENT:-}" session_id="${AGENT_SESSION_ID:-}"
     local selected_provider selected_session_id
     shift || true
     [[ "$target" == local || "$target" == cloud ]] || die "target must be local or cloud"
-    # 明确点名一个会话。这是 `ags ls` 里按 s 走的同一条路，也是在任何地方导出一个
-    # 早就结束了的会话的方式——`ags save` 以前只认「AGS 起的、此刻正在跑的」那个，
-    # 而列表里的会话绝大多数两条都不满足。
     if [[ "${1:-}" == --session ]]; then
         (( $# >= 2 )) || die "--session 需要 <provider>/<session_id>"
         split_live_selector "live:$2"
@@ -6000,25 +6381,8 @@ save_active_checkpoint() {
         save_live_session "$selected_provider" "$selected_session_id" "$*"
         return
     fi
-    # 会话 ID 在**启动时**就定好了（见 `prepare_session_identity`），所以在一个 AGS
-    # 起的会话里保存只需要给描述：`ags save "描述"`。
-    #
-    #   ags save "描述"              ID 用这个会话自己的
-    #   ags save --id 别的名字 "描述"  显式换一个（分支一条新工作线）
-    #   ags save <ID> "描述"          只在**没有** AGS_ID 时有效，即这个会话不是
-    #                                 AGS 起的——那种会话没有自己的 ID 可用
-    #
-    # 刻意**不去猜**第一个参数是 ID 还是描述。猜过一版："长得像 ID 就当 ID"，于是
-    # `ags save "fixed"` 这种单词英文描述被当成了 ID，描述变空，报出来的却是
-    # "description must be 1-80 characters"——人明明给了描述。判据一旦是启发式的，
-    # 错的那一侧就总会有人踩到。
-    if [[ -n "${AGS_ID:-}" ]]; then
-        if [[ "${1:-}" == --id ]]; then
-            (( $# >= 2 )) || die "--id 需要一个会话 ID"
-            shift
-        else
-            set -- "$AGS_ID" "$@"
-        fi
+    if [[ "${1:-}" == --id ]]; then
+        die "ags save 不再接受 --id；当前会话的 ID 是 provider/session-id"
     fi
     if [[ -z "$agent" || -z "$session_id" ]]; then
         if [[ -n "${CODEX_THREAD_ID:-}" ]]; then
@@ -6026,10 +6390,13 @@ save_active_checkpoint() {
         elif [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
             agent=claude session_id="$CLAUDE_CODE_SESSION_ID"
         else
-            die "save 需要知道存哪个会话：在 AGS 起的会话里直接 \`ags save 描述\`，在外面用 \`ags save --session <provider>/<id> 描述\`，或从 \`ags ls\` 里按 s"
+            die "ags save 只能在 Agent 会话里由 skill 调用；本地终端请用 ags ls 里按 s，或 ags save --session provider/id"
         fi
     fi
-    queue_checkpoint "$target" "$agent" "$session_id" "$@"
+    (( $# >= 1 )) || die "ags save 需要一段描述"
+    require_ags_backend_key
+    queue_checkpoint "$target" "$agent" "$session_id" \
+        "$(session_archive_id "$agent" "$session_id")" "$*"
 }
 
 flush_pending() {
@@ -6749,7 +7116,7 @@ load_local_checkpoint_menu() {
 # 先把一份冻结的副本写回它的 home 再让它读。后者是 `ags save` 存下来的东西才需要
 # 的动作，`restore_checkpoint_file` 那一整套覆盖 + 回滚日志只为它存在。
 #
-# 存档因此退成第二类：`ags ls -a` 才会把它们和活会话并排列出来，KIND 一列区分。
+# 存档因此退成第二类：`ags archives` 才列它们。`ags ls -a` 是列全部工作目录的活会话。
 #
 # 描述、启动参数、pin 这三样原生会话里没有，AGS 记在自己的状态目录下，键是
 # `<provider>/<session_id>`。两个地方刻意不放：
@@ -7210,7 +7577,7 @@ native_session_limit() {
 converter_cli() {
     local binary
     binary="$(resolve_ags_converter_binary)"
-    "$binary" convert "$@"
+    "$binary" convert "$@" 8>&- 9>&-
 }
 
 # 原生会话，最近的在前。
@@ -7226,9 +7593,13 @@ converter_cli() {
 # 排序在 jq 里做而不是交给 `sort`：`ags convert list` 是按 provider 分组各自截断的，跨
 # provider 的先后只有把两边合起来看才成立。
 native_session_rows() {
-    local binary
-    converter_cli --json list --all-workspaces --sort date \
-        --limit "$(native_session_limit)" 2>/dev/null |
+    local -a list_args=(--json list --sort date --limit "$(native_session_limit)")
+    if [[ -n "${native_list_workspace:-}" ]]; then
+        list_args+=(--workspace "$native_list_workspace")
+    else
+        list_args+=(--all-workspaces)
+    fi
+    converter_cli "${list_args[@]}" 2>/dev/null |
         jq -r '
             # 一行给人看的标题。
             #
@@ -7314,8 +7685,7 @@ managed_agent_for_provider() {
 # 这一行过不过得了当前的 Agent 过滤。
 #
 # 两套名字都认：ags 那边的 provider slug（`claude-code`）和 AGS 启动它时用的名字
-# （`claude`）。存档那一半只有后者，活会话那一半只有前者，而 `-a` 会把两种并排列
-# 出来——只认一套的话，`ags ls -a claude` 就会莫名其妙地只剩存档或者只剩活会话。
+# （`claude`）。菜单 `f` 过滤时两边都会碰到，只认一套就会漏行。
 #
 # 不调 `managed_agent_for_provider`：那是一次子 shell，而这个判断每行都要做一次，
 # 一百条会话就是一百次进程启动。
@@ -7434,7 +7804,7 @@ load_native_session_menu() {
     local -a live_provider=() live_id=() live_when=() live_workspace=() live_title=()
     local -a live_path=() live_key=() live_native=() live_when_epoch=()
     local -a live_started=()
-    local -A annotation_map=() ordinal_map=()
+    local -A annotation_map=()
     local annotations_batched=1
     while IFS=$'\x1f' read -r provider session_id started started_epoch \
                               when when_epoch workspace \
@@ -7451,38 +7821,11 @@ load_native_session_menu() {
         live_path+=("$path")
         live_key+=("$provider/$session_id")
     done < <(native_session_rows)
-    load_session_ordinals
     now="$(date +%s)"
     # 一次读完，别一行起一次 jq。读不动就退回逐条，批量只是优化。
     load_all_annotations || annotations_batched=0
-    # **先剔掉不显示的，再发短号。**
-    #
-    # 短号发出去就不收回（那正是它作为坐标的价值）。所以给一条永远不会显示的空
-    # 会话发一个号，等于把后面每一条可见会话的号往后推一格——而 Codex 每起一次
-    # 就落一条 rollout，用不了多久 `ags ls` 的第一列就变成四位数了。
-    #
-    # 这一趟只是查一遍注解表（内存里的 map），不额外读盘。
-    local scan probe
-    local -a numbered_key=()
-    for scan in "${!live_id[@]}"; do
-        if (( annotations_batched == 1 )); then
-            annotation_from_map "${live_key[$scan]}"
-        else
-            read_session_annotation "${live_provider[$scan]}" "${live_id[$scan]}"
-        fi
-        probe="${annotation_description:-${live_native[$scan]:-${annotation_summary:-${live_title[$scan]}}}}"
-        [[ -n "$probe" ]] || (( annotation_pinned == 1 )) || continue
-        numbered_key+=("${live_key[$scan]}")
-    done
-    (( ${#numbered_key[@]} == 0 )) || assign_session_ordinals "${numbered_key[@]}"
-    local ordinal_key ordinal_value
-    while IFS=$'\t' read -r ordinal_key ordinal_value; do
-        [[ -n "$ordinal_key" ]] || continue
-        ordinal_map["$ordinal_key"]="$ordinal_value"
-    done < <(jq -r '.ids | to_entries[] | "\(.key)\t\(.value)"' \
-        <<< "$session_ordinals_json" 2>/dev/null || true)
 
-    local index ordinal started
+    local index display_n=0 started
     local -A agent_seen=()
     native_list_agents=()
     for index in "${!live_id[@]}"; do
@@ -7517,11 +7860,8 @@ load_native_session_menu() {
         # 这一批里出现过哪些 Agent。**在过滤之前收集**：过滤之后收集的话，一旦切到
         # codex，可选项就只剩 codex，`f` 再也回不到 claude。
         agent_seen["$provider"]=1
-        # 过滤只管**显示**，不管发号——短号是这台机器给会话的坐标，它不该因为你此刻
-        # 正好在看哪个 Agent 而变。所以这一刀落在发号之后。
         agent_filter_matches "$provider" || continue
-        ordinal="${ordinal_map[${live_key[$index]}]:--}"
-        [[ -n "$ordinal" ]] || ordinal='-'
+        display_n=$((display_n + 1))
         terminal_menu_ids+=("live:$provider/$session_id")
         terminal_menu_agents+=("$(managed_agent_for_provider "$provider")")
         terminal_menu_names+=("$annotation_description")
@@ -7532,7 +7872,7 @@ load_native_session_menu() {
            [[ -z "$annotation_summary_stamp" ]]; then
             native_menu_missing=$((native_menu_missing + 1))
         fi
-        rows+=("$marker$ordinal"$'\t'"live"$'\t'"$provider"$'\t'"$started"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"$description")
+        rows+=("$marker$display_n"$'\t'"live"$'\t'"$provider"$'\t'"$session_id"$'\t'"$started"$'\t'"$when"$'\t'"$(workspace_cell "$workspace" "$table_width")"$'\t'"$description")
     done
 
     if (( ${#agent_seen[@]} > 0 )); then
@@ -7545,14 +7885,13 @@ load_native_session_menu() {
             [[ -n "$args" ]] || args='[]'
             archive_agent="${selector%%/*}"
             agent_filter_matches "$archive_agent" || continue
+            display_n=$((display_n + 1))
             terminal_menu_ids+=("saved:$selector")
             terminal_menu_agents+=("$archive_agent")
             terminal_menu_names+=("")
             terminal_menu_args+=("$args")
             terminal_menu_details+=("$(format_launch_args "$args")")
-            # 存档没有短号：那一列的含义是"敲这个数字能打开它"，而存档要用它自己
-            # 的检查点 ID。ID 挪到工作区那一栏，因为存档本来就不显示工作区。
-            rows+=(" -"$'\t'"saved"$'\t'"$archive_agent"$'\t'"$saved_date"$'\t'"$checkpoint_id"$'\t'"$description")
+            rows+=(" $display_n"$'\t'"saved"$'\t'"$archive_agent"$'\t'"$checkpoint_id"$'\t'"$saved_date"$'\t'"-"$'\t'"-"$'\t'"$description")
         done < <(list_checkpoint_root local "$local_checkpoints" 1)
     fi
 
@@ -7562,16 +7901,16 @@ load_native_session_menu() {
     if (( for_menu == 1 )); then
         mapfile -t rendered < <(
             {
-                printf '#\tKIND\tAGENT\tSTARTED\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
+                printf '#\tKIND\tAGENT\tSESSION\tSTARTED\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
                 printf '%s\n' "${rows[@]}"
-            } | render_checkpoint_table 2 1 7
+            } | render_checkpoint_table 2 1 8
         )
     else
         mapfile -t rendered < <(
             {
-                printf '#\tKIND\tAGENT\tSTARTED\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
+                printf '#\tKIND\tAGENT\tSESSION\tSTARTED\tACTIVE\tWORKSPACE\tDESCRIPTION\n'
                 printf '%s\n' "${rows[@]}"
-            } | render_checkpoint_table 0 0 7
+            } | render_checkpoint_table 0 0 8
         )
     fi
     if (( ${#rendered[@]} == ${#rows[@]} + 1 )); then
@@ -7593,6 +7932,7 @@ load_native_session_menu() {
 resume_live_session() {
     local provider="$1" session_id="$2" agent launch_binary session_path workspace
     local -a client_args=()
+    require_ags_backend_key
     agent="$(managed_agent_for_provider "$provider")"
     if [[ -z "$agent" ]]; then
         show_foreign_resume_command "$provider" "$session_id"
@@ -7657,6 +7997,7 @@ resume_live_cross_agent() {
     local target_cwd launch_binary
     local -a client_args=()
 
+    require_ags_backend_key
     source_agent="$(managed_agent_for_provider "$provider")"
     target_agent="${ags_to:-}"
     [[ "$source_agent" == codex || "$source_agent" == claude ]] ||
@@ -7764,13 +8105,14 @@ resume_live_cross_agent() {
 # 从 ags 现读一次而不是在列表里带着走：列表那行是给人看的（可能只有仓库名），
 # 而 `cd` 需要的是完整路径。
 native_session_workspace() {
-    local provider="$1" session_id="$2" binary
-    converter_cli --json list --all-workspaces --sort date \
+    local provider="$1" session_id="$2" row=
+    row="$(converter_cli --json list --all-workspaces --sort date \
         --limit "$(native_session_limit)" 2>/dev/null |
         jq -r --arg provider "$provider" --arg id "$session_id" '
             (.items // [])
             | map(select(.provider == $provider and .session_id == $id))
-            | (.[0].workspace // "") | tostring' 2>/dev/null
+            | (.[0].workspace // "") | tostring' 2>/dev/null)" || true
+    printf '%s\n' "$row"
 }
 
 # AGS 不负责启动的 Agent：把它自己的恢复命令说出来，不代跑。
@@ -7797,6 +8139,7 @@ show_foreign_resume_command() {
 # 行——列表里的会话多半早就结束了，也多半不是 AGS 起的。
 save_live_session() {
     local provider="$1" session_id="$2" description="${3:-}" agent archive_id native_home
+    require_ags_backend_key
     agent="$(managed_agent_for_provider "$provider")"
     [[ -n "$agent" ]] ||
         die "AGS 只导出 Codex 和 Claude 的会话；${provider} 不在其中"
@@ -7807,7 +8150,7 @@ save_live_session() {
     # 存档 ID 带上时刻。同一个会话在两个时间点各存一份是这个功能存在的理由——
     # 「回到我按过 save 的那些点」——所以拿会话 ID 本身当存档 ID 会让第二次保存被
     # `checkpoint ID already exists` 顶回去，把唯一的用法挡在门外。
-    archive_id="${session_id:0:8}-$(date +%y%m%d-%H%M%S)"
+    archive_id="$(session_archive_id "$agent" "$session_id")"
     if [[ "$agent" == codex ]]; then native_home="$codex_home"; else native_home="$claude_home"; fi
     # 会话还开着的时候不能立刻抄。
     #
@@ -7881,6 +8224,30 @@ split_live_selector() {
     [[ -n "$selected_provider" && -n "$selected_session_id" &&
        "$selected_provider" != "$body" ]] ||
         die "unreadable session selector: $1"
+    case "$selected_provider" in
+        claude) selected_provider=claude-code ;;
+    esac
+}
+
+# 命令行身份：provider/session-id。不要 live: 前缀，也不要检查点 ID / 序号。
+parse_session_selector() {
+    local body="${1:-}"
+    [[ -n "$body" ]] ||
+        die "usage: ags resume provider/session-id [--to codex|claude] [--cwd PATH] [--profile NAME] [-- AGENT_ARGS...]"
+    if [[ "$body" == live:* ]]; then
+        die "ags resume 用 provider/session-id，不要加 live: 前缀"
+    fi
+    if [[ "$body" =~ ^[0-9]{1,9}$ ]]; then
+        die "ags resume 不再接受序号；用 ags ls 里 SESSION 列的 provider/session-id"
+    fi
+    selected_provider="${body%%/*}"
+    selected_session_id="${body#*/}"
+    [[ -n "$selected_provider" && -n "$selected_session_id" &&
+       "$selected_provider" != "$body" ]] ||
+        die "ags resume 需要 provider/session-id（例如 codex/<id> 或 claude/<id>）；恢复存档用 ags restore"
+    case "$selected_provider" in
+        claude) selected_provider=claude-code ;;
+    esac
 }
 
 # 这条会话是不是已经不写了。
@@ -8143,31 +8510,33 @@ native_session_name() {
 list_native_sessions() {
     local include_archives=0 menu_status selector action_output summarize=0
     local selected_provider selected_session_id rename_input rename_limit
+    local workspace_arg= list_all=0
     while (( $# > 0 )); do
         case "$1" in
-            -a|--all) include_archives=1; shift ;;
+            -a|--all) list_all=1; shift ;;
             -s|--summarize) summarize=1; shift ;;
-            -*) die "usage: ags ls [-a] [--summarize] [AGENT]" ;;
-            # 位置参数就是要看哪个 Agent：`ags ls codex`。做成位置参数而不是
-            # `--agent codex`，因为这是每天都要敲的东西，而 `-a` 已经被存档占了。
-            #
-            # 不在这里校验名字：合不合法要看这台机器**此刻**有哪些会话，而那要等
-            # 列表加载完才知道。空结果那条路上会把可选的名字一起报出来。
+            -*) die "usage: ags ls [-a] [--summarize] [DIR]" ;;
             *)
-                [[ -z "$native_list_agent_filter" ]] ||
-                    die "usage: ags ls [-a] [--summarize] [AGENT]"
-                native_list_agent_filter="${1,,}"
+                [[ -z "$workspace_arg" ]] ||
+                    die "usage: ags ls [-a] [--summarize] [DIR]"
+                workspace_arg="$1"
                 shift
                 ;;
         esac
     done
+    if (( list_all == 1 )); then
+        [[ -z "$workspace_arg" ]] ||
+            die "ags ls -a 不接受目录参数"
+        native_list_workspace=
+    elif [[ -n "$workspace_arg" ]]; then
+        [[ -d "$workspace_arg" ]] ||
+            die "ags ls 的参数是工作目录：$workspace_arg"
+        native_list_workspace="$(cd -- "$workspace_arg" && pwd -P)"
+    else
+        native_list_workspace="$(pwd -P)"
+    fi
     need column; need jq
     (( summarize == 0 )) || summarize_native_sessions
-    if (( include_archives == 1 )); then
-        load_local_storage
-        need age; need tar
-        load_encryption_identity
-    fi
 
     if [[ ! -t 0 || ! -t 1 ]]; then
         load_native_session_menu "$include_archives" 0
@@ -8334,10 +8703,11 @@ list_native_sessions() {
 }
 
 # 一条会话都没列出来时说清楚为什么。
-#
-# 过滤器打错一个字（`ags ls cladue`）和"这台机器真的没有会话"在屏幕上长得一模一样，
-# 而前者是每次都会犯的错。所以带上这一批里实际有哪些名字——那个列表本来就在手里。
 report_empty_session_list() {
+    if [[ -n "$native_list_workspace" ]]; then
+        log "no sessions in $native_list_workspace"
+        return 0
+    fi
     if [[ -z "$native_list_agent_filter" ]]; then
         log "no sessions"
         return 0
@@ -8777,7 +9147,7 @@ gc_candidate_rows() {
 
 list_local_checkpoints() {
     local menu_status delete_status delete_output
-    (( $# == 0 )) || die "usage: ags list"
+    (( $# == 0 )) || die "usage: ags archives"
     load_local_storage
     need age; need column; need jq; need tar
     load_encryption_identity
@@ -9760,55 +10130,39 @@ resolve_resume_cwd() {
     esac
 }
 
+resume_native_session() {
+    local selected_provider selected_session_id
+    local -a live_client_args=()
+    parse_session_selector "${1:-}"
+    require_ags_backend_key
+    shift || true
+    (( $# == 0 )) ||
+        die "ags resume 只接受一个会话标识：$1（给 Agent 的参数写在 -- 之后）"
+    if [[ -n "${ags_to:-}" ]]; then
+        [[ "$ags_to" == codex || "$ags_to" == claude ]] ||
+            die "--to requires codex or claude"
+        managed_agent_for_provider "$selected_provider" >/dev/null ||
+            die "live session provider cannot be converted by AGS: $selected_provider"
+        if [[ "${ags_to}" != "$(managed_agent_for_provider "$selected_provider")" ]]; then
+            resume_live_cross_agent "$selected_provider" "$selected_session_id"
+            return
+        fi
+    fi
+    if (( ${ags_agent_args_given:-0} == 1 )); then
+        live_client_args=(${ags_agent_args[@]+"${ags_agent_args[@]}"})
+        resume_live_session "$selected_provider" "$selected_session_id" \
+            --agent-args ${live_client_args[@]+"${live_client_args[@]}"}
+    else
+        resume_live_session "$selected_provider" "$selected_session_id"
+    fi
+}
+
 resume_checkpoint() {
     local target="$1"
     shift
-    # `live:<provider>/<id>` 走活会话那条路。
-    #
-    # 这个前缀就是 `ags ls` 内部用的选择器，原样接受它有两个理由：菜单里能干的事
-    # 命令行也要能干（否则接着上次干这件事只有一条交互路径，脚本和测试都够不着），
-    # 以及它和存档 ID 不会撞——存档的选择器是 `<agent>/<record_id>`，没有前缀。
-    # 纯数字是 `ags ls` 里那一列短号。人看完列表要接着干的时候，敲的是他刚在屏幕
-    # 上看到的那个数字，而不是一串十六进制。
-    #
-    # 只在本地这条路上认：短号是这台机器发的，云端存档没有这个概念。数字认不出来
-    # 就报错而不是当成检查点 ID 继续——一个叫 `42` 的检查点确实可能存在，但把"短号
-    # 没找到"悄悄变成"去找一个叫 42 的存档"会让人打开完全不相干的东西。
-    if [[ "$target" == local && "${1:-}" =~ ^[0-9]{1,9}$ ]]; then
-        local ordinal_selector
-        if selector_for_ordinal "$1"; then
-            shift
-            set -- "$ordinal_selector" "$@"
-        else
-            die "没有第 ${1} 号会话；先跑 ags ls 看看现在有哪些"
-        fi
-    fi
+    require_ags_backend_key
     if [[ "${1:-}" == live:* ]]; then
-        local selected_provider selected_session_id
-        local -a live_client_args=()
-        split_live_selector "$1"
-        shift
-        (( $# == 0 )) ||
-            die "ags resume 只接受一个会话标识：$1（给 Agent 的参数写在 -- 之后）"
-        if [[ -n "${ags_to:-}" ]]; then
-            managed_agent_for_provider "$selected_provider" >/dev/null ||
-                die "live session provider cannot be converted by AGS: $selected_provider"
-            if [[ "${ags_to}" != "$(managed_agent_for_provider "$selected_provider")" ]]; then
-                resume_live_cross_agent "$selected_provider" "$selected_session_id"
-                return
-            fi
-        fi
-        # 给 Agent 的参数在顶层就被 `--` 摘进 `ags_agent_args` 了，不会以位置参数
-        # 的形式走到这里。和存档那条路取的是同一个来源，两条入口才不会一个认
-        # `--model o3`、另一个不认。
-        if (( ${ags_agent_args_given:-0} == 1 )); then
-            live_client_args=(${ags_agent_args[@]+"${ags_agent_args[@]}"})
-            resume_live_session "$selected_provider" "$selected_session_id" \
-                --agent-args ${live_client_args[@]+"${live_client_args[@]}"}
-        else
-            resume_live_session "$selected_provider" "$selected_session_id"
-        fi
-        return
+        die "ags resume 用 provider/session-id，不要加 live: 前缀"
     fi
     local checkpoint_id="${1:-}" launch_binary resume_cwd= resume_target_agent=
     local profile= agent_profile= effective_profile=
@@ -9822,9 +10176,9 @@ resume_checkpoint() {
     scrub_transport_password_environment
     (( $# >= 1 )) || {
         if [[ "$target" == cloud ]]; then
-            die "usage: ags cloud resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH] [--profile PROFILE] [-- CLIENT_ARGS...]"
+            die "usage: ags cloud restore ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH] [--profile PROFILE] [-- CLIENT_ARGS...]"
         else
-            die "usage: ags resume ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH] [--profile PROFILE] [-- CLIENT_ARGS...]"
+            die "usage: ags restore ID|AGENT/RECORD_ID [--to codex|claude] [--cwd PATH] [--profile PROFILE] [-- CLIENT_ARGS...]"
         fi
     }
     shift
@@ -9851,7 +10205,7 @@ resume_checkpoint() {
         client_args_explicit=1
     fi
     (( $# == 0 )) ||
-        die "ags resume 只接受一个检查点标识：$1（给 Agent 的参数写在 -- 之后）"
+        die "ags restore 只接受一个检查点标识：$1（给 Agent 的参数写在 -- 之后）"
     if (( ${ags_agent_args_given:-0} == 1 )); then
         # `--` 出现过就是一个决定：哪怕后面什么都没有，也表示"这次不要 Agent
         # 参数"，而不是"没说"——否则会被检查点里存的参数覆盖回去。
@@ -12649,6 +13003,7 @@ ags_to=
 ags_cwd_option=
 ags_profile_option=
 ags_environment_profile=
+ags_runtime=
 ags_consumed=0
 ags_id_option=
 ags_agent_args=()
@@ -12657,6 +13012,21 @@ ags_agent_args_given=0
 # 里填；声明在这里是因为 `export_pool_device_id` 和 `report_pool_session` 也要读。
 ags_session_id=
 ags_pool_live_ids=()
+
+# Forward `ags [global flags] berth ...` verbatim to the Rust binary before the
+# Bash wrapper parses options (so `--account`, `--id`, `--`, etc. pass untouched).
+ags_first_cmd=
+for ags_peek in "$@"; do
+    case "$ags_peek" in
+        --json|--verbose|--trace) continue ;;
+        *) ags_first_cmd="$ags_peek"; break ;;
+    esac
+done
+if [[ "$ags_first_cmd" == "berth" ]]; then
+    ags_berth_bin="$(resolve_ags_converter_binary)"
+    exec "$ags_berth_bin" "$@"
+fi
+unset ags_first_cmd ags_peek
 
 ags_words=()
 ags_separator_seen=0
@@ -12710,37 +13080,43 @@ done
 unset ags_words
 set -- ${ags_positionals[@]+"${ags_positionals[@]}"}
 unset ags_positionals
+apply_agent_runtime_bind "${1:-}"
 
 # ags 的参数用在不吃它的命令上，只会被解析走然后没人读——那是静默无视，比报错
 # 糟得多：你以为设上了，其实什么都没发生。
 if [[ -n "$ags_account" ]] || (( ags_pick_account == 1 )); then
     case "${1:-}" in
-        codex|claude|resume|cloud) ;;
-        *) die "--account / --pick-account 只对启动 Agent 的命令有意义（codex、claude、resume、cloud resume）" ;;
+        codex|claude|resume|restore|cloud) ;;
+        *) die "--account / --pick-account 只对启动 Agent 的命令有意义（codex、claude、resume、restore）" ;;
     esac
 fi
-# 同理，`--id` 用在别处会被解析走然后没人读——那是静默无视。`resume` 不在里面：恢复
-# 一条工作线用的是检查点自己的 ID，再给一个只会矛盾。
+# 同理，`--id` 用在别处会被解析走然后没人读——那是静默无视。
 if [[ -n "$ags_id_option" ]]; then
     case "${1:-}" in
-        codex|claude|save) ;;
-        *) die "--id 只对新起会话（codex、claude）和 ags save 有意义；ags resume 用检查点自己的 ID" ;;
+        codex|claude) ;;
+        save) die "ags save 不再接受 --id；当前会话的 ID 是 provider/session-id" ;;
+        *) die "--id 只对新起会话（codex、claude）有意义" ;;
     esac
 fi
 case "${1:-}" in
-    resume|cloud) ;;
+    resume|restore|cloud) ;;
     *)
-        [[ -z "$ags_to" ]] || die "--to 只对 resume / cloud resume 有意义"
-        [[ -z "$ags_cwd_option" ]] || die "--cwd 只对 resume / cloud resume 有意义"
-        [[ -z "$ags_profile_option" ]] || die "--profile 只对 resume / cloud resume 有意义"
+        [[ -z "$ags_to" ]] || die "--to 只对 resume / restore 有意义"
+        [[ -z "$ags_cwd_option" ]] || die "--cwd 只对 resume / restore 有意义"
+        [[ -z "$ags_profile_option" ]] || die "--profile 只对 resume / restore 有意义"
         (( ags_no_agent_args == 0 )) ||
-            die "--no-agent-args 只对 resume / cloud resume 有意义"
+            die "--no-agent-args 只对 resume / restore 有意义"
         ;;
 esac
 if [[ -n "${ags_environment_profile:-}" ]]; then
     case "${1:-}" in
         codex|claude|resume) ;;
         *) die "--environment-profile 只对启动 Agent 的命令有意义（codex、claude、resume）" ;;
+    esac
+fi
+if [[ -n "${ags_runtime:-}" ]]; then
+    case "${1:-}" in
+        runtime) die "--runtime 不能和 ags runtime 一起用；选一个" ;;
     esac
 fi
 
@@ -12753,7 +13129,8 @@ case "${1:-}" in
 esac
 
 case "${1:-}" in
-    '') enter_ags ;;
+    '') usage; exit 0 ;;
+    info) shift; show_ags_info "$@" ;;
     claude|codex)
         ags_agent_command="$1"
         shift
@@ -12825,10 +13202,10 @@ case "${1:-}" in
         deprecated_store_alias storage 'ags store list|use|merge|retire'
         storage_command "$@"
         ;;
-    # `ls` 是 `list` 的别名。这是手上敲得最多的一个，而 `ls` 是所有人肌肉记忆里
-    # "列出来"的那个词。只给这一个加别名：别名不减少复杂度，它增加表面积，只有
-    # 高频那一个才划算。
-    list|ls) shift; list_native_sessions "$@" ;;
+    ls) shift; list_native_sessions "$@" ;;
+    list)
+        die "ags list 没有了；用 ags ls（当前目录）或 ags ls -a（全部目录）"
+        ;;
     summarize) shift
         # `--force` 重算已经有的：换了模型、或者一条会话后来长出了完全不同的内容。
         case "${1:-}" in
@@ -12842,13 +13219,19 @@ case "${1:-}" in
     archives) shift; list_local_checkpoints "$@" ;;
     show) shift; show_local_checkpoint "$@" ;;
     save) shift; save_active_checkpoint local "$@" ;;
-    resume) shift; resume_checkpoint local "$@" ;;
+    resume) shift; resume_native_session "$@" ;;
     delete) shift; delete_local_checkpoint "$@" ;;
     queue) shift; queue_checkpoint "$@" ;;
     save-now) shift; save_checkpoint "$@" ;;
     hook) run_hook ;;
     flush) shift; flush_pending "${1:-}" ;;
-    restore) shift; restore_checkpoint "$@" ;;
+    restore)
+        shift
+        case "${1:-}" in
+            local|cloud) restore_checkpoint "$@" ;;
+            *) resume_checkpoint local "$@" ;;
+        esac
+        ;;
     push) shift; sync_records push "$@" ;;
     pull) shift; sync_records pull "$@" ;;
     # `ags status` 就是"只看计划的 sync"，所以它是 `sync` 的一个开关，不是第四个

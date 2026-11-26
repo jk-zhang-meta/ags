@@ -18,7 +18,9 @@ set -Eeuo pipefail
 # 套件自己要用的每一个变量都在下面用 `env` 前缀显式给出，不依赖继承，所以全擦是安全的。
 while IFS='=' read -r ags_inherited _; do
     case "$ags_inherited" in
-        AGS_*|AGENT_SESSION_*) unset "$ags_inherited" ;;
+        AGS_*|AGENT_SESSION_*|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL)
+            unset "$ags_inherited"
+            ;;
     esac
 done < <(env)
 unset ags_inherited
@@ -100,6 +102,10 @@ cat > "$ags_zone_home/bin/codext" <<'AGS_ZONE_FAKE'
 { echo "ARGS=$*"
   echo "ACCOUNT=${CODEXT_POOL_ACCOUNT:-}"
   echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
+  echo "HTTPS_PROXY=${HTTPS_PROXY:-}"
+  echo "ALL_PROXY=${ALL_PROXY:-}"
+  echo "NO_PROXY=${NO_PROXY:-}"
+  echo "PATH=${PATH:-}"
 } > "$AGS_ZONE_OUT"
 AGS_ZONE_FAKE
 mkdir -p "$ags_zone_home/nopool" "$ags_zone_home/home" \
@@ -129,6 +135,7 @@ ags_zone_launch() {
     # "不该依赖任何人的真实状态"，只是当时只堵了 `CODEX_HOME` 一个口子。
     AGENT_SESSION_CODEX_BINARY="$ags_zone_home/bin/codext" \
         AGENT_SESSION_CLAUDE_BINARY="$ags_zone_home/bin/claude" \
+        AGENT_SESSION_DISABLE_GEO="${AGENT_SESSION_DISABLE_GEO:-1}" \
         AGS_UPDATE_CHECK=0 \
         HOME="$ags_zone_home/home" \
         CODEX_HOME="$ags_zone_home/nopool" \
@@ -241,6 +248,322 @@ ags_zone_refuse 'an agent option without --' codex --model o3
 ags_zone_refuse 'a pool option for claude' --account a@b.com claude
 ags_zone_refuse 'the interactive picker for claude' --pick-account claude
 ags_zone_refuse 'a resume-only option on a direct launch' codex --profile native
+
+# Terminal/global proxies must not reach the agent. AGS owns the child's HTTP
+# traffic even when no named runtime is selected.
+got="$(HTTPS_PROXY='http://10.0.0.1:9' ALL_PROXY='socks5://10.0.0.1:9' \
+    NO_PROXY='*' ags_zone_launch codex)" || {
+    printf 'ags zone: ambient proxy launch failed\n' >&2
+    ags_zone_diagnose
+    exit 1
+}
+[[ -z "$(ags_zone_field HTTPS_PROXY "$got")" ]] || {
+    printf 'ags zone: ambient HTTPS_PROXY leaked: %q\n' "$(ags_zone_field HTTPS_PROXY "$got")" >&2
+    exit 1
+}
+[[ -z "$(ags_zone_field ALL_PROXY "$got")" ]] || {
+    printf 'ags zone: ambient ALL_PROXY leaked\n' >&2
+    exit 1
+}
+[[ -z "$(ags_zone_field NO_PROXY "$got")" ]] || {
+    printf 'ags zone: ambient NO_PROXY leaked\n' >&2
+    exit 1
+}
+
+got="$(PATH="/usr/bin:/bin:/mnt/c/WINDOWS/system32:/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/" \
+    ags_zone_launch codex)" || {
+    printf 'ags zone: windows PATH launch failed\n' >&2
+    ags_zone_diagnose
+    exit 1
+}
+case "$(ags_zone_field PATH "$got")" in
+    */mnt/[cC]/*)
+        printf 'ags zone: Windows PATH leaked: %q\n' "$(ags_zone_field PATH "$got")" >&2
+        exit 1
+        ;;
+esac
+[[ "$(ags_zone_field PATH "$got")" == *'/usr/bin'* ]] || {
+    printf 'ags zone: unix PATH was dropped\n' >&2
+    exit 1
+}
+
+# Named runtime: distinct home + split HTTP proxy. The stub converter is the
+# same binary `env-apply` already has to find; it implements runtime-apply so
+# these assertions do not depend on a compiled ags sitting on PATH.
+ags_runtime_home="$(mktemp -d "$tmp/ags-runtime.XXXXXX")"
+mkdir -p "$ags_runtime_home/bin" "$ags_runtime_home/work-codex" \
+    "$ags_runtime_home/store" "$ags_runtime_home/state" "$ags_runtime_home/home" \
+    "$ags_runtime_home/nopool"
+cat > "$ags_runtime_home/bin/ags" <<'AGS_RUNTIME_STUB'
+#!/bin/sh
+if [ "$1" = --version ]; then
+    echo 'ags 0.8.1'
+    exit 0
+fi
+if [ "$1" = env-apply ]; then
+    printf '%s\n' '# ags-environment-apply-v1' '# none'
+    exit 0
+fi
+if [ "$1" != runtime-apply ]; then
+    echo "unexpected converter command: $*" >&2
+    exit 2
+fi
+name=
+command=
+intent=homes
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name) name=$2; shift 2 ;;
+        --command) command=$2; shift 2 ;;
+        --intent) intent=$2; shift 2 ;;
+        --format) shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$name" ] || name=work-codex
+if [ "$command" = claude ] && [ "$name" = work-codex ]; then
+    echo "runtime work-codex is provider=codex and cannot launch claude" >&2
+    exit 1
+fi
+home=$AGS_RUNTIME_WORK_HOME
+case "$intent" in
+    homes)
+        printf '%s\n' \
+            "# ags-agent-runtime-apply-v1" \
+            "codex_home='$home'" \
+            "export CODEX_HOME='$home'" \
+            "export AGS_RUNTIME='$name'"
+        ;;
+    egress-proxy|login-proxy)
+        printf '%s\n' \
+            "# ags-agent-runtime-apply-v1" \
+            "unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy" \
+            "AGS_RUNTIME_PROXY_MODE='local'" \
+            "export HTTPS_PROXY='http://127.0.0.1:7890'" \
+            "export HTTP_PROXY='http://127.0.0.1:7890'" \
+            "export https_proxy='http://127.0.0.1:7890'" \
+            "export http_proxy='http://127.0.0.1:7890'"
+        ;;
+    *)
+        echo "unexpected intent $intent" >&2
+        exit 2
+        ;;
+esac
+AGS_RUNTIME_STUB
+chmod +x "$ags_runtime_home/bin/ags"
+cp "$ags_zone_home/bin/codext" "$ags_runtime_home/bin/codext"
+cp "$ags_zone_home/bin/claude" "$ags_runtime_home/bin/claude"
+# The zone fake only printed ARGS/ACCOUNT/DEVICE. Runtime assertions need the
+# home and proxy the child actually inherited.
+cat > "$ags_runtime_home/bin/codext" <<'AGS_RUNTIME_FAKE'
+#!/bin/sh
+{
+  echo "ARGS=$*"
+  echo "ACCOUNT=${CODEXT_POOL_ACCOUNT:-}"
+  echo "DEVICE=${CODEXT_POOL_DEVICE_ID:-}"
+  echo "CODEX_HOME=${CODEX_HOME:-}"
+  echo "HTTPS_PROXY=${HTTPS_PROXY:-}"
+  echo "ALL_PROXY=${ALL_PROXY:-}"
+  echo "TZ=${TZ:-}"
+} > "$AGS_ZONE_OUT"
+AGS_RUNTIME_FAKE
+cp "$ags_runtime_home/bin/codext" "$ags_runtime_home/bin/claude"
+chmod +x "$ags_runtime_home/bin/codext" "$ags_runtime_home/bin/claude"
+
+ags_runtime_launch() {
+    local out="$ags_runtime_home/out"
+    local converter="${AGS_RUNTIME_CONVERTER:-$ags_runtime_home/bin/ags}"
+    rm -f "$out"
+    AGENT_SESSION_CODEX_BINARY="$ags_runtime_home/bin/codext" \
+        AGENT_SESSION_CLAUDE_BINARY="$ags_runtime_home/bin/claude" \
+        AGS_CONVERTER_BINARY="$converter" \
+        AGS_RUNTIME_WORK_HOME="$ags_runtime_home/work-codex" \
+        AGENT_SESSION_DISABLE_GEO="${AGENT_SESSION_DISABLE_GEO:-1}" \
+        AGS_UPDATE_CHECK=0 \
+        HOME="$ags_runtime_home/home" \
+        CODEX_HOME="$ags_runtime_home/nopool" \
+        AGENT_SESSION_STORAGE_MODE=local \
+        AGENT_SESSION_LOCAL_DIR="$ags_runtime_home/store" \
+        AGENT_SESSION_STATE_DIR="$ags_runtime_home/state" \
+        AGS_ZONE_OUT="$out" "$tool" "$@" >/dev/null 2>"$ags_runtime_home/err" || return $?
+    cat "$out"
+}
+
+got="$(ags_runtime_launch --runtime work-codex codex)" || {
+    printf 'runtime: launch failed\n' >&2
+    sed 's/^/    /' "$ags_runtime_home/err" >&2
+    exit 1
+}
+[[ "$(ags_zone_field CODEX_HOME "$got")" == "$ags_runtime_home/work-codex" ]] || {
+    printf 'runtime: CODEX_HOME was %q\n' "$(ags_zone_field CODEX_HOME "$got")" >&2
+    exit 1
+}
+[[ "$(ags_zone_field HTTPS_PROXY "$got")" == "http://127.0.0.1:7890" ]] || {
+    printf 'runtime: local proxy was %q\n' "$(ags_zone_field HTTPS_PROXY "$got")" >&2
+    exit 1
+}
+[[ -z "$(ags_zone_field ALL_PROXY "$got")" ]] || {
+    printf 'runtime: ALL_PROXY must stay unset so SOCKS leftovers cannot apply\n' >&2
+    exit 1
+}
+
+got="$(ags_runtime_launch --runtime work-codex codex -- login)" || {
+    printf 'runtime: login launch failed\n' >&2
+    sed 's/^/    /' "$ags_runtime_home/err" >&2
+    exit 1
+}
+[[ "$(ags_zone_field HTTPS_PROXY "$got")" == "http://127.0.0.1:7890" ]] || {
+    printf 'runtime: login proxy was %q\n' "$(ags_zone_field HTTPS_PROXY "$got")" >&2
+    exit 1
+}
+
+if ags_runtime_launch --runtime work-codex claude >/dev/null 2>&1; then
+    printf 'runtime: expected provider mismatch refusal\n' >&2
+    exit 1
+fi
+
+# Catalog without a stored TZ: probe ipwho.is through the active proxy.
+cat > "$ags_runtime_home/bin/ags-probe" <<'AGS_RUNTIME_PROBE_STUB'
+#!/bin/sh
+if [ "$1" = --version ]; then
+    echo 'ags 0.8.1'
+    exit 0
+fi
+if [ "$1" = env-apply ]; then
+    printf '%s\n' '# ags-environment-apply-v1' '# none'
+    exit 0
+fi
+if [ "$1" != runtime-apply ]; then
+    echo "unexpected converter command: $*" >&2
+    exit 2
+fi
+intent=homes
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --intent) intent=$2; shift 2 ;;
+        --format|--name|--command) shift 2 ;;
+        *) shift ;;
+    esac
+done
+home=$AGS_RUNTIME_WORK_HOME
+case "$intent" in
+    homes)
+        printf '%s\n' \
+            "# ags-agent-runtime-apply-v1" \
+            "codex_home='$home'" \
+            "export CODEX_HOME='$home'" \
+            "export AGS_RUNTIME='work-codex'"
+        ;;
+    egress-proxy)
+        printf '%s\n' \
+            "# ags-agent-runtime-apply-v1" \
+            "unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy" \
+            "AGS_RUNTIME_PROXY_MODE='local'" \
+            "export HTTPS_PROXY='http://127.0.0.1:7890'" \
+            "export HTTP_PROXY='http://127.0.0.1:7890'"
+        ;;
+    *)
+        echo "unexpected intent $intent" >&2
+        exit 2
+        ;;
+esac
+AGS_RUNTIME_PROBE_STUB
+chmod +x "$ags_runtime_home/bin/ags-probe"
+mkdir -p "$ags_runtime_home/probe-bin"
+cat > "$ags_runtime_home/probe-bin/curl" <<'AGS_FAKE_CURL'
+#!/bin/sh
+echo '{"success":true,"ip":"1.2.3.4","timezone":{"id":"America/Chicago","offset":-21600}}'
+AGS_FAKE_CURL
+chmod +x "$ags_runtime_home/probe-bin/curl"
+got="$(
+    PATH="$ags_runtime_home/probe-bin:$PATH" \
+        AGENT_SESSION_DISABLE_GEO=0 \
+        AGS_RUNTIME_CONVERTER="$ags_runtime_home/bin/ags-probe" \
+        ags_runtime_launch --runtime work-codex codex
+)" || {
+    printf 'runtime: tz probe launch failed\n' >&2
+    sed 's/^/    /' "$ags_runtime_home/err" >&2
+    exit 1
+}
+[[ "$(ags_zone_field TZ "$got")" == "America/Chicago" ]] || {
+    printf 'runtime: probed TZ was %q\n' "$(ags_zone_field TZ "$got")" >&2
+    exit 1
+}
+
+# Pool-issued proxy: auto mode, no local URL, ping JSON supplies the HTTP CONNECT
+# endpoint. Custom local is loopback-only; the pool may issue a remote listener.
+cat > "$ags_runtime_home/bin/ags-pool-proxy" <<'AGS_RUNTIME_POOL_STUB'
+#!/bin/sh
+if [ "$1" = --version ]; then
+    echo 'ags 0.8.1'
+    exit 0
+fi
+if [ "$1" = env-apply ]; then
+    printf '%s\n' '# ags-environment-apply-v1' '# none'
+    exit 0
+fi
+if [ "$1" != runtime-apply ]; then
+    echo "unexpected converter command: $*" >&2
+    exit 2
+fi
+intent=homes
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --intent) intent=$2; shift 2 ;;
+        --format|--name|--command) shift 2 ;;
+        *) shift ;;
+    esac
+done
+home=$AGS_RUNTIME_WORK_HOME
+case "$intent" in
+    homes)
+        printf '%s\n' \
+            "# ags-agent-runtime-apply-v1" \
+            "codex_home='$home'" \
+            "export CODEX_HOME='$home'" \
+            "export AGS_RUNTIME='work-codex'"
+        ;;
+    egress-proxy)
+        printf '%s\n' \
+            "# ags-agent-runtime-apply-v1" \
+            "unset ALL_PROXY all_proxy HTTPS_PROXY https_proxy HTTP_PROXY http_proxy NO_PROXY no_proxy" \
+            "AGS_RUNTIME_PROXY_MODE='auto'"
+        ;;
+    *)
+        echo "unexpected intent $intent" >&2
+        exit 2
+        ;;
+esac
+AGS_RUNTIME_POOL_STUB
+chmod +x "$ags_runtime_home/bin/ags-pool-proxy"
+mkdir -p "$ags_runtime_home/pool-bin"
+printf '{"base_url":"https://pool.example","key":"k"}\n' \
+    > "$ags_runtime_home/work-codex/pool.json"
+cat > "$ags_runtime_home/pool-bin/curl" <<'AGS_POOL_CURL'
+#!/bin/sh
+case " $* " in
+    *'/ping'*)
+        echo '{"success":true,"data":{"proxy":"http://10.0.0.2:8080","accounts":1}}'
+        ;;
+    *)
+        echo '{"success":true,"ip":"1.2.3.4","timezone":{"id":"America/Chicago"}}'
+        ;;
+esac
+AGS_POOL_CURL
+chmod +x "$ags_runtime_home/pool-bin/curl"
+got="$(
+    PATH="$ags_runtime_home/pool-bin:$PATH" \
+        AGS_RUNTIME_CONVERTER="$ags_runtime_home/bin/ags-pool-proxy" \
+        ags_runtime_launch --runtime work-codex codex
+)" || {
+    printf 'runtime: pool proxy launch failed\n' >&2
+    sed 's/^/    /' "$ags_runtime_home/err" >&2
+    exit 1
+}
+[[ "$(ags_zone_field HTTPS_PROXY "$got")" == "http://10.0.0.2:8080" ]] || {
+    printf 'runtime: pool proxy was %q\n' "$(ags_zone_field HTTPS_PROXY "$got")" >&2
+    exit 1
+}
 
 # `--pick-account` 挑号：可多选组成队列，列表是**现取**的，且挑完到启动之间还要
 # 复核一次。
@@ -480,6 +803,9 @@ cat > "$ags_sidpool_home/bin/curl" <<'AGS_SIDPOOL_POOL'
 #!/bin/sh
 for a in "$@"; do
     case "$a" in
+        http://*|https://*) printf '%s\n' "$a" >> "$AGS_SIDPOOL_CURL_LOG" ;;
+    esac
+    case "$a" in
         */sessions) cat "$AGS_SIDPOOL_SESSIONS"; exit 0 ;;
     esac
 done
@@ -496,6 +822,7 @@ ags_sidpool_run() {
         cd "$ags_sidpool_home/work/Proj" || exit 1
         AGS_SIDPOOL_OUT="$ags_sidpool_home/out" \
         AGS_SIDPOOL_SESSIONS="$ags_sidpool_home/sessions.json" \
+        AGS_SIDPOOL_CURL_LOG="$ags_sidpool_home/curl.log" \
         AGENT_SESSION_CODEX_BINARY="$ags_sidpool_home/bin/codext" \
         AGS_UPDATE_CHECK=0 \
         CODEX_HOME="$ags_sidpool_home/codex" \
@@ -529,52 +856,24 @@ grep -q 'pool-line-one' <<< "$ags_sidpool_taken" || {
     exit 1
 }
 # 负对照：没撞上的名字照常起得来。
+: > "$ags_sidpool_home/curl.log"
 ags_sidpool_free="$(ags_sidpool_run --id fresh-line)"
 [[ "$(sed -n 's/^AGS_ID=//p' "$ags_sidpool_home/out")" == fresh-line ]] || {
     printf 'ags sid: a free id must launch, got %q\n' "$ags_sidpool_free" >&2
     exit 1
 }
-
-# `ags save` 的参数归属：会话 ID 在启动时定好了，保存只给描述。
-#
-# 刻意**不猜**第一个参数是 ID 还是描述。猜过一版："长得像 ID 就当 ID"，于是
-# `ags save "fixed"` 这种单词英文描述被当成 ID、描述变空，而报出来的是
-# "description must be 1-80 characters"——人明明给了描述。
-ags_save_argv() {
-    local AGS_ID="$1"
-    shift
-    if [[ -n "${AGS_ID:-}" ]]; then
-        if [[ "${1:-}" == --id ]]; then
-            (( $# >= 2 )) || { printf 'DIE\n'; return 0; }
-            shift
-        else
-            set -- "$AGS_ID" "$@"
-        fi
-    fi
-    printf '%s|%s\n' "${1:-}" "${*:2}"
+# 启动上报成功后，旁路 supervisor 必须在 Agent 进程退出后补报 /session/end。
+# observer 是异步的；最多等一轮默认 5 秒 tick，再留一点调度余量。
+for ((ags_sidpool_wait = 0; ags_sidpool_wait < 70; ags_sidpool_wait++)); do
+    grep -Fq '/session/end' "$ags_sidpool_home/curl.log" && break
+    sleep 0.1
+done
+grep -Fq '/session/end' "$ags_sidpool_home/curl.log" || {
+    printf 'ags sid: agent exit must report /session/end\n' >&2
+    exit 1
 }
 
-ags_save_expect() {
-    local label="$1" want="$2" got
-    shift 2
-    got="$(ags_save_argv "$@")"
-    [[ "$got" == "$want" ]] || {
-        printf 'ags save: %s: got %q, wanted %q\n' "$label" "$got" "$want" >&2
-        exit 1
-    }
-}
-
-ags_save_expect 'a description alone uses the session id' \
-    'work-line|fix the release' work-line 'fix the release'
-# 单词英文描述是这条规则存在的理由。
-ags_save_expect 'a one-word description is still a description' \
-    'work-line|fixed' work-line 'fixed'
-ags_save_expect '--id branches a new work line' \
-    'other-line|描述' work-line --id other-line '描述'
-ags_save_expect '--id without a value is refused' 'DIE' work-line --id
-# 不是 AGS 起的会话没有自己的 ID，老写法仍然是唯一的写法。
-ags_save_expect 'a session AGS did not start still names its id' \
-    'rel-fix|描述' '' rel-fix '描述'
+# `ags save` 只在 Agent 会话里收描述，不再收 --id。
 
 # 启动前核一遍点名的名字：**只**拦匹配不到任何账号的那些。
 #
@@ -705,12 +1004,7 @@ ags_upd_run() {
     exit 1
 }
 
-# `ls` 和 `list` 是同一个命令：列 Agent 自己的会话。存档是另一个命令
-# （`ags archives`），两者列的是不同的东西，所以这里只比 `ls` 和 `list`。
-#
-# 要带沙箱跑。裸调 `$tool` 的话，`ags ls` 列的是**开发者自己**的会话（这台机器上
-# 2977 条），还会照常起后台补描述——对着真实会话调模型。而在跑步机上一条都没有，
-# 于是两边行为完全不同，本地这条断言的绿是假的。
+# `ags list` 已经没有了。
 ags_alias_home="$tmp/alias-home"
 mkdir -p "$ags_alias_home/codex" "$ags_alias_home/claude" "$tmp/alias-state"
 ags_alias_env=(
@@ -726,10 +1020,12 @@ ags_alias_env=(
     AGS_AUTO_GC=0
     AGS_UPDATE_CHECK=0
 )
-"${ags_alias_env[@]}" "$tool" ls --help >/dev/null 2>&1 || true
-[[ "$("${ags_alias_env[@]}" "$tool" ls 2>&1 | head -1)" == \
-   "$("${ags_alias_env[@]}" "$tool" list 2>&1 | head -1)" ]] || {
-    printf 'ags ls: must behave like ags list\n' >&2
+if "${ags_alias_env[@]}" "$tool" list </dev/null >/dev/null 2>"$tmp/ags-list-gone.err"; then
+    printf 'ags list: must be refused\n' >&2
+    exit 1
+fi
+grep -Fq 'ags ls' "$tmp/ags-list-gone.err" || {
+    printf 'ags list: should point at ags ls, got %s\n' "$(cat "$tmp/ags-list-gone.err")" >&2
     exit 1
 }
 unset ags_alias_home
@@ -753,7 +1049,7 @@ grep -q 'ags help all' <<< "$ags_help_short" || {
     exit 1
 }
 # 在用的动词一个都不能因为分层丢掉。
-for ags_help_verb in init set list show save resume delete update store sync gc; do
+for ags_help_verb in init set ls show save resume restore delete update store sync gc info; do
     grep -q "ags $ags_help_verb" <<< "$ags_help_all" || {
         printf 'ags help: `help all` lost the %s command\n' "$ags_help_verb" >&2
         exit 1
@@ -762,13 +1058,81 @@ done
 # 反过来也要钉住：并进 `ags store` 的那三个名字、以及已经自动化或被别的命令覆盖的
 # 那几个，**不许**再出现在帮助里。它们还能调用（老脚本和后台任务靠着），但帮助是
 # 给人读的——留在里面就等于这次简化没做。
-for ags_help_verb in remote storage cloud summarize archives legacy rehome-claude; do
+for ags_help_verb in remote storage cloud summarize archives legacy rehome-claude list; do
     grep -q "ags $ags_help_verb" <<< "$ags_help_all" && {
         printf 'ags help: %s is deprecated but still documented\n' "$ags_help_verb" >&2
         exit 1
     }
 done
 unset ags_help_verb ags_help_short ags_help_all
+
+# 日常会话 CLI：单独 ags 是 help；save 不能在本地终端跑；resume 只要 provider/id。
+ags_daily_home="$tmp/daily-cli-home"
+mkdir -p "$ags_daily_home/codex" "$ags_daily_home/claude" "$ags_daily_home/.codex" \
+    "$tmp/daily-cli-state"
+ags_daily_env=(
+    env -u CODEX_THREAD_ID -u CLAUDE_CODE_SESSION_ID -u AGENT_SESSION_AGENT \
+        -u AGENT_SESSION_ID -u AGS_ID
+    HOME="$ags_daily_home"
+    PATH="$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    CODEX_HOME="$ags_daily_home/codex"
+    CLAUDE_CONFIG_DIR="$ags_daily_home/claude"
+    XDG_CONFIG_HOME="$ags_daily_home/.config"
+    XDG_DATA_HOME="$ags_daily_home/.local/share"
+    XDG_STATE_HOME="$ags_daily_home/.local/state"
+    AGENT_SESSION_STATE_DIR="$tmp/daily-cli-state"
+    AGS_AUTO_SUMMARY=0
+    AGS_AUTO_GC=0
+    AGS_UPDATE_CHECK=0
+)
+ags_bare="$("${ags_daily_env[@]}" "$tool" 2>&1)" || true
+grep -Fq 'ags <命令>' <<< "$ags_bare" || {
+    printf 'ags: bare invocation must show help, got %s\n' "$ags_bare" >&2
+    exit 1
+}
+if "${ags_daily_env[@]}" "$tool" save 'should not save' \
+    >"$tmp/daily-save.out" 2>"$tmp/daily-save.err"; then
+    printf 'ags save: a local terminal must be refused\n' >&2
+    exit 1
+fi
+grep -Fq '只能在 Agent 会话里' "$tmp/daily-save.err" || {
+    printf 'ags save: missing skill-only error, got %s\n' "$(cat "$tmp/daily-save.err")" >&2
+    exit 1
+}
+if "${ags_daily_env[@]}" "$tool" resume 7 \
+    >"$tmp/daily-resume-n.out" 2>"$tmp/daily-resume-n.err"; then
+    printf 'ags resume: ordinals must be refused\n' >&2
+    exit 1
+fi
+grep -Fq '不再接受序号' "$tmp/daily-resume-n.err" || {
+    printf 'ags resume: missing ordinal error, got %s\n' "$(cat "$tmp/daily-resume-n.err")" >&2
+    exit 1
+}
+if "${ags_daily_env[@]}" "$tool" resume 'live:codex/aaaaaaaa-1111-4111-8111-111111111111' \
+    >"$tmp/daily-resume-live.out" 2>"$tmp/daily-resume-live.err"; then
+    printf 'ags resume: live: prefix must be refused\n' >&2
+    exit 1
+fi
+grep -Fq '不要加 live:' "$tmp/daily-resume-live.err" || {
+    printf 'ags resume: missing live: error, got %s\n' "$(cat "$tmp/daily-resume-live.err")" >&2
+    exit 1
+}
+if "${ags_daily_env[@]}" "$tool" info \
+    >"$tmp/daily-info.out" 2>"$tmp/daily-info.err"; then
+    printf 'ags info: missing key must be refused\n' >&2
+    exit 1
+fi
+printf '{"base_url":"https://www.itachi.fans","key":"daily-test-key"}\n' \
+    > "$ags_daily_home/codex/pool.json"
+"${ags_daily_env[@]}" "$tool" info >"$tmp/daily-info.out"
+grep -Fq 'account    (reserved)' "$tmp/daily-info.out"
+grep -Fq 'space      (reserved)' "$tmp/daily-info.out"
+grep -Fq 'https://www.itachi.fans' "$tmp/daily-info.out"
+grep -Fq 'sha256:' "$tmp/daily-info.out"
+! grep -Fq 'daily-test-key' "$tmp/daily-info.out" || {
+    printf 'ags info: must not print the raw key\n' >&2
+    exit 1
+}
 
 # 还原路径上的符号链接：解析之后按 StrictModes 判，不是一律拒绝。把两个
 # `CODEX_HOME` 的 `sessions` 指到同一份是正当用法（共用一份会话历史），而一律
@@ -996,6 +1360,9 @@ start_claude_session_process() {
 write_codex_profile() {
     local native_home="$1" profile="$2" provider="${3:-openai}"
     mkdir -p "$native_home"
+    [[ -f "$native_home/pool.json" ]] ||
+        printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' \
+            > "$native_home/pool.json"
     printf 'model_provider = "%s"\n' "$provider" \
         > "$native_home/$profile.config.toml"
 }
@@ -1011,7 +1378,9 @@ test_sha256_file() {
 }
 
 ssh-keygen -q -t ed25519 -N '' -f "$tmp/key"
-mkdir -p "$tmp/home/.local/bin"
+mkdir -p "$tmp/home/.local/bin" "$tmp/home/.codex"
+printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' \
+    > "$tmp/home/.codex/pool.json"
 printf '%s\n' '#!/usr/bin/env sh' \
     'printf '\''%s\n'\'' '\''{"success":true,"ip":"203.0.113.7","country":"Test Country","region":"Test Region","city":"Test City","latitude":1.25,"longitude":2.5}'\''' \
     > "$tmp/home/.local/bin/curl"
@@ -1099,7 +1468,20 @@ if [[ "${1:-}" == --version ]]; then
     printf 'ags 0.3.0-test\n'
     exit
 fi
-[[ ! -e "/dev/fd/9" ]]
+if [[ "${1:-}" == env-apply ]]; then
+    printf '%s\n' '# ags-environment-apply-v1' '# none'
+    exit 0
+fi
+if [[ "${1:-}" == runtime-apply ]]; then
+    printf '%s\n' '# ags-agent-runtime-apply-v1' '# none'
+    exit 0
+fi
+invoked_convert=0
+if [[ "${1:-}" == convert ]]; then
+    shift
+    invoked_convert=1
+fi
+[[ "$invoked_convert" == 1 || ! -e "/dev/fd/9" ]]
 
 if [[ "${1:-}" == checkpoint-register-codex ]]; then
     [[ $# == 4 && -f "$3" && "$4" == /* ]]
@@ -1110,17 +1492,13 @@ fi
 
 
 # 转换那套收在 `ags convert` 底下，真二进制就是这么被调的，假的也得认。
-invoked_convert=0
-if [[ "${1:-}" == convert ]]; then
-    shift
-    invoked_convert=1
-fi
-
 [[ "${1:-}" == --json ]]
 shift
-[[ -z "${OPENAI_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]
 case "${1:-}" in
     resume)
+        # convert resume 在隔离沙箱里跑，密钥不得漏进来。list/info 走 converter_cli，
+        # 不经过那层，不能用同一条检查，否则宿主有 ANTHROPIC_API_KEY 时 ags ls/gc 全空。
+        [[ -z "${OPENAI_API_KEY:-}" && -z "${ANTHROPIC_API_KEY:-}" ]]
         target="${2:-}"
         source_id="${3:-}"
         shift 3
@@ -1187,8 +1565,23 @@ case "${1:-}" in
         # JSON 数组文件喂进来——时间戳要能精确控制（"31 天前"必须真的是 31 天前），
         # 在磁盘上摆 rollout 文件再指望解析器算出想要的 last_active_at 做不到这点。
         # 不设就是空列表，等同于加这个分支之前的 `exit 64`（那时 stdout 也是空的）。
+        workspace_filter=
+        while (( $# )); do
+            if [[ "$1" == "--workspace" && -n "${2:-}" && "$2" != -* ]]; then
+                workspace_filter="$2"
+                shift 2
+                continue
+            fi
+            shift
+        done
         if [[ -n "${FAKE_LIST_ITEMS:-}" && -f "${FAKE_LIST_ITEMS:-}" ]]; then
-            jq -c '{items: .}' "$FAKE_LIST_ITEMS"
+            if [[ -n "$workspace_filter" ]]; then
+                jq -c --arg ws "$workspace_filter" \
+                    '{items: [.[] | select((.workspace // "") == $ws)]}' \
+                    "$FAKE_LIST_ITEMS"
+            else
+                jq -c '{items: .}' "$FAKE_LIST_ITEMS"
+            fi
         else
             printf '{"items":[]}\n'
         fi
@@ -1528,6 +1921,8 @@ chmod +x "$tmp/home/.local/bin/sshpass"
 mkdir -p "$tmp/source/codex/sessions/2026/01/01" "$tmp/source/claude/projects/-work-demo"
 printf '%s\n' '{"turn":1}' > "$tmp/source/codex/sessions/2026/01/01/test.jsonl"
 printf '%s\n' '{"turn":1}' > "$tmp/source/claude/projects/-work-demo/test.jsonl"
+printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' \
+    > "$tmp/source/codex/pool.json"
 
 source_env=(
     HOME="$tmp/home"
@@ -2233,6 +2628,9 @@ reference_ascii_claude_project_key() {
 run_clean_init() {
     local init_home="$1"
     shift
+    mkdir -p "$init_home/.codex"
+    printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' \
+        > "$init_home/.codex/pool.json"
     env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
         -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
         -u XDG_CONFIG_HOME -u XDG_DATA_HOME -u XDG_STATE_HOME \
@@ -2416,7 +2814,7 @@ age_resume="$(
     cd "$tmp/age-work"
     env -u AGENT_SESSION_IDENTITY_FILE -u AGENT_SESSION_SSH_KEY \
         -u AGENT_SESSION_LOCAL_DIR -u AGENT_SESSION_STATE_DIR \
-        "${age_env[@]}" "$tool" resume age-only -- --model test-model
+        "${age_env[@]}" "$tool" restore age-only -- --model test-model
 )"
 grep -Fq "FAKE_CODEX <resume> <$age_session_id> <--model> <test-model>" <<< "$age_resume"
 
@@ -2895,7 +3293,7 @@ EOF
         cd "$tmp/work"
         env "${source_env[@]}" CODEX_HOME="$tmp/cwd-same-target/codex" \
             AGENT_SESSION_LOCAL_DIR="$args_menu_root" \
-            "$tmp/stty-guard" "$tool" resume with-args
+            "$tmp/stty-guard" "$tool" restore with-args
     )"
     ! grep -Fq 'saved in a different directory' <<< "$cwd_same_out"
     grep -Fqx "FAKE_PWD=$tmp/work" <<< "$cwd_same_out"
@@ -3046,7 +3444,7 @@ cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-target/codex/$session_rel"
    "$codex_mode:$codex_mtime" ]]
 write_codex_profile "$tmp/checkpoint-record-target/codex" exact-record
 record_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/checkpoint-record-target/codex" \
-    "$tool" resume "$checkpoint_record_id" --profile=exact-record)"
+    "$tool" restore "$checkpoint_record_id" --profile=exact-record)"
 # 这条断言我一度以为过期了，给它补上了一个 `--dangerously-skip-permissions`——
 # 那其实是跑测试这个人的 `AGS_LAUNCH_ARGS` 从环境里漏进来的。套件开头现在会把继承
 # 来的 AGS_* 全擦掉，原来的期望才是对的。改断言之前先确认那个值不是漏进来的。
@@ -3059,7 +3457,7 @@ cmp "$tmp/source/codex/$session_rel" "$tmp/checkpoint-record-target/codex/$sessi
 resume_saved_args="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-target/codex" \
         AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
-        "$tool" resume with-args 2> "$tmp/resume-saved-args.err"
+        "$tool" restore with-args 2> "$tmp/resume-saved-args.err"
 )"
 grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--yolo> <--model> <o3 mini>" \
     <<< "$resume_saved_args"
@@ -3083,7 +3481,7 @@ mkdir -p "$tmp/stale-args-checkpoints"
 resume_stale_args="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/stale-args-target/codex" \
         AGENT_SESSION_LOCAL_DIR="$tmp/stale-args-checkpoints" \
-        "$tool" resume stale-args 2> "$tmp/resume-stale-args.err"
+        "$tool" restore stale-args 2> "$tmp/resume-stale-args.err"
 )"
 grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
     <<< "$resume_stale_args"
@@ -3095,7 +3493,7 @@ grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=["--model","o3"]' <<< "$resume_stale_args"
 resume_typed_selection="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/typed-selection-target/codex" \
         AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
-        "$tool" resume with-args -- resume --last --model o3 \
+        "$tool" restore with-args -- resume --last --model o3 \
         2> "$tmp/resume-typed-selection.err"
 )"
 grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
@@ -3109,7 +3507,7 @@ grep -Fq 'dropped native session selection from codex arguments' \
 resume_cleared_args="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-cleared/codex" \
         AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
-        "$tool" resume with-args --
+        "$tool" restore with-args --
 )"
 grep -Fqx "FAKE_CODEX <resume> <$launch_args_session>" <<< "$resume_cleared_args"
 grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$resume_cleared_args"
@@ -3117,7 +3515,7 @@ grep -Fqx 'FAKE_AGS_LAUNCH_ARGS=[]' <<< "$resume_cleared_args"
 resume_override_args="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-override/codex" \
         AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" \
-        "$tool" resume with-args -- --model o3
+        "$tool" restore with-args -- --model o3
 )"
 grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
     <<< "$resume_override_args"
@@ -3126,7 +3524,7 @@ grep -Fqx "FAKE_CODEX <resume> <$launch_args_session> <--model> <o3>" \
 # synchronized record must not be a way around it.
 env "${source_env[@]}" CODEX_HOME="$tmp/launch-args-forbidden/codex" \
     AGENT_SESSION_LOCAL_DIR="$tmp/forbidden-args-checkpoints" \
-    "$tool" resume with-args > "$tmp/forbidden-args.out" 2> "$tmp/forbidden-args.err" && exit 1
+    "$tool" restore with-args > "$tmp/forbidden-args.out" 2> "$tmp/forbidden-args.err" && exit 1
 grep -Fq 'cannot be forwarded' "$tmp/forbidden-args.err"
 mkdir -p "$tmp/symlinked-codex-home-real"
 ln -s "$tmp/symlinked-codex-home-real" "$tmp/symlinked-codex-home"
@@ -3206,7 +3604,7 @@ assert_format4_archive "$zst_path" "$tmp/extracted/zst"
 grep -Fqx "relative_path=$zst_rel" "$tmp/extracted/zst/manifest"
 cmp "$tmp/source/codex/$zst_rel" "$tmp/extracted/zst/artifacts/$zst_rel"
 zst_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/zst-target/codex" \
-    "$tool" resume compressed -- --model compressed-model)"
+    "$tool" restore compressed -- --model compressed-model)"
 grep -Fqx \
     "FAKE_CODEX <resume> <$zst_session_id> <--model> <compressed-model>" \
     <<< "$zst_resume"
@@ -3216,7 +3614,7 @@ zst_cross_home="$tmp/zst-cross-target/claude"
 zst_cross_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$tmp/work")"
 zst_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$zst_cross_home" \
     OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
-    "$tool" resume compressed --to claude -- \
+    "$tool" restore compressed --to claude -- \
         --model converted-zstd)"
 grep -Fqx \
     "FAKE_CLAUDE <--resume> <$converted_claude_id> <--model> <converted-zstd>" \
@@ -3287,12 +3685,12 @@ grep -Fqx 'status=deleted' <<< "$delete_move_done"
 queued_output="$(
     cd "$tmp/work"
     env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-        "$tool" save active-window '活动窗口'
+        "$tool" save '活动窗口'
 )"
 queued_id="$(sed -n 's/^checkpoint_id=//p' <<< "$queued_output")"
 queued_path="$(sed -n 's/^path=//p' <<< "$queued_output")"
 grep -Fqx 'status=pending' <<< "$queued_output"
-[[ "$queued_id" == active-window ]]
+[[ "$queued_id" == codex--* ]]
 [[ ! -e "$queued_path" ]]
 mkdir -p "$tmp/pending-set-target"
 storage_before_pending_set="$(sha256sum "$tmp/state/storage.json")"
@@ -3316,7 +3714,7 @@ cp -- "$tmp/source/codex/$session_rel" "$codex_active_home/$session_rel"
 start_codex_session_process "$codex_active_home" "$session_id" "$session_rel"
 codex_active_pid="$active_test_pid"
 if env "${source_env[@]}" CODEX_HOME="$codex_active_home" \
-    "$tool" resume "$queued_id" \
+    "$tool" restore "$queued_id" \
     >"$tmp/codex-active.out" 2>"$tmp/codex-active.err"; then
     echo 'resume accepted an active target Codex session' >&2
     exit 1
@@ -3337,7 +3735,7 @@ codex_deleted_target="$(test_fd9_target "$codex_deleted_pid")"
 [[ "$codex_deleted_target" == "$codex_deleted_path" ||
    "$codex_deleted_target" == "$codex_deleted_path (deleted)" ]]
 if env "${source_env[@]}" CODEX_HOME="$codex_deleted_home" \
-    "$tool" resume "$queued_id" \
+    "$tool" restore "$queued_id" \
     >"$tmp/codex-deleted.out" 2>"$tmp/codex-deleted.err"; then
     echo 'resume ignored an unlinked active Codex rollout' >&2
     exit 1
@@ -3355,7 +3753,7 @@ start_codex_session_process "$codex_unrelated_home" "$codex_unrelated_id"
 write_codex_profile "$codex_unrelated_home" unrelated-running
 codex_unrelated_pid="$active_test_pid"
 codex_unrelated_resume="$(env "${source_env[@]}" CODEX_HOME="$codex_unrelated_home" \
-    "$tool" resume "$queued_id" -- -punrelated-running)"
+    "$tool" restore "$queued_id" -- -punrelated-running)"
 grep -Fqx \
     "FAKE_CODEX <resume> <$session_id> <-punrelated-running>" \
     <<< "$codex_unrelated_resume"
@@ -3376,34 +3774,34 @@ chmod +x "$tmp/other-home/.local/bin/codex" "$tmp/other-home/.local/bin/pgrep"
 resume_output="$(env "${source_env[@]}" \
     PATH="$tmp/other-home/.local/bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     CODEX_HOME="$tmp/resume-target/codex" \
-    "$tool" resume "$queued_id" --to codex -- \
+    "$tool" restore "$queued_id" --to codex -- \
         --to agent-owned --model test-model 'prompt words')"
 grep -Fqx \
     "FAKE_CODEX <resume> <$session_id> <--to> <agent-owned> <--model> <test-model> <prompt words>" \
     <<< "$resume_output"
 cmp "$tmp/source/codex/$session_rel" "$tmp/resume-target/codex/$session_rel"
 if env "${source_env[@]}" CODEX_HOME="$tmp/resume-boundary-target/codex" \
-    "$tool" resume "$queued_id" --model must-follow-separator --to claude \
+    "$tool" restore "$queued_id" --model must-follow-separator --to claude \
     >"$tmp/resume-boundary.out" 2>"$tmp/resume-boundary.err"; then
     echo 'resume accepted an Agent argument before --' >&2
     exit 1
 fi
 # 拒绝的说法后来改过（也换成了中文），断言跟着改。要点没变：`--` 之前的东西归 ags，
 # 之后的归 Agent，写错了要**拒**而不是猜。
-grep -Fq 'ags resume 只接受一个检查点标识：--model' "$tmp/resume-boundary.err"
+grep -Fq 'ags restore 只接受一个检查点标识：--model' "$tmp/resume-boundary.err"
 [[ ! -e "$tmp/resume-boundary-target" ]]
 
 conversion_log="$tmp/home/.local/ags.log"
 conversion_log_lines="$(wc -l < "$conversion_log")"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/version-gate-target/claude" \
-    "$tool" resume "$queued_id" --to claude --force-unsupported-version \
+    "$tool" restore "$queued_id" --to claude --force-unsupported-version \
     >"$tmp/version-gate.out" 2>"$tmp/version-gate.err"; then
     echo 'cross-Agent resume accepted a removed compatibility flag' >&2
     exit 1
 fi
 # 这个兼容开关早就没了，连带那句专门的"已被移除"提示也没了：现在它撞的是通用的
 # "resume 只收一个检查点标识"。用例要钉住的东西没变——**被拒**，而不是被悄悄忽略。
-grep -Fq -- 'ags resume 只接受一个检查点标识：--force-unsupported-version' \
+grep -Fq -- 'ags restore 只接受一个检查点标识：--force-unsupported-version' \
     "$tmp/version-gate.err"
 [[ "$conversion_log_lines" == "$(wc -l < "$conversion_log")" ]]
 [[ ! -e "$tmp/version-gate-target" ]]
@@ -3421,7 +3819,7 @@ codex_to_claude_settings_sha="$(
 codex_to_claude_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$codex_to_claude_work")"
 codex_to_claude="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$codex_to_claude_home" \
     OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
-    "$tool" resume "$queued_id" --to claude \
+    "$tool" restore "$queued_id" --to claude \
         --profile sub2api --cwd "$codex_to_claude_work" -- \
         --model sonnet 'converted handoff')"
 grep -Fqx \
@@ -3453,7 +3851,7 @@ grep -Fqx 'EXACT_SOURCE=1' "$conversion_log"
 missing_claude_profile_home="$tmp/codex-to-missing-claude-profile-target/claude"
 conversion_log_lines="$(wc -l < "$conversion_log")"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$missing_claude_profile_home" \
-    "$tool" resume "$queued_id" --to claude \
+    "$tool" restore "$queued_id" --to claude \
         --profile missing \
     >"$tmp/missing-claude-profile.out" 2>"$tmp/missing-claude-profile.err"; then
     echo 'cross-Agent Claude resume accepted a missing profile' >&2
@@ -3464,7 +3862,7 @@ grep -Fq 'Claude profile does not exist' "$tmp/missing-claude-profile.err"
 [[ ! -e "$missing_claude_profile_home/projects" ]]
 
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$codex_to_claude_home" \
-    "$tool" resume "$queued_id" --to claude \
+    "$tool" restore "$queued_id" --to claude \
         --profile ../outside \
     >"$tmp/unsafe-claude-profile.out" 2>"$tmp/unsafe-claude-profile.err"; then
     echo 'Claude resume accepted an unsafe profile name' >&2
@@ -3474,7 +3872,7 @@ grep -Fq 'invalid profile name' "$tmp/unsafe-claude-profile.err"
 
 conversion_log_lines="$(wc -l < "$conversion_log")"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$codex_to_claude_home" \
-    "$tool" resume "$queued_id" --to claude \
+    "$tool" restore "$queued_id" --to claude \
         --profile sub2api -- --settings "$tmp/other-claude-settings.json" \
     >"$tmp/conflicting-claude-settings.out" \
     2>"$tmp/conflicting-claude-settings.err"; then
@@ -3491,7 +3889,7 @@ mkdir -p "$unicode_cross_work"
 unicode_parent_key="$(reference_ascii_claude_project_key "$tmp")"
 unicode_cross_key="${unicode_parent_key}-----"
 unicode_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$unicode_cross_home" \
-    "$tool" resume "$queued_id" --to=claude \
+    "$tool" restore "$queued_id" --to=claude \
         --cwd="$unicode_cross_work" -- -p 'print handoff')"
 grep -Fqx \
     "FAKE_CLAUDE <--resume> <$converted_claude_id> <-p> <print handoff>" \
@@ -3516,7 +3914,7 @@ long_cross_home="$tmp/long-cross-target/claude"
 mkdir -p "$long_cross_work"
 long_cross_key="$(reference_ascii_claude_project_key "$long_cross_work")"
 long_cross="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$long_cross_home" \
-    "$tool" resume "$queued_id" --to claude \
+    "$tool" restore "$queued_id" --to claude \
         --cwd "$long_cross_work")"
 grep -Fqx "FAKE_CLAUDE <--resume> <$converted_claude_id>" <<< "$long_cross"
 [[ -f "$long_cross_home/projects/$long_cross_key/$converted_claude_id.jsonl" ]]
@@ -3527,19 +3925,20 @@ vanishing_pending="$(
     cd "$tmp/work"
     env "${source_env[@]}" PATH="$tmp/vanishing-bin:$tmp/home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-        "$tool" save vanishing-binary 'Vanishing binary'
+        "$tool" save 'Vanishing binary'
 )"
+vanishing_id="$(sed -n 's/^checkpoint_id=//p' <<< "$vanishing_pending")"
 grep -Fqx "agent_binary=$tmp/vanishing-bin/codex" <<< "$vanishing_pending"
 rm -f -- "$tmp/vanishing-bin/codex"
 printf '{"hook_event_name":"Stop","session_id":"%s"}\n' "$session_id" | \
     env "${source_env[@]}" AGENT_SESSION_LOCAL_DIR="$tmp/local-checkpoints" "$tool" hook
 vanishing_list="$(env "${source_env[@]}" "$tool" archives)"
-grep -Eq '^vanishing-binary +CODEX +' <<< "$vanishing_list"
-vanishing_show="$(env "${source_env[@]}" "$tool" show vanishing-binary)"
+grep -Fq "$vanishing_id" <<< "$vanishing_list"
+vanishing_show="$(env "${source_env[@]}" "$tool" show "$vanishing_id")"
 grep -Eq "^Binary invoked +$tmp/vanishing-bin/codex$" <<< "$vanishing_show"
 write_codex_profile "$tmp/vanishing-target/codex" fallback
 vanishing_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/vanishing-target/codex" \
-    "$tool" resume vanishing-binary --profile fallback 2>"$tmp/vanishing.err")"
+    "$tool" restore "$vanishing_id" --profile fallback 2>"$tmp/vanishing.err")"
 grep -Fqx "FAKE_CODEX <resume> <$session_id> <--profile> <fallback>" <<< "$vanishing_resume"
 grep -Fq "saved codex binary is unavailable: $tmp/vanishing-bin/codex" "$tmp/vanishing.err"
 
@@ -3552,9 +3951,10 @@ printf '%s\n' '{"type":"user","source":"initial"}' \
 claude_pending="$(
     cd "$tmp/work"
     env "${source_env[@]}" CLAUDE_CODE_SESSION_ID="$claude_session_id" \
-        "$tool" save claude-window 'Claude 恢复检查'
+        "$tool" save 'Claude 恢复检查'
 )"
-grep -Fqx 'checkpoint_id=claude-window' <<< "$claude_pending"
+claude_window_id="$(sed -n 's/^checkpoint_id=//p' <<< "$claude_pending")"
+grep -Fq "checkpoint_id=$claude_window_id" <<< "$claude_pending"
 grep -Fqx 'agent=claude' <<< "$claude_pending"
 grep -Fqx "agent_binary=$tmp/home/.local/bin/claude" <<< "$claude_pending"
 claude_path="$(sed -n 's/^path=//p' <<< "$claude_pending")"
@@ -3621,7 +4021,7 @@ cp -- "$tmp/source/claude/$claude_session_rel" \
 start_claude_session_process "$claude_active_home" "$claude_session_id"
 claude_active_pid="$active_test_pid"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_active_home" \
-    "$tool" resume claude-window \
+    "$tool" restore "$claude_window_id" \
     >"$tmp/claude-active.out" 2>"$tmp/claude-active.err"; then
     echo 'resume accepted an active target Claude session' >&2
     exit 1
@@ -3640,7 +4040,7 @@ start_claude_session_process "$claude_unrelated_home" "$claude_unrelated_id"
 claude_unrelated_pid="$active_test_pid"
 claude_unrelated_resume="$(
     env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_unrelated_home" \
-        "$tool" resume claude-window -- -p 'print native'
+        "$tool" restore "$claude_window_id" -- -p 'print native'
 )"
 grep -Fqx \
     "FAKE_CLAUDE <--resume> <$claude_session_id> <-p> <print native>" \
@@ -3653,7 +4053,7 @@ start_claude_session_process "$claude_stale_home" "$claude_session_id" 1
 claude_stale_pid="$active_test_pid"
 claude_stale_resume="$(
     env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_stale_home" \
-        "$tool" resume claude-window -- --model stale-registry
+        "$tool" restore "$claude_window_id" -- --model stale-registry
 )"
 grep -Fqx \
     "FAKE_CLAUDE <--resume> <$claude_session_id> <--model> <stale-registry>" \
@@ -3670,7 +4070,7 @@ touch -d '@1600000000' -- "$rollback_main"
 cp -p "$rollback_main" "$tmp/rollback-before.jsonl"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$rollback_home" \
     AGENT_SESSION_TEST_FAIL_REPLACE_AT=2 \
-    "$tool" restore local claude-window \
+    "$tool" restore local "$claude_window_id" \
     >"$tmp/rollback.out" 2>"$tmp/rollback.err"; then
     echo 'restore ignored an injected multi-artifact write failure' >&2
     exit 1
@@ -3698,7 +4098,7 @@ chmod 700 "$symlink_outside"
 ln -s "$symlink_outside" \
     "$symlink_home/projects/$claude_hook_key/$claude_session_id"
 env "${source_env[@]}" CLAUDE_CONFIG_DIR="$symlink_home" \
-    "$tool" restore local claude-window \
+    "$tool" restore local "$claude_window_id" \
     >"$tmp/symlink-escape.out" 2>"$tmp/symlink-escape.err"
 [[ -f "$symlink_outside/subagents/child.jsonl" ]]
 
@@ -3710,7 +4110,7 @@ chmod 777 "$symlink_open_outside"
 ln -s "$symlink_open_outside" \
     "$symlink_open_home/projects/$claude_hook_key/$claude_session_id"
 if env "${source_env[@]}" CLAUDE_CONFIG_DIR="$symlink_open_home" \
-    "$tool" restore local claude-window \
+    "$tool" restore local "$claude_window_id" \
     >"$tmp/symlink-open.out" 2>"$tmp/symlink-open.err"; then
     echo 'restore followed a world-writable symbolic-link target' >&2
     exit 1
@@ -3725,7 +4125,7 @@ claude_resume_key="$(LC_ALL=C sed 's/[^A-Za-z0-9]/-/g' <<< "$claude_resume_work"
 claude_resume_rel="projects/$claude_resume_key/$claude_session_id.jsonl"
 claude_resume_tree="projects/$claude_resume_key/$claude_session_id"
 claude_resume="$(env "${source_env[@]}" CLAUDE_CONFIG_DIR="$tmp/claude-resume-target/claude" \
-    "$tool" resume claude-window --cwd "$claude_resume_work" -- \
+    "$tool" restore "$claude_window_id" --cwd "$claude_resume_work" -- \
         --model sonnet 'continue here')"
 grep -Fqx "FAKE_CLAUDE <--resume> <$claude_session_id> <--model> <sonnet> <continue here>" <<< "$claude_resume"
 grep -Fqx "FAKE_PWD=$claude_resume_work" <<< "$claude_resume"
@@ -3766,7 +4166,7 @@ printf '%s\n' \
 claude_profile_sha="$(sha256sum "$claude_profile_settings" | cut -d' ' -f1)"
 claude_profile_resume="$(
     env "${source_env[@]}" CLAUDE_CONFIG_DIR="$claude_profile_home" \
-        "$tool" resume claude-window --profile sub2api
+        "$tool" restore "$claude_window_id" --profile sub2api
 )"
 grep -Fqx \
     "FAKE_CLAUDE <--resume> <$claude_session_id> <--settings> <$claude_profile_settings>" \
@@ -3783,7 +4183,7 @@ printf '%s\n' 'model_provider = "sub2api"' \
     > "$profile_after_separator_home/sub2api.config.toml"
 profile_after_separator="$(
     env "${source_env[@]}" CODEX_HOME="$profile_after_separator_home" \
-    "$tool" resume claude-window --to codex -- \
+    "$tool" restore "$claude_window_id" --to codex -- \
         -p sub2api
 )"
 grep -Fqx \
@@ -3802,7 +4202,7 @@ profile_long_home="$tmp/profile-long/codex"
 write_codex_profile "$profile_long_home" sub2api sub2api
 profile_long="$(
     env "${source_env[@]}" CODEX_HOME="$profile_long_home" \
-    "$tool" resume claude-window --to codex -- \
+    "$tool" restore "$claude_window_id" --to codex -- \
         --profile sub2api
 )"
 grep -Fqx \
@@ -3819,7 +4219,7 @@ profile_equals_home="$tmp/profile-equals/codex"
 write_codex_profile "$profile_equals_home" sub2api sub2api
 profile_equals="$(
     env "${source_env[@]}" CODEX_HOME="$profile_equals_home" \
-    "$tool" resume claude-window --to codex -- \
+    "$tool" restore "$claude_window_id" --to codex -- \
         --profile=sub2api
 )"
 grep -Fqx \
@@ -3835,7 +4235,7 @@ jq -s -e '
 duplicate_profile_home="$tmp/profile-duplicate/codex"
 write_codex_profile "$duplicate_profile_home" sub2api sub2api
 if env "${source_env[@]}" CODEX_HOME="$duplicate_profile_home" \
-    "$tool" resume claude-window --to codex \
+    "$tool" restore "$claude_window_id" --to codex \
         --profile sub2api -- --profile=sub2api \
         >"$tmp/profile-duplicate.out" 2>"$tmp/profile-duplicate.err"; then
     echo 'resume accepted both AGS and native Codex profiles' >&2
@@ -3851,7 +4251,7 @@ assert_cross_codex_provider_override_rejected() {
     target_home="$tmp/codex-provider-override-$label/codex"
     before="$(wc -l < "$conversion_log")"
     if env "${source_env[@]}" CODEX_HOME="$target_home" \
-        "$tool" resume claude-window --to codex -- "$@" \
+        "$tool" restore "$claude_window_id" --to codex -- "$@" \
         >"$tmp/codex-provider-override-$label.out" \
         2>"$tmp/codex-provider-override-$label.err"; then
         echo "cross-Agent Codex resume accepted provider override: $label" >&2
@@ -3885,7 +4285,7 @@ cross_unrelated_codex_pid="$active_test_pid"
 cross_unrelated_codex_path="$active_codex_path"
 claude_to_codex="$(env "${source_env[@]}" CODEX_HOME="$claude_to_codex_home" \
     OPENAI_API_KEY=must-not-leak ANTHROPIC_API_KEY=must-not-leak \
-    "$tool" resume claude-window --to codex \
+    "$tool" restore "$claude_window_id" --to codex \
         --profile sub2api)"
 grep -Fqx \
     "FAKE_CODEX <resume> <$converted_codex_id> <--profile> <sub2api>" \
@@ -3922,7 +4322,7 @@ register_failure_home="$tmp/register-failure-target/codex"
 register_failure_file="$register_failure_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
 if env "${source_env[@]}" CODEX_HOME="$register_failure_home" \
     AGS_REGISTER_FAIL=1 \
-    "$tool" resume claude-window --to codex --cwd "$claude_hook_work" \
+    "$tool" restore "$claude_window_id" --to codex --cwd "$claude_hook_work" \
     >"$tmp/register-failure.out" 2>"$tmp/register-failure.err"; then
     echo 'Codex resume ignored a failed thread-index registration' >&2
     exit 1
@@ -3940,7 +4340,7 @@ grep -Fqx \
 claude_to_default_codex_home="$tmp/claude-to-default-codex-target/codex"
 claude_to_default_codex="$(env "${source_env[@]}" \
     CODEX_HOME="$claude_to_default_codex_home" \
-    "$tool" resume claude-window --to codex)"
+    "$tool" restore "$claude_window_id" --to codex)"
 grep -Fqx "FAKE_CODEX <resume> <$converted_codex_id>" \
     <<< "$claude_to_default_codex"
 claude_to_default_codex_file="$claude_to_default_codex_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
@@ -3964,9 +4364,12 @@ jq -n --arg id "$live_session_id" --arg workspace "$claude_hook_work" \
     '[{provider:"claude-code",session_id:$id,workspace:$workspace}]' > "$live_items"
 live_cross_home="$tmp/live-cross-target/codex"
 persistent_archives_before="$(find "$tmp/local-checkpoints" -type f -name '*.checkpoint.tar.gz.age' | wc -l)"
+mkdir -p "$live_cross_home"
+printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' \
+    > "$live_cross_home/pool.json"
 live_cross="$(env "${source_env[@]}" FAKE_LIST_ITEMS="$live_items" \
     CODEX_HOME="$live_cross_home" \
-    "$tool" resume "live:claude-code/$live_session_id" --to codex -- \
+    "$tool" resume "claude-code/$live_session_id" --to codex -- \
         --dangerously-bypass-approvals-and-sandbox)"
 grep -Fqx "FAKE_CODEX <resume> <$converted_codex_id> <--dangerously-bypass-approvals-and-sandbox>" \
     <<< "$live_cross"
@@ -3980,7 +4383,7 @@ printf '%s\n' "model_provider = 'basegateway'" \
     > "$claude_to_base_codex_home/config.toml"
 claude_to_base_codex="$(env "${source_env[@]}" \
     CODEX_HOME="$claude_to_base_codex_home" \
-    "$tool" resume claude-window --to codex)"
+    "$tool" restore "$claude_window_id" --to codex)"
 grep -Fqx "FAKE_CODEX <resume> <$converted_codex_id>" \
     <<< "$claude_to_base_codex"
 claude_to_base_codex_file="$claude_to_base_codex_home/sessions/2026/07/25/rollout-test-$converted_codex_id.jsonl"
@@ -3995,7 +4398,7 @@ jq -e '
 missing_profile_home="$tmp/claude-to-missing-profile-target/codex"
 conversion_log_lines="$(wc -l < "$conversion_log")"
 if env "${source_env[@]}" CODEX_HOME="$missing_profile_home" \
-    "$tool" resume claude-window --to codex \
+    "$tool" restore "$claude_window_id" --to codex \
         --profile missing \
     >"$tmp/missing-profile.out" 2>"$tmp/missing-profile.err"; then
     echo 'cross-Agent Codex resume accepted a missing profile' >&2
@@ -4008,6 +4411,10 @@ grep -Fq 'Codex profile does not exist' "$tmp/missing-profile.err"
 cat > "$tmp/home/.local/bin/ags-fail" <<'EOF'
 #!/usr/bin/env sh
 if [ "${1:-}" = --version ]; then printf 'ags 0.3.0-test\n'; exit; fi
+if [ "${1:-}" = env-apply ] || [ "${1:-}" = runtime-apply ]; then
+    printf '%s\n' '# none'
+    exit 0
+fi
 if [ "${1:-}" = terminal-attach ]; then exit 3; fi
 printf '{"message":"synthetic conversion failure"}\n' >&2
 exit 42
@@ -4015,7 +4422,7 @@ EOF
 chmod +x "$tmp/home/.local/bin/ags-fail"
 if env "${source_env[@]}" CODEX_HOME="$tmp/conversion-failure-target/codex" \
     AGS_CONVERTER_BINARY="$tmp/home/.local/bin/ags-fail" \
-    "$tool" resume claude-window --to codex \
+    "$tool" restore "$claude_window_id" --to codex \
     >"$tmp/conversion-failure.out" 2>"$tmp/conversion-failure.err"; then
     echo 'resume ignored an ags conversion failure' >&2
     exit 1
@@ -4047,9 +4454,9 @@ legacy_list="$(env "${source_env[@]}" "$tool" archives)"
 grep -Fq "$legacy_id" <<< "$legacy_list"
 grep -Fq '旧版检查点' <<< "$legacy_list"
 grep -Eq '^sat-index +CODEX +' <<< "$legacy_list"
-grep -Eq '^claude-window +CLAUDE +' <<< "$legacy_list"
+grep -Fq "$claude_window_id" <<< "$legacy_list"
 legacy_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/legacy-resume-target/codex" \
-    "$tool" resume "$legacy_id" -- --sandbox read-only)"
+    "$tool" restore "$legacy_id" -- --sandbox read-only)"
 grep -Fqx "FAKE_CODEX <resume> <$legacy_session_id> <--sandbox> <read-only>" <<< "$legacy_resume"
 cmp "$legacy_payload/session.jsonl" "$tmp/legacy-resume-target/codex/$legacy_relative"
 
@@ -4081,7 +4488,7 @@ tar -C "$legacy_payload" -czf - manifest session.jsonl | \
     age -R "$tmp/legacy-recipient.pub" \
         -o "$tmp/local-checkpoints/codex/$collision_record_id.checkpoint.tar.gz.age"
 [[ "$(env "${source_env[@]}" "$tool" archives | grep -Ec '^collision +CODEX +')" == 2 ]]
-if env "${source_env[@]}" "$tool" resume "$collision_id" \
+if env "${source_env[@]}" "$tool" restore "$collision_id" \
     >"$tmp/collision.out" 2>"$tmp/collision.err"; then
     echo 'resume allowed a format 2/3 logical-ID collision' >&2
     exit 1
@@ -4101,7 +4508,7 @@ grep -Eq '^Description +New collision$' <<< "$new_collision_show"
 write_codex_profile "$tmp/collision-legacy-target/codex" legacy-collision
 legacy_collision_resume="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/collision-legacy-target/codex" \
-        "$tool" resume "codex/$collision_id" --profile legacy-collision
+        "$tool" restore "codex/$collision_id" --profile legacy-collision
 )"
 grep -Fqx \
     "FAKE_CODEX <resume> <$legacy_session_id> <--profile> <legacy-collision>" \
@@ -4109,7 +4516,7 @@ grep -Fqx \
 write_codex_profile "$tmp/collision-new-target/codex" new-collision
 new_collision_resume="$(
     env "${source_env[@]}" CODEX_HOME="$tmp/collision-new-target/codex" \
-        "$tool" resume "codex/$collision_record_id" --profile new-collision
+        "$tool" restore "codex/$collision_record_id" --profile new-collision
 )"
 grep -Fqx \
     "FAKE_CODEX <resume> <$legacy_session_id> <--profile> <new-collision>" \
@@ -4164,32 +4571,32 @@ tar -C "$legacy_payload" -czf - manifest session.jsonl | \
         -o "$tmp/local-checkpoints/codex/$archive_binary_record_id.checkpoint.tar.gz.age"
 write_codex_profile "$tmp/archive-binary-target/codex" trusted
 archive_binary_resume="$(env "${source_env[@]}" CODEX_HOME="$tmp/archive-binary-target/codex" \
-    "$tool" resume "$archive_binary_id" -- --profile trusted)"
+    "$tool" restore "$archive_binary_id" -- --profile trusted)"
 grep -Fqx \
     "FAKE_CODEX <resume> <$legacy_session_id> <--profile> <trusted>" \
     <<< "$archive_binary_resume"
 [[ "$archive_binary_resume" != *MALICIOUS_ARCHIVE_BINARY* ]]
 
 if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-    "$tool" save missing-description >/dev/null 2>&1; then
+    "$tool" save >/dev/null 2>&1; then
     echo 'save accepted a missing description' >&2
     exit 1
 fi
 if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-    "$tool" save 'bad id' 'Invalid ID' >/dev/null 2>&1; then
-    echo 'save accepted an invalid ID' >&2
+    "$tool" save --id 'bad-id' 'Invalid ID' >/dev/null 2>&1; then
+    echo 'save accepted --id' >&2
     exit 1
 fi
-if env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-    "$tool" save active-window 'Duplicate ID' >/dev/null 2>&1; then
-    echo 'save accepted a duplicate ID' >&2
+if ! env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
+    "$tool" save 'second snapshot' >/dev/null; then
+    echo 'save refused a second snapshot of the same session' >&2
     exit 1
 fi
 
 startup_output="$(
     cd "$tmp/work"
     env "${source_env[@]}" AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-        "$tool" save startup-recovery '意外关闭恢复'
+        "$tool" save '意外关闭恢复'
 )"
 startup_id="$(sed -n 's/^checkpoint_id=//p' <<< "$startup_output")"
 startup_path="$(sed -n 's/^path=//p' <<< "$startup_output")"
@@ -4432,8 +4839,9 @@ auto_sync_pending="$(
     cd "$tmp/work"
     env "${sync_a_env[@]}" AGENT_SESSION_STORAGE_MODE=remote:backup \
         AGENT_SESSION_AGENT=codex AGENT_SESSION_ID="$session_id" \
-        "$tool" save auto-git 'Automatic Git update'
+        "$tool" save 'Automatic Git update'
 )"
+auto_sync_id="$(sed -n 's/^checkpoint_id=//p' <<< "$auto_sync_pending")"
 auto_sync_record_id="$(sed -n 's/^record_id=//p' <<< "$auto_sync_pending")"
 auto_sync_path="$(sed -n 's/^path=//p' <<< "$auto_sync_pending")"
 [[ ! -e "$auto_sync_path" ]]
@@ -4497,7 +4905,7 @@ grep -Fq 'E_SYNC_CONFLICT' "$tmp/git-conflict.err"
 grep -Fq "record_id=$sync_record_id" "$tmp/git-conflict.err"
 cp -- "$queued_path" "$sync_b_record"
 
-sync_delete="$(env "${sync_a_env[@]}" "$tool" delete active-window)"
+sync_delete="$(env "${sync_a_env[@]}" "$tool" delete "$queued_id")"
 grep -Fqx 'status=deleted' <<< "$sync_delete"
 grep -Fqx 'sync_status=synchronized' <<< "$sync_delete"
 grep -Fqx 'storage_mode=remote:backup' <<< "$sync_delete"
@@ -4516,10 +4924,10 @@ grep -Fqx 'status=synchronized' <<< "$tombstone_pull"
 [[ -f "$tmp/sync-b/local/tombstones/codex/$sync_record_id.tombstone" ]]
 find "$tmp/sync-b/state/trash/sync/codex" -type f \
     -name "$sync_record_id.checkpoint.tar.gz.age.deleted.*" | grep -q .
-! env "${sync_b_env[@]}" "$tool" archives | grep -Fq active-window
+! env "${sync_b_env[@]}" "$tool" archives | grep -Fq "$queued_id"
 
 mv -- "$tmp/git/records.git" "$tmp/git/records.offline.git"
-if pending_delete="$(env "${sync_a_env[@]}" "$tool" delete auto-git \
+if pending_delete="$(env "${sync_a_env[@]}" "$tool" delete "$auto_sync_id" \
     2>"$tmp/pending-delete.err")"; then
     pending_delete_status=0
 else
@@ -5364,6 +5772,7 @@ gc_codex="$gc_home/codex"
 gc_state="$tmp/gc-state"
 gc_items="$tmp/gc-items.json"
 mkdir -p "$gc_home" "$gc_codex/sessions" "$gc_state"
+printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' > "$gc_codex/pool.json"
 
 gc_now_ms="$(( $(date +%s) * 1000 ))"
 gc_day_ms=86400000
@@ -5671,7 +6080,10 @@ store_ref="$("${store_env[@]}" "$tool" status 2>&1)" || true
 ls_home="$tmp/ls-sort-home"
 ls_state="$tmp/ls-sort-state"
 ls_items="$tmp/ls-sort-items.json"
-mkdir -p "$ls_home/codex" "$ls_home/claude" "$ls_state"
+ls_ws_codex="$ls_home/ws/codex-proj"
+ls_ws_claude="$ls_home/ws/claude-proj"
+mkdir -p "$ls_home/codex" "$ls_home/claude" "$ls_state" "$ls_ws_codex" "$ls_ws_claude"
+printf '{"base_url":"http://pool.invalid","key":"test-key"}\n' > "$ls_home/codex/pool.json"
 # 时间锚在**昨天中午**，不是 `now`。
 #
 # 用 `now - 1小时` 这种相对量的话，这一段在本地时间 00:00–01:00 之间跑就会把"今天"
@@ -5694,25 +6106,26 @@ ls_day_ms=86400000
 #
 # 丁是空会话：`title` 和 `native_name` 都是空的，而它的时间最新——按时间它该排第
 # 一，按「有没有名字」它一行都不该出现。
-jq -n --argjson base "$ls_base_ms" --argjson h "$ls_hour_ms" --argjson day "$ls_day_ms" '[
+jq -n --argjson base "$ls_base_ms" --argjson h "$ls_hour_ms" --argjson day "$ls_day_ms" \
+  --arg cws "$ls_ws_codex" --arg lws "$ls_ws_claude" '[
   {provider:"codex", session_id:"aaaaaaaa-1111-4111-8111-111111111111",
    started_at:($base + 2*$h), last_active_at:($base + 3*$h + 30000),
-   workspace:"/w", title:"同一分钟先开的", path:"/w/a.jsonl"},
+   workspace:$cws, title:"同一分钟先开的", path:"/w/a.jsonl"},
   {provider:"codex", session_id:"eeeeeeee-5555-4555-8555-555555555555",
    started_at:($base + 2*$h + 1800000), last_active_at:($base + 3*$h),
-   workspace:"/w", title:"同一分钟后开的", path:"/w/e.jsonl"},
+   workspace:$cws, title:"同一分钟后开的", path:"/w/e.jsonl"},
   {provider:"codex", session_id:"bbbbbbbb-2222-4222-8222-222222222222",
    started_at:($base - 3*$day), last_active_at:($base + 5*$h),
-   workspace:"/w", title:"动得最晚的", path:"/w/b.jsonl"},
+   workspace:$cws, title:"动得最晚的", path:"/w/b.jsonl"},
   {provider:"claude-code", session_id:"ffffffff-6666-4666-8666-666666666666",
    started_at:($base + 4*$h), last_active_at:($base + 4*$h),
-   workspace:"/w", title:"claude那条", path:"/w/f.jsonl"},
+   workspace:$lws, title:"claude那条", path:"/w/f.jsonl"},
   {provider:"codex", session_id:"cccccccc-3333-4333-8333-333333333333",
    started_at:($base - $day - $h), last_active_at:($base - $day),
-   workspace:"/w", title:"前一天的", path:"/w/c.jsonl"},
+   workspace:$cws, title:"前一天的", path:"/w/c.jsonl"},
   {provider:"codex", session_id:"dddddddd-4444-4444-8444-444444444444",
    started_at:($base + 6*$h), last_active_at:($base + 6*$h),
-   workspace:"/w", title:"", native_name:"", path:"/w/d.jsonl"}
+   workspace:$cws, title:"", native_name:"", path:"/w/d.jsonl"}
 ]' > "$ls_items"
 ls_env=(
     env
@@ -5731,10 +6144,11 @@ ls_env=(
     COLUMNS=160
 )
 "${ls_env[@]}" "$tool" init >/dev/null
-ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+ls_out="$("${ls_env[@]}" "$tool" ls -a </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
 
-# 两个时间都要有自己的一列。
-grep -Eq 'STARTED[[:space:]]+ACTIVE' <<< "$ls_out"
+# 两个时间都要有自己的一列，SESSION 是 Agent 自己的 id。
+grep -Eq 'SESSION[[:space:]]+STARTED[[:space:]]+ACTIVE' <<< "$ls_out"
+grep -Fq 'bbbbbbbb-2222-4222-8222-222222222222' <<< "$ls_out"
 
 # 顺序：ACTIVE 降序；显示成同一分钟的那两条之间看启动时间，后开的在上。
 ls_want='动得最晚的 claude那条 同一分钟后开的 同一分钟先开的 前一天的 '
@@ -5776,53 +6190,75 @@ ls_times="$(grep -oE '[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<< "$ls_row" | tr '\
     exit 1
 }
 
-# ---------------------------------------------------------------------------
-# `ags ls AGENT`：只看一个 Agent 的会话
-#
-# 最要紧的一条是**短号不跟着过滤变**。短号是这台机器给会话的坐标，`ags resume 3`
-# 得永远指同一条；按当前这一屏重新编号的话，先 `ags ls codex` 再敲 `ags resume 3`
-# 打开的就不是刚看的那条了。
-# ---------------------------------------------------------------------------
-ls_codex="$("${ls_env[@]}" "$tool" ls codex </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
-if grep -q 'claude那条' <<< "$ls_codex"; then
-    printf 'ags ls codex: 不该列出 claude 的会话\n' >&2
-    printf '%s\n' "$ls_codex" >&2
+# 默认 `ags ls` 只看当前目录。
+ls_cwd="$(cd "$ls_ws_codex" && "${ls_env[@]}" "$tool" ls </dev/null 2>&1 |
+    sed 's/\x1b\[[0-9;]*m//g')"
+if grep -q 'claude那条' <<< "$ls_cwd"; then
+    printf 'ags ls: 默认不该列出别的目录里的会话\n' >&2
+    printf '%s\n' "$ls_cwd" >&2
     exit 1
 fi
-ls_codex_numbers="$(grep -E '动得最晚的|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_codex" |
+grep -Fq '动得最晚的' <<< "$ls_cwd" || {
+    printf 'ags ls: 默认应列出当前目录的会话\n' >&2
+    printf '%s\n' "$ls_cwd" >&2
+    exit 1
+}
+
+# `ags ls -a` 无视当前目录，列出全部工作目录。
+ls_all_from_cwd="$(cd "$ls_ws_codex" && "${ls_env[@]}" "$tool" ls -a </dev/null 2>&1 |
+    sed 's/\x1b\[[0-9;]*m//g')"
+grep -Fq 'claude那条' <<< "$ls_all_from_cwd" || {
+    printf 'ags ls -a: 该列出其它目录里的会话\n' >&2
+    printf '%s\n' "$ls_all_from_cwd" >&2
+    exit 1
+}
+grep -Fq '动得最晚的' <<< "$ls_all_from_cwd" || {
+    printf 'ags ls -a: 该仍然列出当前目录的会话\n' >&2
+    printf '%s\n' "$ls_all_from_cwd" >&2
+    exit 1
+}
+ls_all_dir="$("${ls_env[@]}" "$tool" ls -a "$ls_ws_codex" </dev/null 2>&1)" || true
+grep -Fq '不接受目录参数' <<< "$ls_all_dir" || {
+    printf 'ags ls -a DIR: 应该拒绝目录参数，实际是 %s\n' "$ls_all_dir" >&2
+    exit 1
+}
+ls_dir_then_a="$("${ls_env[@]}" "$tool" ls "$ls_ws_codex" -a </dev/null 2>&1)" || true
+grep -Fq '不接受目录参数' <<< "$ls_dir_then_a" || {
+    printf 'ags ls DIR -a: 应该拒绝目录参数，实际是 %s\n' "$ls_dir_then_a" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# `ags ls DIR`：只看一个工作目录的会话。第一列是这一屏的 1..n。
+# ---------------------------------------------------------------------------
+ls_dir="$("${ls_env[@]}" "$tool" ls "$ls_ws_codex" </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+if grep -q 'claude那条' <<< "$ls_dir"; then
+    printf 'ags ls DIR: 不该列出别的目录里的会话\n' >&2
+    printf '%s\n' "$ls_dir" >&2
+    exit 1
+fi
+ls_dir_numbers="$(grep -E '动得最晚的|同一分钟后开的|同一分钟先开的|前一天的' <<< "$ls_dir" |
     grep -oE '^[[:space:]]*[0-9]+' | tr -d ' \n')"
-[[ "$ls_codex_numbers" == 1345 ]] || {
-    printf 'ags ls codex: 短号该保持 1/3/4/5，实际是 %s（过滤把号重排了？）\n' \
-        "$ls_codex_numbers" >&2
-    printf '%s\n' "$ls_codex" >&2
+[[ "$ls_dir_numbers" == 1234 ]] || {
+    printf 'ags ls DIR: 短号该是 1..4，实际是 %s\n' "$ls_dir_numbers" >&2
+    printf '%s\n' "$ls_dir" >&2
+    exit 1
+}
+ls_claude_dir="$("${ls_env[@]}" "$tool" ls "$ls_ws_claude" </dev/null 2>&1 |
+    sed 's/\x1b\[[0-9;]*m//g')"
+grep -Fq 'claude那条' <<< "$ls_claude_dir" || {
+    printf 'ags ls DIR: 应该列出该目录里的 claude 会话\n' >&2
+    printf '%s\n' "$ls_claude_dir" >&2
+    exit 1
+}
+! grep -q '动得最晚的' <<< "$ls_claude_dir" || {
+    printf 'ags ls DIR: 不该列出别的目录里的 codex 会话\n' >&2
     exit 1
 }
 
-# `claude` 和 `claude-code` 是同一个东西的两种拼法：provider 的 slug 和 AGS 启动它
-# 时用的名字。两个都得认，否则 `-a` 那一屏里存档和活会话会各自消失一半。
-for ls_alias in claude claude-code; do
-    ls_claude="$("${ls_env[@]}" "$tool" ls "$ls_alias" </dev/null 2>&1 |
-        sed 's/\x1b\[[0-9;]*m//g')"
-    grep -Fq 'claude那条' <<< "$ls_claude" || {
-        printf 'ags ls %s: 应该列出 claude 的会话\n' "$ls_alias" >&2
-        printf '%s\n' "$ls_claude" >&2
-        exit 1
-    }
-    ! grep -q '动得最晚的' <<< "$ls_claude" || {
-        printf 'ags ls %s: 不该列出 codex 的会话\n' "$ls_alias" >&2
-        exit 1
-    }
-done
-
-# 名字打错了要说清楚，而且要把可选的名字一起报出来——打错和"真的没有会话"在屏幕上
-# 长得一模一样，而前者是每天都会犯的错。
-ls_typo="$("${ls_env[@]}" "$tool" ls cladue </dev/null 2>&1)"
-grep -Fq 'no cladue sessions' <<< "$ls_typo" || {
-    printf 'ags ls cladue: 应该说清楚这个名字一条都没匹配上，实际是 %s\n' "$ls_typo" >&2
-    exit 1
-}
-grep -Fq 'claude-code, codex' <<< "$ls_typo" || {
-    printf 'ags ls cladue: 应该把可选的 Agent 名字列出来，实际是 %s\n' "$ls_typo" >&2
+ls_typo="$("${ls_env[@]}" "$tool" ls "$ls_home/no-such-dir" </dev/null 2>&1)" || true
+grep -Fq '工作目录' <<< "$ls_typo" || {
+    printf 'ags ls missing dir: 应该拒绝不存在的目录，实际是 %s\n' "$ls_typo" >&2
     exit 1
 }
 
@@ -5837,7 +6273,7 @@ if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
         ags_suite_last_pty_input="$input"
         printf -v pty_command '%q ' \
             "${ls_env[@]}" TERM=xterm-256color AGS_PERMISSION_PROMPT=0 "$@" \
-            "$tmp/stty-guard" "$tool" ls
+            "$tmp/stty-guard" "$tool" ls -a
         feed_keys "$input" "$output" | \
             SHELL=/bin/bash /usr/bin/script -q -e -f -c "$pty_command" /dev/null \
                 > "$output" 2>&1
@@ -5873,7 +6309,8 @@ if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
         exit 1
     }
     # 而且它压在原话第一行前面——这一级是四级回退里的第一级。
-    ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+    # PTY 用的是 `ls -a`；默认 `ags ls` 只看测试进程的 cwd，这里要对同一屏。
+    ls_out="$("${ls_env[@]}" "$tool" ls -a </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
     grep -Fq '手写的名字' <<< "$ls_out" || {
         printf 'ags ls: 手写的名字该顶替掉自动来的那个\n' >&2
         printf '%s\n' "$ls_out" >&2
@@ -5892,7 +6329,7 @@ if [[ "$test_platform" == Linux && -x /usr/bin/script ]]; then
         printf '%s\n' "$ls_pty_out" >&2
         exit 1
     }
-    ls_out="$("${ls_env[@]}" "$tool" ls </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
+    ls_out="$("${ls_env[@]}" "$tool" ls -a </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')"
     grep -Fq '动得最晚的' <<< "$ls_out" || {
         printf 'ags ls: 清掉名字之后该回到自动来的那个\n' >&2
         printf '%s\n' "$ls_out" >&2

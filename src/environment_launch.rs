@@ -49,6 +49,8 @@ const CARRIER_UNSET: &[&str] = &[
     "WSL2_GUI_APPS_ENABLED",
     "WSL_HOST",
     "WSL_DISTRO",
+    "WT_SESSION",
+    "WT_PROFILE_ID",
     "AGS_ENV_PROFILE",
     "AGS_BACKEND_KIND",
     "AGS_AGENT_PROVIDER",
@@ -164,6 +166,12 @@ impl LaunchPlan {
 
     pub fn to_shell(&self) -> String {
         let mut lines = vec![format!("# {APPLY_HEADER}"), format!("# {}", self.profile_id)];
+        // Unexported: the launcher patches clock.timezone to the proxy TZ, then
+        // drops this so the child does not inherit the overlay path.
+        lines.push(format!(
+            "AGS_ENV_OVERLAY={}",
+            posix_single_quote(&self.overlay_root.display().to_string())
+        ));
         for (key, value) in &self.set_env {
             lines.push(format!("export {key}={}", posix_single_quote(value)));
         }
@@ -355,10 +363,12 @@ pub fn materialize(
     host: &LaunchHost,
 ) -> Result<LaunchPlan, OverlayError> {
     let kind = ProviderKind::parse(provider);
-    let overlay_root = paths
-        .overlay_parent()
-        .join(sanitize_id(&profile.id))
-        .join(kind.dir_name());
+    let overlay_root = overlay_root_for(
+        paths,
+        &profile.id,
+        kind,
+        std::env::var("AGS_RUNTIME").ok().as_deref(),
+    );
     write_overlay(profile_path, profile, kind, host, &overlay_root)?;
 
     let mut set_env = Vec::new();
@@ -424,18 +434,107 @@ pub fn materialize(
     })
 }
 
+pub fn plan_for_provider(
+    paths: &OverlayPaths,
+    explicit_profile: Option<&Path>,
+    provider: &str,
+    host: &LaunchHost,
+) -> Result<LaunchPlan, OverlayError> {
+    let (profile_path, runtime) = match resolve_profile(paths, explicit_profile)? {
+        Some(selected) => selected,
+        None => observational_fallback(paths, host)?,
+    };
+    materialize(paths, &profile_path, &runtime.profile, provider, host)
+}
+
 pub fn apply_to_spec(
     spec: LaunchSpec,
     paths: &OverlayPaths,
     explicit_profile: Option<&Path>,
     provider: &str,
     host: &LaunchHost,
-) -> Result<LaunchSpec, OverlayError> {
-    let Some((profile_path, runtime)) = resolve_profile(paths, explicit_profile)? else {
-        return Ok(spec);
+) -> Result<(LaunchSpec, Option<PathBuf>), OverlayError> {
+    let plan = plan_for_provider(paths, explicit_profile, provider, host)?;
+    let overlay_root = plan.overlay_root.clone();
+    Ok((plan.apply_to_spec(spec), Some(overlay_root)))
+}
+
+/// Profile used when the user did not `env-use`. Location still follows the
+/// egress IP after launch; identity is a generic observational host.
+fn observational_fallback(
+    paths: &OverlayPaths,
+    _host: &LaunchHost,
+) -> Result<(PathBuf, RuntimeProfile), OverlayError> {
+    let spec = if cfg!(target_os = "macos") {
+        "tokyo-macos"
+    } else {
+        "tokyo-linux"
     };
-    let plan = materialize(paths, &profile_path, &runtime.profile, provider, host)?;
-    Ok(plan.apply_to_spec(spec))
+    let template = resolve_spec_to_path(paths, spec)?;
+    let mut runtime = RuntimeProfile::from_json(&fs::read_to_string(&template)?)?;
+    runtime.profile.id = "egress-observational".into();
+    let hostname = std::env::var("AGS_RUNTIME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "devhost".into());
+    runtime.profile.identity.hostname = hostname;
+    runtime.profile.identity.username = "agent".into();
+    let dest = paths.state.join("egress-observational.json");
+    let encoded = serde_json::to_string_pretty(&runtime.profile)
+        .map_err(|error| OverlayError::Io(error.to_string()))?;
+    atomic_write(&dest, encoded.as_bytes())?;
+    Ok((dest, runtime))
+}
+
+/// Point the overlay date hook at the same IANA zone the proxy egress uses.
+/// Drops a frozen `offset_seconds` so `%Z`/`date` cannot keep the old offset.
+pub fn sync_overlay_clock_timezone(
+    overlay_root: &Path,
+    timezone: &str,
+) -> Result<(), OverlayError> {
+    sync_overlay_region(overlay_root, timezone, None)
+}
+
+/// Same as [`sync_overlay_clock_timezone`], plus LANG/LC_* from the egress
+/// country when ipwho.is supplied one.
+pub fn sync_overlay_region(
+    overlay_root: &Path,
+    timezone: &str,
+    country_code: Option<&str>,
+) -> Result<(), OverlayError> {
+    crate::agent_runtime::validate_timezone(timezone)
+        .map_err(|error| OverlayError::InvalidProfile(error.to_string()))?;
+    let path = overlay_root.join("profile.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&path)?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|error| OverlayError::Io(error.to_string()))?;
+    if let Some(clock) = value.get_mut("clock").and_then(serde_json::Value::as_object_mut) {
+        clock.insert(
+            "timezone".into(),
+            serde_json::Value::String(timezone.to_string()),
+        );
+        clock.remove("offset_seconds");
+    }
+    if let Some(code) = country_code.filter(|value| !value.is_empty()) {
+        let lang = crate::agent_runtime::locale_for_country(code);
+        if let Some(locale) = value.get_mut("locale").and_then(serde_json::Value::as_object_mut)
+        {
+            locale.insert("lang".into(), serde_json::Value::String(lang.clone()));
+            locale.insert("lc_all".into(), serde_json::Value::String(lang.clone()));
+            locale.insert("lc_time".into(), serde_json::Value::String(lang));
+        }
+    }
+    let encoded = serde_json::to_string_pretty(&value)
+        .map_err(|error| OverlayError::Io(error.to_string()))?;
+    atomic_write(&path, encoded.as_bytes())?;
+    if let Ok(runtime) = RuntimeProfile::from_json(&fs::read_to_string(&path)?) {
+        write_observational_fs(overlay_root, &runtime.profile)?;
+    }
+    Ok(())
 }
 
 pub fn render_apply(plan: Option<&LaunchPlan>, format: ApplyFormat) -> Result<String, OverlayError> {
@@ -557,6 +656,34 @@ fn write_overlay(
         fs::create_dir_all(parent)?;
     }
     fs::rename(&staging, overlay_root)?;
+    write_observational_fs(overlay_root, profile)?;
+    Ok(())
+}
+
+/// Files libc/`timedatectl`/Python read when they ignore `TZ`. Bind-mounted
+/// over `/etc/*` in a user namespace at launch when `unshare` works.
+fn write_observational_fs(
+    overlay_root: &Path,
+    profile: &EnvironmentProfile,
+) -> Result<(), OverlayError> {
+    let etc = overlay_root.join("fs").join("etc");
+    fs::create_dir_all(&etc)?;
+    atomic_write(
+        &etc.join("hostname"),
+        format!("{}\n", profile.identity.hostname).as_bytes(),
+    )?;
+    atomic_write(
+        &etc.join("timezone"),
+        format!("{}\n", profile.clock.timezone).as_bytes(),
+    )?;
+    let dest = etc.join("localtime");
+    for root in ["/usr/share/zoneinfo", "/var/db/timezone/zoneinfo"] {
+        let src = Path::new(root).join(&profile.clock.timezone);
+        if src.is_file() {
+            fs::copy(&src, &dest)?;
+            return Ok(());
+        }
+    }
     Ok(())
 }
 
@@ -705,6 +832,21 @@ fn is_carrier_key(key: &str) -> bool {
         || key == "WSLENV"
         || key.starts_with("AGS_ENV_")
         || key == "AGS_BACKEND_KIND"
+}
+
+fn overlay_root_for(
+    paths: &OverlayPaths,
+    profile_id: &str,
+    kind: ProviderKind,
+    runtime_id: Option<&str>,
+) -> PathBuf {
+    let mut overlay_root = paths
+        .overlay_parent()
+        .join(sanitize_id(profile_id));
+    if let Some(runtime) = runtime_id.map(str::trim).filter(|value| !value.is_empty()) {
+        overlay_root = overlay_root.join(sanitize_id(runtime));
+    }
+    overlay_root.join(kind.dir_name())
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -882,6 +1024,21 @@ mod tests {
     }
 
     #[test]
+    fn overlay_root_includes_runtime_name() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(tmp.path());
+        let with_runtime = overlay_root_for(&paths, "tokyo-macos", ProviderKind::Codex, Some("work-codex"));
+        let without = overlay_root_for(&paths, "tokyo-macos", ProviderKind::Codex, None);
+        assert!(
+            with_runtime.ends_with("tokyo-macos/work-codex/codex")
+                || with_runtime.to_string_lossy().contains("work-codex"),
+            "{}",
+            with_runtime.display()
+        );
+        assert!(!without.to_string_lossy().contains("work-codex"));
+    }
+
+    #[test]
     fn claude_overlay_merges_settings_and_keeps_theme() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(tmp.path());
@@ -904,13 +1061,44 @@ mod tests {
     }
 
     #[test]
-    fn apply_to_spec_is_noop_without_selection() {
+    fn apply_to_spec_installs_observational_overlay_without_selection() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(tmp.path());
         let host = host_in(tmp.path());
         let spec = LaunchSpec::new("codex", ["resume".into(), "abc".into()]);
-        let applied = apply_to_spec(spec.clone(), &paths, None, "codex", &host).unwrap();
-        assert_eq!(applied.env, spec.env);
+        let (applied, overlay_root) =
+            apply_to_spec(spec.clone(), &paths, None, "codex", &host).unwrap();
+        let overlay = overlay_root.expect("always-on overlay");
+        assert!(applied.env.iter().any(|(key, _)| key == "TZ"));
+        assert!(applied.env.iter().any(|(key, value)| key == "HOSTNAME" && value == "devhost"));
+        assert!(overlay.join("profile.json").is_file());
+        assert!(overlay.join("fs/etc/hostname").is_file());
+        assert!(overlay.join("fs/etc/timezone").is_file());
+        let hostname = fs::read_to_string(overlay.join("fs/etc/hostname")).unwrap();
+        assert_eq!(hostname.trim(), "devhost");
+    }
+
+    #[test]
+    fn sync_overlay_region_updates_locale_and_timezone_file() {
+        let tmp = TempDir::new().unwrap();
+        let overlay = tmp.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let profile = RuntimeProfile::from_json(bundled_profile("tokyo-linux").unwrap()).unwrap();
+        fs::write(
+            overlay.join("profile.json"),
+            serde_json::to_string_pretty(&profile.profile).unwrap(),
+        )
+        .unwrap();
+        sync_overlay_region(&overlay, "America/Chicago", Some("US")).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(overlay.join("profile.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["clock"]["timezone"], "America/Chicago");
+        assert_eq!(value["locale"]["lang"], "en_US.UTF-8");
+        assert_eq!(
+            fs::read_to_string(overlay.join("fs/etc/timezone")).unwrap().trim(),
+            "America/Chicago"
+        );
     }
 
     #[test]
@@ -930,6 +1118,26 @@ mod tests {
         assert!(shell.contains("export TZ='Asia/Tokyo'"));
         assert!(shell.contains("export USER='o'\\''neil'"));
         assert!(shell.contains("unset WSL_DISTRO_NAME"));
+        assert!(shell.contains("AGS_ENV_OVERLAY='/tmp/o'"));
+        assert!(!shell.contains("export AGS_ENV_OVERLAY="));
+    }
+
+    #[test]
+    fn sync_overlay_clock_replaces_timezone_and_drops_frozen_offset() {
+        let tmp = TempDir::new().unwrap();
+        let overlay = tmp.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(
+            overlay.join("profile.json"),
+            r#"{"clock":{"timezone":"Asia/Tokyo","offset_seconds":32400,"follow_realtime":true}}"#,
+        )
+        .unwrap();
+        sync_overlay_clock_timezone(&overlay, "America/Chicago").unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(overlay.join("profile.json")).unwrap())
+                .unwrap();
+        assert_eq!(value["clock"]["timezone"], "America/Chicago");
+        assert!(value["clock"].get("offset_seconds").is_none());
     }
 
     #[test]

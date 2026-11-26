@@ -6,7 +6,32 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
 
 ---
 
+## [v2.0.0] - 2026-11-26
+
+### Berth v2 Control-Plane Client & Authenticated Cage Shim (Breaking Consolidation)
+
+- **Single consolidated release (`v2.0.0`).** Retires `codext` bundling/takeover and supersedes all legacy `v0.x` releases.
+- **Berth v2 Session Lease & Cage Shim (`ags berth init|status|launch|rebind|revoke`).** Negotiates Ed25519-signed Session Leases from Berth Central (`POST /api/v1/ags/leases`), probes regional `berth-edge` ingress relays, launches an authenticated loopback Cage Shim (`http://127.0.0.1:<ephemeral>`, `0600` readiness file), binds unmodified official `codex`, `claude`, `agy`, and `grok` binaries with cohort-consistent `TZ`/`LC_ALL`/`LANG`/`Accept-Language` and scrubbed ambient proxy env vars, and handles HTTP `409 cage_rebind_required` / WebSocket close `4009` via clean session restart.
+
 ## [Unreleased] (after v0.1.1)
+
+### Daily session CLI
+
+- **Bare `ags` shows help.** A subcommand is required.
+- **`ags ls` lists the current directory; `ags ls -a` lists every workspace.**
+  `ags list` is gone. The `#` column is 1, 2, 3 in the current view. SESSION is
+  the agent's own session id.
+- **`ags save "描述"`** is skill-only inside an Agent session. No `--id`.
+  Identity is `provider/session-id`.
+- **`ags resume provider/ID`** continues a live session; `--to` rotates Agent.
+  Checkpoint launch is `ags restore ID`. Ordinals and `live:` prefixes are
+  refused. save and resume require a configured backend key (`ags codex-init`).
+- **`ags info`** prints the configured key's pool URL and a key fingerprint;
+  account and space are reserved.
+
+### Named runtimes
+
+- **`ags runtime add|use|show|list|clear` and `--runtime NAME` give Codex and Claude distinct homes.** `--proxy` is a local loopback HTTP CONNECT listener, `pool` (credential-pool `/ping` `data.proxy`), `none`, or `auto`. SOCKS/`https://`/userinfo and non-loopback custom URLs are refused. AGS always strips terminal/global `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` so ambient Clash cannot leak into the agent. On WSL, launch also drops `/mnt/<drive>/...` from `PATH` so the model cannot exec `powershell.exe`/`cmd.exe` by name. The region the agent should observe is the region of the current egress IP: launch sets `TZ`/`LANG` from `ipwho.is` of that IP (timezone + country), installs overlay hooks even without `env-use`, and bind-mounts overlay `/etc/localtime`, `/etc/timezone`, and `/etc/hostname` in a user namespace when `unshare` works so libc and Python see the same zone. Overlay hooks rewrite Windows/Linux/macOS timezone, locale, Geo, and identity commands (`Get-TimeZone`, `tzutil`, `timedatectl`, `cat /etc/timezone`, Geo registry, `Get-WinHomeLocation`, `hostname`, `whoami`, `id -un`, `systeminfo`, …) from that profile. Encoded PowerShell cannot be rewritten. `gethostname(2)` and vendor account-region policy stay host-visible. Overlay env profiles stay observation-only and key their overlay directory by the runtime name when `AGS_RUNTIME` is set.
 
 ### Environment overlay on launch
 

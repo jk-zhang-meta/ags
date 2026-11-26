@@ -645,6 +645,10 @@ pub struct ContractPolicy {
     /// state policy and therefore cannot weaken the required gate.
     #[serde(default)]
     pub rules: BTreeMap<ProbeId, ProbeRule>,
+    /// Hook/launch adapter mode.  `identity-camouflage` hides timezone, DNS,
+    /// WebRTC/IP oracles, and login names without pretending to be another OS.
+    #[serde(default)]
+    pub mode: AdapterMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -668,6 +672,16 @@ pub enum FailureMode {
     Degraded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterMode {
+    /// Only profile-backed observations run; other commands fail closed.
+    #[default]
+    Strict,
+    /// Real OS and workspace stay visible; identity oracles are rewritten.
+    IdentityCamouflage,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProbeRule {
     #[serde(default)]
@@ -687,6 +701,7 @@ impl Default for ContractPolicy {
             commitment: CommitmentLevel::ObservationalEquivalence,
             unimplemented: FailureMode::FailClosed,
             rules: BTreeMap::new(),
+            mode: AdapterMode::Strict,
         }
     }
 }
@@ -924,6 +939,7 @@ impl EnvironmentProfile {
                 commitment: CommitmentLevel::ObservationalEquivalence,
                 unimplemented: FailureMode::FailClosed,
                 rules: BTreeMap::new(),
+                mode: AdapterMode::Strict,
             },
         };
         profile.validate()?;

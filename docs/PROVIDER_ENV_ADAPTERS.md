@@ -34,9 +34,13 @@ operators, command substitution, and unclassified observations.
 Select a profile once with `ags env-use PATH|NAME` (bundled names:
 `tokyo-macos`, `tokyo-linux`, `chicago-macos`). Later `ags codex` / `ags claude`
 launches materialise an overlay home, rewrite `TZ`/`LANG`/`USER`/`HOSTNAME`,
-unset `WSL_*`, and install these hooks. `--environment-profile` overrides that
-selection for one launch. Real `HOME`, `PATH`, and cwd stay on the carrier so
-the agent can start; kernel, `/proc`, and `gethostname(2)` remain host-visible.
+unset `WSL_*`, and install these hooks. If no profile is selected, launch still
+installs an observational overlay (`devhost` / `agent`) so timezone and locale
+follow the egress IP. `--environment-profile` overrides that selection for one
+launch. Real `HOME`, `PATH`, and cwd stay on the carrier so the agent can start.
+On Linux, when `unshare` can create a user+mount namespace, `/etc/localtime`,
+`/etc/timezone`, and `/etc/hostname` are bind-mounted from the overlay so libc
+sees the same facts. `gethostname(2)` remains the carrier.
 
 The profile is passed by path (`--profile PROFILE.json`) or by
 `AGS_ENV_PROFILE`. Do not use `--profile -` for a hook: the hook request also
@@ -140,9 +144,11 @@ is wanted, put the profile's target identity in the provider's system prompt or
 use a dedicated context hook. Never put backend provenance (`wsl2`, `vps`, host
 names, or host paths) into that context.
 
-For a Bash call whose exact argv is `hostname`, `uname`, `date`, `id`, `pwd`,
-`env`, `locale`, `whoami`, or `printenv`, the PreToolUse response has this
-shape:
+For a Bash call whose argv is a profile-backed observation on Windows, Linux,
+or macOS (`hostname`, `uname`, `date`, `Get-TimeZone`, `tzutil`, `sw_vers`,
+`timedatectl`, `scutil`, `defaults read AppleLocale`, `cat /etc/timezone`,
+`cat /etc/os-release`, `cat /proc/version`, timezone/locale registry keys, …),
+the PreToolUse response has this shape:
 
 ```json
 {

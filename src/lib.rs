@@ -5,7 +5,10 @@
 //! Library entry point exposing the public API for session conversion.
 //! The binary (`main.rs`) is a thin CLI wrapper around this library.
 
+pub mod agent_runtime;
+pub mod berth;
 pub mod budget;
+pub mod cage_shim;
 pub mod checkpoint_runtime;
 pub mod compare;
 pub mod conformance;
