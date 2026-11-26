@@ -418,7 +418,7 @@ pub fn agent_to_platform(agent: &str) -> Result<&'static str, BerthError> {
         "codex" => Ok("openai"),
         "claude" => Ok("anthropic"),
         "agy" => Ok("antigravity"),
-        "grok" => Ok("xai"),
+        "grok" => Ok("grok"),
         _ => unreachable!(),
     }
 }
@@ -1698,11 +1698,19 @@ fn select_matching_platform_key<'a>(
         return Some((*found, "auto-platform-key"));
     }
 
-    // 2. For `agy`, also accept a `gemini` group key when no `antigravity` key exists.
+    // 2. Platform aliases: `agy` also accepts `gemini`; `grok` also accepts `xai`.
     if canonical_agent == "agy"
         && let Some(found) = active.iter().find(|k| {
             k.platform()
                 .is_some_and(|p| p.eq_ignore_ascii_case("gemini"))
+        })
+    {
+        return Some((*found, "auto-platform-key"));
+    }
+    if canonical_agent == "grok"
+        && let Some(found) = active.iter().find(|k| {
+            k.platform()
+                .is_some_and(|p| p.eq_ignore_ascii_case("xai"))
         })
     {
         return Some((*found, "auto-platform-key"));
@@ -3132,9 +3140,17 @@ mod tests {
                                     "status": "active",
                                     "group_id": 3,
                                     "group": { "id": 3, "name": "Gemini Pool", "platform": "gemini", "status": "active" }
+                                },
+                                {
+                                    "id": 13,
+                                    "name": "grok-main",
+                                    "key": "sk-grok-auto",
+                                    "status": "active",
+                                    "group_id": 4,
+                                    "group": { "id": 4, "name": "Grok Pool", "platform": "grok", "status": "active" }
                                 }
                             ],
-                            "total": 3
+                            "total": 4
                         }
                     })
                     .to_string()
@@ -3191,10 +3207,10 @@ mod tests {
         let agy_auth = resolve_auth_for_agent(&paths, &mut config, "agy", None).unwrap();
         assert_eq!(agy_auth.bearer_token, "sk-gemini-auto");
 
-        // `grok` has no matching key -> falls back cleanly to user JWT!
+        // `grok` auto-matches Berth's `grok` platform group!
         let grok_auth = resolve_auth_for_agent(&paths, &mut config, "grok", None).unwrap();
-        assert_eq!(grok_auth.bearer_token, "jwt_refreshed_tok");
-        assert_eq!(grok_auth.source, "user-jwt-fallback");
+        assert_eq!(grok_auth.bearer_token, "sk-grok-auto");
+        assert_eq!(grok_auth.source, "auto-platform-key");
 
         // Pinned local override beats auto resolution without hitting Central.
         config.platform_keys.insert("codex".into(), "sk-pinned-codex".into());
