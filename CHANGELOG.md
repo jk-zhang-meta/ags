@@ -8,10 +8,12 @@ Versions correspond to [GitHub Releases](https://github.com/jk-zhang-meta/ags/re
 
 ## [v2.0.0] - 2026-11-26
 
-### Berth v2 Control-Plane Client & Authenticated Cage Shim (Breaking Consolidation)
+### Renamed to Berth CLI (`berth` / `bh`) & Unified Top-Level Berth Launcher
 
-- **Single consolidated release (`v2.0.0`).** Retires `codext` bundling/takeover and supersedes all legacy `v0.x` releases.
-- **Berth v2 Session Lease & Cage Shim (`ags berth init|status|launch|rebind|revoke`).** Negotiates Ed25519-signed Session Leases from Berth Central (`POST /api/v1/ags/leases`), probes regional `berth-edge` ingress relays, launches an authenticated loopback Cage Shim (`http://127.0.0.1:<ephemeral>`, `0600` readiness file), binds unmodified official `codex`, `claude`, `agy`, and `grok` binaries with cohort-consistent `TZ`/`LC_ALL`/`LANG`/`Accept-Language` and scrubbed ambient proxy env vars, and handles HTTP `409 cage_rebind_required` / WebSocket close `4009` via clean session restart.
+- **Renamed CLI & repo to `berth` (`bh` short alias, repo `jk-zhang-meta/berth-cli`).** Retires `codext` bundling/takeover and supersedes all legacy `ags` `v0.x` releases.
+- **Account login & automatic per-platform API key routing (`bh login`, `bh logout`, `bh key list|set|unset`).** Sign in once to `https://berth.itachi.fans` (email + password, optional TOTP 2FA, automatic `refresh_token` renewal), and `bh codex` / `bh claude` / `bh agy` / `bh grok` automatically selects the matching active Sub2API/Berth platform API key (`openai` / `anthropic` / `antigravity|gemini` / `xai`), with local pinning (`bh key set`) and one-shot `--key` override support.
+- **First-class top-level Berth commands (`bh init`, `bh status`, `bh clear`, `bh codex`, `bh claude`, `bh agy`, `bh grok`).** Negotiates Ed25519-signed Session Leases from Berth Central (`POST /api/v1/ags/leases`), probes regional `berth-edge` ingress relays, starts an authenticated loopback Cage Shim (`http://127.0.0.1:<ephemeral>`, `0600` readiness file), binds unmodified official CLIs with cohort-consistent `TZ`/`LC_ALL`/`LANG`/`Accept-Language` and scrubbed ambient proxy env vars, and handles HTTP `409 cage_rebind_required` / WebSocket close `4009` via clean session restart.
+- **Config path `~/.config/berth/berth.json` (`0600`)** with automatic fallback read from legacy `~/.config/ags/berth.json`.
 
 ## [Unreleased] (after v0.1.1)
 

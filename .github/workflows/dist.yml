@@ -12,9 +12,9 @@ name: dist
 #      workflow_dispatch or branch-push run would sign with an identity the
 #      installer rejects. Tags only, deliberately — there is no manual trigger.
 #   3. The asset names. The installer builds its URLs itself:
-#        ags-<target>.tar.xz              the archive, binary at the root
-#        ags-<target>.tar.xz.sha256       first whitespace field is the hash
-#        ags-<target>.tar.xz.sigstore.json  cosign --bundle (legacy) format
+#        berth-<target>.tar.xz              the archive, binary at the root
+#        berth-<target>.tar.xz.sha256       first whitespace field is the hash
+#        berth-<target>.tar.xz.sigstore.json  cosign --bundle (legacy) format
 #
 # See `set_artifact_url`, `verify_sigstore_bundle`, and the checksum block in
 # install.sh.
@@ -99,9 +99,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }} --bin ags
+            cross build --release --locked --target ${{ matrix.target }} --bin berth
           else
-            cargo build --release --locked --target ${{ matrix.target }} --bin ags
+            cargo build --release --locked --target ${{ matrix.target }} --bin berth
           fi
 
       # The installer looks for the binary at the archive root first, so put it
@@ -109,8 +109,8 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          tar="ags-${{ matrix.target }}.tar.xz"
-          tar -cJf "$tar" -C "target/${{ matrix.target }}/release" ags
+          tar="berth-${{ matrix.target }}.tar.xz"
+          tar -cJf "$tar" -C "target/${{ matrix.target }}/release" berth
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$tar" > "$tar.sha256"
           else
@@ -120,10 +120,10 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ags-${{ matrix.target }}
+          name: berth-${{ matrix.target }}
           path: |
-            ags-${{ matrix.target }}.tar.xz
-            ags-${{ matrix.target }}.tar.xz.sha256
+            berth-${{ matrix.target }}.tar.xz
+            berth-${{ matrix.target }}.tar.xz.sha256
           if-no-files-found: error
 
   release:

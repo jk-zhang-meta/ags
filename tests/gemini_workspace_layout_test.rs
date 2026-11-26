@@ -23,8 +23,8 @@ mod test_env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ags::model::{CanonicalMessage, CanonicalSession, MessageRole};
-use ags::providers::{Provider, WriteOptions, gemini::Gemini};
+use berth::model::{CanonicalMessage, CanonicalSession, MessageRole};
+use berth::providers::{Provider, WriteOptions, gemini::Gemini};
 use assert_cmd::Command;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -64,7 +64,7 @@ impl Drop for EnvGuard {
 /// `~/.local/share/ags` on the machine running them.
 fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
-    let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
+    let mut cmd = Command::cargo_bin("berth").expect("ags binary should be built");
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。前缀加在这里
     // 而不是每个用例里：这个文件测的全是转换。
     cmd.arg("convert");

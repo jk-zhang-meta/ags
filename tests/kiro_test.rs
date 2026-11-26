@@ -11,9 +11,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::discovery::ProviderRegistry;
-use ags::model::MessageRole;
-use ags::providers::{Provider, WriteOptions, kiro::Kiro};
+use berth::discovery::ProviderRegistry;
+use berth::model::MessageRole;
+use berth::providers::{Provider, WriteOptions, kiro::Kiro};
 
 static KIRO_ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -245,7 +245,7 @@ fn cli_list_finds_seeded_kiro_session() {
     // it explicitly via `--workspace` to take it out of cwd scope.
     let workspace =
         "/Users/tranquangdang21/Projects/jcode/.worktrees/feat-380-compaction-resistant-notepad";
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args([
             "convert",
             "list",
@@ -280,7 +280,7 @@ fn cli_info_reports_seeded_kiro_session() {
     let tmp = tempfile::tempdir().unwrap();
     seed_kiro_home(tmp.path());
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args(["convert", "info", FIXTURE_ID, "--source", "kr"])
         .env("KIRO_HOME", tmp.path())
         .output()
@@ -303,7 +303,7 @@ fn cli_info_reports_seeded_kiro_session() {
 /// (sans `.history`) and re-reads cleanly.
 #[test]
 fn foreign_session_writes_and_rereads() {
-    use ags::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
+    use berth::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
 
     let _lock = KIRO_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();

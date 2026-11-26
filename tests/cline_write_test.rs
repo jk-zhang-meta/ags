@@ -9,9 +9,9 @@ mod test_env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ags::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
-use ags::providers::cline::Cline;
-use ags::providers::{Provider, WriteOptions};
+use berth::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
+use berth::providers::cline::Cline;
+use berth::providers::{Provider, WriteOptions};
 
 static CLINE_ENV: test_env::EnvLock = test_env::EnvLock;
 

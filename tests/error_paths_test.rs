@@ -15,17 +15,17 @@ mod unix_error_paths {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
-    use ags::model::{CanonicalMessage, CanonicalSession, MessageRole};
-    use ags::providers::Provider;
-    use ags::providers::WriteOptions;
-    use ags::providers::claude_code::ClaudeCode;
-    use ags::providers::clawdbot::ClawdBot;
-    use ags::providers::codex::Codex;
-    use ags::providers::factory::Factory;
-    use ags::providers::gemini::Gemini;
-    use ags::providers::openclaw::OpenClaw;
-    use ags::providers::pi_agent::PiAgent;
-    use ags::providers::vibe::Vibe;
+    use berth::model::{CanonicalMessage, CanonicalSession, MessageRole};
+    use berth::providers::Provider;
+    use berth::providers::WriteOptions;
+    use berth::providers::claude_code::ClaudeCode;
+    use berth::providers::clawdbot::ClawdBot;
+    use berth::providers::codex::Codex;
+    use berth::providers::factory::Factory;
+    use berth::providers::gemini::Gemini;
+    use berth::providers::openclaw::OpenClaw;
+    use berth::providers::pi_agent::PiAgent;
+    use berth::providers::vibe::Vibe;
 
     static CC_ENV: test_env::EnvLock = test_env::EnvLock;
     static CODEX_ENV: test_env::EnvLock = test_env::EnvLock;

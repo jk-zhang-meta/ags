@@ -28,10 +28,10 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolResult};
-use ags::providers::cursor::Cursor;
-use ags::providers::kiro::Kiro;
-use ags::providers::{Provider, WriteOptions};
+use berth::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolResult};
+use berth::providers::cursor::Cursor;
+use berth::providers::kiro::Kiro;
+use berth::providers::{Provider, WriteOptions};
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 

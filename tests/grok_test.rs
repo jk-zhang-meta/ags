@@ -11,9 +11,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::discovery::ProviderRegistry;
-use ags::model::MessageRole;
-use ags::providers::{Provider, WriteOptions, grok::Grok};
+use berth::discovery::ProviderRegistry;
+use berth::model::MessageRole;
+use berth::providers::{Provider, WriteOptions, grok::Grok};
 
 static GROK_ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -145,7 +145,7 @@ fn read_session_from_seeded_home_matches_fixture_expectations() {
 
 #[test]
 fn write_session_is_refused_without_official_cli() {
-    use ags::model::{CanonicalMessage, CanonicalSession};
+    use berth::model::{CanonicalMessage, CanonicalSession};
 
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -200,7 +200,7 @@ fn cli_list_finds_seeded_grok_session() {
     // `ags convert list` defaults to scoping by the current working-directory
     // project; the fixture's workspace is a synthetic path, so pass it
     // explicitly via `--workspace` to take it out of cwd scope.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args([
             "convert",
             "list",
@@ -235,7 +235,7 @@ fn cli_info_reports_seeded_grok_session() {
     let tmp = tempfile::tempdir().unwrap();
     seed_grok_home(tmp.path());
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args(["convert", "info", FIXTURE_ID, "--source", "grk"])
         .env("GROK_HOME", tmp.path())
         .output()
@@ -270,7 +270,7 @@ fn cli_convert_into_grok_is_refused_without_official_cli() {
     std::fs::create_dir_all(&cc_dir).unwrap();
     std::fs::copy(&cc_fixture, cc_dir.join("cc-simple-001.jsonl")).unwrap();
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args([
             "convert",
             "resume",
@@ -308,7 +308,7 @@ fn cli_convert_into_grok_is_refused_without_official_cli() {
 
 #[test]
 fn write_session_round_trips_and_rolls_back_with_vendor_cli_stub() {
-    use ags::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
+    use berth::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
 
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -390,7 +390,7 @@ fn official_grok_cli_lifecycle_when_configured() {
         return;
     }
 
-    use ags::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
+    use berth::model::{CanonicalMessage, CanonicalSession, ToolCall, ToolResult};
     let _lock = GROK_ENV.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let _home = EnvGuard::set("GROK_HOME", tmp.path());

@@ -33,10 +33,10 @@ mod test_env;
 use std::io::Write;
 use std::path::PathBuf;
 
-use ags::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolResult};
-use ags::providers::claude_code::ClaudeCode;
-use ags::providers::{Provider, WriteOptions, claude_code_ir};
-use ags::replay::resolve;
+use berth::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolResult};
+use berth::providers::claude_code::ClaudeCode;
+use berth::providers::{Provider, WriteOptions, claude_code_ir};
+use berth::replay::resolve;
 
 static CC_ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -374,7 +374,7 @@ fn the_live_head_comes_from_vendor_graph_not_the_last_file_record() {
             .events
             .iter()
             .filter(|event| match &event.body {
-                ags::ir::Body::Control { control_kind, .. } => control_kind == kind,
+                berth::ir::Body::Control { control_kind, .. } => control_kind == kind,
                 _ => false,
             })
             .collect();
@@ -382,7 +382,7 @@ fn the_live_head_comes_from_vendor_graph_not_the_last_file_record() {
         for event in events {
             assert_eq!(
                 event.visibility,
-                ags::ir::Visibility::Ui,
+                berth::ir::Visibility::Ui,
                 "{kind} is session state, not model context"
             );
             assert_eq!(event.parent, None, "{kind} carries no parent link");
@@ -435,7 +435,7 @@ fn the_discarded_history_is_still_reported_as_superseded() {
         .excluded
         .iter()
         .filter_map(|excluded| match &excluded.reason {
-            ags::replay::ExclusionReason::Superseded { .. } => Some(excluded.id.as_str()),
+            berth::replay::ExclusionReason::Superseded { .. } => Some(excluded.id.as_str()),
             _ => None,
         })
         .collect();

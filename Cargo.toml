@@ -1,21 +1,21 @@
 [package]
-name = "ags"
+name = "berth"
 version = "2.0.0"
 edition = "2024"
-description = "Cross Agent Session Resumer — resume AI coding sessions across providers (CLI binary: ags)"
+description = "Berth CLI (bh / berth) — Cage-isolated AI agent launcher and cross-agent session manager"
 license-file = "LICENSE"
-repository = "https://github.com/jk-zhang-meta/ags"
-keywords = ["cli", "agent", "session", "resume", "claude"]
+repository = "https://github.com/jk-zhang-meta/berth-cli"
+keywords = ["cli", "agent", "berth", "session", "claude"]
 categories = ["command-line-utilities"]
 readme = "README.md"
 
-# 这是个私有 fork，不发到 crates.io。包名、lib 名和二进制名统一是 `ags`。
+# Private CLI companion for Berth (`berth`, with short alias `bh`).
 [lib]
-name = "ags"
+name = "berth"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ags"
+name = "berth"
 path = "src/main.rs"
 
 [dependencies]

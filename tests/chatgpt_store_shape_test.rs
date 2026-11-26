@@ -20,7 +20,7 @@ mod test_env;
 
 use std::path::Path;
 
-use ags::providers::{Provider, chatgpt::ChatGpt};
+use berth::providers::{Provider, chatgpt::ChatGpt};
 
 static CHATGPT_ENV: test_env::EnvLock = test_env::EnvLock;
 

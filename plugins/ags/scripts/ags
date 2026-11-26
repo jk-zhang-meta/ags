@@ -222,19 +222,23 @@ usage() {
     fi
     cat <<'EOF'
 用法:
-  ags <命令>                   必须带后续命令；单独运行显示本帮助
-  ags ls [-a]                  列当前目录的会话；-a 列出全部目录
-  ags save "描述"              仅在 Agent 会话内保存当前会话（skill）
-  ags resume provider/ID       接着该会话；--to 换 Agent
-  ags info                     当前密钥的账户与空间（预留）
-  ags codex|claude [--id 名字] 起一个会话（使用官方原版 CLI）
-  ags berth init|status|launch 配置并通过 Berth v2 网关 + Cage 启动官方 CLI
-  ags store                    记录存在哪：本机目录 / git / sftp
-  ags sync                     和当前 store 对一遍
-  ags update                   更新到最新版
+  bh <命令>                    必须带后续命令；单独运行显示本帮助
+  bh login [--url URL]         登录 Berth 账户（自动按平台匹配各 Agent API Key）
+  bh logout                    退出 Berth 账户并撤销本地会话
+  bh key list|set|unset        查看账户各平台 Key 或为特定 Agent 固定 Key
+  bh init --url URL --key KEY  直接以静态 API Key 配置 Berth 网关
+  bh status | clear            查看或清除 Berth 网关配置
+  bh codex|claude|agy|grok     经 Berth Cage Shim 启动官方原版 CLI
+  bh ls [-a]                   列当前目录的会话；-a 列出全部目录
+  bh save "描述"               仅在 Agent 会话内保存当前会话（skill）
+  bh resume provider/ID        接着该会话；--to 换 Agent
+  bh info                      当前密钥的账户与空间（预留）
+  bh store                     记录存在哪：本机目录 / git / sftp
+  bh sync                      和当前 store 对一遍
+  bh update                    更新到最新版
 
-  给 Agent 的参数写在 -- 之后：ags codex -- --model o3
-  全部命令： ags help all
+  `berth` 与 `bh` 完全等价；给 Agent 的参数直接跟在后面或写在 -- 之后：bh codex --model o3
+  全部命令： bh help all
 EOF
 }
 
@@ -12670,8 +12674,8 @@ update_codext() {
 # all, and hand over to the installer that shipped with the target release.
 update_ags() {
     local check_only=0
-    local owner="${AGS_UPDATE_OWNER:-jk-zhang-meta}"
-    local repo="${AGS_UPDATE_REPO:-ags}"
+    local owner="${BERTH_UPDATE_OWNER:-${AGS_UPDATE_OWNER:-jk-zhang-meta}}"
+    local repo="${BERTH_UPDATE_REPO:-${AGS_UPDATE_REPO:-berth-cli}}"
     local binary destination current tag response status workspace
 
     while (( $# > 0 )); do

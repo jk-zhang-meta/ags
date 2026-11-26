@@ -12,14 +12,14 @@
 
 use std::path::{Path, PathBuf};
 
-use ags::model::{
+use berth::model::{
     CanonicalMessage, CanonicalSession, MessageRole, flatten_content, normalize_role,
     parse_timestamp, truncate_title,
 };
-use ags::providers::Provider;
-use ags::providers::claude_code::ClaudeCode;
-use ags::providers::codex::Codex;
-use ags::providers::gemini::Gemini;
+use berth::providers::Provider;
+use berth::providers::claude_code::ClaudeCode;
+use berth::providers::codex::Codex;
+use berth::providers::gemini::Gemini;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

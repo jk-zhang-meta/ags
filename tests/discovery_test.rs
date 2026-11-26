@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ags::{
+use berth::{
     discovery::{DetectionResult, ProviderRegistry, SourceHint},
     error::AgsError,
     model::{CanonicalMessage, CanonicalSession, MessageRole},

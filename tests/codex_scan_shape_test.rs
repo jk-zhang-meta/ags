@@ -17,8 +17,8 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::providers::Provider;
-use ags::providers::codex::Codex;
+use berth::providers::Provider;
+use berth::providers::codex::Codex;
 
 static CODEX_ENV: test_env::EnvLock = test_env::EnvLock;
 

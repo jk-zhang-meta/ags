@@ -28,9 +28,9 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::providers::Provider;
-use ags::providers::cursor::Cursor;
-use ags::providers::kiro::Kiro;
+use berth::providers::Provider;
+use berth::providers::cursor::Cursor;
+use berth::providers::kiro::Kiro;
 
 static ENV: test_env::EnvLock = test_env::EnvLock;
 
@@ -207,7 +207,7 @@ fn list_json(
     envs: &[(&str, &Path)],
     store: &Path,
 ) -> serde_json::Value {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ags"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_berth"));
     // 转换那套收在 `ags convert` 底下（`ags` 本身是会话运行时）。
     cmd.arg("convert");
     cmd.args(["list", "--provider", provider, "--limit", "50", "--json"]);
@@ -483,7 +483,7 @@ fn kiro_session_passed_by_path_is_read_as_kiro() {
     .unwrap();
     let path = cli.join(format!("{cli_id}.json"));
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args(["convert", "info", &path.display().to_string(), "--json"])
         .env("HOME", home.path())
         .env("KIRO_HOME", kiro_home.path())
@@ -512,7 +512,7 @@ fn kiro_session_passed_by_path_is_read_as_kiro() {
     // most plausible parse — which is how a Kiro session comes back as some
     // other agent's. The probe is silent under `--json`, so it is observed
     // without it: the losing providers complain on stderr as they are asked.
-    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let plain = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args(["convert", "info", &path.display().to_string()])
         .env("HOME", home.path())
         .env("KIRO_HOME", kiro_home.path())
@@ -621,7 +621,7 @@ fn cursor_agent_chat_without_transcript_is_reported_not_dropped() {
 
     // And the plain listing says so on stderr rather than silently coming up
     // one short.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ags"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_berth"))
         .args(["convert", "list", "--provider", "cursor", "--limit", "50"])
         .env("CURSOR_CONFIG_DIR", tmp.path())
         .env("CURSOR_DATA_DIR", tmp.path())

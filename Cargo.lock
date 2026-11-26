@@ -3,44 +3,6 @@
 version = 4
 
 [[package]]
-name = "ags"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "blake3",
- "chrono",
- "clap",
- "clap_complete",
- "colored",
- "dirs",
- "glob",
- "json5",
- "predicates",
- "rayon",
- "rich_rust",
- "rusqlite",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "sha2",
- "shlex",
- "signal-hook 0.3.18",
- "tempfile",
- "thiserror",
- "tracing",
- "tracing-subscriber",
- "tungstenite",
- "urlencoding",
- "uuid",
- "vergen-gix",
- "walkdir",
- "webpki-roots",
- "which",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,6 +123,44 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "berth"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "blake3",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "colored",
+ "dirs",
+ "glob",
+ "json5",
+ "predicates",
+ "rayon",
+ "rich_rust",
+ "rusqlite",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
+ "signal-hook 0.3.18",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+ "tungstenite",
+ "urlencoding",
+ "uuid",
+ "vergen-gix",
+ "walkdir",
+ "webpki-roots",
+ "which",
+]
 
 [[package]]
 name = "bit-set"

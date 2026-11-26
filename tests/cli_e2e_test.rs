@@ -25,7 +25,7 @@ fn fixtures_dir() -> PathBuf {
 /// CLI never touches real provider data.
 fn ags_cmd(tmp: &TempDir) -> Command {
     #[allow(deprecated)]
-    let mut cmd = Command::cargo_bin("ags").expect("ags binary should be built");
+    let mut cmd = Command::cargo_bin("berth").expect("ags binary should be built");
     cmd.env("CLAUDE_HOME", tmp.path().join("claude"))
         .env("CODEX_HOME", tmp.path().join("codex"))
         .env("GEMINI_HOME", tmp.path().join("gemini"))
@@ -1892,8 +1892,8 @@ fn cli_resume_piagent_to_cc_works_with_source_hint() {
 // and leave an interactive agent attached to the test runner's terminal.
 // ---------------------------------------------------------------------------
 
-use ags::discovery::ProviderRegistry;
-use ags::launch::LaunchSpec;
+use berth::discovery::ProviderRegistry;
+use berth::launch::LaunchSpec;
 
 /// A Codex rollout whose live context is a sealed compaction.
 ///

@@ -21,8 +21,8 @@ use std::path::PathBuf;
 
 use tempfile::TempDir;
 
-use ags::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
-use ags::providers::{Provider, WriteOptions};
+use berth::model::{CanonicalMessage, CanonicalSession, MessageRole, ToolCall, ToolResult};
+use berth::providers::{Provider, WriteOptions};
 
 // ---------------------------------------------------------------------------
 // Environment isolation (see `tests/test_env.rs`)
@@ -278,7 +278,7 @@ fn is_epoch_seconds(f: f64) -> bool {
 
 mod cc_golden {
     use super::*;
-    use ags::providers::claude_code::ClaudeCode;
+    use berth::providers::claude_code::ClaudeCode;
 
     fn write_cc_session(session: &CanonicalSession) -> (PathBuf, String) {
         let _lock = CC_ENV.lock().unwrap();
@@ -610,7 +610,7 @@ mod cc_golden {
 
 mod codex_golden {
     use super::*;
-    use ags::providers::codex::Codex;
+    use berth::providers::codex::Codex;
 
     fn write_codex_session(session: &CanonicalSession) -> (PathBuf, String) {
         let _lock = CODEX_ENV.lock().unwrap();
@@ -900,7 +900,7 @@ mod codex_golden {
 
 mod gemini_golden {
     use super::*;
-    use ags::providers::gemini::Gemini;
+    use berth::providers::gemini::Gemini;
 
     fn write_gemini_session(session: &CanonicalSession) -> (PathBuf, String) {
         let _lock = GEMINI_ENV.lock().unwrap();
@@ -1144,9 +1144,9 @@ mod gemini_golden {
 
 mod negative {
     use super::*;
-    use ags::providers::claude_code::ClaudeCode;
-    use ags::providers::codex::Codex;
-    use ags::providers::gemini::Gemini;
+    use berth::providers::claude_code::ClaudeCode;
+    use berth::providers::codex::Codex;
+    use berth::providers::gemini::Gemini;
 
     /// Verify that CC writer produces "gitBranch": "main" (hardcoded) regardless
     /// of metadata. This is a format-level assertion the reader won't catch.

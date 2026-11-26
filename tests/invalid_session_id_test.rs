@@ -8,12 +8,12 @@
 
 mod test_env;
 
-use ags::discovery::{ProviderRegistry, SourceHint};
-use ags::error::AgsError;
-use ags::providers::Provider;
-use ags::providers::claude_code::ClaudeCode;
-use ags::providers::clawdbot::ClawdBot;
-use ags::providers::codex::Codex;
+use berth::discovery::{ProviderRegistry, SourceHint};
+use berth::error::AgsError;
+use berth::providers::Provider;
+use berth::providers::claude_code::ClaudeCode;
+use berth::providers::clawdbot::ClawdBot;
+use berth::providers::codex::Codex;
 
 static CC_ENV: test_env::EnvLock = test_env::EnvLock;
 static CLAWDBOT_ENV: test_env::EnvLock = test_env::EnvLock;
@@ -331,7 +331,7 @@ fn registry_never_resolves_an_absolute_path_as_a_session_id() {
     // A relative identifier still resolves — Codex session ids genuinely are
     // `2026/07/27/rollout-…`, so the guard must reject only the absolute case.
     assert!(
-        ags::providers::claude_code::ClaudeCode
+        berth::providers::claude_code::ClaudeCode
             .owns_session("11111111-2222-3333-4444-555555555555")
             .is_some(),
         "the plain identifier must still resolve"

@@ -1,10 +1,10 @@
-# ags
+# berth (`bh`)
 
 <div align="center">
-  <img src="ags_illustration.webp" alt="ags - Cross Agent Session Resumer">
+  <img src="ags_illustration.webp" alt="berth (bh) - Berth CLI & Cross-Agent Session Manager">
 </div>
 
-Cross Agent Session Resumer for coding agents: resume a session created in one provider (Claude Code, Codex, Gemini, and more) using a different provider by converting through a canonical session model.
+**Berth CLI (`berth`, short command `bh`)** — Cage-isolated AI coding-agent launcher for [Berth](https://github.com/jk-zhang-meta/berth) plus cross-provider session manager (`codex`, `claude`, `agy`, `grok`, `gemini`, and more).
 
 ![Rust](https://img.shields.io/badge/Rust-2024%20nightly-orange)
 ![Status](https://img.shields.io/badge/status-active-green)
@@ -13,8 +13,27 @@ Cross Agent Session Resumer for coding agents: resume a session created in one p
 ## Quick Install (Recommended)
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/berth-cli/main/install.sh?$(date +%s)" | bash
 ```
+
+Installs `~/.local/bin/berth` and creates the short alias `~/.local/bin/bh -> berth`.
+
+### Berth Quickstart
+
+```bash
+bh login                     # sign in to https://berth.itachi.fans (supports 2FA & auto-refresh)
+bh key list                  # view per-platform API keys (openai / anthropic / antigravity / xai)
+bh status                    # inspect active login, key pins, and host isolation capabilities
+bh codex                     # auto-selects your openai API key & launches official codex via Cage Shim
+bh claude                    # auto-selects your anthropic API key & launches official claude via Cage Shim
+bh agy                       # auto-selects your antigravity/gemini API key & launches official agy
+bh grok                      # auto-selects your xai API key & launches official grok
+bh key set codex sk-...      # optional: pin a specific API key for codex locally
+bh logout                    # sign out and revoke the refresh token
+bh ls                        # browse/resume local sessions
+```
+
+For headless/CI API-key setup without user login, use `bh login --key <KEY>` or `bh init --url https://berth.itachi.fans --key <KEY>`.
 
 That installer is the primary distribution path. It handles platform detection, secure artifact verification, fallback source builds, shell completions, and agent-oriented local setup in one step.
 It also installs the `age` package when checkpoint setup needs the missing

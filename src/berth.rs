@@ -11,7 +11,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const BERTH_CONFIG_SCHEMA: &str = "ags-berth-v2";
+pub const DEFAULT_BERTH_URL: &str = "https://berth.itachi.fans";
 pub const AGS_VERSION_HEADER_VALUE: &str = "2";
 pub const VALID_ZONES: &[&str] = &["auto", "cn_mainland", "overseas", "home_direct"];
 pub const VALID_AGENTS: &[&str] = &["codex", "claude", "agy", "grok"];
@@ -43,6 +44,7 @@ const PROXY_ENV_UNSET: &[&str] = &[
 ];
 
 const CARRIER_ENV_UNSET: &[&str] = &[
+    "BERTH_LEASE_TOKEN",
     "AGS_BERTH_LEASE_TOKEN",
     "WSL2_GUI_APPS_ENABLED",
     "WSLENV",
@@ -81,7 +83,7 @@ const ALL_PROVIDER_CREDENTIAL_ENVS: &[&str] = &[
 pub enum BerthError {
     #[error("invalid berth configuration: {0}")]
     InvalidConfig(String),
-    #[error("berth is not configured (run `ags berth init --url URL --key KEY`)")]
+    #[error("berth is not configured (run `bh login` or `bh init --url https://berth.itachi.fans --key KEY`)")]
     NotConfigured,
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
@@ -164,15 +166,21 @@ impl BerthPaths {
 
     pub fn from_env() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let config_dir = match std::env::var_os("XDG_CONFIG_HOME") {
-            Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join("ags"),
-            _ => home.join(".config").join("ags"),
-        };
-        let state_dir = match std::env::var_os("AGENT_SESSION_STATE_DIR") {
+        let config_dir = match std::env::var_os("BERTH_CONFIG_DIR") {
             Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-            _ => match std::env::var_os("XDG_STATE_HOME") {
-                Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join("ags"),
-                _ => home.join(".local").join("state").join("ags"),
+            _ => match std::env::var_os("XDG_CONFIG_HOME") {
+                Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join("berth"),
+                _ => home.join(".config").join("berth"),
+            },
+        };
+        let state_dir = match std::env::var_os("BERTH_STATE_DIR") {
+            Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+            _ => match std::env::var_os("AGENT_SESSION_STATE_DIR") {
+                Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+                _ => match std::env::var_os("XDG_STATE_HOME") {
+                    Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join("berth"),
+                    _ => home.join(".local").join("state").join("berth"),
+                },
             },
         };
         Self {
@@ -202,13 +210,82 @@ fn default_weight() -> u32 {
     100
 }
 
-/// Persisted Berth v2 client configuration (`~/.config/ags/berth.json`, mode `0600`).
+/// Authenticated user session saved by `bh login` inside `~/.config/berth/berth.json` (`0600`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAuthSession {
+    pub email: String,
+    #[serde(default)]
+    pub user_id: i64,
+    #[serde(default)]
+    pub role: String,
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+}
+
+impl fmt::Debug for UserAuthSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserAuthSession")
+            .field("email", &self.email)
+            .field("user_id", &self.user_id)
+            .field("role", &self.role)
+            .field("access_token", &redact_secret(&self.access_token))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_deref().map(redact_secret),
+            )
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
+}
+
+impl UserAuthSession {
+    pub fn is_expiring_within(&self, margin_secs: i64) -> bool {
+        let Some(expires_at) = self.expires_at_unix else {
+            return false;
+        };
+        let now = unix_timestamp_now();
+        now.saturating_add(margin_secs) >= expires_at
+    }
+}
+
+fn unix_timestamp_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Redacts a secret into a short deterministic SHA-256 fingerprint prefix (`sha256:abcdef012345…`).
+pub fn redact_secret(secret: &str) -> String {
+    if secret.trim().is_empty() {
+        return "(none)".to_string();
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex_prefix = String::with_capacity(12);
+    for byte in &digest[..6] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex_prefix, "{byte:02x}");
+    }
+    format!("sha256:{hex_prefix}…")
+}
+
+/// Persisted Berth v2 client configuration (`~/.config/berth/berth.json`, mode `0600`).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BerthConfig {
     #[serde(default = "default_schema")]
     pub schema: String,
     pub central_url: String,
+    #[serde(default)]
     pub api_key: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platform_keys: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_session: Option<UserAuthSession>,
     #[serde(default)]
     pub mgmt_entries: Vec<String>,
     #[serde(default = "default_zone_preference")]
@@ -221,10 +298,17 @@ pub struct BerthConfig {
 
 impl fmt::Debug for BerthConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let redacted_platform_keys: BTreeMap<&str, String> = self
+            .platform_keys
+            .iter()
+            .map(|(k, v)| (k.as_str(), redact_secret(v)))
+            .collect();
         f.debug_struct("BerthConfig")
             .field("schema", &self.schema)
             .field("central_url", &self.central_url)
             .field("api_key", &self.redacted_api_key())
+            .field("platform_keys", &redacted_platform_keys)
+            .field("user_session", &self.user_session)
             .field("mgmt_entries", &self.mgmt_entries)
             .field("zone_preference", &self.zone_preference)
             .field("isolation_mode", &self.isolation_mode)
@@ -237,7 +321,7 @@ impl fmt::Debug for BerthConfig {
 }
 
 impl BerthConfig {
-    pub fn validate(&self) -> Result<(), BerthError> {
+    pub fn validate_transport(&self) -> Result<(), BerthError> {
         if self.schema != BERTH_CONFIG_SCHEMA {
             return Err(BerthError::InvalidConfig(format!(
                 "unsupported schema `{}` (expected `{BERTH_CONFIG_SCHEMA}`)",
@@ -249,14 +333,6 @@ impl BerthConfig {
             return Err(BerthError::InvalidConfig(
                 "central_url must use https:// (set allow_insecure_http_for_tests=true only for local tests)"
                     .into(),
-            ));
-        }
-        if self.api_key.trim().is_empty()
-            || self.api_key.contains('\r')
-            || self.api_key.contains('\n')
-        {
-            return Err(BerthError::InvalidConfig(
-                "api_key must be a non-empty single-line token".into(),
             ));
         }
         if !VALID_ZONES.contains(&self.zone_preference.as_str()) {
@@ -272,16 +348,93 @@ impl BerthConfig {
         Ok(())
     }
 
-    pub fn redacted_api_key(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.api_key.as_bytes());
-        let digest = hasher.finalize();
-        let mut hex_prefix = String::with_capacity(12);
-        for byte in &digest[..6] {
-            use std::fmt::Write as _;
-            let _ = write!(&mut hex_prefix, "{byte:02x}");
+    pub fn validate(&self) -> Result<(), BerthError> {
+        self.validate_transport()?;
+        if self.api_key.contains('\r') || self.api_key.contains('\n') {
+            return Err(BerthError::InvalidConfig(
+                "api_key must be a single-line token".into(),
+            ));
         }
-        format!("sha256:{hex_prefix}…")
+        for (target, token) in &self.platform_keys {
+            if target.trim().is_empty()
+                || token.trim().is_empty()
+                || token.contains('\r')
+                || token.contains('\n')
+            {
+                return Err(BerthError::InvalidConfig(format!(
+                    "platform_keys entry `{target}` must have a non-empty single-line token"
+                )));
+            }
+        }
+        if let Some(session) = &self.user_session {
+            if session.access_token.trim().is_empty()
+                || session.access_token.contains('\r')
+                || session.access_token.contains('\n')
+            {
+                return Err(BerthError::InvalidConfig(
+                    "user_session.access_token must be a non-empty single-line token".into(),
+                ));
+            }
+            if let Some(refresh) = &session.refresh_token
+                && (refresh.trim().is_empty() || refresh.contains('\r') || refresh.contains('\n'))
+            {
+                return Err(BerthError::InvalidConfig(
+                    "user_session.refresh_token must be a non-empty single-line token".into(),
+                ));
+            }
+        }
+        if self.api_key.trim().is_empty()
+            && self.platform_keys.is_empty()
+            && self.user_session.is_none()
+        {
+            return Err(BerthError::InvalidConfig(
+                "at least one authentication credential is required (run `bh login` or `bh init --url URL --key KEY`)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn has_any_auth(&self) -> bool {
+        !self.api_key.trim().is_empty()
+            || !self.platform_keys.is_empty()
+            || self.user_session.is_some()
+    }
+
+    pub fn redacted_api_key(&self) -> String {
+        redact_secret(&self.api_key)
+    }
+
+    pub fn redacted_platform_keys(&self) -> BTreeMap<String, String> {
+        self.platform_keys
+            .iter()
+            .map(|(k, v)| (k.clone(), redact_secret(v)))
+            .collect()
+    }
+}
+
+pub fn agent_to_platform(agent: &str) -> Result<&'static str, BerthError> {
+    match validate_agent_name(agent)? {
+        "codex" => Ok("openai"),
+        "claude" => Ok("anthropic"),
+        "agy" => Ok("antigravity"),
+        "grok" => Ok("xai"),
+        _ => unreachable!(),
+    }
+}
+
+/// Normalizes a `bh key set/unset <TARGET>` argument into either `"default"` or
+/// one of the canonical agent names (`codex`, `claude`, `agy`, `grok`).
+pub fn canonical_key_target(target: &str) -> Result<&'static str, BerthError> {
+    match target.trim().to_ascii_lowercase().as_str() {
+        "default" => Ok("default"),
+        "codex" | "openai" => Ok("codex"),
+        "claude" | "claude-code" | "anthropic" => Ok("claude"),
+        "agy" | "antigravity" | "gemini" => Ok("agy"),
+        "grok" | "xai" => Ok("grok"),
+        other => Err(BerthError::InvalidArgument(format!(
+            "key target must be `default`, `codex` (openai), `claude` (anthropic), `agy` (antigravity/gemini), or `grok` (xai); got `{other}`"
+        ))),
     }
 }
 
@@ -402,10 +555,20 @@ pub fn write_private_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), BerthE
 }
 
 pub fn load_config(paths: &BerthPaths) -> Result<Option<BerthConfig>, BerthError> {
-    if !paths.config_file.is_file() {
+    let target = if paths.config_file.is_file() {
+        paths.config_file.clone()
+    } else if let Some(parent) = paths.config_file.parent().and_then(|p| p.parent()) {
+        // Seamless fallback for legacy ~/.config/ags/berth.json installs.
+        let legacy = parent.join("ags").join("berth.json");
+        if legacy.is_file() {
+            legacy
+        } else {
+            return Ok(None);
+        }
+    } else {
         return Ok(None);
-    }
-    let raw = fs::read_to_string(&paths.config_file)?;
+    };
+    let raw = fs::read_to_string(&target)?;
     let config: BerthConfig = serde_json::from_str(&raw)?;
     config.validate()?;
     Ok(Some(config))
@@ -921,7 +1084,7 @@ fn execute_http_once(
     let mut req = Vec::with_capacity(512);
     let _ = write!(
         &mut req,
-        "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nUser-Agent: ags/{}\r\n",
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\nUser-Agent: berth/{}\r\n",
         env!("CARGO_PKG_VERSION")
     );
     for (name, value) in headers {
@@ -1087,22 +1250,31 @@ pub(crate) fn read_chunked_body<R: BufRead>(
     Ok(out)
 }
 
-fn central_http_request(
+fn central_http_request_with_token(
     config: &BerthConfig,
+    bearer: Option<&str>,
     method: &str,
     api_path: &str,
     body: Option<&[u8]>,
 ) -> Result<HttpResponse, BerthError> {
-    config.validate()?;
+    config.validate_transport()?;
     let central_url = ParsedUrl::parse(&config.central_url)?;
     let full_path = central_url.join_path(api_path);
     let host_header = central_url.host_header();
 
     let mut base_headers: Vec<(&str, String)> = vec![
-        ("Authorization", format!("Bearer {}", config.api_key)),
         ("Accept", "application/json".to_string()),
         ("X-Berth-AGS-Version", AGS_VERSION_HEADER_VALUE.to_string()),
     ];
+    if let Some(token) = bearer {
+        let trimmed = token.trim();
+        if trimmed.is_empty() || trimmed.contains('\r') || trimmed.contains('\n') {
+            return Err(BerthError::InvalidConfig(
+                "bearer token must be a non-empty single-line string".into(),
+            ));
+        }
+        base_headers.push(("Authorization", format!("Bearer {trimmed}")));
+    }
     if body.is_some() {
         base_headers.push(("Content-Type", "application/json".to_string()));
     }
@@ -1141,6 +1313,556 @@ fn central_http_request(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Normal-User Authentication & Platform-Scoped API Key Resolution
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BerthUserKeyGroup {
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub status: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BerthUserKey {
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    pub key: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub group_id: Option<i64>,
+    #[serde(default)]
+    pub group: Option<BerthUserKeyGroup>,
+}
+
+impl fmt::Debug for BerthUserKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BerthUserKey")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("key", &redact_secret(&self.key))
+            .field("status", &self.status)
+            .field("group_id", &self.group_id)
+            .field("group", &self.group)
+            .finish()
+    }
+}
+
+impl BerthUserKey {
+    pub fn platform(&self) -> Option<&str> {
+        self.group
+            .as_ref()
+            .map(|g| g.platform.as_str())
+            .filter(|p| !p.trim().is_empty())
+    }
+
+    pub fn is_active(&self) -> bool {
+        let key_ok = self.status.is_empty() || self.status.eq_ignore_ascii_case("active");
+        let group_ok = self
+            .group
+            .as_ref()
+            .map(|g| g.status.is_empty() || g.status.eq_ignore_ascii_case("active"))
+            .unwrap_or(true);
+        key_ok && group_ok
+    }
+
+    pub fn redacted_key(&self) -> String {
+        redact_secret(&self.key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Authenticated(UserAuthSession),
+    Requires2FA {
+        temp_token: String,
+        user_email_masked: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct ApiEnvelope<T> {
+    data: T,
+}
+
+#[derive(Deserialize)]
+struct AuthUserPayload {
+    #[serde(default)]
+    id: i64,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Deserialize)]
+struct AuthLoginData {
+    #[serde(default)]
+    requires_2fa: bool,
+    #[serde(default)]
+    temp_token: Option<String>,
+    #[serde(default)]
+    user_email_masked: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    user: Option<AuthUserPayload>,
+}
+
+fn decode_envelope_or_direct<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, BerthError> {
+    if let Ok(env) = serde_json::from_slice::<ApiEnvelope<T>>(body) {
+        return Ok(env.data);
+    }
+    Ok(serde_json::from_slice::<T>(body)?)
+}
+
+fn build_user_session(
+    fallback_email: &str,
+    data: AuthLoginData,
+) -> Result<UserAuthSession, BerthError> {
+    let access_token = data
+        .access_token
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| BerthError::Json("auth response missing access_token".into()))?;
+    let refresh_token = data.refresh_token.filter(|t| !t.trim().is_empty());
+    let expires_at_unix = data
+        .expires_in
+        .filter(|secs| *secs > 0)
+        .map(|secs| unix_timestamp_now().saturating_add(secs));
+    let (user_id, email, role) = match data.user {
+        Some(u) => (
+            u.id,
+            if u.email.trim().is_empty() {
+                fallback_email.to_string()
+            } else {
+                u.email
+            },
+            u.role,
+        ),
+        None => (0, fallback_email.to_string(), "user".to_string()),
+    };
+    Ok(UserAuthSession {
+        email,
+        user_id,
+        role,
+        access_token,
+        refresh_token,
+        expires_at_unix,
+    })
+}
+
+/// Authenticate a normal Berth user via `POST /api/v1/auth/login`.
+pub fn login_with_password(
+    config: &BerthConfig,
+    email: &str,
+    password: &str,
+) -> Result<LoginOutcome, BerthError> {
+    let email_trimmed = email.trim();
+    if email_trimmed.is_empty() || password.is_empty() {
+        return Err(BerthError::InvalidArgument(
+            "email and password must not be empty".into(),
+        ));
+    }
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "email": email_trimmed,
+        "password": password,
+    }))?;
+    let resp =
+        central_http_request_with_token(config, None, "POST", "/api/v1/auth/login", Some(&payload))?;
+    if !(200..300).contains(&resp.status) {
+        return Err(BerthError::ApiStatus {
+            status: resp.status,
+            body: String::from_utf8_lossy(&resp.body).into_owned(),
+        });
+    }
+    let data: AuthLoginData = decode_envelope_or_direct(&resp.body)?;
+    if data.requires_2fa {
+        let temp_token = data
+            .temp_token
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| BerthError::Json("2FA response missing temp_token".into()))?;
+        return Ok(LoginOutcome::Requires2FA {
+            temp_token,
+            user_email_masked: data
+                .user_email_masked
+                .unwrap_or_else(|| email_trimmed.to_string()),
+        });
+    }
+    Ok(LoginOutcome::Authenticated(build_user_session(
+        email_trimmed,
+        data,
+    )?))
+}
+
+/// Complete TOTP 2FA login via `POST /api/v1/auth/login/2fa`.
+pub fn login_with_2fa(
+    config: &BerthConfig,
+    fallback_email: &str,
+    temp_token: &str,
+    totp_code: &str,
+) -> Result<UserAuthSession, BerthError> {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "temp_token": temp_token.trim(),
+        "totp_code": totp_code.trim(),
+    }))?;
+    let resp = central_http_request_with_token(
+        config,
+        None,
+        "POST",
+        "/api/v1/auth/login/2fa",
+        Some(&payload),
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(BerthError::ApiStatus {
+            status: resp.status,
+            body: String::from_utf8_lossy(&resp.body).into_owned(),
+        });
+    }
+    let data: AuthLoginData = decode_envelope_or_direct(&resp.body)?;
+    build_user_session(fallback_email, data)
+}
+
+/// Refresh an access/refresh token pair via `POST /api/v1/auth/refresh`.
+pub fn refresh_user_session(
+    config: &BerthConfig,
+    current: &UserAuthSession,
+) -> Result<UserAuthSession, BerthError> {
+    let Some(refresh_token) = current.refresh_token.as_deref() else {
+        return Err(BerthError::InvalidConfig(
+            "saved user session has no refresh_token; please run `bh login` again".into(),
+        ));
+    };
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "refresh_token": refresh_token,
+    }))?;
+    let resp = central_http_request_with_token(
+        config,
+        None,
+        "POST",
+        "/api/v1/auth/refresh",
+        Some(&payload),
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(BerthError::ApiStatus {
+            status: resp.status,
+            body: String::from_utf8_lossy(&resp.body).into_owned(),
+        });
+    }
+    let data: AuthLoginData = decode_envelope_or_direct(&resp.body)?;
+    let access_token = data
+        .access_token
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| BerthError::Json("refresh response missing access_token".into()))?;
+    let new_refresh = data
+        .refresh_token
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| current.refresh_token.clone());
+    let expires_at_unix = data
+        .expires_in
+        .filter(|secs| *secs > 0)
+        .map(|secs| unix_timestamp_now().saturating_add(secs))
+        .or(current.expires_at_unix);
+    Ok(UserAuthSession {
+        email: current.email.clone(),
+        user_id: current.user_id,
+        role: current.role.clone(),
+        access_token,
+        refresh_token: new_refresh,
+        expires_at_unix,
+    })
+}
+
+/// Ensures `config.user_session` is fresh; automatically refreshes and persists
+/// when within 60 seconds of expiry.
+pub fn ensure_fresh_user_session(
+    paths: &BerthPaths,
+    config: &mut BerthConfig,
+) -> Result<Option<UserAuthSession>, BerthError> {
+    let Some(current) = config.user_session.clone() else {
+        return Ok(None);
+    };
+    if current.is_expiring_within(60) && current.refresh_token.is_some() {
+        let refreshed = refresh_user_session(config, &current)?;
+        config.user_session = Some(refreshed.clone());
+        let _ = save_config(paths, config);
+        return Ok(Some(refreshed));
+    }
+    Ok(Some(current))
+}
+
+/// Revokes the active refresh token via `POST /api/v1/auth/logout`.
+pub fn logout_user_session(
+    config: &BerthConfig,
+    session: &UserAuthSession,
+) -> Result<(), BerthError> {
+    let payload = match session.refresh_token.as_deref() {
+        Some(rt) => serde_json::to_vec(&serde_json::json!({ "refresh_token": rt }))?,
+        None => b"{}".to_vec(),
+    };
+    let resp = central_http_request_with_token(
+        config,
+        Some(&session.access_token),
+        "POST",
+        "/api/v1/auth/logout",
+        Some(&payload),
+    )?;
+    if (200..300).contains(&resp.status) || resp.status == 401 {
+        return Ok(());
+    }
+    Err(BerthError::ApiStatus {
+        status: resp.status,
+        body: String::from_utf8_lossy(&resp.body).into_owned(),
+    })
+}
+
+#[derive(Deserialize)]
+struct KeyListData {
+    #[serde(default)]
+    items: Vec<BerthUserKey>,
+}
+
+/// Fetches the authenticated user's active API keys via `GET /api/v1/keys`.
+pub fn list_user_api_keys(
+    config: &BerthConfig,
+    access_token: &str,
+) -> Result<Vec<BerthUserKey>, BerthError> {
+    let resp = central_http_request_with_token(
+        config,
+        Some(access_token),
+        "GET",
+        "/api/v1/keys?status=active&page=1&page_size=100",
+        None,
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(BerthError::ApiStatus {
+            status: resp.status,
+            body: String::from_utf8_lossy(&resp.body).into_owned(),
+        });
+    }
+    let data: KeyListData = decode_envelope_or_direct(&resp.body)?;
+    Ok(data.items)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedAgentAuth {
+    pub bearer_token: String,
+    pub source: String,
+    pub platform: String,
+    pub key_name: Option<String>,
+    pub key_id: Option<i64>,
+    pub group_name: Option<String>,
+}
+
+impl fmt::Debug for ResolvedAgentAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedAgentAuth")
+            .field("bearer_token", &redact_secret(&self.bearer_token))
+            .field("source", &self.source)
+            .field("platform", &self.platform)
+            .field("key_name", &self.key_name)
+            .field("key_id", &self.key_id)
+            .field("group_name", &self.group_name)
+            .finish()
+    }
+}
+
+impl ResolvedAgentAuth {
+    pub fn token_fingerprint(&self) -> String {
+        redact_secret(&self.bearer_token)
+    }
+}
+
+fn select_matching_platform_key<'a>(
+    keys: &'a [BerthUserKey],
+    canonical_agent: &str,
+    platform: &str,
+) -> Option<(&'a BerthUserKey, &'static str)> {
+    let active: Vec<&BerthUserKey> = keys.iter().filter(|k| k.is_active()).collect();
+
+    // 1. Exact group platform match (e.g., codex -> openai, claude -> anthropic, agy -> antigravity, grok -> xai).
+    if let Some(found) = active.iter().find(|k| {
+        k.platform()
+            .is_some_and(|p| p.eq_ignore_ascii_case(platform))
+    }) {
+        return Some((*found, "auto-platform-key"));
+    }
+
+    // 2. For `agy`, also accept a `gemini` group key when no `antigravity` key exists.
+    if canonical_agent == "agy"
+        && let Some(found) = active.iter().find(|k| {
+            k.platform()
+                .is_some_and(|p| p.eq_ignore_ascii_case("gemini"))
+        })
+    {
+        return Some((*found, "auto-platform-key"));
+    }
+
+    // 3. Fallback to an active ungrouped key (`group_id == None`).
+    if let Some(found) = active
+        .iter()
+        .find(|k| k.group_id.is_none() && k.group.is_none())
+    {
+        return Some((*found, "auto-ungrouped-key"));
+    }
+
+    None
+}
+
+/// Resolves the exact Bearer credential (`sk-...` or user JWT) to authenticate
+/// lease minting for `agent`:
+/// 1. Explicit `--key` (`sk-...` directly, or matched by key name/ID via `/api/v1/keys`)
+/// 2. Local pinned override from `bh key set <agent|platform> <sk-...>`
+/// 3. Logged-in `user_session` (auto-refreshed if needed) -> automatic per-platform `sk-...`
+///    selection from `GET /api/v1/keys?status=active` (or ungrouped active key, else user JWT)
+/// 4. Default static `config.api_key`
+pub fn resolve_auth_for_agent(
+    paths: &BerthPaths,
+    config: &mut BerthConfig,
+    agent: &str,
+    explicit_key: Option<&str>,
+) -> Result<ResolvedAgentAuth, BerthError> {
+    let canonical_agent = validate_agent_name(agent)?;
+    let platform = agent_to_platform(canonical_agent)?.to_string();
+
+    // 1. Explicit one-shot `--key` override.
+    if let Some(raw) = explicit_key.map(str::trim).filter(|s| !s.is_empty()) {
+        if raw.starts_with("sk-") || config.user_session.is_none() {
+            return Ok(ResolvedAgentAuth {
+                bearer_token: raw.to_string(),
+                source: "explicit-flag".to_string(),
+                platform,
+                key_name: None,
+                key_id: None,
+                group_name: None,
+            });
+        }
+        if let Some(session) = ensure_fresh_user_session(paths, config)? {
+            let keys = list_user_api_keys(config, &session.access_token)?;
+            let parsed_id = raw.parse::<i64>().ok();
+            if let Some(found) = keys.iter().find(|k| {
+                k.is_active()
+                    && (k.name.eq_ignore_ascii_case(raw)
+                        || parsed_id.is_some_and(|id| k.id == id))
+            }) {
+                return Ok(ResolvedAgentAuth {
+                    bearer_token: found.key.clone(),
+                    source: "explicit-key-name".to_string(),
+                    platform,
+                    key_name: Some(found.name.clone()),
+                    key_id: Some(found.id),
+                    group_name: found.group.as_ref().map(|g| g.name.clone()),
+                });
+            }
+            let available: Vec<String> = keys
+                .iter()
+                .filter(|k| k.is_active())
+                .map(|k| format!("{} (id={})", k.name, k.id))
+                .collect();
+            return Err(BerthError::InvalidArgument(format!(
+                "no active API key matching `{raw}` found on your Berth account (available: {})",
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            )));
+        }
+    }
+
+    // 2. Local pinned per-agent / per-platform override (`bh key set`).
+    if let Some(pinned) = config
+        .platform_keys
+        .get(canonical_agent)
+        .or_else(|| config.platform_keys.get(&platform))
+        .filter(|k| !k.trim().is_empty())
+    {
+        return Ok(ResolvedAgentAuth {
+            bearer_token: pinned.clone(),
+            source: "pinned-platform-key".to_string(),
+            platform,
+            key_name: None,
+            key_id: None,
+            group_name: None,
+        });
+    }
+
+    // 3. Logged-in user session -> auto-select matching platform `sk-...` key.
+    if let Some(session) = ensure_fresh_user_session(paths, config)? {
+        let mut keys_result = list_user_api_keys(config, &session.access_token);
+        let mut active_session = session;
+
+        // If access_token was rejected with 401 and we have a refresh_token, refresh once and retry.
+        if let Err(BerthError::ApiStatus { status: 401, .. }) = &keys_result
+            && active_session.refresh_token.is_some()
+            && let Ok(refreshed) = refresh_user_session(config, &active_session)
+        {
+            config.user_session = Some(refreshed.clone());
+            let _ = save_config(paths, config);
+            active_session = refreshed;
+            keys_result = list_user_api_keys(config, &active_session.access_token);
+        }
+
+        if let Ok(keys) = keys_result
+            && let Some((matched, source)) =
+                select_matching_platform_key(&keys, canonical_agent, &platform)
+        {
+            return Ok(ResolvedAgentAuth {
+                bearer_token: matched.key.clone(),
+                source: source.to_string(),
+                platform,
+                key_name: Some(matched.name.clone()),
+                key_id: Some(matched.id),
+                group_name: matched.group.as_ref().map(|g| g.name.clone()),
+            });
+        }
+
+        if !config.api_key.trim().is_empty() {
+            return Ok(ResolvedAgentAuth {
+                bearer_token: config.api_key.clone(),
+                source: "default-api-key".to_string(),
+                platform,
+                key_name: None,
+                key_id: None,
+                group_name: None,
+            });
+        }
+
+        return Ok(ResolvedAgentAuth {
+            bearer_token: active_session.access_token,
+            source: "user-jwt-fallback".to_string(),
+            platform,
+            key_name: None,
+            key_id: None,
+            group_name: None,
+        });
+    }
+
+    // 4. Static default `config.api_key`.
+    if !config.api_key.trim().is_empty() {
+        return Ok(ResolvedAgentAuth {
+            bearer_token: config.api_key.clone(),
+            source: "default-api-key".to_string(),
+            platform,
+            key_name: None,
+            key_id: None,
+            group_name: None,
+        });
+    }
+
+    Err(BerthError::NotConfigured)
+}
+
 fn decode_lease_response(body: &[u8]) -> Result<LeaseResponse, BerthError> {
     if let Ok(direct) = serde_json::from_slice::<LeaseResponse>(body) {
         return Ok(direct);
@@ -1153,14 +1875,49 @@ fn decode_lease_response(body: &[u8]) -> Result<LeaseResponse, BerthError> {
     Ok(env.data)
 }
 
-/// Acquire a Berth v2 Cage Session Lease via `POST /api/v1/ags/leases`.
-pub fn acquire_lease(
+/// Acquire a Berth v2 Cage Session Lease via `POST /api/v1/ags/leases` with an explicit Bearer token.
+pub fn acquire_lease_with_token(
     config: &BerthConfig,
+    bearer_token: &str,
     req: &LeaseRequest,
 ) -> Result<LeaseResponse, BerthError> {
     let _ = validate_agent_name(&req.agent)?;
     let payload = serde_json::to_vec(req)?;
-    let resp = central_http_request(config, "POST", "/api/v1/ags/leases", Some(&payload))?;
+    let resp = central_http_request_with_token(
+        config,
+        Some(bearer_token),
+        "POST",
+        "/api/v1/ags/leases",
+        Some(&payload),
+    )?;
+    if !(200..300).contains(&resp.status) {
+        return Err(BerthError::ApiStatus {
+            status: resp.status,
+            body: String::from_utf8_lossy(&resp.body).into_owned(),
+        });
+    }
+    decode_lease_response(&resp.body)
+}
+
+/// Acquire a Berth v2 Cage Session Lease via `POST /api/v1/ags/leases` using `config.api_key`.
+pub fn acquire_lease(
+    config: &BerthConfig,
+    req: &LeaseRequest,
+) -> Result<LeaseResponse, BerthError> {
+    config.validate()?;
+    acquire_lease_with_token(config, &config.api_key, req)
+}
+
+/// Renew an active Berth v2 Lease via `POST /api/v1/ags/leases/{lease_id}/renew` with an explicit Bearer token.
+pub fn renew_lease_with_token(
+    config: &BerthConfig,
+    bearer_token: &str,
+    lease_id: &str,
+) -> Result<LeaseResponse, BerthError> {
+    let encoded_id = urlencoding::encode(lease_id);
+    let path = format!("/api/v1/ags/leases/{encoded_id}/renew");
+    let resp =
+        central_http_request_with_token(config, Some(bearer_token), "POST", &path, Some(b"{}"))?;
     if !(200..300).contains(&resp.status) {
         return Err(BerthError::ApiStatus {
             status: resp.status,
@@ -1172,23 +1929,20 @@ pub fn acquire_lease(
 
 /// Renew an active Berth v2 Lease via `POST /api/v1/ags/leases/{lease_id}/renew`.
 pub fn renew_lease(config: &BerthConfig, lease_id: &str) -> Result<LeaseResponse, BerthError> {
-    let encoded_id = urlencoding::encode(lease_id);
-    let path = format!("/api/v1/ags/leases/{encoded_id}/renew");
-    let resp = central_http_request(config, "POST", &path, Some(b"{}"))?;
-    if !(200..300).contains(&resp.status) {
-        return Err(BerthError::ApiStatus {
-            status: resp.status,
-            body: String::from_utf8_lossy(&resp.body).into_owned(),
-        });
-    }
-    decode_lease_response(&resp.body)
+    config.validate()?;
+    renew_lease_with_token(config, &config.api_key, lease_id)
 }
 
-/// Release an active Berth v2 Lease via `DELETE /api/v1/ags/leases/{lease_id}`.
-pub fn release_lease(config: &BerthConfig, lease_id: &str) -> Result<(), BerthError> {
+/// Release an active Berth v2 Lease via `DELETE /api/v1/ags/leases/{lease_id}` with an explicit Bearer token.
+pub fn release_lease_with_token(
+    config: &BerthConfig,
+    bearer_token: &str,
+    lease_id: &str,
+) -> Result<(), BerthError> {
     let encoded_id = urlencoding::encode(lease_id);
     let path = format!("/api/v1/ags/leases/{encoded_id}");
-    let resp = central_http_request(config, "DELETE", &path, None)?;
+    let resp =
+        central_http_request_with_token(config, Some(bearer_token), "DELETE", &path, None)?;
     if (200..300).contains(&resp.status) || resp.status == 404 {
         return Ok(());
     }
@@ -1196,6 +1950,12 @@ pub fn release_lease(config: &BerthConfig, lease_id: &str) -> Result<(), BerthEr
         status: resp.status,
         body: String::from_utf8_lossy(&resp.body).into_owned(),
     })
+}
+
+/// Release an active Berth v2 Lease via `DELETE /api/v1/ags/leases/{lease_id}`.
+pub fn release_lease(config: &BerthConfig, lease_id: &str) -> Result<(), BerthError> {
+    config.validate()?;
+    release_lease_with_token(config, &config.api_key, lease_id)
 }
 
 fn probe_ingress_once(probe_url: &str, timeout: Duration) -> Option<Duration> {
@@ -1759,6 +2519,8 @@ mod tests {
             schema: BERTH_CONFIG_SCHEMA.into(),
             central_url: "http://127.0.0.1:8080".into(),
             api_key: "sk-berth-secret-123".into(),
+            platform_keys: BTreeMap::new(),
+            user_session: None,
             mgmt_entries: vec![],
             zone_preference: "auto".into(),
             isolation_mode: IsolationMode::TzOverlay,
@@ -2072,6 +2834,8 @@ mod tests {
             schema: BERTH_CONFIG_SCHEMA.into(),
             central_url: format!("http://{central_addr}"),
             api_key: "test-api-key".into(),
+            platform_keys: BTreeMap::new(),
+            user_session: None,
             mgmt_entries: vec![],
             zone_preference: "auto".into(),
             isolation_mode: IsolationMode::TzOverlay,
@@ -2227,6 +2991,8 @@ mod tests {
             schema: BERTH_CONFIG_SCHEMA.into(),
             central_url: "http://127.0.0.1:9".into(), // unreachable directly; forces entry!
             api_key: "test-api-key".into(),
+            platform_keys: BTreeMap::new(),
+            user_session: None,
             mgmt_entries: vec![entry_addr.to_string()],
             zone_preference: "cn_mainland".into(),
             isolation_mode: IsolationMode::TzOverlay,
@@ -2260,5 +3026,189 @@ mod tests {
         let real_text = fs::read_to_string(&real_cfg).unwrap();
         assert!(real_text.contains("inherit = \"all\""));
         assert!(!real_text.contains("America/Chicago"));
+    }
+
+    #[test]
+    fn login_refresh_list_keys_and_resolve_platform_keys() {
+        let dir = TempDir::new().unwrap();
+        let paths = BerthPaths::new(dir.path().join("berth/berth.json"), dir.path().join("state"));
+
+        // Mock Central handling:
+        // 1. POST /api/v1/auth/login -> 2FA required
+        // 2. POST /api/v1/auth/login/2fa -> access_token + refresh_token
+        // 3. POST /api/v1/auth/refresh -> refreshed access_token
+        // 4. GET /api/v1/keys?status=active&page=1&page_size=100 (x4)
+        // 5. POST /api/v1/auth/logout
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..8 {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(s.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let mut headers = String::new();
+                let mut cl = 0usize;
+                loop {
+                    let mut l = String::new();
+                    reader.read_line(&mut l).unwrap();
+                    if l.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = l.to_ascii_lowercase().strip_prefix("content-length:") {
+                        cl = v.trim().parse().unwrap_or(0);
+                    }
+                    headers.push_str(&l);
+                }
+                let mut body = vec![0u8; cl];
+                if cl > 0 {
+                    reader.read_exact(&mut body).unwrap();
+                }
+
+                let payload = if req_line.starts_with("POST /api/v1/auth/login ") {
+                    serde_json::json!({
+                        "code": 0,
+                        "data": {
+                            "requires_2fa": true,
+                            "temp_token": "tmp_2fa_tok",
+                            "user_email_masked": "a***@example.com"
+                        }
+                    })
+                    .to_string()
+                } else if req_line.starts_with("POST /api/v1/auth/login/2fa ") {
+                    serde_json::json!({
+                        "code": 0,
+                        "data": {
+                            "access_token": "jwt_initial_tok",
+                            "refresh_token": "rt_initial_tok",
+                            "expires_in": 3600,
+                            "token_type": "Bearer",
+                            "user": { "id": 42, "email": "alice@example.com", "role": "user" }
+                        }
+                    })
+                    .to_string()
+                } else if req_line.starts_with("POST /api/v1/auth/refresh ") {
+                    serde_json::json!({
+                        "code": 0,
+                        "data": {
+                            "access_token": "jwt_refreshed_tok",
+                            "refresh_token": "rt_refreshed_tok",
+                            "expires_in": 7200,
+                            "token_type": "Bearer"
+                        }
+                    })
+                    .to_string()
+                } else if req_line.starts_with("GET /api/v1/keys") {
+                    assert!(
+                        headers
+                            .to_ascii_lowercase()
+                            .contains("authorization: bearer jwt_refreshed_tok"),
+                        "expected refreshed JWT header, got:\n{headers}"
+                    );
+                    serde_json::json!({
+                        "code": 0,
+                        "data": {
+                            "items": [
+                                {
+                                    "id": 10,
+                                    "name": "codex-main",
+                                    "key": "sk-openai-auto",
+                                    "status": "active",
+                                    "group_id": 1,
+                                    "group": { "id": 1, "name": "OpenAI Pool", "platform": "openai", "status": "active" }
+                                },
+                                {
+                                    "id": 11,
+                                    "name": "claude-main",
+                                    "key": "sk-anthropic-auto",
+                                    "status": "active",
+                                    "group_id": 2,
+                                    "group": { "id": 2, "name": "Anthropic Pool", "platform": "anthropic", "status": "active" }
+                                },
+                                {
+                                    "id": 12,
+                                    "name": "gemini-main",
+                                    "key": "sk-gemini-auto",
+                                    "status": "active",
+                                    "group_id": 3,
+                                    "group": { "id": 3, "name": "Gemini Pool", "platform": "gemini", "status": "active" }
+                                }
+                            ],
+                            "total": 3
+                        }
+                    })
+                    .to_string()
+                } else if req_line.starts_with("POST /api/v1/auth/logout ") {
+                    serde_json::json!({ "code": 0, "data": { "message": "Logged out successfully" } })
+                        .to_string()
+                } else {
+                    panic!("unexpected request: {req_line}");
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                s.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let mut config = BerthConfig {
+            schema: BERTH_CONFIG_SCHEMA.into(),
+            central_url: format!("http://{addr}"),
+            api_key: String::new(),
+            platform_keys: BTreeMap::new(),
+            user_session: None,
+            mgmt_entries: vec![],
+            zone_preference: "auto".into(),
+            isolation_mode: IsolationMode::TzOverlay,
+            allow_insecure_http_for_tests: true,
+        };
+
+        let outcome = login_with_password(&config, "alice@example.com", "pw123456").unwrap();
+        let temp_token = match outcome {
+            LoginOutcome::Requires2FA { temp_token, .. } => temp_token,
+            _ => panic!("expected Requires2FA"),
+        };
+        let mut session = login_with_2fa(&config, "alice@example.com", &temp_token, "123456").unwrap();
+        assert_eq!(session.user_id, 42);
+        assert!(!format!("{session:?}").contains("jwt_initial_tok"));
+
+        // Force expiry so resolve_auth_for_agent triggers automatic refresh!
+        session.expires_at_unix = Some(1);
+        config.user_session = Some(session);
+        save_config(&paths, &config).unwrap();
+
+        let codex_auth = resolve_auth_for_agent(&paths, &mut config, "codex", None).unwrap();
+        assert_eq!(codex_auth.bearer_token, "sk-openai-auto");
+        assert_eq!(codex_auth.source, "auto-platform-key");
+        assert_eq!(config.user_session.as_ref().unwrap().access_token, "jwt_refreshed_tok");
+
+        let claude_auth = resolve_auth_for_agent(&paths, &mut config, "claude", None).unwrap();
+        assert_eq!(claude_auth.bearer_token, "sk-anthropic-auto");
+
+        // `agy` accepts `gemini` fallback group!
+        let agy_auth = resolve_auth_for_agent(&paths, &mut config, "agy", None).unwrap();
+        assert_eq!(agy_auth.bearer_token, "sk-gemini-auto");
+
+        // `grok` has no matching key -> falls back cleanly to user JWT!
+        let grok_auth = resolve_auth_for_agent(&paths, &mut config, "grok", None).unwrap();
+        assert_eq!(grok_auth.bearer_token, "jwt_refreshed_tok");
+        assert_eq!(grok_auth.source, "user-jwt-fallback");
+
+        // Pinned local override beats auto resolution without hitting Central.
+        config.platform_keys.insert("codex".into(), "sk-pinned-codex".into());
+        let pinned_auth = resolve_auth_for_agent(&paths, &mut config, "codex", None).unwrap();
+        assert_eq!(pinned_auth.bearer_token, "sk-pinned-codex");
+        assert_eq!(pinned_auth.source, "pinned-platform-key");
+
+        // Explicit --key beats pinned override.
+        let explicit_auth =
+            resolve_auth_for_agent(&paths, &mut config, "codex", Some("sk-oneshot")).unwrap();
+        assert_eq!(explicit_auth.bearer_token, "sk-oneshot");
+        assert_eq!(explicit_auth.source, "explicit-flag");
+
+        logout_user_session(&config, config.user_session.as_ref().unwrap()).unwrap();
+        server.join().unwrap();
     }
 }

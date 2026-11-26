@@ -9,7 +9,7 @@ use std::{
     time::Instant,
 };
 
-use ags::{
+use berth::{
     discovery::{DetectionResult, ProviderRegistry},
     error::AgsError,
     model::CanonicalSession,

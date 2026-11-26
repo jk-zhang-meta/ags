@@ -17,7 +17,7 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::providers::{Provider, gemini::Gemini};
+use berth::providers::{Provider, gemini::Gemini};
 
 static GEMINI_ENV: test_env::EnvLock = test_env::EnvLock;
 

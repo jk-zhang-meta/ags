@@ -30,7 +30,7 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::providers::{Provider, factory::Factory};
+use berth::providers::{Provider, factory::Factory};
 
 static FACTORY_ENV: test_env::EnvLock = test_env::EnvLock;
 

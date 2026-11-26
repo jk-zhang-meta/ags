@@ -10,9 +10,9 @@ mod test_env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ags::model::{CanonicalMessage, CanonicalSession, MessageRole};
-use ags::providers::opencode::OpenCode;
-use ags::providers::{Provider, WriteOptions};
+use berth::model::{CanonicalMessage, CanonicalSession, MessageRole};
+use berth::providers::opencode::OpenCode;
+use berth::providers::{Provider, WriteOptions};
 
 static OPENCODE_ENV: test_env::EnvLock = test_env::EnvLock;
 

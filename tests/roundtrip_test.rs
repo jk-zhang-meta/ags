@@ -27,22 +27,22 @@ mod test_env;
 
 use std::path::{Path, PathBuf};
 
-use ags::model::{CanonicalSession, MessageRole};
-use ags::providers::aider::Aider;
-use ags::providers::amp::Amp;
-use ags::providers::chatgpt::ChatGpt;
-use ags::providers::claude_code::ClaudeCode;
-use ags::providers::clawdbot::ClawdBot;
-use ags::providers::cline::Cline;
-use ags::providers::codex::Codex;
-use ags::providers::cursor::Cursor;
-use ags::providers::factory::Factory;
-use ags::providers::gemini::Gemini;
-use ags::providers::openclaw::OpenClaw;
-use ags::providers::opencode::OpenCode;
-use ags::providers::pi_agent::PiAgent;
-use ags::providers::vibe::Vibe;
-use ags::providers::{Provider, WriteOptions};
+use berth::model::{CanonicalSession, MessageRole};
+use berth::providers::aider::Aider;
+use berth::providers::amp::Amp;
+use berth::providers::chatgpt::ChatGpt;
+use berth::providers::claude_code::ClaudeCode;
+use berth::providers::clawdbot::ClawdBot;
+use berth::providers::cline::Cline;
+use berth::providers::codex::Codex;
+use berth::providers::cursor::Cursor;
+use berth::providers::factory::Factory;
+use berth::providers::gemini::Gemini;
+use berth::providers::openclaw::OpenClaw;
+use berth::providers::opencode::OpenCode;
+use berth::providers::pi_agent::PiAgent;
+use berth::providers::vibe::Vibe;
+use berth::providers::{Provider, WriteOptions};
 
 // ---------------------------------------------------------------------------
 // Env var isolation (see `tests/test_env.rs`)

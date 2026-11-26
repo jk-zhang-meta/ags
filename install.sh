@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# ags installer
+# berth (bh) installer
 #
 # One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/berth-cli/main/install.sh?$(date +%s)" | bash
 #
 # Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/jk-zhang-meta/berth-cli/main/install.sh | bash
 #
 # Options:
 #   --version vX.Y.Z   Install specific version (default: latest)
@@ -41,8 +41,9 @@ fi
 
 VERSION="${VERSION:-}"
 OWNER="${OWNER:-jk-zhang-meta}"
-REPO="${REPO:-ags}"
-BINARY_NAME="ags"
+REPO="${REPO:-berth-cli}"
+BINARY_NAME="berth"
+SHORT_ALIAS="bh"
 
 # 装的过程里不要让运行时自己去查更新。
 #
@@ -1038,7 +1039,7 @@ set_artifact_url() {
       TAR=$(basename "$ARTIFACT_URL")
       URL="$ARTIFACT_URL"
     elif [ -n "$TARGET" ]; then
-      TAR="ags-${TARGET}.tar.xz"
+      TAR="berth-${TARGET}.tar.xz"
       URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${TAR}"
     else
       warn "No prebuilt artifact for ${OS}/${ARCH}; falling back to build-from-source"
@@ -1823,16 +1824,16 @@ Environment:
 
 Examples:
   # Install latest release
-  curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/ags/main/install.sh?\$(date +%s)" | bash
+  curl -fsSL "https://raw.githubusercontent.com/jk-zhang-meta/berth-cli/main/install.sh?\$(date +%s)" | bash
 
   # Install specific version with self-test
-  bash install.sh --version v0.2.0 --verify
+  bash install.sh --version v2.0.0 --verify
 
   # Install system-wide only when /usr/local/bin is already user-writable
   bash install.sh --system --easy-mode --yes
 
   # Offline / airgap install
-  bash install.sh --offline ./ags-x86_64-unknown-linux-musl.tar.xz
+  bash install.sh --offline ./berth-x86_64-unknown-linux-musl.tar.xz
 
   # Build from source (requires Rust nightly)
   bash install.sh --from-source
@@ -2087,7 +2088,7 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$URL" ]; then
 
   if [ "$DOWNLOAD_OK" -eq 0 ]; then
     # Tier 2: unversioned latest
-    TIER2_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/ags-${TARGET}.tar.xz"
+    TIER2_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/berth-${TARGET}.tar.xz"
     info "Trying unversioned latest: $TIER2_URL"
     if curl -fsSL "${PROXY_ARGS[@]}" "$TIER2_URL" -o "$TMP/$TAR" 2>/dev/null; then
       DOWNLOAD_OK=1
@@ -2096,7 +2097,7 @@ if [ -z "$INSTALL_SOURCE" ] && [ "$FROM_SOURCE" -eq 0 ] && [ -n "$URL" ]; then
 
   if [ "$DOWNLOAD_OK" -eq 0 ]; then
     # Tier 3: simple naming
-    TIER3_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/ags-${OS}-${ARCH}.tar.xz"
+    TIER3_URL="https://github.com/${OWNER}/${REPO}/releases/latest/download/berth-${OS}-${ARCH}.tar.xz"
     info "Trying simple naming: $TIER3_URL"
     if curl -fsSL "${PROXY_ARGS[@]}" "$TIER3_URL" -o "$TMP/$TAR" 2>/dev/null; then
       DOWNLOAD_OK=1
@@ -2174,7 +2175,7 @@ if [ -z "$INSTALL_SOURCE" ]; then
 
   BIN="$TMP/$BINARY_NAME"
   if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-    BIN="$TMP/ags-${TARGET}/$BINARY_NAME"
+    BIN="$TMP/berth-${TARGET}/$BINARY_NAME"
   fi
   if [ ! -x "$BIN" ]; then
     BIN=$(find "$TMP" -maxdepth 3 -type f -name "$BINARY_NAME" -perm -111 | head -n 1)
@@ -2197,6 +2198,7 @@ if [ "$INSTALL_TRANSACTION_ACTIVE" -eq 1 ]; then
   }
 fi
 INSTALL_CORE_COMMITTED=1
+ln -sfn "$DEST/$BINARY_NAME" "$DEST/$SHORT_ALIAS"
 maybe_add_path
 maybe_install_completions
 configure_agents
@@ -2231,6 +2233,7 @@ fi
 
 summary_lines=(
   "Binary:           $DEST/$BINARY_NAME"
+  "Short alias:      $DEST/$SHORT_ALIAS -> $BINARY_NAME"
   "Version:          $VERSION"
   "Install source:   $INSTALL_SOURCE"
   "Providers:        $PROV_LIST"
@@ -2240,24 +2243,25 @@ summary_lines=(
   "Wrapper cc:       $CC_WRAPPER_STATUS"
   "Wrapper cod:      $COD_WRAPPER_STATUS"
   "Wrapper gmi:      $GMI_WRAPPER_STATUS"
-  "Wrapper ags:      $AGS_WRAPPER_STATUS"
-  "AGS Codex skill:  $AGS_CODEX_SKILL_STATUS"
-  "AGS Claude skill: $AGS_CLAUDE_SKILL_STATUS"
-  "AGS hooks:        $AGS_HOOK_STATUS"
-  "AGS vault:        $AGS_INIT_STATUS"
+  "Wrapper berth:    $AGS_WRAPPER_STATUS"
+  "Berth Codex skill:  $AGS_CODEX_SKILL_STATUS"
+  "Berth Claude skill: $AGS_CLAUDE_SKILL_STATUS"
+  "Berth hooks:        $AGS_HOOK_STATUS"
+  "Berth vault:        $AGS_INIT_STATUS"
   ""
   "Get started:"
-  "  ags convert providers"
-  "  ags convert list"
-  "  ags convert -cc <session-id>"
-  "  ags convert -cod <session-id>"
-  "  ags convert -gmi <session-id>"
-  "  ags ls"
-  "  ags"
+  "  bh login"
+  "  bh key list"
+  "  bh status"
+  "  bh codex"
+  "  bh claude"
+  "  bh agy"
+  "  bh grok"
+  "  bh ls"
   ""
   "Managed paths:"
-  "  binary:   $(status_path "$DEST/$BINARY_NAME")"
-  "  wrappers: $(status_path "$DEST")/{cc,cod,gmi,ags}"
+  "  binary:   $(status_path "$DEST/$BINARY_NAME") (alias: $(status_path "$DEST/$SHORT_ALIAS"))"
+  "  wrappers: $(status_path "$DEST")/{cc,cod,gmi}"
   "  skills:   ~/.claude/skills/{ags,ags-convert} and ~/.codex/skills/{ags,ags-convert}"
 )
 
