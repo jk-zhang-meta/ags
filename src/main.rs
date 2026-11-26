@@ -114,8 +114,8 @@ enum BerthCommand {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long, default_value = "auto")]
         zone: String,
-        /// Client isolation mode (tz-overlay|strict).
-        #[arg(long, default_value = "tz-overlay")]
+        /// Client isolation mode (sandbox|tz-overlay|strict).
+        #[arg(long, default_value = "sandbox")]
         isolation: String,
         /// Allow plaintext http:// central URL for local tests only.
         #[arg(long)]
@@ -194,6 +194,16 @@ enum BerthCommand {
         #[arg(last = true, value_name = "AGENT_ARGS")]
         agent_args: Vec<String>,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum SandboxCommand {
+    /// Probe native zero-VM sandbox capabilities (Linux/WSL2 bwrap, macOS Seatbelt, Windows AppContainer).
+    #[command(name = "check")]
+    Check,
+    /// One-time Administrator setup on native Windows to enable AppContainer loopback bridge.
+    #[command(name = "init-windows")]
+    InitWindows,
 }
 
 #[derive(clap::Args, Debug)]
@@ -285,8 +295,8 @@ enum Command {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long, default_value = "auto")]
         zone: String,
-        /// Client isolation mode (tz-overlay|strict).
-        #[arg(long, default_value = "tz-overlay")]
+        /// Client isolation mode (sandbox|tz-overlay|strict).
+        #[arg(long, default_value = "sandbox")]
         isolation: String,
         /// Allow plaintext http:// central URL for local tests only.
         #[arg(long)]
@@ -307,6 +317,28 @@ enum Command {
         /// Re-download and reinstall even if already on the latest version.
         #[arg(long)]
         force: bool,
+    },
+    /// Inspect or initialize the native cross-platform zero-VM sandbox (Linux/WSL2, macOS, Windows).
+    #[command(name = "sandbox")]
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
+    /// Internal trampoline executed inside Linux/WSL2 `--unshare-net` namespaces.
+    #[command(name = "__sandbox-trampoline", hide = true)]
+    SandboxTrampoline {
+        #[arg(long)]
+        shim_sock: PathBuf,
+        #[arg(long)]
+        proxy_sock: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        shim_port: u16,
+        #[arg(long, default_value_t = 0)]
+        proxy_port: u16,
+        #[arg(long)]
+        agent: String,
+        #[arg(last = true, value_name = "CMD")]
+        command: Vec<String>,
     },
     /// Launch unmodified official Codex CLI through Berth Cage Shim.
     #[command(name = "codex")]
@@ -895,6 +927,8 @@ fn main() -> ExitCode {
             | "clear"
             | "update"
             | "self-update"
+            | "sandbox"
+            | "__sandbox-trampoline"
             | "codex"
             | "claude"
             | "agy"
@@ -981,6 +1015,23 @@ fn main() -> ExitCode {
         Command::Status => cmd_berth(BerthCommand::Status, cli.json),
         Command::Clear => cmd_berth(BerthCommand::Clear, cli.json),
         Command::Update { check, force } => cmd_berth_update(check, force, cli.json),
+        Command::Sandbox { command } => cmd_sandbox(command, cli.json),
+        Command::SandboxTrampoline {
+            shim_sock,
+            proxy_sock,
+            shim_port,
+            proxy_port,
+            agent,
+            command,
+        } => berth::sandbox::run_sandbox_trampoline(
+            &shim_sock,
+            &proxy_sock,
+            shim_port,
+            proxy_port,
+            &agent,
+            &command,
+        )
+        .map_err(anyhow::Error::from),
         Command::Codex(args) => cmd_top_level_launch("codex", args, cli.json),
         Command::Claude(args) => cmd_top_level_launch("claude", args, cli.json),
         Command::Agy(args) => cmd_top_level_launch("agy", args, cli.json),
@@ -1532,7 +1583,7 @@ fn cmd_berth_login(
         None => existing
             .as_ref()
             .map(|c| c.isolation_mode)
-            .unwrap_or_default(),
+            .unwrap_or(berth::berth::IsolationMode::Sandbox),
     };
     let zone_preference = zone
         .or_else(|| existing.as_ref().map(|c| c.zone_preference.clone()))
@@ -2529,6 +2580,15 @@ fn cmd_berth_launch(
             }
         }
 
+        let workspace_dir = std::env::current_dir()?;
+        let real_home = dirs::home_dir().unwrap_or_else(|| workspace_dir.clone());
+        let account_home = berth::sandbox::prepare_account_cage_home(
+            &paths.state_dir,
+            lease.account_id,
+            &lease.cage,
+        )?;
+        let sandbox_probe = berth::sandbox::probe_sandbox_backend();
+
         if dry_run {
             let mut redacted_env = launch_env.set_env.clone();
             for secret_key in [
@@ -2557,7 +2617,10 @@ fn cmd_berth_launch(
                 "work_session_id": lease.work_session_id,
                 "selected_ingress": selected,
                 "shim_url": shim.listen_url(),
+                "proxy_addr": shim.proxy_addr().to_string(),
                 "cage": lease.cage,
+                "account_home": account_home.home_dir,
+                "sandbox": sandbox_probe,
                 "isolation": launch_env.isolation,
                 "set_env": redacted_env,
                 "unset_env": launch_env.unset_env,
@@ -2591,8 +2654,15 @@ fn cmd_berth_launch(
                     "  cage        {} / {} / {}",
                     lease.cage.timezone, lease.cage.country_code, lease.cage.locale
                 );
-                println!("  isolation   {}", launch_env.isolation.mode);
+                println!(
+                    "  isolation   {} (backend={}, kernel_egress_blocked={})",
+                    launch_env.isolation.mode,
+                    sandbox_probe.backend,
+                    sandbox_probe.kernel_egress_blocked
+                );
+                println!("  account_home {}", account_home.home_dir.display());
                 println!("  shim_url    {}", shim.listen_url());
+                println!("  proxy_addr  {}", shim.proxy_addr());
             }
             return Ok(ExitCode::SUCCESS);
         }
@@ -2610,33 +2680,59 @@ fn cmd_berth_launch(
             }
         };
 
-        let mut cmd = if isolation_mode == berth::berth::IsolationMode::Strict {
-            if let Some(plan) = &overlay_plan {
-                build_strict_unshare_command(&plan.overlay_root, &stock_bin, &current_args)
+        let status = if isolation_mode == berth::berth::IsolationMode::Sandbox {
+            let spec = berth::sandbox::SandboxLaunchSpec {
+                agent: canonical_agent.to_string(),
+                workspace_dir,
+                real_home,
+                account_home,
+                cage: lease.cage.clone(),
+                stock_bin,
+                agent_args: current_args.clone(),
+                launch_env,
+                overlay_unset_env: overlay_plan
+                    .as_ref()
+                    .map(|p| p.unset_env.clone())
+                    .unwrap_or_default(),
+                overlay_set_env: overlay_plan
+                    .as_ref()
+                    .map(|p| p.set_env.iter().cloned().collect())
+                    .unwrap_or_default(),
+                overlay_fs_etc: overlay_plan
+                    .as_ref()
+                    .map(|p| p.overlay_root.join("fs").join("etc")),
+                allow_env_fallback: isolation_override.is_none(),
+            };
+            berth::sandbox::launch_in_sandbox(&spec, &mut shim)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        } else {
+            let mut cmd = if isolation_mode == berth::berth::IsolationMode::Strict {
+                if let Some(plan) = &overlay_plan {
+                    build_strict_unshare_command(&plan.overlay_root, &stock_bin, &current_args)
+                } else {
+                    let mut c = std::process::Command::new(&stock_bin);
+                    c.args(&current_args);
+                    c
+                }
             } else {
                 let mut c = std::process::Command::new(&stock_bin);
                 c.args(&current_args);
                 c
+            };
+
+            if let Some(plan) = &overlay_plan {
+                for key in &plan.unset_env {
+                    cmd.env_remove(key);
+                }
+                for (key, value) in &plan.set_env {
+                    cmd.env(key, value);
+                }
+                cmd.env("AGS_FS_OVERLAY", plan.overlay_root.join("fs").join("etc"));
             }
-        } else {
-            let mut c = std::process::Command::new(&stock_bin);
-            c.args(&current_args);
-            c
+            // Authoritative Berth Cage env & loopback shim URLs override overlay defaults.
+            launch_env.apply_to_command(&mut cmd);
+            cmd.status()
         };
-
-        if let Some(plan) = &overlay_plan {
-            for key in &plan.unset_env {
-                cmd.env_remove(key);
-            }
-            for (key, value) in &plan.set_env {
-                cmd.env(key, value);
-            }
-            cmd.env("AGS_FS_OVERLAY", plan.overlay_root.join("fs").join("etc"));
-        }
-        // Authoritative Berth Cage env & loopback shim URLs override overlay defaults.
-        launch_env.apply_to_command(&mut cmd);
-
-        let status = cmd.status();
         let rebind_signal: Option<berth::berth::RebindSignal> = if rebind_file.is_file() {
             std::fs::read_to_string(&rebind_file)
                 .ok()
@@ -2693,6 +2789,48 @@ fn cmd_berth_launch(
     }
 
     Ok(ExitCode::from(75))
+}
+
+fn cmd_sandbox(command: SandboxCommand, json_mode: bool) -> anyhow::Result<ExitCode> {
+    match command {
+        SandboxCommand::Check => {
+            let probe = berth::sandbox::probe_sandbox_backend();
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&probe)?);
+            } else {
+                println!("berth sandbox check");
+                println!("  os                     {}", probe.os);
+                println!("  wsl                    {}", probe.is_wsl);
+                println!("  backend                {}", probe.backend);
+                println!("  available              {}", probe.available);
+                println!("  kernel_egress_blocked  {}", probe.kernel_egress_blocked);
+                println!(
+                    "  localtime_override     {}",
+                    probe.localtime_mount_override
+                );
+                for note in &probe.notes {
+                    println!("  note                   {note}");
+                }
+            }
+            Ok(if probe.available {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
+        SandboxCommand::InitWindows => {
+            berth::sandbox::run_windows_appcontainer_init()?;
+            if json_mode {
+                println!("{{\"initialized\":true,\"profile\":\"Berth.Cage.Sandbox\"}}");
+            } else {
+                println!(
+                    "Windows AppContainer `{}` initialized with loopback bridge.",
+                    berth::sandbox::WINDOWS_APPCONTAINER_NAME
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn build_strict_unshare_command(

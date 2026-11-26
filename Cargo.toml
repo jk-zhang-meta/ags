@@ -1,6 +1,6 @@
 [package]
 name = "berth"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 description = "Berth CLI (bh / berth) — Cage-isolated AI agent launcher and cross-agent session manager"
 license-file = "LICENSE"

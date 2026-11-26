@@ -119,6 +119,10 @@ pub enum IsolationMode {
     /// Does NOT claim OS-level network egress isolation.
     #[default]
     TzOverlay,
+    /// Cross-platform native zero-VM kernel sandbox (Linux/WSL2 bwrap --unshare-net,
+    /// macOS sandbox-exec Seatbelt, Windows AppContainer) with all outbound traffic
+    /// forced through the Berth Landing proxy and per-account isolated HOME.
+    Sandbox,
     /// Requires Linux + zoneinfo + unprivileged `unshare -Ur -m` + no active
     /// Windows/WSL interop bypass. Fails closed otherwise.
     Strict,
@@ -128,16 +132,18 @@ impl IsolationMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TzOverlay => "tz-overlay",
+            Self::Sandbox => "sandbox",
             Self::Strict => "strict",
         }
     }
 
     pub fn parse(raw: &str) -> Result<Self, BerthError> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "tz-overlay" | "tz_overlay" => Ok(Self::TzOverlay),
+            "tz-overlay" | "tz_overlay" | "env" => Ok(Self::TzOverlay),
+            "sandbox" | "auto" => Ok(Self::Sandbox),
             "strict" => Ok(Self::Strict),
             other => Err(BerthError::InvalidArgument(format!(
-                "isolation mode must be `tz-overlay` or `strict`; got `{other}`"
+                "isolation mode must be `sandbox`, `tz-overlay`, or `strict`; got `{other}`"
             ))),
         }
     }
@@ -2170,6 +2176,17 @@ pub fn evaluate_isolation(
                 host_visible_notes: Vec::new(),
             })
         }
+        IsolationMode::Sandbox => Ok(IsolationReport {
+            mode: "sandbox".to_string(),
+            os_egress_isolation: true,
+            mount_namespace_localtime: caps.os == "linux" && caps.zoneinfo_exists,
+            windows_interop_path_scrubbed: true,
+            strict_eligible,
+            strict_blockers: Vec::new(),
+            host_visible_notes: vec![
+                "sandbox mode routes all outbound network through the Berth Landing proxy with OS-native kernel egress confinement and per-account isolated HOME".into(),
+            ],
+        }),
         IsolationMode::TzOverlay => Ok(IsolationReport {
             mode: "tz-overlay".to_string(),
             os_egress_isolation: false,

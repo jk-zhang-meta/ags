@@ -247,6 +247,8 @@ fn cli_berth_lease_and_launch_e2e_with_mock_central_ingress_and_stock_codex() {
             &format!("http://{central_addr}"),
             "--key",
             "sk-e2e",
+            "--isolation",
+            "tz-overlay",
             "--allow-insecure-http-for-tests",
         ])
         .output()
@@ -357,6 +359,213 @@ curl -fsS -X POST "${OPENAI_BASE_URL}/responses" \
     assert!(report.contains(r#""from":"berth-edge""#), "report:\n{report}");
     assert!(saw_real_lease_token.load(Ordering::SeqCst));
     assert_eq!(released_count.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_berth_sandbox_full_proxy_and_zero_leak_e2e() {
+    if !berth::sandbox::probe_sandbox_backend().available {
+        return;
+    }
+
+    fn sbx_read_http_head(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while buf.len() < 16 * 1024 {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    buf.push(byte[0]);
+                    if buf.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn sbx_write_json(stream: &mut TcpStream, status: u16, body: &str) {
+        let resp = format!(
+            "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.flush();
+    }
+
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let workspace = dir.path().join("workspace");
+    let xdg_config = dir.path().join("config");
+    let xdg_state = dir.path().join("state");
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(home.join(".ssh").join("id_ed25519"), "TOP_SECRET_SSH_KEY").unwrap();
+
+    // Mock Berth Ingress handling BOTH:
+    //   1. `GET /healthz`
+    //   2. `POST /v1/responses` (main AI API via CageShim -> Unix socket -> exact port!)
+    //   3. `CONNECT statsig.anthropic.com:443` (side-channel via ForwardProxy -> Unix socket!)
+    let ingress_ln = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ingress_addr = ingress_ln.local_addr().unwrap();
+    let saw_main_api = Arc::new(AtomicBool::new(false));
+    let saw_connect_proxy = Arc::new(AtomicBool::new(false));
+    let saw_main_clone = Arc::clone(&saw_main_api);
+    let saw_conn_clone = Arc::clone(&saw_connect_proxy);
+
+    let _ingress_thread = thread::spawn(move || {
+        for stream in ingress_ln.incoming() {
+            let Ok(mut s) = stream else { break };
+            let head = sbx_read_http_head(&mut s);
+            if head.starts_with("GET /healthz") {
+                sbx_write_json(&mut s, 200, r#"{"ok":true}"#);
+                continue;
+            }
+            if head.starts_with("POST /v1/responses") {
+                assert!(head.contains("Authorization: Bearer bst_sandbox_live_lease"));
+                saw_main_clone.store(true, Ordering::SeqCst);
+                sbx_write_json(&mut s, 200, r#"{"sandbox_api":"ok"}"#);
+                continue;
+            }
+            if head.starts_with("CONNECT statsig.anthropic.com:443") {
+                assert!(head.contains("X-Berth-Lease: bst_sandbox_live_lease"));
+                saw_conn_clone.store(true, Ordering::SeqCst);
+                let _ = s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                let _ = s.flush();
+                let mut req_buf = [0u8; 512];
+                let _ = s.read(&mut req_buf);
+                let _ = s.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nproxied-tunnel",
+                );
+                let _ = s.flush();
+                continue;
+            }
+            sbx_write_json(&mut s, 404, r#"{"error":"unexpected"}"#);
+        }
+    });
+
+    // Mock Berth Central returning a Houston America/Chicago lease.
+    let central_ln = TcpListener::bind("127.0.0.1:0").unwrap();
+    let central_addr = central_ln.local_addr().unwrap();
+    let _central_thread = thread::spawn(move || {
+        for stream in central_ln.incoming() {
+            let Ok(mut s) = stream else { break };
+            let head = sbx_read_http_head(&mut s);
+            if head.starts_with("POST /api/v1/ags/leases ") {
+                let body = format!(
+                    r#"{{
+                        "lease_id":"lease_sbx_01",
+                        "lease_token":"bst_sandbox_live_lease",
+                        "work_session_id":"ws_sbx_01",
+                        "account_id":901,
+                        "expires_at":"2099-01-01T00:00:00Z",
+                        "cage":{{"cage_id":"cage_houston","gate_epoch":1,"timezone":"America/Chicago","country_code":"US","locale":"en_US.UTF-8","strict_mode":true}},
+                        "zone":{{"zone_slug":"overseas","ingress_candidates":[{{"node_id":"la-1","url":"http://{ingress_addr}","weight":100}}]}}
+                    }}"#
+                );
+                sbx_write_json(&mut s, 200, &body);
+            } else if head.starts_with("DELETE /api/v1/ags/leases/") {
+                sbx_write_json(&mut s, 200, r#"{"released":true}"#);
+            }
+        }
+    });
+
+    // Init with NEW default `--isolation sandbox`!
+    let init = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "init",
+            "--url",
+            &format!("http://{central_addr}"),
+            "--key",
+            "sk-sbx-e2e",
+            "--allow-insecure-http-for-tests",
+        ])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "init stderr: {}", String::from_utf8_lossy(&init.stderr));
+
+    // Create fake `codex` inside workspace (so it's visible inside bwrap) testing ALL 6 sandbox guarantees!
+    let fake_codex = workspace.join("fake-codex.sh");
+    let report_file = workspace.join("sandbox-report.txt");
+    fs::write(
+        &fake_codex,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+{
+  echo "BACKEND=${BERTH_SANDBOX_BACKEND:-}"
+  echo "TZ=${TZ:-}"
+  echo "SSH_HIDDEN=$([ ! -e "$HOME/.ssh/id_ed25519" ] && echo yes || echo no)"
+  echo "WSL_CLEARED=$([ -z "${WSL_INTEROP:-}" ] && [ -z "${WSL_DISTRO_NAME:-}" ] && echo yes || echo no)"
+  echo "RESOLV_CLEAN=$(grep -c '127.0.0.1' /etc/resolv.conf || true)"
+  echo "MACHINE_ID_LEN=$(cat /etc/machine-id | tr -d '\n' | wc -c)"
+  echo "PROXY_SET=$([ -n "${HTTPS_PROXY:-}" ] && [ -n "${ALL_PROXY:-}" ] && echo yes || echo no)"
+  echo "DIRECT_BLOCKED=$(python3 -c "import socket,sys
+s=socket.socket()
+s.settimeout(1)
+try:
+    s.connect(('1.1.1.1',443))
+    print('no')
+except OSError:
+    print('yes')
+")"
+  echo "MAIN_API=$(curl -fsS --noproxy 127.0.0.1 -X POST "${OPENAI_BASE_URL}/responses" -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" -d '{}')"
+  echo "CONNECT_PROXY=$(python3 -c "import os,socket,base64,urllib.parse
+u=urllib.parse.urlparse(os.environ['HTTPS_PROXY'])
+s=socket.create_connection((u.hostname,u.port),timeout=5)
+auth=base64.b64encode((u.username+':'+u.password).encode()).decode()
+s.sendall(f'CONNECT statsig.anthropic.com:443 HTTP/1.1\r\nHost: statsig.anthropic.com:443\r\nProxy-Authorization: Basic {auth}\r\n\r\n'.encode())
+hdr=s.recv(4096)
+assert b'200' in hdr, hdr
+s.sendall(b'GET / HTTP/1.1\r\nHost: statsig.anthropic.com\r\n\r\n')
+resp=s.recv(4096).decode()
+print(resp.splitlines()[-1])
+")"
+} > sandbox-report.txt
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let launch = Command::new(ags_bin())
+        .current_dir(&workspace)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("AGENT_SESSION_STATE_DIR", &xdg_state)
+        .env("AGENT_SESSION_CODEX_BINARY", &fake_codex)
+        .env("WSL_INTEROP", "/run/WSL/999_interop")
+        .env("WSL_DISTRO_NAME", "Arch")
+        .args(["codex"])
+        .output()
+        .unwrap();
+    assert!(
+        launch.status.success(),
+        "sandbox launch failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&launch.stdout),
+        String::from_utf8_lossy(&launch.stderr)
+    );
+
+    let report = fs::read_to_string(&report_file).unwrap();
+    assert!(report.contains("BACKEND=linux-bwrap"), "report:\n{report}");
+    assert!(report.contains("TZ=America/Chicago"), "report:\n{report}");
+    assert!(report.contains("SSH_HIDDEN=yes"), "report:\n{report}");
+    assert!(report.contains("WSL_CLEARED=yes"), "report:\n{report}");
+    assert!(report.contains("RESOLV_CLEAN=1"), "report:\n{report}");
+    assert!(report.contains("MACHINE_ID_LEN=32"), "report:\n{report}");
+    assert!(report.contains("PROXY_SET=yes"), "report:\n{report}");
+    assert!(report.contains("DIRECT_BLOCKED=yes"), "report:\n{report}");
+    assert!(report.contains(r#"MAIN_API={"sandbox_api":"ok"}"#), "report:\n{report}");
+    assert!(report.contains("CONNECT_PROXY=proxied-tunnel"), "report:\n{report}");
+    assert!(saw_main_api.load(Ordering::SeqCst));
+    assert!(saw_connect_proxy.load(Ordering::SeqCst));
 }
 
 #[test]

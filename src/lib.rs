@@ -25,5 +25,6 @@ pub mod pipeline;
 pub mod providers;
 pub mod replay;
 pub mod responses;
+pub mod sandbox;
 pub mod self_update;
 pub mod store;

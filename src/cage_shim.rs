@@ -173,9 +173,17 @@ pub struct CageShim;
 
 pub struct CageShimHandle {
     listen_addr: SocketAddr,
+    proxy_addr: SocketAddr,
     shim_token: String,
     state: Arc<ShimSharedState>,
     accept_thread: Option<JoinHandle<()>>,
+    proxy_thread: Option<JoinHandle<()>>,
+    #[cfg(unix)]
+    unix_bridge_shutdown: Arc<AtomicBool>,
+    #[cfg(unix)]
+    unix_bridge_threads: Vec<JoinHandle<()>>,
+    #[cfg(unix)]
+    unix_bridge_paths: Vec<PathBuf>,
 }
 
 impl CageShim {
@@ -201,6 +209,10 @@ impl CageShim {
 
         let listener = TcpListener::bind(bind_socket)?;
         let listen_addr = listener.local_addr()?;
+
+        // Companion authenticated Forward Proxy (HTTP CONNECT + SOCKS5h) bound strictly on 127.0.0.1:0.
+        let proxy_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+        let proxy_addr = proxy_listener.local_addr()?;
 
         // 32 random bytes (64 lowercase hex chars) from OS CSPRNG via Uuid::new_v4().
         let shim_token = format!(
@@ -249,11 +261,25 @@ impl CageShim {
             .spawn(move || accept_loop(listener, accept_state))
             .map_err(|e| BerthError::Io(format!("failed to spawn shim accept thread: {e}")))?;
 
+        let proxy_state = Arc::clone(&state);
+        let proxy_thread = thread::Builder::new()
+            .name("ags-cage-proxy-accept".into())
+            .spawn(move || proxy_accept_loop(proxy_listener, proxy_state))
+            .map_err(|e| BerthError::Io(format!("failed to spawn proxy accept thread: {e}")))?;
+
         Ok(CageShimHandle {
             listen_addr,
+            proxy_addr,
             shim_token,
             state,
             accept_thread: Some(accept_thread),
+            proxy_thread: Some(proxy_thread),
+            #[cfg(unix)]
+            unix_bridge_shutdown: Arc::new(AtomicBool::new(false)),
+            #[cfg(unix)]
+            unix_bridge_threads: Vec::new(),
+            #[cfg(unix)]
+            unix_bridge_paths: Vec::new(),
         })
     }
 }
@@ -265,6 +291,18 @@ impl CageShimHandle {
 
     pub fn listen_url(&self) -> String {
         format!("http://{}", self.listen_addr)
+    }
+
+    pub fn proxy_addr(&self) -> SocketAddr {
+        self.proxy_addr
+    }
+
+    pub fn proxy_http_url(&self) -> String {
+        format!("http://bh:{}@{}", self.shim_token, self.proxy_addr)
+    }
+
+    pub fn proxy_socks5_url(&self) -> String {
+        format!("socks5h://bh:{}@{}", self.shim_token, self.proxy_addr)
     }
 
     pub fn shim_token(&self) -> &str {
@@ -281,11 +319,83 @@ impl CageShimHandle {
         }
     }
 
+    /// Starts private `0600` Unix Domain Socket bridges (`shim.sock` and `proxy.sock`)
+    /// forwarding raw byte streams directly to the host-side `CageShim` and `ForwardProxy`
+    /// so Linux/WSL `--unshare-net` sandboxes need zero external network interfaces.
+    #[cfg(unix)]
+    pub fn start_unix_bridges(
+        &mut self,
+        dir: &std::path::Path,
+    ) -> Result<(PathBuf, PathBuf), BerthError> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+
+        let shim_sock = dir.join("shim.sock");
+        let proxy_sock = dir.join("proxy.sock");
+        let _ = std::fs::remove_file(&shim_sock);
+        let _ = std::fs::remove_file(&proxy_sock);
+
+        let shim_unix = UnixListener::bind(&shim_sock)?;
+        let _ = std::fs::set_permissions(&shim_sock, std::fs::Permissions::from_mode(0o600));
+        let proxy_unix = UnixListener::bind(&proxy_sock)?;
+        let _ = std::fs::set_permissions(&proxy_sock, std::fs::Permissions::from_mode(0o600));
+
+        self.unix_bridge_shutdown.store(false, Ordering::SeqCst);
+
+        let shim_target = self.listen_addr;
+        let state1 = Arc::clone(&self.state);
+        let bshut1 = Arc::clone(&self.unix_bridge_shutdown);
+        let t1 = thread::Builder::new()
+            .name("ags-unix-shim-bridge".into())
+            .spawn(move || unix_to_tcp_accept_loop(shim_unix, shim_target, state1, bshut1))
+            .map_err(|e| BerthError::Io(format!("spawn unix shim bridge: {e}")))?;
+
+        let proxy_target = self.proxy_addr;
+        let state2 = Arc::clone(&self.state);
+        let bshut2 = Arc::clone(&self.unix_bridge_shutdown);
+        let t2 = thread::Builder::new()
+            .name("ags-unix-proxy-bridge".into())
+            .spawn(move || unix_to_tcp_accept_loop(proxy_unix, proxy_target, state2, bshut2))
+            .map_err(|e| BerthError::Io(format!("spawn unix proxy bridge: {e}")))?;
+
+        self.unix_bridge_threads.push(t1);
+        self.unix_bridge_threads.push(t2);
+        self.unix_bridge_paths.push(shim_sock.clone());
+        self.unix_bridge_paths.push(proxy_sock.clone());
+
+        Ok((shim_sock, proxy_sock))
+    }
+
+    /// Stops and joins Unix Domain Socket bridge listeners BEFORE the temp directory
+    /// holding the socket paths is deleted.
+    #[cfg(unix)]
+    pub fn stop_unix_bridges(&mut self) {
+        self.unix_bridge_shutdown.store(true, Ordering::SeqCst);
+        for sock_path in &self.unix_bridge_paths {
+            let _ = std::os::unix::net::UnixStream::connect(sock_path);
+        }
+        for handle in self.unix_bridge_threads.drain(..) {
+            let _ = handle.join();
+        }
+        for sock_path in self.unix_bridge_paths.drain(..) {
+            let _ = std::fs::remove_file(sock_path);
+        }
+    }
+
     pub fn shutdown(&mut self) {
+        #[cfg(unix)]
+        self.stop_unix_bridges();
         if !self.state.shutdown.swap(true, Ordering::SeqCst) {
             let _ = TcpStream::connect_timeout(&self.listen_addr, Duration::from_millis(200));
+            let _ = TcpStream::connect_timeout(&self.proxy_addr, Duration::from_millis(200));
         }
         if let Some(handle) = self.accept_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.proxy_thread.take() {
             let _ = handle.join();
         }
     }
@@ -1309,6 +1419,446 @@ fn write_simple_response(
 }
 
 // ---------------------------------------------------------------------------
+// Unified Forward Proxy (HTTP CONNECT + Plain HTTP + SOCKS5h -> Berth Landing)
+// ---------------------------------------------------------------------------
+
+fn proxy_accept_loop(listener: TcpListener, state: Arc<ShimSharedState>) {
+    for incoming in listener.incoming() {
+        if state.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(stream) = incoming else {
+            if state.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            continue;
+        };
+        if state.shutdown.load(Ordering::SeqCst) {
+            let _ = stream.shutdown(Shutdown::Both);
+            break;
+        }
+        let active = state.active_conns.fetch_add(1, Ordering::SeqCst);
+        if active >= MAX_CONCURRENT_CONNS {
+            state.active_conns.fetch_sub(1, Ordering::SeqCst);
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
+        }
+        let conn_state = Arc::clone(&state);
+        let _ = thread::Builder::new()
+            .name("ags-cage-proxy-conn".into())
+            .spawn(move || {
+                let _guard = ActiveConnGuard(Arc::clone(&conn_state));
+                let _ = handle_forward_proxy_conn(stream, &conn_state);
+            });
+    }
+}
+
+#[cfg(unix)]
+fn unix_to_tcp_accept_loop(
+    listener: std::os::unix::net::UnixListener,
+    target: SocketAddr,
+    state: Arc<ShimSharedState>,
+    bridge_shutdown: Arc<AtomicBool>,
+) {
+    for incoming in listener.incoming() {
+        if bridge_shutdown.load(Ordering::SeqCst) || state.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let Ok(unix_stream) = incoming else {
+            if bridge_shutdown.load(Ordering::SeqCst) || state.shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+            continue;
+        };
+        if bridge_shutdown.load(Ordering::SeqCst) || state.shutdown.load(Ordering::SeqCst) {
+            let _ = unix_stream.shutdown(Shutdown::Both);
+            break;
+        }
+        let _ = thread::Builder::new()
+            .name("ags-unix-bridge-conn".into())
+            .spawn(move || {
+                let Ok(tcp) = TcpStream::connect_timeout(&target, Duration::from_secs(5)) else {
+                    let _ = unix_stream.shutdown(Shutdown::Both);
+                    return;
+                };
+                let _ = tcp.set_nodelay(true);
+                crate::sandbox::pipe_tcp_and_unix(tcp, unix_stream);
+            });
+    }
+}
+
+fn handle_forward_proxy_conn(client: TcpStream, state: &ShimSharedState) -> io::Result<()> {
+    let _ = client.set_nodelay(true);
+    let _ = client.set_read_timeout(Some(CLIENT_HEAD_TIMEOUT));
+    let _ = client.set_write_timeout(Some(Duration::from_secs(30)));
+
+    let mut first = [0u8; 1];
+    match client.peek(&mut first) {
+        Ok(0) => return Ok(()),
+        Ok(_) => {}
+        Err(_) => return Ok(()),
+    }
+
+    if first[0] == 0x05 {
+        return handle_socks5_proxy(client, state);
+    }
+    handle_http_forward_proxy(client, state)
+}
+
+fn open_berth_connect_tunnel(
+    target_host_port: &str,
+    state: &ShimSharedState,
+) -> Result<(ClientTransport, Vec<u8>), (u16, String)> {
+    let (lease_id, lease_token, work_session_id) = {
+        let guard = state
+            .secrets
+            .read()
+            .map_err(|_| (500u16, "shim secret lock poisoned".to_string()))?;
+        (
+            guard.lease_id.clone(),
+            guard.lease_token.clone(),
+            guard.work_session_id.clone(),
+        )
+    };
+
+    let mut upstream = ClientTransport::connect_direct(&state.ingress, state.upstream_timeout)
+        .map_err(|e| (502u16, format!("berth ingress connect failed: {e}")))?;
+
+    let req = format!(
+        "CONNECT {target_host_port} HTTP/1.1\r\n\
+         Host: {target_host_port}\r\n\
+         X-Berth-Lease: {lease_token}\r\n\
+         X-Berth-Connect-Target: {target_host_port}\r\n\
+         X-Berth-Lease-ID: {lease_id}\r\n\
+         X-Berth-Work-Session-ID: {work_session_id}\r\n\
+         X-Berth-AGS-Version: {AGS_VERSION_HEADER_VALUE}\r\n\r\n"
+    );
+    upstream
+        .write_all(req.as_bytes())
+        .and_then(|()| upstream.flush())
+        .map_err(|e| (502u16, format!("berth CONNECT write failed: {e}")))?;
+
+    let (status_line, _headers, trailing) = read_http_head(&mut upstream)
+        .map_err(|e| (502u16, format!("berth CONNECT response failed: {e}")))?
+        .ok_or_else(|| (502u16, "berth CONNECT unexpected EOF".to_string()))?;
+
+    let status = parse_http_status_code(&status_line).unwrap_or(502);
+    if status != 200 {
+        return Err((status, format!("berth CONNECT rejected with HTTP {status}")));
+    }
+    Ok((upstream, trailing))
+}
+
+fn handle_socks5_proxy(mut client: TcpStream, state: &ShimSharedState) -> io::Result<()> {
+    // 1. Greeting: VER(1) NMETHODS(1) METHODS(n)
+    let mut hdr = [0u8; 2];
+    client.read_exact(&mut hdr)?;
+    if hdr[0] != 0x05 || hdr[1] == 0 {
+        return Ok(());
+    }
+    let mut methods = vec![0u8; hdr[1] as usize];
+    client.read_exact(&mut methods)?;
+    // Require RFC 1929 Username/Password authentication (0x02).
+    if !methods.contains(&0x02) {
+        let _ = client.write_all(&[0x05, 0xFF]);
+        let _ = client.flush();
+        state.metrics.auth_rejected.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    client.write_all(&[0x05, 0x02])?;
+    client.flush()?;
+
+    // 2. RFC 1929 Subnegotiation: VER(1)=0x01 ULEN(1) UNAME PLEN(1) PASSWD
+    let mut auth_hdr = [0u8; 2];
+    client.read_exact(&mut auth_hdr)?;
+    if auth_hdr[0] != 0x01 {
+        let _ = client.write_all(&[0x01, 0x01]);
+        return Ok(());
+    }
+    let mut uname = vec![0u8; auth_hdr[1] as usize];
+    client.read_exact(&mut uname)?;
+    let mut plen = [0u8; 1];
+    client.read_exact(&mut plen)?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    client.read_exact(&mut pass)?;
+
+    if !constant_time_eq_digest(&sha256_bytes(&pass), &state.shim_token_digest) {
+        let _ = client.write_all(&[0x01, 0x01]);
+        let _ = client.flush();
+        state.metrics.auth_rejected.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    client.write_all(&[0x01, 0x00])?;
+    client.flush()?;
+
+    // 3. Request: VER(1) CMD(1) RSV(1) ATYP(1) DST.ADDR DST.PORT(2)
+    let mut req_hdr = [0u8; 4];
+    client.read_exact(&mut req_hdr)?;
+    if req_hdr[0] != 0x05 || req_hdr[1] != 0x01 {
+        // Only TCP CONNECT (0x01) is supported (rejects BIND & UDP ASSOCIATE!).
+        let _ = client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        let _ = client.flush();
+        return Ok(());
+    }
+
+    let host = match req_hdr[3] {
+        0x01 => {
+            let mut ip4 = [0u8; 4];
+            client.read_exact(&mut ip4)?;
+            Ipv4Addr::from(ip4).to_string()
+        }
+        0x03 => {
+            let mut dlen = [0u8; 1];
+            client.read_exact(&mut dlen)?;
+            let mut dom = vec![0u8; dlen[0] as usize];
+            client.read_exact(&mut dom)?;
+            match String::from_utf8(dom) {
+                Ok(s) if !s.is_empty() && !s.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace()) => s,
+                _ => {
+                    let _ = client.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+                    return Ok(());
+                }
+            }
+        }
+        // Reject IPv6 (0x04) and unknown address types (IPv4-only / remote-domain policy).
+        _ => {
+            let _ = client.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            let _ = client.flush();
+            return Ok(());
+        }
+    };
+    let mut port_bytes = [0u8; 2];
+    client.read_exact(&mut port_bytes)?;
+    let port = u16::from_be_bytes(port_bytes);
+    if port == 0 {
+        let _ = client.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        return Ok(());
+    }
+    let target = format!("{host}:{port}");
+
+    match open_berth_connect_tunnel(&target, state) {
+        Ok((upstream, trailing)) => {
+            client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])?;
+            if !trailing.is_empty() {
+                client.write_all(&trailing)?;
+            }
+            client.flush()?;
+            state
+                .metrics
+                .requests_forwarded
+                .fetch_add(1, Ordering::Relaxed);
+            run_websocket_tunnel(client, upstream, &state.shutdown)
+        }
+        Err((status, _)) => {
+            let rep = if status == 403 { 0x02 } else { 0x05 };
+            let _ = client.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            let _ = client.flush();
+            Ok(())
+        }
+    }
+}
+
+fn handle_http_forward_proxy(mut client: TcpStream, state: &ShimSharedState) -> io::Result<()> {
+    let req = match parse_request_head(&mut client) {
+        Ok(Some(req)) => req,
+        Ok(None) => return Ok(()),
+        Err(_) => {
+            return write_simple_response(
+                &mut client,
+                400,
+                "Bad Request",
+                &[],
+                b"{\"error\":\"malformed_proxy_request\"}",
+            );
+        }
+    };
+
+    if req
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("origin"))
+    {
+        state
+            .metrics
+            .forbidden_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        return write_simple_response(
+            &mut client,
+            403,
+            "Forbidden",
+            &[],
+            b"{\"error\":\"origin_header_rejected\"}",
+        );
+    }
+
+    if !verify_proxy_auth(&req.headers, &state.shim_token_digest) {
+        state.metrics.auth_rejected.fetch_add(1, Ordering::Relaxed);
+        return write_simple_response(
+            &mut client,
+            407,
+            "Proxy Authentication Required",
+            &[("Proxy-Authenticate", "Basic realm=\"berth-cage-proxy\"")],
+            b"{\"error\":\"proxy_auth_required\"}",
+        );
+    }
+
+    if req.method.eq_ignore_ascii_case("CONNECT") {
+        let target = req.target.trim();
+        if target.is_empty()
+            || !target.contains(':')
+            || target.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        {
+            return write_simple_response(
+                &mut client,
+                400,
+                "Bad Request",
+                &[],
+                b"{\"error\":\"invalid_connect_target\"}",
+            );
+        }
+        match open_berth_connect_tunnel(target, state) {
+            Ok((mut upstream, upstream_trailing)) => {
+                client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+                if !upstream_trailing.is_empty() {
+                    client.write_all(&upstream_trailing)?;
+                }
+                client.flush()?;
+                if !req.trailing.is_empty() {
+                    upstream.write_all(&req.trailing)?;
+                    upstream.flush()?;
+                }
+                state
+                    .metrics
+                    .requests_forwarded
+                    .fetch_add(1, Ordering::Relaxed);
+                return run_websocket_tunnel(client, upstream, &state.shutdown);
+            }
+            Err((status, msg)) => {
+                let reason = if status == 403 {
+                    "Forbidden"
+                } else {
+                    "Bad Gateway"
+                };
+                let body = serde_json::json!({ "error": msg }).to_string();
+                return write_simple_response(&mut client, status, reason, &[], body.as_bytes());
+            }
+        }
+    }
+
+    // Plain HTTP proxy request (e.g., `GET http://example.com/path HTTP/1.1`).
+    let parsed = match ParsedUrl::parse(&req.target) {
+        Ok(p) if !p.is_https => p,
+        _ => {
+            return write_simple_response(
+                &mut client,
+                400,
+                "Bad Request",
+                &[],
+                b"{\"error\":\"plain_proxy_requires_http_url\"}",
+            );
+        }
+    };
+    let connect_target = format!("{}:{}", parsed.host, parsed.port);
+    let (mut upstream, _) = match open_berth_connect_tunnel(&connect_target, state) {
+        Ok(pair) => pair,
+        Err((status, msg)) => {
+            let reason = if status == 403 { "Forbidden" } else { "Bad Gateway" };
+            let body = serde_json::json!({ "error": msg }).to_string();
+            return write_simple_response(&mut client, status, reason, &[], body.as_bytes());
+        }
+    };
+
+    let rel_path = if parsed.path_and_query.is_empty() {
+        "/".to_string()
+    } else {
+        parsed.path_and_query.clone()
+    };
+    let mut wire = Vec::with_capacity(512 + req.trailing.len());
+    let _ = write!(
+        &mut wire,
+        "{} {} HTTP/1.1\r\nHost: {}\r\n",
+        req.method,
+        rel_path,
+        parsed.host_header()
+    );
+    for (k, v) in &req.headers {
+        let lk = k.to_ascii_lowercase();
+        if matches!(lk.as_str(), "host" | "proxy-authorization" | "proxy-connection") {
+            continue;
+        }
+        let _ = write!(&mut wire, "{k}: {v}\r\n");
+    }
+    wire.extend_from_slice(b"Connection: close\r\n\r\n");
+    wire.extend_from_slice(&req.trailing);
+    upstream.write_all(&wire)?;
+    upstream.flush()?;
+    state
+        .metrics
+        .requests_forwarded
+        .fetch_add(1, Ordering::Relaxed);
+    run_websocket_tunnel(client, upstream, &state.shutdown)
+}
+
+fn verify_proxy_auth(headers: &[(String, String)], expected_digest: &[u8; 32]) -> bool {
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        let mut parts = value.splitn(2, char::is_whitespace);
+        let scheme = parts.next().unwrap_or("");
+        let creds = parts.next().map(str::trim).unwrap_or("");
+        if scheme.eq_ignore_ascii_case("bearer") && !creds.is_empty() {
+            if constant_time_eq_digest(&sha256_bytes(creds.as_bytes()), expected_digest) {
+                return true;
+            }
+        } else if scheme.eq_ignore_ascii_case("basic") && !creds.is_empty() {
+            if let Some(decoded) = decode_base64_std(creds)
+                && let Ok(text) = String::from_utf8(decoded)
+                && let Some((_user, pass)) = text.split_once(':')
+                && constant_time_eq_digest(&sha256_bytes(pass.as_bytes()), expected_digest)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn decode_base64_std(input: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    let val = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in bytes {
+        if b == b'=' {
+            break;
+        }
+        let v = val(b)?;
+        buf = (buf << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1u32 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1727,5 +2277,136 @@ mod tests {
         assert_eq!(sig.recommended_locale, "en_US.UTF-8");
         assert_eq!(sig.available_cohorts, vec!["America/Chicago", "Europe/London"]);
         assert_eq!(shim.metrics().rebind_signals, 1);
+    }
+
+    fn encode_base64_std(input: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b0 = chunk[0];
+            let b1 = *chunk.get(1).unwrap_or(&0);
+            let b2 = *chunk.get(2).unwrap_or(&0);
+            out.push(TABLE[(b0 >> 2) as usize] as char);
+            out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if chunk.len() > 2 {
+                out.push(TABLE[(b2 & 0x3f) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn forward_proxy_http_connect_and_socks5h_tunnel_via_berth_ingress() {
+        // Mock Berth Ingress Relay accepting `CONNECT host:port` + X-Berth-Lease and echoing payload.
+        let ingress_ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ingress_addr = ingress_ln.local_addr().unwrap();
+        let seen_targets = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_clone = Arc::clone(&seen_targets);
+
+        let _ingress_thread = thread::spawn(move || {
+            for stream in ingress_ln.incoming().take(2) {
+                let mut s = stream.unwrap();
+                let (line, hdrs, trailing) = read_http_head(&mut s).unwrap().unwrap();
+                assert!(line.starts_with("CONNECT "), "expected CONNECT, got {line}");
+                let has_lease = hdrs.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("x-berth-lease")
+                        && v == "bst_real_ed25519_secret_token_do_not_leak"
+                });
+                assert!(has_lease, "missing authoritative X-Berth-Lease header");
+                let target = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen_clone.lock().unwrap().push(target);
+
+                s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .unwrap();
+                s.flush().unwrap();
+                if !trailing.is_empty() {
+                    s.write_all(&trailing).unwrap();
+                    s.flush().unwrap();
+                }
+                let mut buf = [0u8; 256];
+                if let Ok(n) = s.read(&mut buf)
+                    && n > 0
+                {
+                    let _ = s.write_all(&buf[..n]);
+                    let _ = s.flush();
+                }
+            }
+        });
+
+        let shim = CageShim::start(base_config(format!("http://{ingress_addr}"))).unwrap();
+        let proxy_addr = shim.proxy_addr();
+        let token = shim.shim_token().to_string();
+
+        // 1. Unauthenticated HTTP CONNECT MUST return 407 Proxy Authentication Required!
+        let unauth = send_raw_http(
+            proxy_addr,
+            "CONNECT statsig.anthropic.com:443 HTTP/1.1\r\nHost: statsig.anthropic.com:443\r\n\r\n",
+        );
+        assert!(unauth.starts_with("HTTP/1.1 407 "), "expected 407, got: {unauth}");
+
+        // 2. Authenticated HTTP CONNECT tunnels full-duplex bytes through Berth Ingress!
+        let basic = encode_base64_std(format!("bh:{token}").as_bytes());
+        let mut c1 = TcpStream::connect(proxy_addr).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write!(
+            c1,
+            "CONNECT statsig.anthropic.com:443 HTTP/1.1\r\nHost: statsig.anthropic.com:443\r\nProxy-Authorization: Basic {basic}\r\n\r\n"
+        )
+        .unwrap();
+        c1.flush().unwrap();
+        let (st1, _, _) = read_http_head(&mut c1).unwrap().unwrap();
+        assert!(st1.contains("200"), "expected 200, got {st1}");
+        c1.write_all(b"ping-connect").unwrap();
+        c1.flush().unwrap();
+        let mut echo1 = [0u8; 12];
+        c1.read_exact(&mut echo1).unwrap();
+        assert_eq!(&echo1, b"ping-connect");
+        drop(c1);
+
+        // 3. Authenticated SOCKS5h (RFC 1928 + RFC 1929 + ATYP=0x03 domain) tunnels cleanly!
+        let mut c2 = TcpStream::connect(proxy_addr).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        // Greeting: VER=5, NMETHODS=1, METHOD=0x02 (user/pass)
+        c2.write_all(&[0x05, 0x01, 0x02]).unwrap();
+        let mut method_resp = [0u8; 2];
+        c2.read_exact(&mut method_resp).unwrap();
+        assert_eq!(method_resp, [0x05, 0x02]);
+        // Auth: VER=1, "bh", token
+        let mut auth_msg = vec![0x01, 2, b'b', b'h', token.len() as u8];
+        auth_msg.extend_from_slice(token.as_bytes());
+        c2.write_all(&auth_msg).unwrap();
+        let mut auth_resp = [0u8; 2];
+        c2.read_exact(&mut auth_resp).unwrap();
+        assert_eq!(auth_resp, [0x01, 0x00]);
+        // Request: CONNECT domain="api.ipify.org" port=443
+        let dom = b"api.ipify.org";
+        let mut req_msg = vec![0x05, 0x01, 0x00, 0x03, dom.len() as u8];
+        req_msg.extend_from_slice(dom);
+        req_msg.extend_from_slice(&443u16.to_be_bytes());
+        c2.write_all(&req_msg).unwrap();
+        let mut rep = [0u8; 10];
+        c2.read_exact(&mut rep).unwrap();
+        assert_eq!(rep[0], 0x05);
+        assert_eq!(rep[1], 0x00);
+        c2.write_all(b"ping-socks5h").unwrap();
+        c2.flush().unwrap();
+        let mut echo2 = [0u8; 12];
+        c2.read_exact(&mut echo2).unwrap();
+        assert_eq!(&echo2, b"ping-socks5h");
+        drop(c2);
+
+        let targets = seen_targets.lock().unwrap().clone();
+        assert_eq!(
+            targets,
+            vec!["statsig.anthropic.com:443", "api.ipify.org:443"]
+        );
     }
 }
