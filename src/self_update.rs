@@ -10,6 +10,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -490,6 +491,7 @@ pub fn download_verify_and_install(
     }
 
     let candidate_path = tmp_dir.path().join("berth");
+    #[cfg(unix)]
     fs::set_permissions(&candidate_path, fs::Permissions::from_mode(0o755))
         .map_err(|e| format!("chmod extracted binary: {e}"))?;
 
@@ -751,6 +753,7 @@ mod tests {
         assert!(parse_sha256_file("not-a-hash").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn download_verify_and_install_verifies_sha256_and_swaps_atomically() {
         // Build a tiny real .tar.xz archive containing a runnable `berth` script.

@@ -20,10 +20,14 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::SocketAddr;
+#[cfg(unix)]
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
+#[cfg(unix)]
 use std::thread;
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +40,7 @@ use crate::berth::{
 use crate::cage_shim::CageShimHandle;
 
 pub const WINDOWS_APPCONTAINER_NAME: &str = "Berth.Cage.Sandbox";
+#[cfg(unix)]
 const TRAMPOLINE_SHIM_TOKEN_ENV: &str = "BERTH_TRAMPOLINE_SHIM_TOKEN";
 
 /// Detected native sandbox backend for the current OS.
@@ -86,6 +91,7 @@ pub struct SandboxLaunchSpec {
 /// Probes native zero-VM sandbox capabilities on Linux/WSL2, macOS, or Windows.
 pub fn probe_sandbox_backend() -> SandboxProbe {
     let os = std::env::consts::OS.to_string();
+    #[cfg(target_os = "linux")]
     let is_wsl = is_wsl_host();
 
     #[cfg(target_os = "linux")]
@@ -962,6 +968,35 @@ fn sbpl_escape(path: &Path) -> String {
         .replace('"', "\\\"")
 }
 
+/// Returns the raw path plus its canonicalized / macOS `/private/*` variants (deduplicated).
+/// On macOS, `/tmp`, `/var`, and `/etc` symlink into `/private/*`, and Seatbelt evaluates
+/// rules against kernel-resolved real paths.
+fn macos_seatbelt_path_variants(path: &Path) -> Vec<PathBuf> {
+    let mut out = vec![path.to_path_buf()];
+    if let Ok(canon) = fs::canonicalize(path) {
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    if let Some(s) = path.to_str() {
+        for prefix in ["/var/", "/tmp/", "/etc/"] {
+            if s.starts_with(prefix) {
+                let priv_path = PathBuf::from(format!("/private{s}"));
+                if !out.contains(&priv_path) {
+                    out.push(priv_path);
+                }
+            }
+        }
+        if matches!(s, "/var" | "/tmp" | "/etc") {
+            let priv_path = PathBuf::from(format!("/private{s}"));
+            if !out.contains(&priv_path) {
+                out.push(priv_path);
+            }
+        }
+    }
+    out
+}
+
 /// Generates a fail-closed macOS Seatbelt (`.sb`) profile enforcing:
 /// - `(deny network*)`, allowing ONLY `localhost:<shim_port>` and `localhost:<proxy_port>`
 /// - Denies `/private/var/run/mDNSResponder` (blocks host DNS lookups)
@@ -974,11 +1009,27 @@ pub fn generate_macos_seatbelt_profile(
     shim_addr: SocketAddr,
     proxy_addr: SocketAddr,
 ) -> String {
-    let ws = sbpl_escape(workspace_dir);
-    let ch = sbpl_escape(cage_home);
-    let rh = sbpl_escape(real_home);
     let shim_port = shim_addr.port();
     let proxy_port = proxy_addr.port();
+
+    let mut deny_read_lines = Vec::new();
+    for rh in macos_seatbelt_path_variants(real_home) {
+        let esc = sbpl_escape(&rh);
+        for sensitive in [".ssh", ".berth", ".gnupg", ".aws", ".kube"] {
+            deny_read_lines.push(format!("  (subpath \"{esc}/{sensitive}\")"));
+        }
+    }
+
+    let mut allow_write_lines = Vec::new();
+    for ws in macos_seatbelt_path_variants(workspace_dir) {
+        allow_write_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&ws)));
+    }
+    for ch in macos_seatbelt_path_variants(cage_home) {
+        allow_write_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&ch)));
+    }
+
+    let deny_read_block = deny_read_lines.join("\n");
+    let allow_write_block = allow_write_lines.join("\n");
 
     format!(
         r#"(version 1)
@@ -991,25 +1042,23 @@ pub fn generate_macos_seatbelt_profile(
 (allow network-inbound (local ip "localhost:*"))
 (allow network-outbound (remote unix-socket))
 (deny network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))
+(deny network-outbound (remote unix-socket (literal "/var/run/mDNSResponder")))
 
-;; 2. Hide host sensitive credential directories.
+;; 2. Hide host sensitive credential directories (raw + canonical paths).
 (deny file-read*
-  (subpath "{rh}/.ssh")
-  (subpath "{rh}/.berth")
-  (subpath "{rh}/.gnupg")
-  (subpath "{rh}/.aws")
-  (subpath "{rh}/.kube"))
+{deny_read_block})
 
 ;; 3. Restrict file writes strictly to workspace, isolated account home, and temp/tty.
 (deny file-write*)
 (allow file-write*
-  (subpath "{ws}")
-  (subpath "{ch}")
+{allow_write_block}
   (subpath "/tmp")
   (subpath "/private/tmp")
   (subpath "/private/var/tmp")
   (subpath "/private/var/folders")
   (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/dtracehelper")
   (literal "/dev/tty")
   (literal "/dev/ptmx")
   (regex #"^/dev/ttys[0-9]+$")
@@ -1400,9 +1449,9 @@ mod tests {
     #[test]
     fn macos_seatbelt_profile_blocks_network_mdns_and_ssh_while_allowing_shim_and_workspace() {
         let sb = generate_macos_seatbelt_profile(
-            Path::new("/Users/alice/code/app"),
+            Path::new("/var/folders/ab/work/app"),
             Path::new("/Users/alice"),
-            Path::new("/Users/alice/.local/state/berth/cages/acct-7/home"),
+            Path::new("/tmp/berth-cages/acct-7/home"),
             "127.0.0.1:41001".parse().unwrap(),
             "127.0.0.1:41002".parse().unwrap(),
         );
@@ -1412,7 +1461,9 @@ mod tests {
         assert!(sb.contains("/private/var/run/mDNSResponder"));
         assert!(sb.contains("/Users/alice/.ssh"));
         assert!(sb.contains("/Users/alice/.berth"));
-        assert!(sb.contains("(subpath \"/Users/alice/code/app\")"));
+        assert!(sb.contains("(subpath \"/var/folders/ab/work/app\")"));
+        assert!(sb.contains("(subpath \"/private/var/folders/ab/work/app\")"));
+        assert!(sb.contains("(subpath \"/private/tmp/berth-cages/acct-7/home\")"));
     }
 
     #[test]
