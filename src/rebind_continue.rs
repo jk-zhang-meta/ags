@@ -1559,18 +1559,21 @@ fn migrate_codex_goal_row(
             .is_ok()
             && tmp_db.is_file();
         if vacuum_ok {
-            let dst = Connection::open(&tmp_db)?;
-            let _ = dst.execute("DELETE FROM thread_goal_continuation_deferrals", []);
-            let _ = dst.execute("DELETE FROM thread_goals", []);
+            let mut dst = Connection::open(&tmp_db)?;
+            let tx = dst.transaction()?;
+            let _ = tx.execute("DELETE FROM thread_goal_continuation_deferrals", []);
+            tx.execute("DELETE FROM thread_goals", [])?;
+            tx.commit()?;
             drop(dst);
             fs::rename(&tmp_db, &new_db)?;
         } else {
             let _ = fs::remove_file(&tmp_db);
             copy_regular_file_safe(&old_db, &new_db)?;
-            if let Ok(dst) = Connection::open(&new_db) {
-                let _ = dst.execute("DELETE FROM thread_goal_continuation_deferrals", []);
-                let _ = dst.execute("DELETE FROM thread_goals", []);
-            }
+            let mut dst = Connection::open(&new_db)?;
+            let tx = dst.transaction()?;
+            let _ = tx.execute("DELETE FROM thread_goal_continuation_deferrals", []);
+            tx.execute("DELETE FROM thread_goals", [])?;
+            tx.commit()?;
         }
     }
 
@@ -1748,22 +1751,74 @@ where
     best.map(|(_, p)| p)
 }
 
+fn ensure_no_symlink_in_path(root_boundary: Option<&Path>, target: &Path) -> Result<()> {
+    let mut cur = match root_boundary {
+        Some(r) => r.to_path_buf(),
+        None => PathBuf::new(),
+    };
+    let tail = match root_boundary {
+        Some(r) => target.strip_prefix(r).unwrap_or(target),
+        None => target,
+    };
+    for comp in tail.components() {
+        cur.push(comp);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to traverse symlink component {} while writing {}",
+                    cur.display(),
+                    target.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn copy_regular_file_safe(src: &Path, dst: &Path) -> Result<()> {
     if is_symlink(src) {
         anyhow::bail!("refusing to copy symlink {}", src.display());
     }
     if let Some(parent) = dst.parent() {
+        ensure_no_symlink_in_path(None, parent)?;
         fs::create_dir_all(parent)?;
     }
+    ensure_no_symlink_in_path(None, dst)?;
     if is_symlink(dst) {
         anyhow::bail!("refusing to overwrite symlink {}", dst.display());
     }
+    #[cfg(unix)]
+    let bytes = {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            anyhow::bail!("refusing to copy non-regular file {}", src.display());
+        }
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        buf
+    };
+    #[cfg(not(unix))]
     let bytes = fs::read(src)?;
+
     let tmp = dst.with_extension(format!(
         "rebind-tmp-{}",
         uuid::Uuid::new_v4().simple()
     ));
-    fs::write(&tmp, &bytes)?;
+    {
+        use std::io::Write as _;
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        out.write_all(&bytes)?;
+        out.sync_all()?;
+    }
     fs::rename(&tmp, dst)?;
     Ok(())
 }

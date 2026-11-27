@@ -1409,13 +1409,20 @@ pub fn generate_macos_seatbelt_profile(
         ".npmrc",
         ".pypirc",
         ".config/gh",
+        ".config/gcloud",
+        ".config/op",
         ".config/berth",
         ".config/ags",
         ".claude",
         ".codex",
         ".grok",
         ".gemini",
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library/Cookies",
         "Library/Keychains",
+        "Library/Preferences/com.apple.Terminal.plist",
         "Library/Application Support/berth",
         "Library/Application Support/ags",
         "Library/Application Support/Google/Chrome",
@@ -1505,9 +1512,10 @@ pub fn generate_macos_seatbelt_profile(
 ;; without ever permitting directory listing (`file-read-data`) of sibling cages or state_dir!
 (allow file-read-metadata
 {allow_ancestor_meta_block})
-;; Re-allow reading strictly inside the active account's own isolated cage home.
+;; Re-allow reading strictly inside the active account's own isolated cage home and current project workspace.
 (allow file-read*
-{allow_cage_read_block})
+{allow_cage_read_block}
+{allow_write_block})
 
 ;; 3. Restrict file writes strictly to workspace, isolated account home, and temp/tty.
 (deny file-write*)

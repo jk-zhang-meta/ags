@@ -3748,6 +3748,7 @@ fn cmd_berth_launch(
     let mut pending_handoff: Option<(
         berth::sandbox::AccountCageHome,
         berth::rebind_continue::DetectedCageSession,
+        Option<i64>,
     )> = None;
     let max_rebinds = if auto_rebind { 5usize } else { 0usize };
 
@@ -3941,8 +3942,27 @@ fn cmd_berth_launch(
         // If we are entering a new Cage after a 409 cross-cohort rebind, cleanly migrate
         // ONLY pure session transcript (+ single-thread goal state) into the new Cage
         // and compute the state-aware continuation argv (never leaking old identity files).
-        if let Some((old_home, detected)) = pending_handoff.take() {
-            let migrated_sid = if isolation_mode == berth::berth::IsolationMode::Sandbox {
+        if let Some((old_home, detected, expected_target_account)) = pending_handoff.take() {
+            let uses_isolated_cage_home = matches!(
+                isolation_mode,
+                berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+            );
+            if let (Some(expected_acct), Some(bound_acct)) = (expected_target_account, lease.account_id) {
+                if bound_acct != 0 && bound_acct != expected_acct {
+                    eprintln!(
+                        "[berth] rebind target mismatch: expected account {} but lease bound account {}; aborting auto-migration to prevent cross-cage corruption",
+                        expected_acct, bound_acct
+                    );
+                    shim.shutdown();
+                    let _ = berth::berth::release_lease_with_token(
+                        &config,
+                        &resolved_auth.bearer_token,
+                        &lease.lease_id,
+                    );
+                    return Ok(ExitCode::from(75));
+                }
+            }
+            let migrated_sid = if uses_isolated_cage_home {
                 match berth::rebind_continue::migrate_session_for_rebind(
                     canonical_agent,
                     &old_home,
@@ -3951,8 +3971,17 @@ fn cmd_berth_launch(
                 ) {
                     Ok(sid) => sid,
                     Err(err) => {
-                        eprintln!("[berth] warning: session migration across cages failed: {err}");
-                        detected.session_id.clone()
+                        eprintln!("[berth] error: session migration across cages failed: {err}");
+                        eprintln!(
+                            "[berth] aborting auto-continue to avoid leaking or dropping session state; resume manually once resolved"
+                        );
+                        shim.shutdown();
+                        let _ = berth::berth::release_lease_with_token(
+                            &config,
+                            &resolved_auth.bearer_token,
+                            &lease.lease_id,
+                        );
+                        return Ok(ExitCode::from(75));
                     }
                 }
             } else {
@@ -3969,7 +3998,11 @@ fn cmd_berth_launch(
             );
         }
 
-        let inspect_home_for_attempt = if isolation_mode == berth::berth::IsolationMode::Sandbox {
+        let uses_isolated_cage_home = matches!(
+            isolation_mode,
+            berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+        );
+        let inspect_home_for_attempt = if uses_isolated_cage_home {
             account_home.home_dir.clone()
         } else {
             real_home.clone()
@@ -3983,7 +4016,10 @@ fn cmd_berth_launch(
             std::collections::BTreeSet::new()
         };
 
-        let status = if isolation_mode == berth::berth::IsolationMode::Sandbox {
+        // Both `sandbox` and `strict` modes MUST execute inside the kernel-enforced
+        // network-isolated OS sandbox (`bwrap --unshare-net` on Linux, Seatbelt on macOS,
+        // AppContainer on Windows) with fail-closed `allow_env_fallback: false` (C-7).
+        let status = if uses_isolated_cage_home {
             let spec = berth::sandbox::SandboxLaunchSpec {
                 agent: canonical_agent.to_string(),
                 workspace_dir: workspace_dir.clone(),
@@ -4005,26 +4041,15 @@ fn cmd_berth_launch(
                 overlay_fs_etc: overlay_plan
                     .as_ref()
                     .map(|p| p.overlay_root.join("fs").join("etc")),
-                // Fail closed when sandbox isolation is selected; users can pass `--isolation tz-overlay` to opt out.
+                // Fail closed when sandbox/strict isolation is selected; users can pass `--isolation tz-overlay` to opt out.
                 allow_env_fallback: false,
                 auto_rebind,
             };
             berth::sandbox::launch_in_sandbox(&spec, &mut shim)
                 .map_err(|e| std::io::Error::other(e.to_string()))
         } else {
-            let mut cmd = if isolation_mode == berth::berth::IsolationMode::Strict {
-                if let Some(plan) = &overlay_plan {
-                    build_strict_unshare_command(&plan.overlay_root, &stock_bin, &current_args)
-                } else {
-                    let mut c = std::process::Command::new(&stock_bin);
-                    c.args(&current_args);
-                    c
-                }
-            } else {
-                let mut c = std::process::Command::new(&stock_bin);
-                c.args(&current_args);
-                c
-            };
+            let mut cmd = std::process::Command::new(&stock_bin);
+            cmd.args(&current_args);
 
             if let Some(plan) = &overlay_plan {
                 for key in &plan.unset_env {
@@ -4079,7 +4104,7 @@ fn cmd_berth_launch(
                 if let Some(rec_acct) = signal.recommended_account_id {
                     next_accounts = vec![rec_acct.to_string()];
                 }
-                pending_handoff = Some((account_home, detected));
+                pending_handoff = Some((account_home, detected, signal.recommended_account_id));
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             }
