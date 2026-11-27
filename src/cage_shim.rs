@@ -781,16 +781,55 @@ fn forward_to_upstream(
     let is_ws = is_websocket_upgrade_request(&req.headers);
 
     // Read full request body for non-WS requests before dialing or stream it right after headers.
+    const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
     let mut content_length: Option<usize> = None;
+    let mut has_content_length = false;
     let mut req_chunked = false;
+    let mut has_transfer_encoding = false;
     for (k, v) in &req.headers {
         if k.eq_ignore_ascii_case("content-length") {
-            content_length = v.parse::<usize>().ok();
-        } else if k.eq_ignore_ascii_case("transfer-encoding")
-            && v.to_ascii_lowercase().contains("chunked")
-        {
-            req_chunked = true;
+            let trimmed = v.trim();
+            match trimmed.parse::<usize>() {
+                Ok(parsed) => {
+                    if let Some(prev) = content_length
+                        && prev != parsed
+                    {
+                        return write_simple_response(
+                            &mut client,
+                            400,
+                            "Bad Request",
+                            &[],
+                            b"{\"error\":\"conflicting_content_length\"}",
+                        );
+                    }
+                    content_length = Some(parsed);
+                    has_content_length = true;
+                }
+                Err(_) => {
+                    return write_simple_response(
+                        &mut client,
+                        400,
+                        "Bad Request",
+                        &[],
+                        b"{\"error\":\"invalid_content_length\"}",
+                    );
+                }
+            }
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            has_transfer_encoding = true;
+            if v.to_ascii_lowercase().contains("chunked") {
+                req_chunked = true;
+            }
         }
+    }
+    if has_content_length && has_transfer_encoding {
+        return write_simple_response(
+            &mut client,
+            400,
+            "Bad Request",
+            &[],
+            b"{\"error\":\"ambiguous_framing_cl_and_te\"}",
+        );
     }
 
     let mut req_body = Vec::new();
@@ -800,7 +839,7 @@ fn forward_to_upstream(
     } else if req_chunked {
         let chained = io::Cursor::new(req.trailing).chain(&mut client);
         let mut br = BufReader::new(chained);
-        match read_chunked_body(&mut br, 16 * 1024 * 1024) {
+        match read_chunked_body(&mut br, MAX_REQUEST_BODY_BYTES) {
             Ok(decoded) => req_body = decoded,
             Err(_) => {
                 return write_simple_response(
@@ -815,6 +854,15 @@ fn forward_to_upstream(
     } else if let Some(len) = content_length
         && len > 0
     {
+        if len > MAX_REQUEST_BODY_BYTES {
+            return write_simple_response(
+                &mut client,
+                413,
+                "Payload Too Large",
+                &[],
+                b"{\"error\":\"request_body_too_large\"}",
+            );
+        }
         req_body.reserve(len);
         let from_trailing = len.min(req.trailing.len());
         req_body.extend_from_slice(&req.trailing[..from_trailing]);

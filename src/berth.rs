@@ -57,6 +57,12 @@ const CARRIER_ENV_UNSET: &[&str] = &[
 ];
 
 const ALL_PROVIDER_CREDENTIAL_ENVS: &[&str] = &[
+    "AGY_LLM_GATEWAY_API_KEY",
+    "AGY_LLM_GATEWAY_HEADERS",
+    "AGY_LLM_GATEWAY_MODELS",
+    "AGY_LLM_GATEWAY_PROXY_URL",
+    "AGY_LLM_GATEWAY_URL",
+    "AGY_LLM_GATEWAY_WIRE_PROTOCOL",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
@@ -2527,6 +2533,8 @@ pub fn build_cli_launch_env_with_caps(
             set_env.insert("DISABLE_TELEMETRY".to_string(), "1".to_string());
         }
         "agy" => {
+            set_env.insert("AGY_LLM_GATEWAY_URL".to_string(), base.to_string());
+            set_env.insert("AGY_LLM_GATEWAY_API_KEY".to_string(), shim_token.to_string());
             set_env.insert("GEMINI_API_BASE".to_string(), base.to_string());
             set_env.insert("GOOGLE_GEMINI_BASE_URL".to_string(), base.to_string());
             set_env.insert("GEMINI_API_KEY".to_string(), shim_token.to_string());
