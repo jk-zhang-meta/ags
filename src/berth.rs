@@ -2362,17 +2362,39 @@ pub fn evaluate_isolation(
 // Per-CLI Environment Plan Generator (Stock codex / claude / agy / grok)
 // ---------------------------------------------------------------------------
 
-/// Strips `/mnt/<drive>` and `/mnt/<drive>/...` Windows DrvFs segments from `PATH`.
+/// Strips Windows DrvFs (`/mnt/<drive>/...`) and WSL interop/runtime segments
+/// (`/mnt/wsl*`, `/usr/lib/wsl*`) from `PATH`.
 pub fn scrub_windows_interop_path(raw_path: &str) -> String {
-    let kept: Vec<&str> = raw_path
-        .split(':')
-        .filter(|segment| !segment.is_empty() && !is_windows_drvfs_segment(segment))
-        .collect();
+    let mut kept: Vec<&str> = Vec::new();
+    for segment in raw_path.split(':') {
+        if segment.is_empty()
+            || is_windows_drvfs_segment(segment)
+            || is_wsl_runtime_path_segment(segment)
+        {
+            continue;
+        }
+        if !kept.contains(&segment) {
+            kept.push(segment);
+        }
+    }
     if kept.is_empty() {
         "/usr/local/bin:/usr/bin:/bin".to_string()
     } else {
         kept.join(":")
     }
+}
+
+fn is_wsl_runtime_path_segment(segment: &str) -> bool {
+    segment == "/usr/lib/wsl"
+        || segment.starts_with("/usr/lib/wsl/")
+        || segment == "/mnt/wsl"
+        || segment.starts_with("/mnt/wsl/")
+        || segment == "/mnt/wslg"
+        || segment.starts_with("/mnt/wslg/")
+        || segment.contains("/.gemini/")
+        || segment.contains("/.antigravity/")
+        || segment.contains("/.vscode-server/")
+        || segment.contains("/.cursor-server/")
 }
 
 fn is_windows_drvfs_segment(segment: &str) -> bool {

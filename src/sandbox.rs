@@ -223,6 +223,8 @@ pub struct AccountCageHome {
     pub etc_dir: PathBuf,
     pub machine_id_file: PathBuf,
     pub timezone_file: PathBuf,
+    pub locale_file: PathBuf,
+    pub passwd_file: PathBuf,
     pub resolv_conf_file: PathBuf,
     pub hostname_file: PathBuf,
     pub hosts_file: PathBuf,
@@ -504,6 +506,8 @@ pub fn prepare_account_cage_home(
         &root_dir,
         &home_dir,
         &etc_dir,
+        &home_dir.join(".tmp"),
+        &home_dir.join(".run"),
         &home_dir.join(".config"),
         &home_dir.join(".cache"),
         &home_dir.join(".local").join("share"),
@@ -520,6 +524,8 @@ pub fn prepare_account_cage_home(
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&root_dir, fs::Permissions::from_mode(0o700));
         let _ = fs::set_permissions(&home_dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(home_dir.join(".tmp"), fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(home_dir.join(".run"), fs::Permissions::from_mode(0o700));
     }
 
     let machine_id = deterministic_hex(&format!("berth-cage-machine-id:{account_key}"), 32);
@@ -532,12 +538,20 @@ pub fn prepare_account_cage_home(
 
     let machine_id_file = etc_dir.join("machine-id");
     let timezone_file = etc_dir.join("timezone");
+    let locale_file = etc_dir.join("locale.conf");
+    let passwd_file = etc_dir.join("passwd");
     let resolv_conf_file = etc_dir.join("resolv.conf");
     let hostname_file = etc_dir.join("hostname");
     let hosts_file = etc_dir.join("hosts");
 
     write_private_file_atomic(&machine_id_file, format!("{machine_id}\n").as_bytes())?;
     write_private_file_atomic(&timezone_file, format!("{}\n", cage.timezone).as_bytes())?;
+    write_private_file_atomic(
+        &locale_file,
+        format!("LANG={}\nLC_ALL={}\n", cage.locale, cage.locale).as_bytes(),
+    )?;
+    let synthetic_passwd = build_minimal_synthetic_passwd();
+    write_private_file_atomic(&passwd_file, synthetic_passwd.as_bytes())?;
     write_private_file_atomic(
         &resolv_conf_file,
         b"# Managed local resolver\nnameserver 127.0.0.1\n",
@@ -573,12 +587,136 @@ pub fn prepare_account_cage_home(
         etc_dir,
         machine_id_file,
         timezone_file,
+        locale_file,
+        passwd_file,
         resolv_conf_file,
         hostname_file,
         hosts_file,
         hostname,
         machine_id,
     })
+}
+
+/// Builds a minimal `/etc/passwd` containing only `root`, the current host UID entry
+/// (with GECOS real-name field stripped and shell normalized to `/bin/bash`), and `nobody`,
+/// preventing enumeration of sibling host user accounts inside Linux `bwrap`.
+fn build_minimal_synthetic_passwd() -> String {
+    let default_shell = if Path::new("/bin/bash").is_file() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    let cur_home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/root".to_string());
+    let cur_user = std::env::var("USER").unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    if let Ok(raw) = fs::read_to_string("/etc/passwd") {
+        for line in raw.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 7 {
+                continue;
+            }
+            let uname = parts[0];
+            let uid = parts[2];
+            let gid = parts[3];
+            let home = parts[5];
+            let keep = uid == "0"
+                || uid == "65534"
+                || uname == "nobody"
+                || (!cur_user.is_empty() && uname == cur_user)
+                || home == cur_home;
+            if !keep {
+                continue;
+            }
+            let shell = if uid == "65534" || uname == "nobody" {
+                parts[6]
+            } else {
+                default_shell
+            };
+            // Strip GECOS real-name field (index 4).
+            let entry = format!("{uname}:x:{uid}:{gid}::{home}:{shell}");
+            if !lines.contains(&entry) {
+                lines.push(entry);
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push(format!("root:x:0:0::/root:{default_shell}"));
+        lines.push("nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin".to_string());
+    }
+    lines.join("\n") + "\n"
+}
+
+/// Builds the child environment strictly from an allowlist (`cmd.env_clear()`), preventing
+/// leakage of host IDE/desktop/WSL/telemetry/other-agent env vars (`ANTIGRAVITY_*`,
+/// `PULSE_SERVER`, `WAYLAND_DISPLAY`, `DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `WSL*`,
+/// `HOSTNAME`, `ZSH`, `__CF_USER_TEXT_ENCODING`, `AGS_BERTH_*`, `AGENT_SESSION_*`, etc.).
+#[cfg(unix)]
+fn apply_clean_sandbox_env(
+    cmd: &mut Command,
+    spec: &SandboxLaunchSpec,
+    tmp_dir: &Path,
+    runtime_dir: &Path,
+) {
+    cmd.env_clear();
+
+    // Forward ONLY strictly benign terminal/display formatting preferences.
+    const SAFE_HOST_TERM_VARS: &[&str] = &[
+        "TERM",
+        "COLORTERM",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "COLUMNS",
+        "LINES",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+    ];
+    for key in SAFE_HOST_TERM_VARS {
+        if let Ok(val) = std::env::var(key) {
+            if !val.trim().is_empty() {
+                cmd.env(key, val);
+            }
+        }
+    }
+    if std::env::var_os("TERM").is_none() {
+        cmd.env("TERM", "xterm-256color");
+    }
+
+    let shell = if Path::new("/bin/bash").is_file() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    };
+    cmd.env("SHELL", shell);
+    cmd.env("HOSTNAME", &spec.account_home.hostname);
+    cmd.env("TMPDIR", tmp_dir);
+    cmd.env("XDG_RUNTIME_DIR", runtime_dir);
+
+    for (key, value) in &spec.overlay_set_env {
+        // Never allow overlay to re-inject berth/cage marker env vars.
+        if !key.starts_with("AGS_BERTH_") && !key.starts_with("BERTH_") {
+            cmd.env(key, value);
+        }
+    }
+    for key in &spec.overlay_unset_env {
+        cmd.env_remove(key);
+    }
+
+    spec.launch_env.apply_to_command(cmd);
+
+    // Antidetect: never advertise the cage tool name inside the sandboxed AI CLI's environment.
+    for marker in [
+        "AGS_BERTH_CAGE_TZ",
+        "AGS_BERTH_CAGE_COUNTRY",
+        "AGS_BERTH_CAGE_LOCALE",
+        "AGS_BERTH_ISOLATION_MODE",
+    ] {
+        cmd.env_remove(marker);
+    }
+    // Keep Cage hostname authoritative even if overlay set another HOSTNAME.
+    cmd.env("HOSTNAME", &spec.account_home.hostname);
 }
 
 /// Writes Codex `model_provider = "berth"` + `[model_providers.berth]` + `[shell_environment_policy]`
@@ -920,10 +1058,26 @@ pub fn build_bwrap_args(
                     name.as_str(),
                     "localtime"
                         | "timezone"
+                        | "locale.conf"
+                        | "locale.gen"
+                        | "default"
+                        | "passwd"
                         | "machine-id"
                         | "resolv.conf"
                         | "hostname"
                         | "hosts"
+                        | "hosts.allow"
+                        | "hosts.deny"
+                        | "wsl.conf"
+                        | "fstab"
+                        | "mtab"
+                        | "crypttab"
+                        | "NetworkManager"
+                        | "netplan"
+                        | "systemd"
+                        | "tailscale"
+                        | "wireguard"
+                        | "meshharbor"
                         | "ssh"
                         | "shadow"
                         | "gshadow"
@@ -964,6 +1118,17 @@ pub fn build_bwrap_args(
     args.push("--ro-bind".into());
     args.push(account_home.timezone_file.to_string_lossy().into_owned());
     args.push("/etc/timezone".into());
+    args.push("--ro-bind".into());
+    args.push(account_home.locale_file.to_string_lossy().into_owned());
+    args.push("/etc/locale.conf".into());
+    args.push("--dir".into());
+    args.push("/etc/default".into());
+    args.push("--ro-bind".into());
+    args.push(account_home.locale_file.to_string_lossy().into_owned());
+    args.push("/etc/default/locale".into());
+    args.push("--ro-bind".into());
+    args.push(account_home.passwd_file.to_string_lossy().into_owned());
+    args.push("/etc/passwd".into());
     args.push("--ro-bind".into());
     args.push(account_home.machine_id_file.to_string_lossy().into_owned());
     args.push("/etc/machine-id".into());
@@ -1152,15 +1317,8 @@ fn launch_linux_bwrap(
     }
 
     let mut cmd = Command::new(&bwrap_bin);
-    scrub_sensitive_host_env(&mut cmd);
     cmd.args(&bwrap_args);
-    for key in &spec.overlay_unset_env {
-        cmd.env_remove(key);
-    }
-    for (key, value) in &spec.overlay_set_env {
-        cmd.env(key, value);
-    }
-    spec.launch_env.apply_to_command(&mut cmd);
+    apply_clean_sandbox_env(&mut cmd, spec, Path::new("/tmp"), Path::new("/tmp/runtime"));
     // Inside bwrap, real_home path IS bind-mounted to account_home.home_dir!
     cmd.env("HOME", &spec.real_home);
     cmd.env("XDG_CONFIG_HOME", spec.real_home.join(".config"));
@@ -1200,6 +1358,15 @@ pub fn run_sandbox_trampoline(
         ));
     }
     let shim_token = std::env::var(TRAMPOLINE_SHIM_TOKEN_ENV).unwrap_or_default();
+    if let Ok(rt_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        let rt_path = Path::new(&rt_dir);
+        let _ = fs::create_dir_all(rt_path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(rt_path, fs::Permissions::from_mode(0o700));
+        }
+    }
 
     let shim_listener = TcpListener::bind(("127.0.0.1", shim_port))
         .or_else(|_| TcpListener::bind("127.0.0.1:0"))?;
@@ -1242,6 +1409,7 @@ pub fn run_sandbox_trampoline(
             child.env("ANTHROPIC_BASE_URL", &base);
         }
         "agy" => {
+            child.env("AGY_LLM_GATEWAY_URL", &base);
             child.env("GEMINI_API_BASE", &base);
             child.env("GOOGLE_GEMINI_BASE_URL", &base);
         }
@@ -1380,10 +1548,16 @@ fn macos_seatbelt_path_variants(path: &Path) -> Vec<PathBuf> {
 
 /// Generates a fail-closed macOS Seatbelt (`.sb`) profile enforcing:
 /// - `(deny network*)`, allowing ONLY `localhost:<shim_port>` and `localhost:<proxy_port>`
-/// - Denies `/private/var/run/mDNSResponder` (blocks host DNS lookups)
-/// - Hides `~/.ssh`, `~/.berth`, `~/.config/berth`, `~/.config/ags`, `~/.gnupg`, `~/.aws`, `~/.kube`,
-///   host provider homes (`~/.claude`, `~/.codex`, `~/.grok`, `~/.gemini`), and ALL sibling cages under `<state_dir>/cages`
-/// - Allows reads/writes ONLY to `$PWD`, the active `<cage_home>`, and temp/tty devices.
+///   and blocking `mDNSResponder`
+/// - **Deny-by-default on the entire real `$HOME`** (`(deny file-read* (subpath "<real_home>"))`),
+///   eliminating exposure of `~/.claude.json`, `~/.gitconfig`, `~/.zsh_history`, `~/OneDrive`,
+///   `~/Library/Preferences`, `~/.ssh`, sibling cages, and any future files in `$HOME`
+/// - Blocks host timezone (`/etc/localtime`, `/var/db/timed`), resolver (`/etc/resolv.conf`),
+///   system preferences, `cfprefsd`/`timed`/`locationd`/`SystemConfiguration` Mach IPC,
+///   cross-process enumeration (`process-info*`), IOKit hardware UUID/serial (`iokit-open`/
+///   `iokit-get-properties`), and host-identifying `sysctl` (`kern.hostname`, `kern.uuid`,
+///   `kern.boottime`, `kern.proc`, `net.routetable`)
+/// - Re-allows reads ONLY inside `$PWD`, the active `<cage_home>`, and narrow safe toolchain dirs
 pub fn generate_macos_seatbelt_profile(
     workspace_dir: &Path,
     real_home: &Path,
@@ -1392,50 +1566,35 @@ pub fn generate_macos_seatbelt_profile(
     shim_addr: SocketAddr,
     proxy_addr: SocketAddr,
 ) -> String {
+    generate_macos_seatbelt_profile_with_bin(
+        workspace_dir,
+        real_home,
+        state_dir,
+        cage_home,
+        shim_addr,
+        proxy_addr,
+        None,
+    )
+}
+
+pub fn generate_macos_seatbelt_profile_with_bin(
+    workspace_dir: &Path,
+    real_home: &Path,
+    state_dir: &Path,
+    cage_home: &Path,
+    shim_addr: SocketAddr,
+    proxy_addr: SocketAddr,
+    stock_bin: Option<&Path>,
+) -> String {
     let shim_port = shim_addr.port();
     let proxy_port = proxy_addr.port();
 
     let cages_root = state_dir.join("cages");
     let mut deny_read_lines = Vec::new();
-    for rel in [
-        ".ssh",
-        ".berth",
-        ".aws",
-        ".kube",
-        ".gnupg",
-        ".docker",
-        ".netrc",
-        ".git-credentials",
-        ".npmrc",
-        ".pypirc",
-        ".config/gh",
-        ".config/gcloud",
-        ".config/op",
-        ".config/berth",
-        ".config/ags",
-        ".claude",
-        ".codex",
-        ".grok",
-        ".gemini",
-        "Desktop",
-        "Documents",
-        "Downloads",
-        "Library/Cookies",
-        "Library/Keychains",
-        "Library/Preferences/com.apple.Terminal.plist",
-        "Library/Application Support/berth",
-        "Library/Application Support/ags",
-        "Library/Application Support/Google/Chrome",
-        "Library/Application Support/BraveSoftware",
-        "Library/Application Support/Arc",
-        "Library/Application Support/Firefox",
-        "Library/Application Support/Microsoft Edge",
-        "Library/Safari",
-    ] {
-        for base in macos_seatbelt_path_variants(real_home) {
-            let p = Path::new(&base).join(rel);
-            deny_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&p)));
-        }
+    // Deny the ENTIRE real home directory by default (catches ~/.claude.json, ~/.gitconfig,
+    // ~/.zsh_history, ~/OneDrive, ~/Library/Preferences, ~/.ssh, etc. with zero blind spots).
+    for rh in macos_seatbelt_path_variants(real_home) {
+        deny_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&rh)));
     }
     for cr in macos_seatbelt_path_variants(&cages_root) {
         deny_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&cr)));
@@ -1448,20 +1607,109 @@ pub fn generate_macos_seatbelt_profile(
     for ch in macos_seatbelt_path_variants(cage_home) {
         allow_cage_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&ch)));
     }
+
+    // Collect narrow safe user toolchain read-only paths inside real_home ONLY when needed
+    // (never ~/.ssh, ~/.berth, ~/.claude, ~/.claude.json, ~/.codex, ~/.config, ~/Library).
+    let mut safe_tool_paths: Vec<PathBuf> = Vec::new();
+    for rel in [
+        ".local/bin",
+        ".local/share/claude/versions",
+        ".local/lib/node_modules",
+        ".cargo/bin",
+        ".rustup",
+        ".nvm",
+        ".fnm",
+        ".pyenv",
+        ".local/share/mise",
+        ".npm-global",
+        ".bun",
+        ".volta",
+        "go/bin",
+    ] {
+        let candidate = real_home.join(rel);
+        if candidate.exists() {
+            safe_tool_paths.push(candidate);
+        }
+    }
+    let is_sensitive_home_path = |p: &Path| -> bool {
+        if let Ok(rel) = p.strip_prefix(real_home) {
+            if let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) {
+                return matches!(
+                    first,
+                    ".ssh"
+                        | ".berth"
+                        | ".claude"
+                        | ".claude.json"
+                        | ".codex"
+                        | ".grok"
+                        | ".gemini"
+                        | ".aws"
+                        | ".gnupg"
+                        | ".config"
+                        | "Library"
+                );
+            }
+        }
+        false
+    };
+    if let Some(bin) = stock_bin {
+        if let Some(parent) = bin.parent() {
+            if parent.starts_with(real_home) && !is_sensitive_home_path(parent) && parent.is_dir() {
+                safe_tool_paths.push(parent.to_path_buf());
+            }
+        }
+        if let Ok(canon) = fs::canonicalize(bin) {
+            if canon.starts_with(real_home) && !is_sensitive_home_path(&canon) {
+                if let Some(parent) = canon.parent() {
+                    if !is_sensitive_home_path(parent) {
+                        safe_tool_paths.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    for tp in &safe_tool_paths {
+        for v in macos_seatbelt_path_variants(tp) {
+            let line = format!("  (subpath \"{}\")", sbpl_escape(&v));
+            if !allow_cage_read_lines.contains(&line) {
+                allow_cage_read_lines.push(line);
+            }
+        }
+    }
+
     // Allow lstat/realpath traversal (`file-read-metadata` ONLY, NOT `file-read-data` / readdir)
-    // on the exact ancestor path literals leading to the active cage home so Rust `fs::canonicalize`
-    // (used by `codex`) succeeds while sibling cages and `state_dir` contents remain unreadable!
+    // on the exact ancestor path literals leading from real_home to cage_home, workspace_dir,
+    // and safe toolchain dirs so fs::canonicalize() succeeds without listing real_home!
     let mut allow_ancestor_meta_lines = Vec::new();
-    for ancestor in [
-        Some(state_dir),
-        Some(cages_root.as_path()),
-        cage_home.parent(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        for variant in macos_seatbelt_path_variants(ancestor) {
-            allow_ancestor_meta_lines.push(format!("  (literal \"{}\")", sbpl_escape(&variant)));
+    let mut add_ancestors_to = |target: &Path| {
+        let mut cur = target.parent();
+        while let Some(anc) = cur {
+            if anc == Path::new("/") {
+                break;
+            }
+            for variant in macos_seatbelt_path_variants(anc) {
+                let line = format!("  (literal \"{}\")", sbpl_escape(&variant));
+                if !allow_ancestor_meta_lines.contains(&line) {
+                    allow_ancestor_meta_lines.push(line);
+                }
+            }
+            if anc == real_home {
+                break;
+            }
+            cur = anc.parent();
+        }
+    };
+    add_ancestors_to(cage_home);
+    if workspace_dir.starts_with(real_home) {
+        add_ancestors_to(workspace_dir);
+    }
+    for tp in &safe_tool_paths {
+        add_ancestors_to(tp);
+    }
+    for variant in macos_seatbelt_path_variants(real_home) {
+        let line = format!("  (literal \"{}\")", sbpl_escape(&variant));
+        if !allow_ancestor_meta_lines.contains(&line) {
+            allow_ancestor_meta_lines.push(line);
         }
     }
 
@@ -1483,7 +1731,6 @@ pub fn generate_macos_seatbelt_profile(
         "  (literal \"/var/run/syslog\")".to_string(),
         "  (subpath \"/tmp\")".to_string(),
         "  (subpath \"/private/tmp\")".to_string(),
-        "  (subpath \"/private/var/folders\")".to_string(),
     ];
     for ch in macos_seatbelt_path_variants(cage_home) {
         allow_unix_sock_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&ch)));
@@ -1505,14 +1752,54 @@ pub fn generate_macos_seatbelt_profile(
 (deny network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))
 (deny network-outbound (remote unix-socket (literal "/var/run/mDNSResponder")))
 
-;; 2. Hide host credentials, provider homes, Berth config/state, and ALL sibling account cages.
+;; 2. Hide host timezone, locale, geolocation, system DNS/proxy, ENTIRE real `$HOME` by default,
+;;    Berth config/state, and ALL sibling account cages.
+;; Note: `/var/db/timezone/zoneinfo` and `/usr/share/zoneinfo` remain readable so `TZ=<IANA>`
+;; resolves the Cage timezone cleanly across libc, CoreFoundation (`CFTimeZoneCopySystem`),
+;; ICU/Node/Bun, Python, Go, and Rust without ever seeing the host's `/etc/localtime` symlink.
 (deny file-read*
+  (literal "/etc/localtime")
+  (literal "/private/etc/localtime")
+  (literal "/var/db/timezone/localtime")
+  (literal "/private/var/db/timezone/localtime")
+  (literal "/etc/resolv.conf")
+  (literal "/private/etc/resolv.conf")
+  (literal "/var/run/resolv.conf")
+  (literal "/private/var/run/resolv.conf")
+  (literal "/Library/Preferences/com.apple.timezone.auto.plist")
+  (literal "/Library/Preferences/.GlobalPreferences.plist")
+  (literal "/Library/Preferences/.GlobalPreferences_m.plist")
+  (subpath "/Library/Preferences/SystemConfiguration")
+  (subpath "/private/var/db/timed")
+  (subpath "/var/db/timed")
 {deny_read_block})
-;; Allow lstat metadata ONLY on exact ancestor literals so realpath()/canonicalize() can reach cage_home
-;; without ever permitting directory listing (`file-read-data`) of sibling cages or state_dir!
+;; Block Mach IPC daemons that bypass file denials to leak real host locale (`en_CN`),
+;; host timezone (`timed`), geolocation (`locationd`), and host DNS/VPN proxy (`SystemConfiguration`).
+(deny mach-lookup
+  (global-name "com.apple.cfprefsd.daemon")
+  (global-name "com.apple.cfprefsd.agent")
+  (global-name "com.apple.cfprefsd.daemon.system")
+  (global-name "com.apple.timed.xpc")
+  (global-name-prefix "com.apple.locationd")
+  (global-name-prefix "com.apple.CoreLocation")
+  (global-name-prefix "com.apple.SystemConfiguration."))
+;; Block host process enumeration (`ps aux` sees only self), IOKit hardware serial/UUID
+;; (`IOPlatformExpertDevice`), and host-identifying `sysctl` (`hostname`, `uuid`, `routetable`/`ifconfig`).
+(deny process-info* (target others))
+(deny iokit-open)
+(deny iokit-get-properties)
+(deny sysctl-read
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.uuid")
+  (sysctl-name "kern.boottime")
+  (sysctl-name "kern.bootuuid")
+  (sysctl-name-prefix "kern.proc")
+  (sysctl-name-prefix "net.routetable"))
+;; Allow lstat metadata ONLY on exact ancestor literals so realpath()/canonicalize() can reach
+;; cage_home/workspace/toolchains without permitting directory listing (`file-read-data`) of real_home!
 (allow file-read-metadata
 {allow_ancestor_meta_block})
-;; Re-allow reading strictly inside the active account's own isolated cage home and current project workspace.
+;; Re-allow reading strictly inside the active account's own isolated cage home, workspace, and safe toolchains.
 (allow file-read*
 {allow_cage_read_block}
 {allow_write_block})
@@ -1524,7 +1811,6 @@ pub fn generate_macos_seatbelt_profile(
   (subpath "/tmp")
   (subpath "/private/tmp")
   (subpath "/private/var/tmp")
-  (subpath "/private/var/folders")
   (literal "/dev/null")
   (literal "/dev/zero")
   (literal "/dev/dtracehelper")
@@ -1552,13 +1838,14 @@ fn launch_macos_seatbelt(
         );
     }
 
-    let profile = generate_macos_seatbelt_profile(
+    let profile = generate_macos_seatbelt_profile_with_bin(
         &spec.workspace_dir,
         &spec.real_home,
         &spec.state_dir,
         &spec.account_home.home_dir,
         shim.listen_addr(),
         shim.proxy_addr(),
+        Some(&spec.stock_bin),
     );
     let sb_dir = tempfile::Builder::new()
         .prefix("berth-seatbelt-")
@@ -1567,19 +1854,14 @@ fn launch_macos_seatbelt(
     write_private_file_atomic(&sb_file, profile.as_bytes())?;
 
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
-    scrub_sensitive_host_env(&mut cmd);
     cmd.arg("-f").arg(&sb_file);
     cmd.arg(&spec.stock_bin);
     cmd.args(&spec.agent_args);
     cmd.current_dir(&spec.workspace_dir);
 
-    for key in &spec.overlay_unset_env {
-        cmd.env_remove(key);
-    }
-    for (key, value) in &spec.overlay_set_env {
-        cmd.env(key, value);
-    }
-    spec.launch_env.apply_to_command(&mut cmd);
+    let cage_tmp = spec.account_home.home_dir.join(".tmp");
+    let cage_run = spec.account_home.home_dir.join(".run");
+    apply_clean_sandbox_env(&mut cmd, spec, &cage_tmp, &cage_run);
     apply_proxy_and_home_env(
         &mut cmd,
         &spec.account_home,
@@ -1731,9 +2013,12 @@ public static class BerthAppContainer {{
 
 Add-Type -TypeDefinition $code
 $sid = [BerthAppContainer]::EnsureProfileAndGetSidString($profileName)
-& CheckNetIsolation.exe LoopbackExempt -a "-p=$($sid)" 2>$null | Out-Null
+& CheckNetIsolation.exe LoopbackExempt -a "-p=$($sid)" | Out-Null
+if ($LASTEXITCODE -ne 0) {{ throw "CheckNetIsolation LoopbackExempt failed with exit code $LASTEXITCODE" }}
 & icacls $cageHome /grant "*$($sid):(OI)(CI)F" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) {{ throw "icacls grant on cageHome failed with exit code $LASTEXITCODE" }}
 & icacls $workspace /grant "*$($sid):(OI)(CI)M" /Q | Out-Null
+if ($LASTEXITCODE -ne 0) {{ throw "icacls grant on workspace failed with exit code $LASTEXITCODE" }}
 try {{
     $rc = [BerthAppContainer]::RunZeroNet($profileName, $exePath, $cmdLine, $workspace)
 }} finally {{
@@ -1938,10 +2223,21 @@ mod tests {
         assert!(sb.contains("(allow network-outbound (remote ip \"localhost:41001\"))"));
         assert!(sb.contains("(allow network-outbound (remote ip \"localhost:41002\"))"));
         assert!(sb.contains("/private/var/run/mDNSResponder"));
-        assert!(sb.contains("/Users/alice/.ssh"));
-        assert!(sb.contains("/Users/alice/.config/berth"));
-        assert!(sb.contains("/Users/alice/.claude"));
-        assert!(sb.contains("/Users/alice/.codex"));
+        assert!(sb.contains("(literal \"/etc/localtime\")"));
+        assert!(sb.contains("(literal \"/private/etc/localtime\")"));
+        assert!(sb.contains("(literal \"/etc/resolv.conf\")"));
+        assert!(sb.contains("(literal \"/private/var/run/resolv.conf\")"));
+        assert!(sb.contains("(literal \"/Library/Preferences/.GlobalPreferences.plist\")"));
+        assert!(sb.contains("(subpath \"/Library/Preferences/SystemConfiguration\")"));
+        assert!(sb.contains("(global-name \"com.apple.cfprefsd.daemon\")"));
+        assert!(sb.contains("(global-name \"com.apple.timed.xpc\")"));
+        assert!(sb.contains("(global-name-prefix \"com.apple.SystemConfiguration.\")"));
+        assert!(sb.contains("(deny process-info* (target others))"));
+        assert!(sb.contains("(deny iokit-open)"));
+        assert!(sb.contains("(deny iokit-get-properties)"));
+        assert!(sb.contains("(sysctl-name \"kern.hostname\")"));
+        assert!(sb.contains("(sysctl-name-prefix \"net.routetable\")"));
+        assert!(sb.contains("  (subpath \"/Users/alice\")"));
         assert!(sb.contains("/private/tmp/berth-state/cages"));
         assert!(sb.contains("(allow file-read*\n  (subpath \"/tmp/berth-state/cages/acct-7/home\")"));
         assert!(sb.contains("(subpath \"/var/folders/ab/work/app\")"));
