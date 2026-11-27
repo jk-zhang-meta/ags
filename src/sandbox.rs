@@ -1555,8 +1555,11 @@ fn macos_seatbelt_path_variants(path: &Path) -> Vec<PathBuf> {
 /// - Blocks host timezone (`/etc/localtime`, `/var/db/timed`), resolver (`/etc/resolv.conf`),
 ///   system preferences, `cfprefsd`/`timed`/`locationd`/`SystemConfiguration` Mach IPC,
 ///   cross-process enumeration (`process-info*`), IOKit hardware UUID/serial (`iokit-open`/
-///   `iokit-get-properties`), and host-identifying `sysctl` (`kern.hostname`, `kern.uuid`,
-///   `kern.boottime`, `kern.proc`, `net.routetable`)
+///   `iokit-get-properties`), and host-identifying `sysctl` (`kern.uuid`, `kern.boottime`,
+///   `kern.bootuuid`, `kern.proc`, `net.routetable`).
+///   Note: `kern.hostname` is intentionally left readable because macOS `uname(2)` queries
+///   `CTL_KERN/KERN_HOSTNAME` internally; denying it crashes Node 24 (`uv_os_uname`) and
+///   Python `ctypes` (`os.uname()`). `HOSTNAME` env is overridden to the Cage hostname.
 /// - Re-allows reads ONLY inside `$PWD`, the active `<cage_home>`, and narrow safe toolchain dirs
 pub fn generate_macos_seatbelt_profile(
     workspace_dir: &Path,
@@ -1784,12 +1787,13 @@ pub fn generate_macos_seatbelt_profile_with_bin(
   (global-name-prefix "com.apple.CoreLocation")
   (global-name-prefix "com.apple.SystemConfiguration."))
 ;; Block host process enumeration (`ps aux` sees only self), IOKit hardware serial/UUID
-;; (`IOPlatformExpertDevice`), and host-identifying `sysctl` (`hostname`, `uuid`, `routetable`/`ifconfig`).
+;; (`IOPlatformExpertDevice`), and host-identifying `sysctl` (`uuid`, `boottime`, `proc`, `routetable`/`ifconfig`).
+;; Keep `kern.hostname` readable because macOS libc `uname(2)` reads it internally and denying it
+;; aborts Node 24 (`uv_os_uname`) and Python `ctypes` (`os.uname()`).
 (deny process-info* (target others))
 (deny iokit-open)
 (deny iokit-get-properties)
 (deny sysctl-read
-  (sysctl-name "kern.hostname")
   (sysctl-name "kern.uuid")
   (sysctl-name "kern.boottime")
   (sysctl-name "kern.bootuuid")
@@ -2235,7 +2239,8 @@ mod tests {
         assert!(sb.contains("(deny process-info* (target others))"));
         assert!(sb.contains("(deny iokit-open)"));
         assert!(sb.contains("(deny iokit-get-properties)"));
-        assert!(sb.contains("(sysctl-name \"kern.hostname\")"));
+        assert!(sb.contains("(sysctl-name \"kern.uuid\")"));
+        assert!(!sb.contains("(sysctl-name \"kern.hostname\")"));
         assert!(sb.contains("(sysctl-name-prefix \"net.routetable\")"));
         assert!(sb.contains("  (subpath \"/Users/alice\")"));
         assert!(sb.contains("/private/tmp/berth-state/cages"));
