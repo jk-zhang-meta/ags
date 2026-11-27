@@ -54,6 +54,10 @@ pub struct CageShimConfig {
     pub rebind_file: Option<PathBuf>,
     pub ready_file: Option<PathBuf>,
     pub upstream_timeout: Duration,
+    /// When true, once a `409 cage_rebind_required` is intercepted, immediately
+    /// fast-reject subsequent client SDK retry requests with non-retryable HTTP 400
+    /// so `bh --auto-rebind` does not wait through 15-30s of SDK exponential backoff.
+    pub abort_retries_on_rebind: bool,
 }
 
 impl fmt::Debug for CageShimConfig {
@@ -163,6 +167,8 @@ struct ShimSharedState {
     ingress: ParsedUrl,
     upstream_timeout: Duration,
     rebind_file: Option<PathBuf>,
+    abort_retries_on_rebind: bool,
+    rebind_signaled: AtomicBool,
     secrets: RwLock<LeaseSecrets>,
     metrics: ShimMetrics,
     shutdown: AtomicBool,
@@ -232,6 +238,8 @@ impl CageShim {
                 config.upstream_timeout
             },
             rebind_file: config.rebind_file.clone(),
+            abort_retries_on_rebind: config.abort_retries_on_rebind,
+            rebind_signaled: AtomicBool::new(false),
             secrets: RwLock::new(LeaseSecrets {
                 lease_id: config.lease_id,
                 lease_token: config.lease_token,
@@ -307,6 +315,10 @@ impl CageShimHandle {
 
     pub fn shim_token(&self) -> &str {
         &self.shim_token
+    }
+
+    pub fn has_rebind_signal(&self) -> bool {
+        self.state.rebind_signaled.load(Ordering::Acquire)
     }
 
     pub fn metrics(&self) -> ShimMetricsSnapshot {
@@ -757,6 +769,15 @@ fn forward_to_upstream(
     req: ParsedRequestHead,
     state: &ShimSharedState,
 ) -> io::Result<()> {
+    if state.abort_retries_on_rebind && state.rebind_signaled.load(Ordering::Acquire) {
+        return write_simple_response(
+            &mut client,
+            400,
+            "Bad Request",
+            &[("X-Berth-Action", "cage_rebind_required")],
+            b"{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"cage_rebind_in_progress\",\"message\":\"Berth Cage rebind is already in progress\"}}",
+        );
+    }
     let is_ws = is_websocket_upgrade_request(&req.headers);
 
     // Read full request body for non-WS requests before dialing or stream it right after headers.
@@ -955,6 +976,7 @@ fn forward_to_upstream(
                     let _ = write_private_file_atomic(rebind_path, &encoded);
                 }
             }
+            state.rebind_signaled.store(true, Ordering::Release);
         }
         let mut wire_resp = Vec::with_capacity(512 + resp_body.len());
         let _ = write!(&mut wire_resp, "{status_line}\r\n");
@@ -1179,9 +1201,11 @@ pub fn extract_rebind_signal(
         return None;
     }
 
+    let data_obj = json.get("data").and_then(|v| v.as_object());
     let offer = err_obj
-        .and_then(|e| e.get("offer"))
-        .or_else(|| json.get("offer"))
+        .and_then(|e| e.get("offer").or_else(|| e.get("recommended_cohort")))
+        .or_else(|| data_obj.and_then(|d| d.get("recommended_cohort")))
+        .or_else(|| json.get("offer").or_else(|| json.get("recommended_cohort")))
         .and_then(|v| v.as_object());
     let offer_cage = offer
         .and_then(|o| o.get("cage"))
@@ -1195,6 +1219,11 @@ pub fn extract_rebind_signal(
                 return Some(s.to_string());
             }
             if let Some(s) = err_obj.and_then(|e| e.get(*key)).and_then(|v| v.as_str())
+                && !s.is_empty()
+            {
+                return Some(s.to_string());
+            }
+            if let Some(s) = data_obj.and_then(|d| d.get(*key)).and_then(|v| v.as_str())
                 && !s.is_empty()
             {
                 return Some(s.to_string());
@@ -1218,10 +1247,18 @@ pub fn extract_rebind_signal(
     let current_cohort_tz =
         pick_str(&["current_cohort_tz"]).unwrap_or_else(|| fallback_current_tz.to_string());
     let recommended_cohort_tz =
-        pick_str(&["recommended_cohort_tz", "timezone"]).unwrap_or_default();
+        pick_str(&["recommended_cohort_tz", "cohort_timezone", "timezone"]).unwrap_or_default();
     let recommended_country_code =
-        pick_str(&["recommended_country_code", "country_code"]).unwrap_or_default();
-    let recommended_locale = pick_str(&["recommended_locale", "locale"]).unwrap_or_default();
+        pick_str(&["recommended_country_code", "cohort_country_code", "country_code"])
+            .unwrap_or_default();
+    let recommended_locale =
+        pick_str(&["recommended_locale", "cohort_locale", "locale"]).unwrap_or_default();
+    let recommended_account_id = offer
+        .and_then(|o| o.get("account_id"))
+        .or_else(|| err_obj.and_then(|e| e.get("account_id")))
+        .or_else(|| json.get("account_id"))
+        .and_then(|v| v.as_i64())
+        .filter(|id| *id > 0);
 
     let available_cohorts = json
         .get("available_cohorts")
@@ -1240,6 +1277,7 @@ pub fn extract_rebind_signal(
         recommended_cohort_tz,
         recommended_country_code,
         recommended_locale,
+        recommended_account_id,
         available_cohorts,
     })
 }
@@ -1897,6 +1935,7 @@ mod tests {
             rebind_file: None,
             ready_file: None,
             upstream_timeout: Duration::from_secs(5),
+            abort_retries_on_rebind: false,
         }
     }
 
@@ -2408,5 +2447,67 @@ mod tests {
             targets,
             vec!["statsig.anthropic.com:443", "api.ipify.org:443"]
         );
+    }
+
+    #[test]
+    fn berth_edge_409_recommended_cohort_extracted_and_subsequent_retries_fast_aborted() {
+        let upstream_ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream_ln.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&upstream_hits);
+
+        let _up_thread = thread::spawn(move || {
+            for stream in upstream_ln.incoming().take(2) {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut s = stream.unwrap();
+                let _ = read_http_head(&mut s);
+                let body = serde_json::json!({
+                    "error": {
+                        "code": "cage_rebind_required",
+                        "message": "No healthy accounts remain in cohort SG/Asia/Singapore",
+                        "recommended_cohort": {
+                            "account_id": 24,
+                            "landing_node_id": 2,
+                            "cohort_timezone": "America/Los_Angeles",
+                            "cohort_country_code": "US",
+                            "cohort_locale": "en_US.UTF-8"
+                        }
+                    }
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 409 Conflict\r\nX-Berth-Action: cage_rebind_required\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+                let _ = s.flush();
+            }
+        });
+
+        let mut cfg = base_config(format!("http://{upstream_addr}"));
+        cfg.cage_tz = "Asia/Singapore".into();
+        cfg.abort_retries_on_rebind = true;
+        let shim = CageShim::start(cfg).unwrap();
+        let token = shim.shim_token().to_string();
+        let host = format!("127.0.0.1:{}", shim.listen_addr().port());
+
+        let req_raw = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        let resp1 = send_raw_http(shim.listen_addr(), &req_raw);
+        assert!(resp1.starts_with("HTTP/1.1 409 "), "resp1={resp1}");
+        assert!(shim.has_rebind_signal());
+        let sig = shim.metrics().last_rebind.expect("rebind signal captured");
+        assert_eq!(sig.recommended_cohort_tz, "America/Los_Angeles");
+        assert_eq!(sig.recommended_country_code, "US");
+        assert_eq!(sig.recommended_locale, "en_US.UTF-8");
+        assert_eq!(sig.recommended_account_id, Some(24));
+
+        // Second request (SDK retry) MUST be fast-rejected locally with HTTP 400 without hitting upstream!
+        let resp2 = send_raw_http(shim.listen_addr(), &req_raw);
+        assert!(resp2.starts_with("HTTP/1.1 400 "), "resp2={resp2}");
+        assert!(resp2.contains("cage_rebind_in_progress"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
     }
 }

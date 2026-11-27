@@ -78,6 +78,139 @@ impl ClaudeCode {
     fn projects_dir() -> Option<PathBuf> {
         Self::home_dir().map(|h| h.join("projects"))
     }
+
+    /// Lists sessions inside an explicit Claude home directory (e.g. a Berth Sandbox cage home)
+    /// without mutating process environment variables.
+    pub fn list_sessions_in_home(claude_home: &Path) -> SessionListing {
+        let projects_dir = claude_home.join("projects");
+        let mut listing = SessionListing::default();
+        if !projects_dir.is_dir() {
+            return listing;
+        }
+        for project_entry in read_dir_reporting(&projects_dir, &mut listing.unreadable) {
+            let project_path = project_entry.path();
+            if !project_path.is_dir() {
+                continue;
+            }
+            for session_entry in read_dir_reporting(&project_path, &mut listing.unreadable) {
+                let path = session_entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("jsonl") || !path.is_file() {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let session_id = claude_session_id_hint(&path).unwrap_or_else(|| stem.to_string());
+                if session_id.trim().is_empty() {
+                    continue;
+                }
+                listing.sessions.push((session_id, path));
+            }
+        }
+        listing
+    }
+
+    /// Writes a canonical session directly into an explicit Claude home directory
+    /// (such as a Berth Sandbox cage home), refusing symlinks to prevent confused-deputy writes.
+    pub fn write_session_to_home(
+        &self,
+        claude_home: &Path,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
+    ) -> anyhow::Result<WrittenSession> {
+        if let Ok(meta) = std::fs::symlink_metadata(claude_home) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write Claude session through symlinked home {}",
+                    claude_home.display()
+                );
+            }
+        }
+        let projects_dir = claude_home.join("projects");
+        if let Ok(meta) = std::fs::symlink_metadata(&projects_dir) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write Claude session through symlinked projects dir {}",
+                    projects_dir.display()
+                );
+            }
+        }
+        let workspace_str = session.workspace.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing target workspace path (pass `--workspace <DIR>` instead of defaulting to /tmp)"
+            )
+        })?;
+        self.write_session_into_projects_dir(&projects_dir, workspace_str, session, opts)
+    }
+
+    fn write_session_into_projects_dir(
+        &self,
+        projects_dir: &Path,
+        workspace_str: &Path,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
+    ) -> anyhow::Result<WrittenSession> {
+        let target_session_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let dir_key = project_dir_key(workspace_str);
+        let target_dir = projects_dir.join(&dir_key);
+        let target_path = target_dir.join(format!("{target_session_id}.jsonl"));
+
+        let mut lines: Vec<String> = Vec::with_capacity(session.messages.len());
+        let mut prev_uuid: Option<String> = None;
+
+        for msg in &session.messages {
+            let entry_uuid = uuid::Uuid::new_v4().to_string();
+            let msg_ts = msg
+                .timestamp
+                .map(|ts| {
+                    chrono::DateTime::from_timestamp_millis(ts)
+                        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                        .unwrap_or_else(|| now_iso.clone())
+                })
+                .unwrap_or_else(|| now_iso.clone());
+
+            let entry_type = claude_entry_type(&msg.role);
+            let inner_msg = build_inner_message(msg, session.model_name.as_deref(), entry_type);
+
+            let parent_uuid_val = match &prev_uuid {
+                Some(u) => serde_json::Value::String(u.clone()),
+                None => serde_json::Value::Null,
+            };
+            let entry = serde_json::json!({
+                "parentUuid": parent_uuid_val,
+                "isSidechain": false,
+                "userType": "external",
+                "cwd": workspace_str.to_string_lossy(),
+                "sessionId": target_session_id,
+                "version": "berth",
+                "gitBranch": "main",
+                "type": entry_type,
+                "message": inner_msg,
+                "uuid": entry_uuid,
+                "timestamp": msg_ts,
+            });
+            lines.push(serde_json::to_string(&entry)?);
+            prev_uuid = Some(entry_uuid);
+        }
+
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        let content_bytes = content.into_bytes();
+        let outcome =
+            crate::pipeline::atomic_write(&target_path, &content_bytes, opts.force, self.slug())?;
+
+        Ok(WrittenSession {
+            paths: vec![outcome.target_path.clone()],
+            session_id: target_session_id.clone(),
+            resume_command: self.resume_command(&target_session_id),
+            backups: outcome.displaced().into_iter().collect(),
+            warnings: Vec::new(),
+        })
+    }
 }
 
 impl Provider for ClaudeCode {
@@ -216,6 +349,7 @@ impl Provider for ClaudeCode {
         // supersede earlier ones, so we keep the last seen of each.
         let mut custom_title: Option<String> = None;
         let mut ai_title: Option<String> = None;
+        let mut away_summary_title: Option<String> = None;
         let mut summary_title: Option<String> = None;
         let mut started_at: Option<i64> = None;
         let mut ended_at: Option<i64> = None;
@@ -289,6 +423,20 @@ impl Provider for ClaudeCode {
                 Some("ai-title") => {
                     if let Some(t) = entry.get("aiTitle").and_then(|v| v.as_str()) {
                         ai_title = Some(t.to_string());
+                    }
+                }
+                Some("system")
+                    if entry.get("subtype").and_then(|v| v.as_str()) == Some("away_summary") =>
+                {
+                    if let Some(t) = entry
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| entry.get("summary").and_then(|v| v.as_str()))
+                    {
+                        let first_line = t.lines().next().unwrap_or(t).trim();
+                        if !first_line.is_empty() {
+                            away_summary_title = Some(truncate_title(first_line, 120));
+                        }
                     }
                 }
                 Some("summary") => {
@@ -398,10 +546,11 @@ impl Provider for ClaudeCode {
         if let Some(ref v) = version {
             metadata.insert("claudeVersion".into(), serde_json::Value::String(v.clone()));
         }
-        // Provider-native display name: user `/rename` wins, then the
-        // auto-generated title, then a classic summary. Blank values are ignored.
+        // Provider-native display name: user `/rename` wins, then auto-generated
+        // `ai-title`, then Claude 2.1 `away_summary` recap, then classic `summary`.
         let native_name = custom_title
             .or(ai_title)
+            .or(away_summary_title)
             .or(summary_title)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());

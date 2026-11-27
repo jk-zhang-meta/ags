@@ -723,6 +723,8 @@ pub struct RebindSignal {
     pub recommended_cohort_tz: String,
     pub recommended_country_code: String,
     pub recommended_locale: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_account_id: Option<i64>,
     #[serde(default)]
     pub available_cohorts: Vec<String>,
 }
@@ -1077,6 +1079,154 @@ pub fn bhe1_attest(entry_addr: &str, timeout: Duration) -> Result<String, BerthE
 struct HttpResponse {
     status: u16,
     body: Vec<u8>,
+}
+
+/// Raw HTTP response returned by [`vault_http_request`], preserving lowercase response headers
+/// and supporting large compressed session blobs (up to `max_response_bytes`).
+#[derive(Debug, Clone)]
+pub struct VaultHttpResponse {
+    pub status: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+/// Resolves the vault-owner credential strictly from the logged-in Berth account JWT
+/// (refreshing if expired) or the root static Berth API key — NEVER via per-agent/account
+/// pool key selection (`resolve_auth_for_agent`).
+pub fn resolve_vault_owner_token(
+    config: &mut BerthConfig,
+    paths: &BerthPaths,
+) -> Result<(String, String), BerthError> {
+    if config.user_session.is_some() {
+        if let Some(session) = ensure_fresh_user_session(paths, config)? {
+            if !session.access_token.trim().is_empty() {
+                return Ok((session.access_token, "jwt".to_string()));
+            }
+        }
+    }
+    if !config.api_key.trim().is_empty() {
+        return Ok((config.api_key.clone(), "api_key".to_string()));
+    }
+    Err(BerthError::NotConfigured)
+}
+
+/// Executes an authenticated HTTPS/HTTP request against Berth Cloud Vault (`/api/v1/berth/vault/*`)
+/// supporting streaming-sized binary upload/download bodies up to `max_response_bytes`.
+pub fn vault_http_request(
+    base_url: &str,
+    bearer_token: &str,
+    method: &str,
+    path_and_query: &str,
+    extra_headers: &[(&str, String)],
+    body: Option<&[u8]>,
+    max_response_bytes: usize,
+) -> Result<VaultHttpResponse, BerthError> {
+    let parsed = ParsedUrl::parse(base_url)?;
+    let stream = ClientTransport::connect_direct(&parsed, Duration::from_secs(60))?;
+
+    let mut req = Vec::with_capacity(512 + body.map_or(0, |b| b.len()));
+    let _ = write!(
+        &mut req,
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: berth/{}\r\nAuthorization: Bearer {bearer_token}\r\n",
+        parsed.host_header(),
+        env!("CARGO_PKG_VERSION")
+    );
+    for (name, value) in extra_headers {
+        let _ = write!(&mut req, "{name}: {value}\r\n");
+    }
+    if let Some(payload) = body {
+        let _ = write!(&mut req, "Content-Length: {}\r\n", payload.len());
+    }
+    req.extend_from_slice(b"\r\n");
+    if let Some(payload) = body {
+        req.extend_from_slice(payload);
+    }
+
+    let mut stream = stream;
+    stream
+        .write_all(&req)
+        .map_err(|e| BerthError::Transport(format!("Vault HTTP write failed: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| BerthError::Transport(format!("Vault HTTP flush failed: {e}")))?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    if reader
+        .read_line(&mut status_line)
+        .map_err(|e| BerthError::Transport(format!("Vault HTTP status read failed: {e}")))?
+        == 0
+    {
+        return Err(BerthError::Transport(
+            "vault closed connection before HTTP status line".into(),
+        ));
+    }
+    let status = parse_http_status_code(&status_line)?;
+
+    let mut resp_headers = BTreeMap::new();
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut header_bytes = status_line.len();
+    loop {
+        let mut line = String::new();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| BerthError::Transport(format!("Vault HTTP header read failed: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        header_bytes += n;
+        if header_bytes > 128 * 1024 {
+            return Err(BerthError::Transport("Vault HTTP headers too large".into()));
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let lower = name.trim().to_ascii_lowercase();
+            let val = value.trim().to_string();
+            if lower == "content-length" {
+                content_length = val.parse::<usize>().ok();
+            } else if lower == "transfer-encoding" && val.to_ascii_lowercase().contains("chunked") {
+                is_chunked = true;
+            }
+            resp_headers.insert(lower, val);
+        }
+    }
+
+    let body_bytes = if method == "HEAD" || status == 204 || status == 304 {
+        Vec::new()
+    } else if is_chunked {
+        read_chunked_body(&mut reader, max_response_bytes)?
+    } else if let Some(len) = content_length {
+        if len > max_response_bytes {
+            return Err(BerthError::Transport(format!(
+                "Vault response exceeds safety cap ({len} > {max_response_bytes} bytes)"
+            )));
+        }
+        let mut buf = vec![0u8; len];
+        reader
+            .read_exact(&mut buf)
+            .map_err(|e| BerthError::Transport(format!("Vault HTTP body read failed: {e}")))?;
+        buf
+    } else {
+        let mut buf = Vec::new();
+        reader
+            .take((max_response_bytes + 1) as u64)
+            .read_to_end(&mut buf)
+            .map_err(|e| BerthError::Transport(format!("Vault HTTP body read failed: {e}")))?;
+        if buf.len() > max_response_bytes {
+            return Err(BerthError::Transport("Vault HTTP response too large".into()));
+        }
+        buf
+    };
+
+    Ok(VaultHttpResponse {
+        status,
+        headers: resp_headers,
+        body: body_bytes,
+    })
 }
 
 fn execute_http_once(
@@ -2230,11 +2380,15 @@ fn is_windows_drvfs_segment(segment: &str) -> bool {
     bytes.len() == 1 || bytes[1] == b'/'
 }
 
-/// Generates the Codex `[shell_environment_policy]` TOML snippet so Codex tool
-/// subshells and MCP stdio servers retain the authoritative Cage TZ/locale.
-pub fn build_codex_shell_env_policy_toml(cage: &LeaseCageProfile) -> String {
+/// Generates the Codex `model_provider = "berth"` + `[model_providers.berth]` +
+/// `[shell_environment_policy]` TOML snippet so stock `codex` routes Responses API
+/// over HTTP SSE directly to the authenticated loopback `CageShim` (disabling direct
+/// Responses WebSockets that bypass HTTP proxy/SSE rewriting) and retains Cage TZ/locale.
+pub fn build_codex_shell_env_policy_toml(cage: &LeaseCageProfile, shim_base_url: &str) -> String {
+    let base_v1 = format!("{}/v1", shim_base_url.trim_end_matches('/'));
     format!(
-        "[shell_environment_policy]\ninherit = \"core\"\n\n[shell_environment_policy.set]\nTZ = {}\nLANG = {}\nLC_ALL = {}\nLC_TIME = {}\n",
+        "model_provider = \"berth\"\n\n[model_providers.berth]\nname = \"Berth\"\nbase_url = {}\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\nsupports_websockets = false\n\n[shell_environment_policy]\ninherit = \"core\"\n\n[shell_environment_policy.set]\nTZ = {}\nLANG = {}\nLC_ALL = {}\nLC_TIME = {}\n",
+        toml_quote(&base_v1),
         toml_quote(&cage.timezone),
         toml_quote(&cage.locale),
         toml_quote(&cage.locale),
@@ -2361,7 +2515,7 @@ pub fn build_cli_launch_env_with_caps(
         "codex" => {
             set_env.insert("OPENAI_BASE_URL".to_string(), format!("{base}/v1"));
             set_env.insert("OPENAI_API_KEY".to_string(), shim_token.to_string());
-            codex_shell_env_policy_toml = Some(build_codex_shell_env_policy_toml(cage));
+            codex_shell_env_policy_toml = Some(build_codex_shell_env_policy_toml(cage, base));
         }
         "claude" => {
             set_env.insert("ANTHROPIC_BASE_URL".to_string(), base.to_string());
@@ -2443,26 +2597,108 @@ pub fn resolve_stock_cli_binary(agent: &str) -> Result<PathBuf, BerthError> {
     })
 }
 
-/// Writes the Codex `[shell_environment_policy]` into an overlay `CODEX_HOME/config.toml`
-/// without ever mutating the user's real `~/.codex/config.toml` (unlinks symlink first).
+/// Ensures `dir` and its immediate parent contain no symlink components before writing.
+fn verify_no_symlink_overlay_dir(overlay_codex_home: &Path) -> Result<(), BerthError> {
+    if let Some(parent) = overlay_codex_home.parent() {
+        if let Ok(pmeta) = fs::symlink_metadata(parent) {
+            if pmeta.file_type().is_symlink() {
+                return Err(BerthError::Io(format!(
+                    "refusing to write Codex config beneath symlinked parent {}",
+                    parent.display()
+                )));
+            }
+        }
+    }
+    if let Ok(meta) = fs::symlink_metadata(overlay_codex_home) {
+        if meta.file_type().is_symlink() {
+            return Err(BerthError::Io(format!(
+                "refusing to write Codex config through symlinked directory {}",
+                overlay_codex_home.display()
+            )));
+        }
+        if !meta.is_dir() {
+            return Err(BerthError::Io(format!(
+                "overlay CODEX_HOME path is not a directory: {}",
+                overlay_codex_home.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Writes the Codex `[model_providers.berth]` + `[shell_environment_policy]` into an overlay
+/// `CODEX_HOME/config.toml` using a real TOML document parser (handling multiline strings,
+/// quoted keys, comments, and `[profiles.*]` overrides) without ever following symlinks.
 pub fn write_codex_overlay_config_toml(
     overlay_codex_home: &Path,
     snippet: &str,
 ) -> Result<PathBuf, BerthError> {
+    verify_no_symlink_overlay_dir(overlay_codex_home)?;
     fs::create_dir_all(overlay_codex_home)?;
-    let config_path = overlay_codex_home.join("config.toml");
-    let existing = if config_path.is_file() {
-        fs::read_to_string(&config_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    if config_path
-        .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        fs::remove_file(&config_path)?;
+    verify_no_symlink_overlay_dir(overlay_codex_home)?;
+
+    // Verify canonical path stays inside its canonicalized parent (defends against concurrent swap).
+    if let Some(parent) = overlay_codex_home.parent() {
+        let canon_parent = fs::canonicalize(parent)?;
+        let canon_dir = fs::canonicalize(overlay_codex_home)?;
+        if !canon_dir.starts_with(&canon_parent) {
+            return Err(BerthError::Io(format!(
+                "overlay CODEX_HOME escaped parent directory: {}",
+                overlay_codex_home.display()
+            )));
+        }
     }
+
+    let config_path = overlay_codex_home.join("config.toml");
+    // Open config.toml directly with O_NOFOLLOW on Unix (zero TOCTOU between check and read)
+    // to prevent a sandboxed agent from swapping in a symlink to a host secret file.
+    // Propagate all non-NotFound/non-ELOOP read/open failures so settings are never silently wiped.
+    let existing = match fs::symlink_metadata(&config_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::remove_file(&config_path)?;
+            String::new()
+        }
+        Ok(meta) if meta.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                match fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&config_path)
+                {
+                    Ok(mut f) => {
+                        let mut s = String::new();
+                        f.read_to_string(&mut s)?;
+                        s
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                        fs::remove_file(&config_path)?;
+                        String::new()
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                match fs::read_to_string(&config_path) {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(_) => {
+            return Err(BerthError::Io(format!(
+                "refusing to overwrite non-regular file {}",
+                config_path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+
     // Remove symlinked auth.json inside the overlay only (never touches real ~/.codex/auth.json)
     // so stock `codex` authenticates strictly through the Berth loopback shim.
     let overlay_auth = overlay_codex_home.join("auth.json");
@@ -2473,37 +2709,127 @@ pub fn write_codex_overlay_config_toml(
     {
         let _ = fs::remove_file(&overlay_auth);
     }
-    let cleaned = strip_toml_table(&existing, "shell_environment_policy");
-    let merged = if cleaned.trim().is_empty() {
-        snippet.to_string()
-    } else {
-        format!("{}\n\n{snippet}", cleaned.trim_end())
-    };
-    write_private_file_atomic(&config_path, merged.as_bytes())?;
-    Ok(config_path)
-}
 
-fn strip_toml_table(source: &str, table_prefix: &str) -> String {
-    let mut out = Vec::new();
-    let mut skipping = false;
-    for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let header = trimmed
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .trim();
-            skipping = header == table_prefix
-                || header.starts_with(&format!("{table_prefix}."));
-            if skipping {
-                continue;
+    let mut doc: toml::Table = if existing.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        toml::from_str(&existing).map_err(|e| {
+            BerthError::Io(format!(
+                "existing overlay Codex config {} is invalid TOML: {e}",
+                config_path.display()
+            ))
+        })?
+    };
+
+    let snip_doc: toml::Table = toml::from_str(snippet)
+        .map_err(|e| BerthError::Io(format!("internal Berth Codex TOML snippet invalid: {e}")))?;
+
+    // Apply owned keys authoritatively while preserving all unrelated user settings.
+    if let Some(mp) = snip_doc.get("model_provider") {
+        doc.insert("model_provider".to_string(), mp.clone());
+    }
+    if let Some(toml::Value::Table(snip_providers)) = snip_doc.get("model_providers") {
+        let providers_entry = doc
+            .entry("model_providers".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !providers_entry.is_table() {
+            *providers_entry = toml::Value::Table(toml::Table::new());
+        }
+        if let Some(providers_tbl) = providers_entry.as_table_mut() {
+            for (k, v) in snip_providers {
+                providers_tbl.insert(k.clone(), v.clone());
             }
         }
-        if !skipping {
-            out.push(line);
+    }
+    if let Some(policy) = snip_doc.get("shell_environment_policy") {
+        doc.insert("shell_environment_policy".to_string(), policy.clone());
+    }
+    if let Some(toml::Value::Table(snip_projects)) = snip_doc.get("projects") {
+        let projects_entry = doc
+            .entry("projects".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !projects_entry.is_table() {
+            *projects_entry = toml::Value::Table(toml::Table::new());
+        }
+        if let Some(projects_tbl) = projects_entry.as_table_mut() {
+            for (k, v) in snip_projects {
+                projects_tbl.entry(k.clone()).or_insert_with(|| v.clone());
+            }
         }
     }
-    out.join("\n")
+    if let Some(toml::Value::Table(snip_features)) = snip_doc.get("features") {
+        let features_entry = doc
+            .entry("features".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !features_entry.is_table() {
+            *features_entry = toml::Value::Table(toml::Table::new());
+        }
+        if let Some(features_tbl) = features_entry.as_table_mut() {
+            for (k, v) in snip_features {
+                features_tbl.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    // Ensure no selected `[profiles.<name>]` table can override `model_provider` away from `"berth"`.
+    if let Some(expected_mp) = snip_doc.get("model_provider").and_then(|v| v.as_str()) {
+        if let Some(toml::Value::Table(profiles)) = doc.get_mut("profiles") {
+            for (_name, prof_val) in profiles.iter_mut() {
+                if let Some(prof_tbl) = prof_val.as_table_mut() {
+                    if prof_tbl.contains_key("model_provider") {
+                        prof_tbl.insert(
+                            "model_provider".to_string(),
+                            toml::Value::String(expected_mp.to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let merged = toml::to_string_pretty(&doc)
+        .map_err(|e| BerthError::Io(format!("serialize merged Codex config.toml: {e}")))?;
+
+    // Verify by re-parsing before atomic replacement so malformed/hidden tables are impossible.
+    let verified: toml::Table = toml::from_str(&merged)
+        .map_err(|e| BerthError::Io(format!("re-parse verification of Codex config.toml failed: {e}")))?;
+    if let Some(expected_mp) = snip_doc.get("model_provider").and_then(|v| v.as_str()) {
+        let got_mp = verified.get("model_provider").and_then(|v| v.as_str());
+        if got_mp != Some(expected_mp) {
+            return Err(BerthError::Io(format!(
+                "merged Codex config.toml model_provider mismatch: got {got_mp:?}"
+            )));
+        }
+        let expected_url = snip_doc
+            .get("model_providers")
+            .and_then(|v| v.get("berth"))
+            .and_then(|v| v.get("base_url"))
+            .and_then(|v| v.as_str());
+        let got_url = verified
+            .get("model_providers")
+            .and_then(|v| v.get("berth"))
+            .and_then(|v| v.get("base_url"))
+            .and_then(|v| v.as_str());
+        if got_url != expected_url {
+            return Err(BerthError::Io(format!(
+                "merged Codex config.toml model_providers.berth.base_url mismatch: got {got_url:?}"
+            )));
+        }
+    }
+    if verified
+        .get("shell_environment_policy")
+        .and_then(|v| v.get("inherit"))
+        .and_then(|v| v.as_str())
+        != Some("core")
+    {
+        return Err(BerthError::Io(
+            "merged Codex config.toml missing shell_environment_policy.inherit = \"core\"".into(),
+        ));
+    }
+
+    verify_no_symlink_overlay_dir(overlay_codex_home)?;
+    write_private_file_atomic(&config_path, merged.as_bytes())?;
+    Ok(config_path)
 }
 
 pub fn posix_single_quote(value: &str) -> String {
@@ -3035,22 +3361,99 @@ mod tests {
         fs::create_dir_all(&real_home).unwrap();
         fs::create_dir_all(&overlay_home).unwrap();
         let real_cfg = real_home.join("config.toml");
-        fs::write(&real_cfg, "model = \"o3\"\n[shell_environment_policy]\ninherit = \"all\"\n").unwrap();
+        fs::write(
+            &real_cfg,
+            "model = \"o3\"\n[shell_environment_policy]\ninherit = \"all\"\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_cfg, overlay_home.join("config.toml")).unwrap();
 
         let cage = sample_cage("America/Chicago", "US", "en_US.UTF-8");
-        let snippet = build_codex_shell_env_policy_toml(&cage);
+        let snippet = build_codex_shell_env_policy_toml(&cage, "http://127.0.0.1:41234");
         let written = write_codex_overlay_config_toml(&overlay_home, &snippet).unwrap();
         let overlay_text = fs::read_to_string(&written).unwrap();
-        assert!(overlay_text.contains("model = \"o3\""));
+        // Confused-deputy defense: symlinked config.toml must NEVER be read through;
+        // it is unlinked and replaced with a clean file containing only the cage policy.
+        assert!(overlay_text.contains("model_provider = \"berth\""));
+        assert!(overlay_text.contains("base_url = \"http://127.0.0.1:41234/v1\""));
+        assert!(overlay_text.contains("supports_websockets = false"));
         assert!(overlay_text.contains("TZ = \"America/Chicago\""));
         assert!(!overlay_text.contains("inherit = \"all\""));
+        #[cfg(unix)]
+        assert!(!overlay_text.contains("model = \"o3\""));
 
         // Real file remains untouched!
         let real_text = fs::read_to_string(&real_cfg).unwrap();
         assert!(real_text.contains("inherit = \"all\""));
         assert!(!real_text.contains("America/Chicago"));
+
+        // Regular (non-symlink) config.toml inside the cage preserves non-policy settings.
+        let regular_home = dir.path().join("regular-codex");
+        fs::create_dir_all(&regular_home).unwrap();
+        fs::write(
+            regular_home.join("config.toml"),
+            "model = \"o3\"\n[shell_environment_policy]\ninherit = \"all\"\n",
+        )
+        .unwrap();
+        let written2 = write_codex_overlay_config_toml(&regular_home, &snippet).unwrap();
+        let regular_text = fs::read_to_string(&written2).unwrap();
+        assert!(regular_text.contains("model = \"o3\""));
+        assert!(regular_text.find("model = \"o3\"").unwrap() < regular_text.find("[model_providers.berth]").unwrap());
+        assert!(regular_text.contains("TZ = \"America/Chicago\""));
+        assert!(!regular_text.contains("inherit = \"all\""));
+    }
+
+    #[test]
+    fn write_codex_overlay_config_toml_handles_multiline_and_profile_override() {
+        let dir = TempDir::new().unwrap();
+        let overlay = dir.path().join("cage-codex");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(
+            overlay.join("config.toml"),
+            concat!(
+                "model = \"gpt-5\"\n",
+                "developer_instructions = \"\"\"\n",
+                "[review]\n",
+                "Always verify diffs carefully.\n",
+                "\"\"\"\n\n",
+                "[profiles.work]\n",
+                "model = \"o3\"\n",
+                "model_provider = \"openai\"\n",
+            ),
+        )
+        .unwrap();
+
+        let cage = sample_cage("Asia/Singapore", "SG", "en_SG.UTF-8");
+        let snippet = build_codex_shell_env_policy_toml(&cage, "http://127.0.0.1:49999");
+        let written = write_codex_overlay_config_toml(&overlay, &snippet).unwrap();
+        let parsed: toml::Table = toml::from_str(&fs::read_to_string(&written).unwrap()).unwrap();
+
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("berth")
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|v| v.get("berth"))
+                .and_then(|v| v.get("base_url"))
+                .and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:49999/v1")
+        );
+        let dev_inst = parsed
+            .get("developer_instructions")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(dev_inst.contains("[review]"));
+        assert_eq!(
+            parsed
+                .get("profiles")
+                .and_then(|v| v.get("work"))
+                .and_then(|v| v.get("model_provider"))
+                .and_then(|v| v.as_str()),
+            Some("berth")
+        );
     }
 
     #[test]

@@ -26,9 +26,10 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, ExitStatus};
+use std::process::{Child, Command, ExitCode, ExitStatus};
 #[cfg(unix)]
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +43,164 @@ use crate::cage_shim::CageShimHandle;
 pub const WINDOWS_APPCONTAINER_NAME: &str = "Berth.Cage.Sandbox";
 #[cfg(unix)]
 const TRAMPOLINE_SHIM_TOKEN_ENV: &str = "BERTH_TRAMPOLINE_SHIM_TOKEN";
+
+/// Returns the isolated per-account Windows AppContainer profile name so each
+/// account cage has its own SID and cannot read or write sibling account cages.
+pub fn windows_appcontainer_profile_name(account_key: &str) -> String {
+    format!("{WINDOWS_APPCONTAINER_NAME}.{}", sanitize_account_key(account_key))
+}
+
+/// Exact Win32 `CommandLineToArgvW` argument quoting (handles spaces, tabs, quotes,
+/// and 2*N trailing backslashes before quotes).
+pub fn quote_win32_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '"')) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// Validates that `workspace_dir` will not expose the user's real `$HOME` or the
+/// Berth state/cages directory inside a sandboxed agent.
+pub fn validate_sandbox_workspace(
+    workspace_dir: &Path,
+    real_home: &Path,
+    state_dir: &Path,
+) -> Result<(), BerthError> {
+    let norm = |p: &Path| -> PathBuf {
+        if let Ok(c) = fs::canonicalize(p) {
+            return c;
+        }
+        // Walk up to the deepest existing ancestor so symlinks like macOS
+        // `/var` -> `/private/var` or `/tmp` -> `/private/tmp` are resolved
+        // even when `p` itself does not exist yet.
+        let mut suffix = Vec::new();
+        let mut cur = p;
+        while let Some(parent) = cur.parent() {
+            if let Some(name) = cur.file_name() {
+                suffix.push(name.to_os_string());
+            }
+            if let Ok(mut base) = fs::canonicalize(parent) {
+                for part in suffix.into_iter().rev() {
+                    base.push(part);
+                }
+                return base;
+            }
+            cur = parent;
+        }
+        p.to_path_buf()
+    };
+    let ws = norm(workspace_dir);
+    let home = norm(real_home);
+    let state = norm(state_dir);
+
+    if ws == home || home.starts_with(&ws) {
+        return Err(BerthError::InvalidArgument(format!(
+            "refusing to mount `{}` as sandbox workspace because it exposes your real home directory `{}`; cd into a specific project directory instead",
+            workspace_dir.display(),
+            real_home.display()
+        )));
+    }
+    if ws == state || state.starts_with(&ws) || ws.starts_with(&state) {
+        return Err(BerthError::InvalidArgument(format!(
+            "refusing to mount `{}` as sandbox workspace because it overlaps Berth's isolated state/cages directory `{}`",
+            workspace_dir.display(),
+            state_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Removes sensitive host environment variables before launching a sandboxed agent.
+pub fn scrub_sensitive_host_env(cmd: &mut Command) {
+    for (k, _) in std::env::vars_os() {
+        let Some(key) = k.to_str() else {
+            continue;
+        };
+        if is_sensitive_host_env_key(key) {
+            cmd.env_remove(key);
+        }
+    }
+}
+
+fn is_sensitive_host_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "SSH_AUTH_SOCK"
+            | "SSH_AGENT_PID"
+            | "WSL_INTEROP"
+            | "WSL_DISTRO_NAME"
+            | "WSLENV"
+            | "WT_SESSION"
+            | "WT_PROFILE_ID"
+            | "GPG_AGENT_INFO"
+    ) {
+        return true;
+    }
+    if upper.starts_with("BERTH_")
+        || upper.starts_with("AGS_")
+        || upper.starts_with("AWS_")
+        || upper.starts_with("GITHUB_")
+        || upper.starts_with("GH_")
+        || upper.starts_with("OPENAI_")
+        || upper.starts_with("ANTHROPIC_")
+        || upper.starts_with("CLAUDE_")
+        || upper.starts_with("CODEX_")
+        || upper.starts_with("GEMINI_")
+        || upper.starts_with("GOOGLE_")
+        || upper.starts_with("GROK_")
+        || upper.starts_with("XAI_")
+    {
+        return true;
+    }
+    upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
+        || upper.contains("API_KEY")
+        || upper.contains("PRIVATE_KEY")
+        || upper.contains("CREDENTIAL")
+}
+
+fn ensure_dir_no_symlink(path: &Path) -> Result<(), BerthError> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(BerthError::Io(format!(
+                "refusing to traverse symlink inside cage directory: {}",
+                path.display()
+            )));
+        }
+        if meta.is_dir() {
+            return Ok(());
+        }
+    }
+    fs::create_dir_all(path)?;
+    Ok(())
+}
 
 /// Detected native sandbox backend for the current OS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +236,7 @@ pub struct SandboxLaunchSpec {
     pub agent: String,
     pub workspace_dir: PathBuf,
     pub real_home: PathBuf,
+    pub state_dir: PathBuf,
     pub account_home: AccountCageHome,
     pub cage: LeaseCageProfile,
     pub stock_bin: PathBuf,
@@ -86,6 +246,56 @@ pub struct SandboxLaunchSpec {
     pub overlay_set_env: BTreeMap<String, String>,
     pub overlay_fs_etc: Option<PathBuf>,
     pub allow_env_fallback: bool,
+    pub auto_rebind: bool,
+}
+
+/// Waits for a spawned CLI child process, or — when `auto_rebind` is enabled
+/// and `shim` intercepts `409 cage_rebind_required` — allows a short 350ms
+/// transcript-flush window and then cleanly terminates the old CLI process so
+/// `bh` can immediately migrate state into the new Cage without waiting for
+/// manual user exit or 30s SDK retry backoff.
+pub fn wait_child_or_rebind(
+    mut child: Child,
+    shim: &CageShimHandle,
+    auto_rebind: bool,
+) -> std::io::Result<ExitStatus> {
+    if !auto_rebind {
+        return child.wait();
+    }
+    let mut rebind_seen_at: Option<Instant> = None;
+    let mut sigterm_sent_at: Option<Instant> = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if shim.has_rebind_signal() {
+            let first_seen = *rebind_seen_at.get_or_insert_with(Instant::now);
+            // Allow 350ms for CLI to flush last tool_result / JSONL line to disk.
+            if first_seen.elapsed() >= Duration::from_millis(350) {
+                match sigterm_sent_at {
+                    None => {
+                        #[cfg(unix)]
+                        {
+                            let _ = Command::new("kill")
+                                .args(["-TERM", &child.id().to_string()])
+                                .status();
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = child.kill();
+                        }
+                        sigterm_sent_at = Some(Instant::now());
+                    }
+                    Some(t) if t.elapsed() >= Duration::from_secs(2) => {
+                        let _ = child.kill();
+                        return child.wait();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Probes native zero-VM sandbox capabilities on Linux/WSL2, macOS, or Windows.
@@ -284,11 +494,14 @@ pub fn prepare_account_cage_home(
         ),
     };
     let account_key = sanitize_account_key(&raw_key);
-    let root_dir = state_dir.join("cages").join(&account_key);
+    let cages_root = state_dir.join("cages");
+    ensure_dir_no_symlink(&cages_root)?;
+    let root_dir = cages_root.join(&account_key);
     let home_dir = root_dir.join("home");
     let etc_dir = root_dir.join("etc");
 
     for sub in [
+        &root_dir,
         &home_dir,
         &etc_dir,
         &home_dir.join(".config"),
@@ -297,8 +510,10 @@ pub fn prepare_account_cage_home(
         &home_dir.join(".local").join("state"),
         &home_dir.join(".claude"),
         &home_dir.join(".codex"),
+        &home_dir.join(".grok"),
+        &home_dir.join(".gemini").join("antigravity-cli"),
     ] {
-        fs::create_dir_all(sub)?;
+        ensure_dir_no_symlink(sub)?;
     }
     #[cfg(unix)]
     {
@@ -308,9 +523,11 @@ pub fn prepare_account_cage_home(
     }
 
     let machine_id = deterministic_hex(&format!("berth-cage-machine-id:{account_key}"), 32);
+    // Antidetect principle: never advertise the cage tool name in os.hostname();
+    // use a realistic, deterministic workstation hostname stable across restarts.
     let hostname = format!(
-        "berth-{}",
-        deterministic_hex(&format!("berth-cage-host:{account_key}"), 8)
+        "dev-{}",
+        deterministic_hex(&format!("berth-cage-host:{account_key}"), 6)
     );
 
     let machine_id_file = etc_dir.join("machine-id");
@@ -323,13 +540,31 @@ pub fn prepare_account_cage_home(
     write_private_file_atomic(&timezone_file, format!("{}\n", cage.timezone).as_bytes())?;
     write_private_file_atomic(
         &resolv_conf_file,
-        b"# Managed by Berth Sandbox (DNS resolved remotely on Landing Node via proxy)\nnameserver 127.0.0.1\n",
+        b"# Managed local resolver\nnameserver 127.0.0.1\n",
     )?;
     write_private_file_atomic(&hostname_file, format!("{hostname}\n").as_bytes())?;
     write_private_file_atomic(
         &hosts_file,
         format!("127.0.0.1 localhost {hostname}\n").as_bytes(),
     )?;
+
+    // Persist deterministic device persona profile (antidetect sticky binding).
+    let profile_path = root_dir.join("profile.json");
+    let profile_json = serde_json::json!({
+        "schema_version": 1,
+        "account_key": account_key,
+        "hostname": hostname,
+        "machine_id": machine_id,
+        "cohort_timezone": cage.timezone,
+        "cohort_country": cage.country_code,
+        "cohort_locale": cage.locale,
+        "cohort_accept_language": cage.accept_language,
+        "cage_id": cage.cage_id,
+        "gate_epoch": cage.gate_epoch,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&profile_json) {
+        let _ = write_private_file_atomic(&profile_path, &bytes);
+    }
 
     Ok(AccountCageHome {
         account_key,
@@ -346,13 +581,16 @@ pub fn prepare_account_cage_home(
     })
 }
 
-/// Writes Codex `[shell_environment_policy]` into the isolated per-account `$HOME/.codex/config.toml`
-/// preserving TZ/locale AND the Berth proxy env vars for Codex subshells & MCP tools.
+/// Writes Codex `model_provider = "berth"` + `[model_providers.berth]` + `[shell_environment_policy]`
+/// into the isolated per-account `$HOME/.codex/config.toml` so `codex` sends Responses API SSE requests
+/// strictly to the loopback `CageShim` while subshells & MCP tools inherit Cage TZ/locale + ForwardProxy.
 pub fn write_codex_sandbox_config(
     account_home: &AccountCageHome,
     cage: &LeaseCageProfile,
+    shim_url: &str,
     http_proxy_url: &str,
     socks5_proxy_url: &str,
+    workspace_dir: Option<&Path>,
 ) -> Result<PathBuf, BerthError> {
     let quote = |raw: &str| -> String {
         let esc = raw
@@ -361,12 +599,31 @@ pub fn write_codex_sandbox_config(
             .replace('\n', "\\n");
         format!("\"{esc}\"")
     };
+    let base_v1 = format!("{}/v1", shim_url.trim_end_matches('/'));
+    let trust_block = workspace_dir
+        .map(|ws| {
+            format!(
+                "\n[projects.{}]\ntrust_level = \"trusted\"\n",
+                quote(&ws.to_string_lossy())
+            )
+        })
+        .unwrap_or_default();
     let snippet = format!(
-        "[shell_environment_policy]\ninherit = \"core\"\n\n[shell_environment_policy.set]\n\
+        "model_provider = \"berth\"\n\n\
+         [features]\n\
+         daemon_auto_start = false\n\n\
+         [model_providers.berth]\n\
+         name = \"Berth\"\n\
+         base_url = {}\n\
+         env_key = \"OPENAI_API_KEY\"\n\
+         wire_api = \"responses\"\n\
+         supports_websockets = false\n\n\
+         [shell_environment_policy]\ninherit = \"core\"\n\n[shell_environment_policy.set]\n\
          TZ = {}\nLANG = {}\nLC_ALL = {}\nLC_TIME = {}\n\
          HTTP_PROXY = {}\nHTTPS_PROXY = {}\nALL_PROXY = {}\n\
          http_proxy = {}\nhttps_proxy = {}\nall_proxy = {}\n\
-         NO_PROXY = \"127.0.0.1,localhost\"\nno_proxy = \"127.0.0.1,localhost\"\n",
+         NO_PROXY = \"127.0.0.1,localhost\"\nno_proxy = \"127.0.0.1,localhost\"\n{}",
+        quote(&base_v1),
         quote(&cage.timezone),
         quote(&cage.locale),
         quote(&cage.locale),
@@ -377,8 +634,81 @@ pub fn write_codex_sandbox_config(
         quote(http_proxy_url),
         quote(http_proxy_url),
         quote(socks5_proxy_url),
+        trust_block,
     );
     write_codex_overlay_config_toml(&account_home.home_dir.join(".codex"), &snippet)
+}
+
+/// Ensures the isolated per-account `$CLAUDE_CONFIG_DIR/.claude.json` has
+/// first-run UI onboarding and current-workspace trust pre-accepted so
+/// interactive `bh claude` (including seamless cross-cage `--auto-rebind`)
+/// never stalls on theme/trust wizards in a brand-new account Cage.
+///
+/// Security guarantee: NEVER copies `machineID`, `userID`, `anonymousId`, or
+/// credentials from the host or another account Cage; Claude generates fresh
+/// per-account identity fields inside each isolated Cage.
+pub fn write_claude_sandbox_config(
+    account_home: &AccountCageHome,
+    workspace_dir: &Path,
+) -> Result<PathBuf, BerthError> {
+    let claude_dir = account_home.home_dir.join(".claude");
+    fs::create_dir_all(&claude_dir)?;
+    let cfg_path = claude_dir.join(".claude.json");
+    if cfg_path
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(BerthError::InvalidArgument(format!(
+            "refusing to write symlinked Claude config {}",
+            cfg_path.display()
+        )));
+    }
+    let mut root: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    root.entry("hasCompletedOnboarding".to_string())
+        .or_insert(serde_json::Value::Bool(true));
+    root.entry("theme".to_string())
+        .or_insert_with(|| serde_json::Value::String("dark".to_string()));
+    let projects = root
+        .entry("projects".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !projects.is_object() {
+        *projects = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(proj_map) = projects.as_object_mut() {
+        let mut keys = vec![workspace_dir.to_string_lossy().into_owned()];
+        if let Ok(canon) = fs::canonicalize(workspace_dir) {
+            let cs = canon.to_string_lossy().into_owned();
+            if !keys.contains(&cs) {
+                keys.push(cs);
+            }
+        }
+        for key in keys {
+            let entry = proj_map
+                .entry(key)
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert(
+                    "hasTrustDialogAccepted".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+                obj.insert(
+                    "hasCompletedProjectOnboarding".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
+    }
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| BerthError::Io(e.to_string()))?;
+    let tmp_path = claude_dir.join(format!(".claude.json.tmp-{}", uuid::Uuid::new_v4().simple()));
+    fs::write(&tmp_path, body)?;
+    fs::rename(&tmp_path, &cfg_path)?;
+    Ok(cfg_path)
 }
 
 /// Applies isolated per-account HOME/USERPROFILE + unified Berth ForwardProxy env vars.
@@ -416,7 +746,6 @@ pub fn apply_proxy_and_home_env(
     cmd.env("all_proxy", socks5_proxy_url);
     cmd.env("NO_PROXY", "127.0.0.1,localhost");
     cmd.env("no_proxy", "127.0.0.1,localhost");
-    cmd.env("BERTH_SANDBOX_ACCOUNT", &account_home.account_key);
 }
 
 /// Launches the stock CLI inside the OS-native zero-VM sandbox (Linux/WSL2 `bwrap`,
@@ -426,6 +755,10 @@ pub fn launch_in_sandbox(
     spec: &SandboxLaunchSpec,
     shim: &mut CageShimHandle,
 ) -> Result<ExitStatus, BerthError> {
+    validate_sandbox_workspace(&spec.workspace_dir, &spec.real_home, &spec.state_dir)?;
+    if spec.agent == "claude" {
+        let _ = write_claude_sandbox_config(&spec.account_home, &spec.workspace_dir);
+    }
     let probe = probe_sandbox_backend();
 
     #[cfg(target_os = "linux")]
@@ -489,13 +822,16 @@ fn launch_env_with_proxy(
         let _ = write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
+            &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
+            Some(&spec.workspace_dir),
         );
     }
     let mut cmd = Command::new(&spec.stock_bin);
     cmd.args(&spec.agent_args);
     cmd.current_dir(&spec.workspace_dir);
+    scrub_sensitive_host_env(&mut cmd);
     for key in &spec.overlay_unset_env {
         cmd.env_remove(key);
     }
@@ -512,7 +848,8 @@ fn launch_env_with_proxy(
         &shim.proxy_http_url(),
         &shim.proxy_socks5_url(),
     );
-    Ok(cmd.status()?)
+    let child = cmd.spawn()?;
+    Ok(wait_child_or_rebind(child, shim, spec.auto_rebind)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +918,17 @@ pub fn build_bwrap_args(
             .filter(|name| {
                 !matches!(
                     name.as_str(),
-                    "localtime" | "timezone" | "machine-id" | "resolv.conf" | "hostname" | "hosts"
+                    "localtime"
+                        | "timezone"
+                        | "machine-id"
+                        | "resolv.conf"
+                        | "hostname"
+                        | "hosts"
+                        | "ssh"
+                        | "shadow"
+                        | "gshadow"
+                        | "sudoers"
+                        | "sudoers.d"
                 )
             })
             .collect();
@@ -647,10 +994,15 @@ pub fn build_bwrap_args(
     args.push(real_home_str.clone());
 
     // Read-only mount safe user developer toolchains (NEVER ~/.ssh, ~/.berth, ~/.claude, ~/.codex, ~/.aws, ~/.gnupg).
+    // Include `~/.local/share/claude/versions` and `~/.local/lib/node_modules` so official native
+    // Claude Code (`~/.local/bin/claude -> ~/.local/share/claude/versions/<ver>`) and user-prefix
+    // npm CLIs resolve cleanly inside the isolated home bind mount without exposing credentials.
     for safe_tool_rel in [
         ".cargo/bin",
         ".rustup",
         ".local/bin",
+        ".local/share/claude/versions",
+        ".local/lib/node_modules",
         ".nvm",
         ".fnm",
         ".pyenv",
@@ -669,8 +1021,19 @@ pub fn build_bwrap_args(
         }
     }
 
-    // If stock_bin lives in an uncommon non-system path (e.g. custom prefix), expose its parent dir read-only
-    // unless it sits inside real_home sensitive dirs.
+    // If stock_bin (or its symlink target) lives in an uncommon non-system path (e.g. custom prefix),
+    // expose its parent dir or resolved file read-only unless it sits inside sensitive home dirs.
+    let is_sensitive_home_path = |p: &Path| -> bool {
+        if let Ok(rel) = p.strip_prefix(real_home) {
+            if let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) {
+                return matches!(
+                    first,
+                    ".ssh" | ".berth" | ".claude" | ".codex" | ".aws" | ".gnupg" | ".config"
+                );
+            }
+        }
+        false
+    };
     if let Some(bin_parent) = stock_bin.parent() {
         let bp_str = bin_parent.to_string_lossy();
         let covered_by_sys = ["/usr", "/bin", "/sbin", "/opt", "/var"]
@@ -680,6 +1043,21 @@ pub fn build_bwrap_args(
             args.push("--ro-bind".into());
             args.push(bp_str.clone().into_owned());
             args.push(bp_str.into_owned());
+        }
+    }
+    if let Ok(resolved_bin) = fs::canonicalize(stock_bin) {
+        let rb_str = resolved_bin.to_string_lossy();
+        let covered_by_sys = ["/usr", "/bin", "/sbin", "/opt", "/var"]
+            .iter()
+            .any(|p| rb_str.starts_with(p));
+        if resolved_bin != stock_bin
+            && !covered_by_sys
+            && resolved_bin.is_file()
+            && !is_sensitive_home_path(&resolved_bin)
+        {
+            args.push("--ro-bind".into());
+            args.push(rb_str.clone().into_owned());
+            args.push(rb_str.into_owned());
         }
     }
 
@@ -766,12 +1144,15 @@ fn launch_linux_bwrap(
         let _ = write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
+            &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
+            Some(&spec.workspace_dir),
         );
     }
 
     let mut cmd = Command::new(&bwrap_bin);
+    scrub_sensitive_host_env(&mut cmd);
     cmd.args(&bwrap_args);
     for key in &spec.overlay_unset_env {
         cmd.env_remove(key);
@@ -789,10 +1170,10 @@ fn launch_linux_bwrap(
     cmd.env("CODEX_HOME", spec.real_home.join(".codex"));
     cmd.env("CLAUDE_CONFIG_DIR", spec.real_home.join(".claude"));
     cmd.env(TRAMPOLINE_SHIM_TOKEN_ENV, shim.shim_token());
-    cmd.env("BERTH_SANDBOX_BACKEND", "linux-bwrap");
-    cmd.env("BERTH_SANDBOX_ACCOUNT", &spec.account_home.account_key);
 
-    let status = cmd.status();
+    let status = cmd
+        .spawn()
+        .and_then(|child| wait_child_or_rebind(child, shim, spec.auto_rebind));
     // Shut down Unix socket bridges BEFORE bridge_tmp drops and unlinks the socket files!
     shim.stop_unix_bridges();
     Ok(status?)
@@ -1000,11 +1381,13 @@ fn macos_seatbelt_path_variants(path: &Path) -> Vec<PathBuf> {
 /// Generates a fail-closed macOS Seatbelt (`.sb`) profile enforcing:
 /// - `(deny network*)`, allowing ONLY `localhost:<shim_port>` and `localhost:<proxy_port>`
 /// - Denies `/private/var/run/mDNSResponder` (blocks host DNS lookups)
-/// - Hides `~/.ssh`, `~/.berth`, `~/.gnupg`, `~/.aws`, `~/.kube`
-/// - Allows writes ONLY to `$PWD`, `<cage_home>`, and temp/tty devices.
+/// - Hides `~/.ssh`, `~/.berth`, `~/.config/berth`, `~/.config/ags`, `~/.gnupg`, `~/.aws`, `~/.kube`,
+///   host provider homes (`~/.claude`, `~/.codex`, `~/.grok`, `~/.gemini`), and ALL sibling cages under `<state_dir>/cages`
+/// - Allows reads/writes ONLY to `$PWD`, the active `<cage_home>`, and temp/tty devices.
 pub fn generate_macos_seatbelt_profile(
     workspace_dir: &Path,
     real_home: &Path,
+    state_dir: &Path,
     cage_home: &Path,
     shim_addr: SocketAddr,
     proxy_addr: SocketAddr,
@@ -1012,11 +1395,66 @@ pub fn generate_macos_seatbelt_profile(
     let shim_port = shim_addr.port();
     let proxy_port = proxy_addr.port();
 
+    let cages_root = state_dir.join("cages");
     let mut deny_read_lines = Vec::new();
-    for rh in macos_seatbelt_path_variants(real_home) {
-        let esc = sbpl_escape(&rh);
-        for sensitive in [".ssh", ".berth", ".gnupg", ".aws", ".kube"] {
-            deny_read_lines.push(format!("  (subpath \"{esc}/{sensitive}\")"));
+    for rel in [
+        ".ssh",
+        ".berth",
+        ".aws",
+        ".kube",
+        ".gnupg",
+        ".docker",
+        ".netrc",
+        ".git-credentials",
+        ".npmrc",
+        ".pypirc",
+        ".config/gh",
+        ".config/berth",
+        ".config/ags",
+        ".claude",
+        ".codex",
+        ".grok",
+        ".gemini",
+        "Library/Keychains",
+        "Library/Application Support/berth",
+        "Library/Application Support/ags",
+        "Library/Application Support/Google/Chrome",
+        "Library/Application Support/BraveSoftware",
+        "Library/Application Support/Arc",
+        "Library/Application Support/Firefox",
+        "Library/Application Support/Microsoft Edge",
+        "Library/Safari",
+    ] {
+        for base in macos_seatbelt_path_variants(real_home) {
+            let p = Path::new(&base).join(rel);
+            deny_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&p)));
+        }
+    }
+    for cr in macos_seatbelt_path_variants(&cages_root) {
+        deny_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&cr)));
+    }
+    for sd in macos_seatbelt_path_variants(state_dir) {
+        deny_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&sd)));
+    }
+
+    let mut allow_cage_read_lines = Vec::new();
+    for ch in macos_seatbelt_path_variants(cage_home) {
+        allow_cage_read_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&ch)));
+    }
+    // Allow lstat/realpath traversal (`file-read-metadata` ONLY, NOT `file-read-data` / readdir)
+    // on the exact ancestor path literals leading to the active cage home so Rust `fs::canonicalize`
+    // (used by `codex`) succeeds while sibling cages and `state_dir` contents remain unreadable!
+    let mut allow_ancestor_meta_lines = Vec::new();
+    for ancestor in [
+        Some(state_dir),
+        Some(cages_root.as_path()),
+        cage_home.parent(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for variant in macos_seatbelt_path_variants(ancestor) {
+            allow_ancestor_meta_lines.push(format!("  (literal \"{}\")", sbpl_escape(&variant)));
         }
     }
 
@@ -1029,7 +1467,21 @@ pub fn generate_macos_seatbelt_profile(
     }
 
     let deny_read_block = deny_read_lines.join("\n");
+    let allow_cage_read_block = allow_cage_read_lines.join("\n");
+    let allow_ancestor_meta_block = allow_ancestor_meta_lines.join("\n");
     let allow_write_block = allow_write_lines.join("\n");
+
+    let mut allow_unix_sock_lines = vec![
+        "  (literal \"/private/var/run/syslog\")".to_string(),
+        "  (literal \"/var/run/syslog\")".to_string(),
+        "  (subpath \"/tmp\")".to_string(),
+        "  (subpath \"/private/tmp\")".to_string(),
+        "  (subpath \"/private/var/folders\")".to_string(),
+    ];
+    for ch in macos_seatbelt_path_variants(cage_home) {
+        allow_unix_sock_lines.push(format!("  (subpath \"{}\")", sbpl_escape(&ch)));
+    }
+    let allow_unix_sock_block = allow_unix_sock_lines.join("\n");
 
     format!(
         r#"(version 1)
@@ -1040,13 +1492,22 @@ pub fn generate_macos_seatbelt_profile(
 (allow network-outbound (remote ip "localhost:{shim_port}"))
 (allow network-outbound (remote ip "localhost:{proxy_port}"))
 (allow network-inbound (local ip "localhost:*"))
-(allow network-outbound (remote unix-socket))
+;; Restrict outbound Unix domain sockets to syslog/tmp/active cage (blocks mDNSResponder, docker, ssh-agent, etc.).
+(allow network-outbound (remote unix-socket
+{allow_unix_sock_block}))
 (deny network-outbound (remote unix-socket (literal "/private/var/run/mDNSResponder")))
 (deny network-outbound (remote unix-socket (literal "/var/run/mDNSResponder")))
 
-;; 2. Hide host sensitive credential directories (raw + canonical paths).
+;; 2. Hide host credentials, provider homes, Berth config/state, and ALL sibling account cages.
 (deny file-read*
 {deny_read_block})
+;; Allow lstat metadata ONLY on exact ancestor literals so realpath()/canonicalize() can reach cage_home
+;; without ever permitting directory listing (`file-read-data`) of sibling cages or state_dir!
+(allow file-read-metadata
+{allow_ancestor_meta_block})
+;; Re-allow reading strictly inside the active account's own isolated cage home.
+(allow file-read*
+{allow_cage_read_block})
 
 ;; 3. Restrict file writes strictly to workspace, isolated account home, and temp/tty.
 (deny file-write*)
@@ -1076,14 +1537,17 @@ fn launch_macos_seatbelt(
         let _ = write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
+            &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
+            Some(&spec.workspace_dir),
         );
     }
 
     let profile = generate_macos_seatbelt_profile(
         &spec.workspace_dir,
         &spec.real_home,
+        &spec.state_dir,
         &spec.account_home.home_dir,
         shim.listen_addr(),
         shim.proxy_addr(),
@@ -1095,6 +1559,7 @@ fn launch_macos_seatbelt(
     write_private_file_atomic(&sb_file, profile.as_bytes())?;
 
     let mut cmd = Command::new("/usr/bin/sandbox-exec");
+    scrub_sensitive_host_env(&mut cmd);
     cmd.arg("-f").arg(&sb_file);
     cmd.arg(&spec.stock_bin);
     cmd.args(&spec.agent_args);
@@ -1113,9 +1578,9 @@ fn launch_macos_seatbelt(
         &shim.proxy_http_url(),
         &shim.proxy_socks5_url(),
     );
-    cmd.env("BERTH_SANDBOX_BACKEND", "macos-seatbelt");
 
-    Ok(cmd.status()?)
+    let child = cmd.spawn()?;
+    Ok(wait_child_or_rebind(child, shim, spec.auto_rebind)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,32 +1592,27 @@ fn launch_macos_seatbelt(
 /// and spawns the target CLI with `CapabilityCount = 0` (NO `internetClient` -> kernel blocks
 /// all direct internet TCP/UDP/IPv6/DNS).
 pub fn generate_windows_appcontainer_script(
+    account_key: &str,
     workspace_dir: &Path,
     cage_home: &Path,
     stock_bin: &Path,
     agent_args: &[String],
 ) -> String {
     let ps_quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let profile_name = windows_appcontainer_profile_name(account_key);
     let ws = ps_quote(&workspace_dir.to_string_lossy());
     let ch = ps_quote(&cage_home.to_string_lossy());
     let bin = ps_quote(&stock_bin.to_string_lossy());
-    let args_joined = agent_args
-        .iter()
-        .map(|a| {
-            let escaped = a.replace('"', "\\\"");
-            if escaped.contains(' ') || escaped.is_empty() {
-                format!("\"{escaped}\"")
-            } else {
-                escaped
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let cmd_line = ps_quote(&format!("\"{}\" {}", stock_bin.to_string_lossy(), args_joined));
+    let mut cmd_parts = Vec::with_capacity(agent_args.len() + 1);
+    cmd_parts.push(quote_win32_arg(&stock_bin.to_string_lossy()));
+    for a in agent_args {
+        cmd_parts.push(quote_win32_arg(a));
+    }
+    let cmd_line = ps_quote(&cmd_parts.join(" "));
 
     format!(
         r#"$ErrorActionPreference = 'Stop'
-$profileName = '{WINDOWS_APPCONTAINER_NAME}'
+$profileName = '{profile_name}'
 $workspace = {ws}
 $cageHome = {ch}
 $exePath = {bin}
@@ -1263,9 +1723,15 @@ public static class BerthAppContainer {{
 
 Add-Type -TypeDefinition $code
 $sid = [BerthAppContainer]::EnsureProfileAndGetSidString($profileName)
-& icacls $workspace /grant "*$($sid):(OI)(CI)M" /Q | Out-Null
+& CheckNetIsolation.exe LoopbackExempt -a "-p=$($sid)" 2>$null | Out-Null
 & icacls $cageHome /grant "*$($sid):(OI)(CI)F" /Q | Out-Null
-$rc = [BerthAppContainer]::RunZeroNet($profileName, $exePath, $cmdLine, $workspace)
+& icacls $workspace /grant "*$($sid):(OI)(CI)M" /Q | Out-Null
+try {{
+    $rc = [BerthAppContainer]::RunZeroNet($profileName, $exePath, $cmdLine, $workspace)
+}} finally {{
+    # Revoke workspace ACL grant on exit so prior workspaces do not remain readable across launches.
+    & icacls $workspace /remove:g "*$($sid)" /Q 2>$null | Out-Null
+}}
 exit $rc
 "#
     )
@@ -1339,11 +1805,14 @@ fn launch_windows_appcontainer(
         let _ = write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
+            &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
+            Some(&spec.workspace_dir),
         );
     }
     let script = generate_windows_appcontainer_script(
+        &spec.account_home.account_key,
         &spec.workspace_dir,
         &spec.account_home.home_dir,
         &spec.stock_bin,
@@ -1356,6 +1825,7 @@ fn launch_windows_appcontainer(
     write_private_file_atomic(&ps1, script.as_bytes())?;
 
     let mut cmd = Command::new("powershell.exe");
+    scrub_sensitive_host_env(&mut cmd);
     cmd.args([
         "-NoProfile",
         "-ExecutionPolicy",
@@ -1377,8 +1847,8 @@ fn launch_windows_appcontainer(
         &shim.proxy_http_url(),
         &shim.proxy_socks5_url(),
     );
-    cmd.env("BERTH_SANDBOX_BACKEND", "windows-appcontainer");
-    Ok(cmd.status()?)
+    let child = cmd.spawn()?;
+    Ok(wait_child_or_rebind(child, shim, spec.auto_rebind)?)
 }
 
 #[cfg(test)]
@@ -1451,7 +1921,8 @@ mod tests {
         let sb = generate_macos_seatbelt_profile(
             Path::new("/var/folders/ab/work/app"),
             Path::new("/Users/alice"),
-            Path::new("/tmp/berth-cages/acct-7/home"),
+            Path::new("/tmp/berth-state"),
+            Path::new("/tmp/berth-state/cages/acct-7/home"),
             "127.0.0.1:41001".parse().unwrap(),
             "127.0.0.1:41002".parse().unwrap(),
         );
@@ -1460,24 +1931,47 @@ mod tests {
         assert!(sb.contains("(allow network-outbound (remote ip \"localhost:41002\"))"));
         assert!(sb.contains("/private/var/run/mDNSResponder"));
         assert!(sb.contains("/Users/alice/.ssh"));
-        assert!(sb.contains("/Users/alice/.berth"));
+        assert!(sb.contains("/Users/alice/.config/berth"));
+        assert!(sb.contains("/Users/alice/.claude"));
+        assert!(sb.contains("/Users/alice/.codex"));
+        assert!(sb.contains("/private/tmp/berth-state/cages"));
+        assert!(sb.contains("(allow file-read*\n  (subpath \"/tmp/berth-state/cages/acct-7/home\")"));
         assert!(sb.contains("(subpath \"/var/folders/ab/work/app\")"));
         assert!(sb.contains("(subpath \"/private/var/folders/ab/work/app\")"));
-        assert!(sb.contains("(subpath \"/private/tmp/berth-cages/acct-7/home\")"));
+        assert!(sb.contains("(subpath \"/private/tmp/berth-state/cages/acct-7/home\")"));
     }
 
     #[test]
-    fn windows_appcontainer_script_uses_zero_network_capabilities() {
+    fn windows_appcontainer_script_uses_zero_network_capabilities_and_per_account_sid() {
         let ps = generate_windows_appcontainer_script(
+            "acct-7",
             Path::new("C:\\work\\repo"),
             Path::new("C:\\Users\\alice\\AppData\\Local\\berth\\cages\\acct-7\\home"),
             Path::new("C:\\Tools\\claude.exe"),
-            &["--help".into()],
+            &["--prompt".into(), "say \"hi\" \\".into()],
         );
-        assert!(ps.contains(WINDOWS_APPCONTAINER_NAME));
+        assert!(ps.contains("Berth.Cage.Sandbox.acct-7"));
         assert!(ps.contains("CapabilityCount = 0"));
         assert!(!ps.contains("internetClient\""));
         assert!(ps.contains("C:\\work\\repo"));
+        assert_eq!(quote_win32_arg("a\\b\\"), "a\\b\\");
+        assert_eq!(quote_win32_arg("say \"hi\" \\"), "\"say \\\"hi\\\" \\\\\"");
+    }
+
+    #[test]
+    fn validate_sandbox_workspace_rejects_home_and_state_overlap() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let state = home.join(".local/state/berth");
+        let project = home.join("code/proj");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&project).unwrap();
+
+        assert!(validate_sandbox_workspace(&project, &home, &state).is_ok());
+        assert!(validate_sandbox_workspace(&home, &home, &state).is_err());
+        assert!(validate_sandbox_workspace(tmp.path(), &home, &state).is_err());
+        assert!(validate_sandbox_workspace(&state, &home, &state).is_err());
+        assert!(validate_sandbox_workspace(&state.join("cages/acct-1"), &home, &state).is_err());
     }
 
     #[cfg(target_os = "linux")]

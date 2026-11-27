@@ -206,6 +206,65 @@ enum SandboxCommand {
     InitWindows,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum StoreCommand {
+    /// List configured sync stores (`*` marks the active store).
+    List,
+    /// Add a local, Git/GitHub, or SFTP/SCP sync store.
+    Add {
+        /// Store name (e.g. `github`, `nas`, `backup`).
+        name: String,
+        /// Backend kind: `local`, `git`, `sftp`, or `scp`.
+        kind: String,
+        /// Target path or URL (`ABSOLUTE_DIR`, `https://github.com/...`, `git@...`, `sftp://...`, `scp://...`).
+        target: String,
+        /// Git branch name (only for `git` stores; default: `berth-vault`).
+        #[arg(long, default_value = "berth-vault")]
+        branch: String,
+        /// SSH identity key file (for `sftp`/`scp` stores).
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+        /// Pinned SSH known_hosts file (for `sftp`/`scp` stores).
+        #[arg(long)]
+        known_hosts: Option<PathBuf>,
+        /// Encrypt bundles with pure-Rust `age` by default when saving to this store.
+        #[arg(long)]
+        encrypt: bool,
+    },
+    /// Make a named store active (`berth` or any added store).
+    Use { name: String },
+    /// Show details of a store (defaults to the active store).
+    Show { name: Option<String> },
+    /// Remove a named store (built-in `berth` cannot be removed).
+    Remove { name: String },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum VaultCommand {
+    /// Show Berth Cloud Vault storage quota and usage bar.
+    Quota,
+    /// List uploaded sessions in Berth Cloud Vault.
+    Ls {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+    },
+    /// Rename a cloud session's title.
+    Rename {
+        vault_id: String,
+        title: String,
+    },
+    /// Pin or unpin a cloud session.
+    Pin {
+        vault_id: String,
+        #[arg(long)]
+        unpin: bool,
+    },
+    /// Tombstone-delete a session from Berth Cloud Vault and reclaim quota.
+    Rm { vault_id: String },
+}
+
 #[derive(clap::Args, Debug)]
 struct AgentLaunchArgs {
     /// Override Berth API key (`sk-...`) or account key name/ID for this launch.
@@ -217,25 +276,18 @@ struct AgentLaunchArgs {
     /// Override logical zone preference (auto|cn_mainland|overseas|home_direct).
     #[arg(long)]
     zone: Option<String>,
-    /// Override isolation mode (tz-overlay|strict).
+    /// Override isolation mode (sandbox|tz-overlay|strict).
     #[arg(long)]
     isolation: Option<String>,
-    /// Optional work session ID.
-    #[arg(long)]
-    session_id: Option<String>,
+    /// Optional Berth work session ID (renamed from --session-id to avoid confusion with Claude).
+    #[arg(long = "work-session")]
+    work_session: Option<String>,
     /// Print the launch plan without executing the stock CLI.
     #[arg(long)]
     dry_run: bool,
     /// Automatically rebind and relaunch if upstream signals 409 cage_rebind_required.
     #[arg(long)]
     auto_rebind: bool,
-    /// Arguments forwarded verbatim to the stock CLI.
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        value_name = "AGENT_ARGS"
-    )]
-    agent_args: Vec<String>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -264,7 +316,7 @@ enum Command {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long)]
         zone: Option<String>,
-        /// Client isolation mode (tz-overlay|strict).
+        /// Client isolation mode (sandbox|tz-overlay|strict).
         #[arg(long)]
         isolation: Option<String>,
         /// Allow plaintext http:// central URL for local tests only.
@@ -352,6 +404,156 @@ enum Command {
     /// Launch unmodified official Grok CLI through Berth Cage Shim.
     #[command(name = "grok")]
     Grok(AgentLaunchArgs),
+    /// Interactive cross-platform session browser across host, Berth sandboxes, and cloud vault.
+    #[command(name = "ls")]
+    Ls {
+        /// List sessions across all workspaces (default: current directory).
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Filter by agent (`claude`, `codex`, `agy`, `grok`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Filter sessions by fuzzy search query.
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// Show only cloud/synced vault sessions.
+        #[arg(long)]
+        cloud: bool,
+        /// Optional workspace directory override.
+        dir: Option<PathBuf>,
+    },
+    /// Package, redact, compress, and upload an important session to Berth Cloud Vault or active store.
+    #[command(name = "save")]
+    Save {
+        /// Session ID to save (or prefix/UUID from `bh ls`).
+        session_id: String,
+        /// Optional custom title.
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional description / note.
+        #[arg(short = 'm', long)]
+        description: Option<String>,
+        /// Encrypt with pure-Rust `age` (passphrase or managed X25519 identity; hides cloud metadata).
+        #[arg(long)]
+        encrypt: bool,
+        /// Explicit passphrase for `--encrypt` (omit to use managed `~/.config/berth/identity.agekey`).
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Disable automatic secret redaction (not recommended).
+        #[arg(long)]
+        no_redact: bool,
+        /// Pin this snapshot in the vault.
+        #[arg(long)]
+        pin: bool,
+        /// Override destination store name (`berth` or any store from `bh store`).
+        #[arg(long)]
+        store: Option<String>,
+        /// Disambiguate origin (`host`, `cage:<key>`).
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Resume a local, cage, or cloud session — optionally converting across agents (`--to`) inside Berth Sandbox.
+    #[command(name = "resume")]
+    SessionResume {
+        /// Session ID or cloud `vault_id` (or `provider/id`).
+        session_id: String,
+        /// Convert and resume in another agent (`claude`, `codex`, `agy`, `grok`).
+        #[arg(long)]
+        to: Option<String>,
+        /// Override target workspace directory (defaults to current working directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Disambiguate source origin (`host`, `cage:<key>`, `cloud`).
+        #[arg(long)]
+        from: Option<String>,
+        /// Passphrase for decrypting an `--encrypt` cloud bundle.
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Override Berth API key for the resumed launch.
+        #[arg(long)]
+        key: Option<String>,
+        /// Optional comma-separated account preference queue.
+        #[arg(long)]
+        account: Option<String>,
+        /// Override logical zone preference.
+        #[arg(long)]
+        zone: Option<String>,
+        /// Override isolation mode (`sandbox`|`tz-overlay`|`strict`).
+        #[arg(long)]
+        isolation: Option<String>,
+        /// Print the resume/conversion plan without launching the agent.
+        #[arg(long)]
+        dry_run: bool,
+        /// Automatically rebind on 409 cage_rebind_required.
+        #[arg(long)]
+        auto_rebind: bool,
+    },
+    /// Restore a saved session snapshot from Berth Cloud Vault or active store (optionally launching).
+    #[command(name = "restore")]
+    Restore {
+        /// Cloud `vault_id` or snapshot ID.
+        vault_id: String,
+        /// Convert into target agent (`claude`, `codex`, `agy`, `grok`).
+        #[arg(long)]
+        to: Option<String>,
+        /// Target workspace directory (defaults to current working directory).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Passphrase for encrypted bundles.
+        #[arg(long)]
+        passphrase: Option<String>,
+        /// Launch the restored session immediately inside Berth Sandbox.
+        #[arg(long)]
+        launch: bool,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        zone: Option<String>,
+        #[arg(long)]
+        isolation: Option<String>,
+    },
+    /// Delete (tombstone) a snapshot from Berth Cloud Vault or active store and reclaim quota.
+    #[command(name = "delete")]
+    Delete {
+        vault_id: String,
+        #[arg(long)]
+        store: Option<String>,
+    },
+    /// Manage session sync stores (`berth` cloud vault, `local`, `git`/GitHub, `sftp`/`scp`).
+    #[command(name = "store")]
+    Store {
+        #[command(subcommand)]
+        command: Option<StoreCommand>,
+    },
+    /// Synchronize snapshots and tombstones with the active store (or named store).
+    #[command(name = "sync")]
+    Sync {
+        store: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Push local vault snapshots to the active store (or named store).
+    #[command(name = "push")]
+    Push {
+        store: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Pull remote vault snapshots and tombstones from the active store (or named store).
+    #[command(name = "pull")]
+    Pull {
+        store: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Manage Berth Cloud Session Vault (quota, list, rename, pin, delete).
+    #[command(name = "vault")]
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
     /// Acquire a Berth Cage Session Lease for a stock CLI.
     #[command(name = "lease")]
     Lease {
@@ -505,7 +707,7 @@ enum Command {
     /// `--launch` and `--launch-dry-run` are mutually exclusive, and
     /// `--launch-anyway` / `-- <agent flags>` only mean something alongside
     /// one of them.
-    #[command(group(clap::ArgGroup::new("launching").args(["launch", "launch_dry_run"])))]
+    #[command(name = "__convert-resume", hide = true, group(clap::ArgGroup::new("launching").args(["launch", "launch_dry_run"])))]
     Resume {
         /// Target provider alias (cc, cod, gmi, agy, cur, cln, aid, amp, opc, gpt).
         target: String,
@@ -695,18 +897,10 @@ enum Command {
         enrich_fs: bool,
     },
 
-    /// Show details for a specific session.
+    /// Show Berth account, Cloud Vault 1 GiB quota, sandbox status, OR details for a specific session.
     Info {
-        /// Session ID, or the path to a session file.
-        ///
-        /// The two are told apart by the filesystem: the argument is a path
-        /// when it names a file that exists (or, for the providers whose
-        /// session paths are `<db-file>/<id>`, when its parent does), and a
-        /// session ID otherwise. Nothing syntactic can separate them — a Codex
-        /// session ID is itself `2026/07/27/rollout-…`, so a rule about slashes
-        /// or dots would swallow it. Use `./name.jsonl` for a file in the
-        /// current directory whose name would otherwise read as an ID.
-        session: String,
+        /// Optional session ID or file path (omit for Berth account & vault quota overview).
+        session: Option<String>,
 
         /// Enrich output with filesystem-derived data (e.g. repo_name from git root).
         #[arg(long)]
@@ -851,7 +1045,7 @@ fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
     // Preserve any global options before the shorthand flag.
     rewritten.extend(args.iter().take(idx).skip(1).cloned());
 
-    rewritten.push(OsString::from("resume"));
+    rewritten.push(OsString::from("__convert-resume"));
     rewritten.push(OsString::from(alias));
 
     // Preserve the remaining args after shorthand (session id + options).
@@ -860,14 +1054,55 @@ fn rewrite_shorthand_resume_args(args: Vec<OsString>) -> Vec<OsString> {
     rewritten
 }
 
+/// Splits `args_os()` strictly at the FIRST exact `"--"` delimiter:
+/// - `prefix`: `bh` command & options (everything before `--`)
+/// - `suffix`: verbatim agent arguments (everything after `--`, never touched by clap)
+fn split_at_double_dash(raw: Vec<OsString>) -> (Vec<OsString>, Vec<OsString>) {
+    if let Some(pos) = raw.iter().enumerate().skip(1).find_map(|(i, a)| {
+        if a == std::ffi::OsStr::new("--") {
+            Some(i)
+        } else {
+            None
+        }
+    }) {
+        let prefix = raw[..pos].to_vec();
+        let suffix = raw[pos + 1..].to_vec();
+        (prefix, suffix)
+    } else {
+        (raw, Vec::new())
+    }
+}
+
+fn os_args_to_strings(args: &[OsString]) -> Vec<String> {
+    args.iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn validate_resume_passthrough_args(target_agent: &str, args: &[String]) -> anyhow::Result<()> {
+    for arg in args {
+        let lower = arg.to_ascii_lowercase();
+        if target_agent == "claude"
+            && matches!(lower.as_str(), "-r" | "--resume" | "-c" | "--continue" | "--session-id")
+        {
+            anyhow::bail!(
+                "refusing `{arg}` after `--` on `bh resume`: `bh resume` already targets the converted session"
+            );
+        }
+        if target_agent == "codex" && matches!(lower.as_str(), "resume" | "--last") {
+            anyhow::bail!(
+                "refusing `{arg}` after `--` on `bh resume`: `bh resume` already targets the converted session"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let raw: Vec<OsString> = std::env::args_os().collect();
-    // The word that decides which half this is, skipping the flags that belong
-    // to both. `--json`, `--verbose` and `--trace` are global, so `ags --json
-    // convert list` has to reach conversion — reading it as a runtime command
-    // instead printed the runtime's usage and exited 0, which is the worst
-    // possible answer: it looks like it worked.
-    let selector = raw
+    let (prefix_raw, passthrough_os) = split_at_double_dash(raw);
+
+    let selector = prefix_raw
         .iter()
         .enumerate()
         .skip(1)
@@ -879,82 +1114,176 @@ fn main() -> ExitCode {
         })
         .map(|(index, arg)| (index, arg.to_string_lossy().into_owned()));
     let first = selector.as_ref().map(|(_, word)| word.clone());
-    // What people type is the session runtime — `ags ls`, `ags resume 7`,
-    // `ags save`. Cross-provider conversion is the occasional errand, so it
-    // lives under `ags convert` and the runtime owns the bare namespace.
-    //
-    // The split has to happen here rather than in clap because both halves
-    // want the same two words. `resume` means "carry on with session 7" to one
-    // and "convert this Codex session into a Claude one" to the other, and
-    // `list` is a picker on one side and a raw inventory on the other. Nesting
-    // one of them is the only way both keep their names.
-    let argv = match first.as_deref() {
-        Some("convert") => {
-            // Drop just the `convert` word; the global flags around it stay.
-            let at = selector.as_ref().map_or(1, |(index, _)| *index);
-            let mut rebuilt = Vec::with_capacity(raw.len().saturating_sub(1));
-            rebuilt.extend(raw[..at].iter().cloned());
-            rebuilt.extend(raw[at + 1..].iter().cloned());
-            // clap builds its `Usage:` line from argv[0]. With `convert` merely
-            // removed it would print `Usage: ags resume …`, and anyone copying
-            // that lands in the runtime's `resume` instead — a different command
-            // that takes a saved-session name, not a provider.
-            if !rebuilt.is_empty() {
-                rebuilt[0] = std::ffi::OsString::from("berth convert");
-            }
-            // The `-cc <id>` shorthand belongs to conversion, so it is only
-            // rewritten once we know that is where we are.
-            rewrite_shorthand_resume_args(rebuilt)
+
+    // Explicit escape hatch for legacy Bash checkpoint commands on Unix only.
+    if first.as_deref() == Some("checkpoint") {
+        let at = selector.as_ref().map_or(1, |(index, _)| *index);
+        let mut legacy: Vec<OsString> = prefix_raw[at + 1..].to_vec();
+        if !passthrough_os.is_empty() {
+            legacy.push(OsString::from("--"));
+            legacy.extend(passthrough_os);
         }
-        // The version must be answered by the binary itself. The runtime asks
-        // `"$binary" --version` in several places to decide what it is talking
-        // to; routing that into the runtime would have it ask itself.
-        Some("--version" | "-V") => raw,
-        // `bh init --identity ...` initializes the encrypted checkpoint vault;
-        // `bh init --url ... --key ...` (and `bh init --help`) configures Berth directly.
-        Some("init") => {
-            if raw.iter().any(|a| a.to_string_lossy() == "--identity") {
-                return cmd_checkpoint(&raw[1..]);
+        return cmd_checkpoint(&legacy);
+    }
+
+    // Legacy `bh convert <resume|list|info|providers>` compatibility shim,
+    // plus backward-compatible 2-positional `ags resume <target> <session_id>` and `-cc/-cod` shorthands.
+    let is_shorthand_resume = matches!(
+        first.as_deref(),
+        Some("-cc" | "-cod" | "-gmi" | "-agy")
+    );
+    let is_legacy_two_pos_resume = if first.as_deref() == Some("resume") {
+        let at = selector.as_ref().map_or(1, |(index, _)| *index);
+        let mut has_to = false;
+        let mut positional_count = 0usize;
+        let mut skip_next = false;
+        for tok in prefix_raw.iter().skip(at + 1) {
+            let s = tok.to_string_lossy();
+            if skip_next {
+                skip_next = false;
+                continue;
             }
-            raw
+            if s == "--to" || s.starts_with("--to=") {
+                has_to = true;
+                if s == "--to" {
+                    skip_next = true;
+                }
+                continue;
+            }
+            if matches!(
+                s.as_ref(),
+                "--workspace"
+                    | "--from"
+                    | "--passphrase"
+                    | "--key"
+                    | "--account"
+                    | "--zone"
+                    | "--isolation"
+                    | "--source"
+                    | "--max-context-tokens"
+                    | "--max-tool-output"
+                    | "--environment-profile"
+            ) {
+                skip_next = true;
+                continue;
+            }
+            if s.starts_with('-') {
+                continue;
+            }
+            positional_count += 1;
         }
-        // First-class top-level Berth commands + internal helpers.
-        Some(
-            "login"
-            | "logout"
-            | "key"
-            | "status"
-            | "clear"
-            | "update"
-            | "self-update"
-            | "sandbox"
-            | "__sandbox-trampoline"
-            | "codex"
-            | "claude"
-            | "agy"
-            | "grok"
-            | "lease"
-            | "shim"
-            | "berth"
-            | "checkpoint-register-codex"
-            | "checkpoint-asset"
-            | "env"
-            | "env-broker"
-            | "env-use"
-            | "env-show"
-            | "env-clear"
-            | "env-list"
-            | "env-apply"
-            | "runtime"
-            | "runtime-apply",
-        ) => raw,
-        // `checkpoint` was how the old `ags` wrapper reached the runtime. Kept
-        // so a machine still holding that wrapper can run long enough to
-        // replace itself.
-        Some("checkpoint") => return cmd_checkpoint(&raw[2..]),
-        _ => return cmd_checkpoint(&raw[1..]),
+        !has_to && positional_count >= 2
+    } else {
+        false
     };
-    let cli = Cli::parse_from(argv);
+
+    let (parse_argv, is_convert_mode) = if first.as_deref() == Some("convert") {
+        let at = selector.as_ref().map_or(1, |(index, _)| *index);
+        let mut rebuilt = Vec::with_capacity(prefix_raw.len());
+        rebuilt.extend(prefix_raw[..at].iter().cloned());
+        rebuilt.extend(prefix_raw[at + 1..].iter().cloned());
+        if !rebuilt.is_empty() {
+            rebuilt[0] = OsString::from("berth convert");
+        }
+        // Map `bh convert resume ...` -> hidden `__convert-resume` so top-level `bh resume`
+        // owns the clean pure-Rust session resume command.
+        rebuilt = rewrite_shorthand_resume_args(rebuilt);
+        if let Some(sub) = rebuilt
+            .iter_mut()
+            .skip(1)
+            .find(|a| !a.to_string_lossy().starts_with('-'))
+        {
+            if sub.to_string_lossy() == "resume" {
+                *sub = OsString::from("__convert-resume");
+            }
+        }
+        if !passthrough_os.is_empty() {
+            rebuilt.push(OsString::from("--"));
+            rebuilt.extend(passthrough_os.iter().cloned());
+        }
+        (rebuilt, true)
+    } else if is_shorthand_resume {
+        let mut rebuilt = rewrite_shorthand_resume_args(prefix_raw.clone());
+        if !passthrough_os.is_empty() {
+            rebuilt.push(OsString::from("--"));
+            rebuilt.extend(passthrough_os.iter().cloned());
+        }
+        (rebuilt, true)
+    } else if is_legacy_two_pos_resume {
+        let at = selector.as_ref().map_or(1, |(index, _)| *index);
+        let mut rebuilt = prefix_raw.clone();
+        rebuilt[at] = OsString::from("__convert-resume");
+        if !passthrough_os.is_empty() {
+            rebuilt.push(OsString::from("--"));
+            rebuilt.extend(passthrough_os.iter().cloned());
+        }
+        (rebuilt, true)
+    } else if first.as_deref() == Some("__sandbox-trampoline") {
+        let mut rebuilt = prefix_raw.clone();
+        if !passthrough_os.is_empty() {
+            rebuilt.push(OsString::from("--"));
+            rebuilt.extend(passthrough_os.iter().cloned());
+        }
+        (rebuilt, false)
+    } else if first.as_deref() == Some("berth") {
+        let mut rebuilt = prefix_raw.clone();
+        if !passthrough_os.is_empty() {
+            rebuilt.push(OsString::from("--"));
+            rebuilt.extend(passthrough_os.iter().cloned());
+        }
+        (rebuilt, false)
+    } else {
+        (prefix_raw.clone(), false)
+    };
+
+    let cli = match Cli::try_parse_from(&parse_argv) {
+        Ok(c) => c,
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument
+                    | clap::error::ErrorKind::InvalidSubcommand
+            ) {
+                if let Some(cmd_name) = first.as_deref() {
+                    if matches!(
+                        cmd_name,
+                        "claude" | "codex" | "agy" | "grok" | "resume" | "restore"
+                    ) {
+                        let _ = err.print();
+                        eprintln!(
+                            "\nhint: arguments for the underlying agent must follow `--`, e.g.:\n  bh {cmd_name} -- <AGENT_ARGS...>"
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            err.exit();
+        }
+    };
+
+    // Enforce strict `--` rule: reject non-empty suffix on commands that do not launch an agent.
+    let accepts_passthrough = is_convert_mode
+        || matches!(
+            cli.command,
+            Command::Codex(_)
+                | Command::Claude(_)
+                | Command::Agy(_)
+                | Command::Grok(_)
+                | Command::SessionResume { .. }
+                | Command::Restore { .. }
+                | Command::SandboxTrampoline { .. }
+                | Command::Berth { .. }
+                | Command::Resume { .. }
+        );
+    if !accepts_passthrough && !passthrough_os.is_empty() {
+        eprintln!(
+            "error: `bh {}` does not launch an agent and does not accept arguments after `--`",
+            first.as_deref().unwrap_or("")
+        );
+        return ExitCode::from(2);
+    }
+
+    let passthrough_args = os_args_to_strings(&passthrough_os);
     init_tracing(&cli);
 
     if matches!(
@@ -1032,10 +1361,119 @@ fn main() -> ExitCode {
             &command,
         )
         .map_err(anyhow::Error::from),
-        Command::Codex(args) => cmd_top_level_launch("codex", args, cli.json),
-        Command::Claude(args) => cmd_top_level_launch("claude", args, cli.json),
-        Command::Agy(args) => cmd_top_level_launch("agy", args, cli.json),
-        Command::Grok(args) => cmd_top_level_launch("grok", args, cli.json),
+        Command::Codex(args) => cmd_top_level_launch("codex", args, &passthrough_args, cli.json),
+        Command::Claude(args) => cmd_top_level_launch("claude", args, &passthrough_args, cli.json),
+        Command::Agy(args) => cmd_top_level_launch("agy", args, &passthrough_args, cli.json),
+        Command::Grok(args) => cmd_top_level_launch("grok", args, &passthrough_args, cli.json),
+        Command::Ls {
+            all,
+            agent,
+            query,
+            cloud,
+            dir,
+        } => cmd_ls_native(
+            all,
+            agent.as_deref(),
+            query.as_deref(),
+            cloud,
+            dir.as_deref(),
+            cli.json,
+        ),
+        Command::Save {
+            session_id,
+            title,
+            description,
+            encrypt,
+            passphrase,
+            no_redact,
+            pin,
+            store,
+            from,
+        } => cmd_save_native(
+            &session_id,
+            title.as_deref(),
+            description.as_deref(),
+            encrypt,
+            passphrase.as_deref(),
+            no_redact,
+            pin,
+            store.as_deref(),
+            from.as_deref(),
+            cli.json,
+        ),
+        Command::SessionResume {
+            session_id,
+            to,
+            workspace,
+            from,
+            passphrase,
+            key,
+            account,
+            zone,
+            isolation,
+            dry_run,
+            auto_rebind,
+        } => cmd_session_resume_native(
+            &session_id,
+            to.as_deref(),
+            workspace.as_deref(),
+            from.as_deref(),
+            passphrase.as_deref(),
+            key.as_deref(),
+            account.as_deref(),
+            zone.as_deref(),
+            isolation.as_deref(),
+            dry_run,
+            auto_rebind,
+            &passthrough_args,
+            cli.json,
+        ),
+        Command::Restore {
+            vault_id,
+            to,
+            workspace,
+            passphrase,
+            launch,
+            key,
+            account,
+            zone,
+            isolation,
+        } => cmd_restore_native(
+            &vault_id,
+            to.as_deref(),
+            workspace.as_deref(),
+            passphrase.as_deref(),
+            launch || !passthrough_args.is_empty(),
+            key.as_deref(),
+            account.as_deref(),
+            zone.as_deref(),
+            isolation.as_deref(),
+            &passthrough_args,
+            cli.json,
+        ),
+        Command::Delete { vault_id, store } => {
+            cmd_delete_native(&vault_id, store.as_deref(), cli.json)
+        }
+        Command::Store { command } => cmd_store_native(command, cli.json),
+        Command::Sync { store, dry_run } => cmd_sync_native(
+            store.as_deref(),
+            berth::vault_sync::SyncDirection::Both,
+            dry_run,
+            cli.json,
+        ),
+        Command::Push { store, dry_run } => cmd_sync_native(
+            store.as_deref(),
+            berth::vault_sync::SyncDirection::PushOnly,
+            dry_run,
+            cli.json,
+        ),
+        Command::Pull { store, dry_run } => cmd_sync_native(
+            store.as_deref(),
+            berth::vault_sync::SyncDirection::PullOnly,
+            dry_run,
+            cli.json,
+        ),
+        Command::Vault { command } => cmd_vault_native(command, cli.json),
         Command::Lease {
             agent,
             key,
@@ -1190,19 +1628,22 @@ fn main() -> ExitCode {
             peek,
             peek_lines,
             digest,
-        } => cmd_info(
-            &session,
-            cli.json,
-            enrich_fs,
-            source,
-            from,
-            &TranscriptRequest {
-                peek,
-                peek_lines,
-                digest,
-            },
-        )
-        .map(|()| ExitCode::SUCCESS),
+        } => match session {
+            Some(session_id) => cmd_info(
+                &session_id,
+                cli.json,
+                enrich_fs,
+                source,
+                from,
+                &TranscriptRequest {
+                    peek,
+                    peek_lines,
+                    digest,
+                },
+            )
+            .map(|()| ExitCode::SUCCESS),
+            None => cmd_berth_info_overview(cli.json),
+        },
         Command::Providers => cmd_providers(cli.json).map(|()| ExitCode::SUCCESS),
         Command::Completions { shell } => cmd_completions(&shell).map(|()| ExitCode::SUCCESS),
     };
@@ -2197,6 +2638,11 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                         );
                     }
                 }
+                let sb_probe = berth::sandbox::probe_sandbox_backend();
+                println!("sandbox:");
+                println!("  backend         {}", sb_probe.backend);
+                println!("  available       {}", sb_probe.available);
+                println!("  egress_blocked  {}", sb_probe.kernel_egress_blocked);
                 println!("host isolation:");
                 println!("  os              {}", caps.os);
                 println!("  wsl             {}", caps.is_wsl);
@@ -2347,6 +2793,7 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                 rebind_file,
                 ready_file: ready_file.clone(),
                 upstream_timeout: std::time::Duration::from_secs(30),
+                abort_retries_on_rebind: false,
             })?;
 
             if ready_file.is_none() {
@@ -2404,6 +2851,7 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
 fn cmd_top_level_launch(
     agent: &str,
     args: AgentLaunchArgs,
+    passthrough_args: &[String],
     json_mode: bool,
 ) -> anyhow::Result<ExitCode> {
     let paths = berth::berth::BerthPaths::from_env();
@@ -2414,12 +2862,815 @@ fn cmd_top_level_launch(
         args.account.as_deref(),
         args.zone.as_deref(),
         args.isolation.as_deref(),
-        args.session_id.as_deref(),
+        args.work_session.as_deref(),
         args.dry_run,
         args.auto_rebind,
-        &args.agent_args,
+        passthrough_args,
         json_mode,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Pure-Rust Cross-Platform Session Manager & 4-Backend Vault Commands
+// ---------------------------------------------------------------------------
+
+fn resolve_unified_session(
+    paths: &berth::berth::BerthPaths,
+    selector: &str,
+    from_origin: Option<&str>,
+    require_local_source: bool,
+) -> anyhow::Result<berth::session_hub::UnifiedSessionRow> {
+    let (provider_hint, raw_id) = match selector.split_once('/') {
+        Some((p, id)) if !p.is_empty() && !id.is_empty() && !selector.starts_with('/') && !selector.starts_with('.') => {
+            (Some(p), id)
+        }
+        _ => (None, selector),
+    };
+    let discovery = berth::session_hub::discover_unified_sessions(paths, true, provider_hint);
+    let mut matches: Vec<berth::session_hub::UnifiedSessionRow> = discovery
+        .rows
+        .into_iter()
+        .filter(|r| {
+            if let Some(orig) = from_origin {
+                let want = orig.trim().to_ascii_lowercase();
+                if r.origin.short_tag().to_ascii_lowercase() != want {
+                    return false;
+                }
+            }
+            r.session_id == raw_id
+                || r.vault_id.as_deref() == Some(raw_id)
+                || r.session_id.starts_with(raw_id)
+                || r.vault_id.as_deref().is_some_and(|v| v.starts_with(raw_id))
+        })
+        .collect();
+
+    if require_local_source && matches.iter().any(|r| r.source_path.is_some()) {
+        matches.retain(|r| r.source_path.is_some());
+    }
+
+    match matches.len() {
+        0 => anyhow::bail!(
+            "session `{selector}` not found across host, Berth cages, or Cloud Vault (run `bh ls -a`)"
+        ),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => {
+            // 1. Exact vault_id match always wins unambiguously.
+            if let Some(exact_vault) = matches
+                .iter()
+                .find(|r| r.vault_id.as_deref() == Some(raw_id))
+            {
+                return Ok(exact_vault.clone());
+            }
+            // 2. If only one local host/cage source has exact session_id (and others are vault copies), prefer the live local session.
+            let exact_locals: Vec<_> = matches
+                .iter()
+                .filter(|r| r.session_id == raw_id && r.source_path.is_some())
+                .collect();
+            if exact_locals.len() == 1 {
+                return Ok(exact_locals[0].clone());
+            }
+            // 3. Otherwise if exact match is unique, pick it.
+            let exacts: Vec<_> = matches
+                .iter()
+                .filter(|r| r.session_id == raw_id || r.vault_id.as_deref() == Some(raw_id))
+                .collect();
+            if exacts.len() == 1 {
+                return Ok(exacts[0].clone());
+            }
+            let list = matches
+                .iter()
+                .take(8)
+                .map(|r| format!("  - {}  [{}]  {}", r.session_id, r.origin.short_tag(), r.display_title()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "session `{selector}` is ambiguous across multiple origins; disambiguate with `--from host|cage:<key>|cloud`:\n{list}"
+            );
+        }
+    }
+}
+
+fn cmd_ls_native(
+    all: bool,
+    agent: Option<&str>,
+    query: Option<&str>,
+    cloud: bool,
+    dir: Option<&Path>,
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    match berth::session_hub::run_ls_command(&paths, all, dir, agent, query, cloud, json_mode)? {
+        berth::session_hub::TuiAction::Quit => Ok(ExitCode::SUCCESS),
+        berth::session_hub::TuiAction::Resume { row, target_agent } => {
+            let sid = row.vault_id.as_deref().unwrap_or(&row.session_id);
+            cmd_session_resume_native(
+                sid,
+                Some(target_agent),
+                dir,
+                Some(&row.origin.short_tag()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                &[],
+                false,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_save_native(
+    session_id: &str,
+    title: Option<&str>,
+    description: Option<&str>,
+    encrypt: bool,
+    passphrase: Option<&str>,
+    no_redact: bool,
+    pin: bool,
+    store: Option<&str>,
+    from: Option<&str>,
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    let row = resolve_unified_session(&paths, session_id, from, true)?;
+    let src = row.source_path.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("session `{session_id}` is already stored in Cloud Vault ({})", row.vault_id.as_deref().unwrap_or("-"))
+    })?;
+    let berth_cfg = berth::berth::load_config(&paths).ok().flatten();
+    let final_title = title.unwrap_or(&row.display_title()).to_string();
+    let (saved, quota, built) = berth::vault_sync::save_session_file_to_store(
+        &paths,
+        berth_cfg.as_ref(),
+        &row.provider,
+        &row.session_id,
+        &row.origin.short_tag(),
+        src,
+        &final_title,
+        description.unwrap_or(""),
+        &row.workspace,
+        &row.git_branch,
+        row.message_count,
+        encrypt,
+        passphrase,
+        no_redact,
+        store,
+        pin,
+    )?;
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "saved": saved,
+                "quota": quota,
+                "redaction": built.manifest.redaction,
+            }))?
+        );
+    } else {
+        println!(
+            "Saved {} ({} -> {}, {} secrets scrubbed{})",
+            saved.vault_id,
+            berth::vault_sync::format_bytes_human(saved.raw_bytes),
+            berth::vault_sync::format_bytes_human(saved.stored_bytes),
+            built.manifest.redaction.total_redactions,
+            if saved.encrypted { ", E2EE age" } else { "" },
+        );
+        if let Some(q) = quota {
+            println!(
+                "Vault quota: {}",
+                berth::vault_sync::render_quota_bar(q.used_bytes, q.quota_bytes, 24)
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_session_resume_native(
+    session_id: &str,
+    to: Option<&str>,
+    workspace: Option<&Path>,
+    from: Option<&str>,
+    passphrase: Option<&str>,
+    key: Option<&str>,
+    account: Option<&str>,
+    zone: Option<&str>,
+    isolation: Option<&str>,
+    dry_run: bool,
+    auto_rebind: bool,
+    passthrough_args: &[String],
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    let row = resolve_unified_session(&paths, session_id, from, false)?;
+    let target_agent = match to {
+        Some(t) => berth::session_hub::canonical_agent_name(t)?,
+        None => berth::session_hub::canonical_agent_name(&row.provider)?,
+    };
+    validate_resume_passthrough_args(target_agent, passthrough_args)?;
+
+    let target_ws = match workspace {
+        Some(w) => std::fs::canonicalize(w).unwrap_or_else(|_| w.to_path_buf()),
+        None => std::env::current_dir()?,
+    };
+    let decryption = berth::session_hub::default_decryption_for(&paths, passphrase);
+
+    // If Berth is configured, acquire lease FIRST so we write directly into the target
+    // account's isolated Berth Sandbox cage home and launch inside the zero-VM sandbox!
+    // Propagate corrupted/unreadable berth.json errors instead of falling back to host home.
+    if let Some(mut config) = berth::berth::load_config(&paths)? {
+        if let Some(z) = zone {
+            config.zone_preference = z.trim().to_string();
+            config.validate()?;
+        }
+        let resolved_auth =
+            berth::berth::resolve_auth_for_agent(&paths, &mut config, target_agent, key)?;
+        let isolation_mode = match isolation {
+            Some(raw) => berth::berth::IsolationMode::parse(raw)?,
+            None => config.isolation_mode,
+        };
+        let accounts: Vec<String> = account
+            .map(|csv| {
+                csv.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let req = berth::berth::LeaseRequest {
+            agent: target_agent.to_string(),
+            work_session_id: None,
+            account_preference: accounts,
+            zone_preference: config.zone_preference.clone(),
+            isolation_mode,
+            cohort_hint: None,
+            rebind_ref: None,
+            ags_version: berth::berth::AGS_VERSION_HEADER_VALUE.to_string(),
+        };
+        let lease =
+            berth::berth::acquire_lease_with_token(&config, &resolved_auth.bearer_token, &req)?;
+        let real_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let account_home = berth::sandbox::prepare_account_cage_home(
+            &paths.state_dir,
+            lease.account_id,
+            &lease.cage,
+        )?;
+        // Inside Linux bwrap, account_home.home_dir is bind-mounted over real_home;
+        // on macOS/Windows, HOME/USERPROFILE points directly to account_home.home_dir.
+        let visible_home = if cfg!(target_os = "linux") {
+            real_home.clone()
+        } else {
+            account_home.home_dir.clone()
+        };
+
+        if dry_run {
+            let canonical = berth::session_hub::load_canonical_session(&paths, &row, &decryption)?;
+            let plan = serde_json::json!({
+                "dry_run": true,
+                "source_session_id": row.session_id,
+                "source_provider": row.provider,
+                "source_origin": row.origin.short_tag(),
+                "target_agent": target_agent,
+                "target_workspace": target_ws,
+                "target_cage_home": account_home.home_dir,
+                "message_count": canonical.messages.len(),
+                "passthrough_args": passthrough_args,
+            });
+            let _ = berth::berth::release_lease_with_token(
+                &config,
+                &resolved_auth.bearer_token,
+                &lease.lease_id,
+            );
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                println!(
+                    "Dry-run resume {} ({}) -> {} ({} messages) in cage {}",
+                    row.session_id,
+                    row.provider,
+                    target_agent,
+                    canonical.messages.len(),
+                    account_home.account_key
+                );
+                println!("  workspace: {}", target_ws.display());
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let prepared = berth::session_hub::materialize_session_into_cage(
+            &paths,
+            &row,
+            target_agent,
+            &target_ws,
+            &account_home,
+            &visible_home,
+            &decryption,
+        )?;
+
+        let _ = berth::berth::release_lease_with_token(
+            &config,
+            &resolved_auth.bearer_token,
+            &lease.lease_id,
+        );
+
+        let mut full_args = prepared.native_resume_args.clone();
+        full_args.extend(passthrough_args.iter().cloned());
+
+        if !json_mode {
+            for w in &prepared.warnings {
+                eprintln!("[berth] warning: {w}");
+            }
+            eprintln!(
+                "[berth] resuming {} -> {} ({}) inside isolated cage `{}`",
+                row.provider, target_agent, prepared.target_session_id, account_home.account_key
+            );
+        }
+
+        // Ensure launched sandbox uses the exact selected workspace directory.
+        std::env::set_current_dir(&target_ws)?;
+        // Pin account preference to the exact account whose cage we just hydrated.
+        let pinned_acct = lease
+            .account_id
+            .map(|id| id.to_string())
+            .or_else(|| account.map(ToOwned::to_owned));
+        return cmd_berth_launch(
+            &paths,
+            target_agent,
+            key,
+            pinned_acct.as_deref(),
+            zone,
+            isolation,
+            Some(&lease.work_session_id),
+            false,
+            auto_rebind,
+            &full_args,
+            json_mode,
+        );
+    }
+
+    // Fallback when Berth is NOT configured: dry-run reports plan without writing,
+    // otherwise converts into host home and prints resume command.
+    let mut canonical = berth::session_hub::load_canonical_session(&paths, &row, &decryption)?;
+    canonical.workspace = Some(target_ws.clone());
+    if dry_run {
+        if json_mode {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": true,
+                    "source_session_id": row.session_id,
+                    "source_provider": row.provider,
+                    "target_agent": target_agent,
+                    "target_workspace": target_ws,
+                    "message_count": canonical.messages.len(),
+                    "passthrough_args": passthrough_args,
+                }))?
+            );
+        } else {
+            println!(
+                "Dry-run resume {} ({}) -> {} ({} messages)\n  workspace: {}",
+                row.session_id,
+                row.provider,
+                target_agent,
+                canonical.messages.len(),
+                target_ws.display()
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let registry = ProviderRegistry::default_registry();
+    let slug = berth::session_hub::provider_slug_for_agent(target_agent);
+    let provider = registry
+        .find_by_alias(slug)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider `{slug}`"))?;
+    let written = provider.write_session(&canonical, &berth::providers::WriteOptions { force: false })?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source_provider": row.provider,
+                "target_agent": target_agent,
+                "target_session_id": written.session_id,
+                "resume_command": written.resume_command,
+                "written_paths": written.paths,
+            }))?
+        );
+    } else {
+        println!(
+            "Converted {} -> {} ({})\n  Resume: {}",
+            row.provider, target_agent, written.session_id, written.resume_command
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_restore_native(
+    vault_id: &str,
+    to: Option<&str>,
+    workspace: Option<&Path>,
+    passphrase: Option<&str>,
+    launch: bool,
+    key: Option<&str>,
+    account: Option<&str>,
+    zone: Option<&str>,
+    isolation: Option<&str>,
+    passthrough_args: &[String],
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    if launch {
+        return cmd_session_resume_native(
+            vault_id,
+            to,
+            workspace,
+            None,
+            passphrase,
+            key,
+            account,
+            zone,
+            isolation,
+            false,
+            false,
+            passthrough_args,
+            json_mode,
+        );
+    }
+    let paths = berth::berth::BerthPaths::from_env();
+    let row = resolve_unified_session(&paths, vault_id, None, false)?;
+    let target_agent = match to {
+        Some(t) => berth::session_hub::canonical_agent_name(t)?,
+        None => berth::session_hub::canonical_agent_name(&row.provider)?,
+    };
+    let target_ws = match workspace {
+        Some(w) => std::fs::canonicalize(w).unwrap_or_else(|_| w.to_path_buf()),
+        None => std::env::current_dir()?,
+    };
+    let decryption = berth::session_hub::default_decryption_for(&paths, passphrase);
+    let mut canonical = berth::session_hub::load_canonical_session(&paths, &row, &decryption)?;
+    canonical.workspace = Some(target_ws.clone());
+    let registry = ProviderRegistry::default_registry();
+    let slug = berth::session_hub::provider_slug_for_agent(target_agent);
+    let provider = registry
+        .find_by_alias(slug)
+        .ok_or_else(|| anyhow::anyhow!("unknown provider `{slug}`"))?;
+    let written = provider.write_session(&canonical, &berth::providers::WriteOptions { force: false })?;
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "restored": true,
+                "source_provider": row.provider,
+                "target_agent": target_agent,
+                "target_session_id": written.session_id,
+                "resume_command": written.resume_command,
+                "written_paths": written.paths,
+            }))?
+        );
+    } else {
+        println!(
+            "Restored {} ({} -> {}) as {}\n  Resume: {}",
+            vault_id, row.provider, target_agent, written.session_id, written.resume_command
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_delete_native(
+    vault_id: &str,
+    store: Option<&str>,
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    let reg = berth::vault_sync::load_store_registry_checked(&paths)?;
+    let active = store.unwrap_or(&reg.active_store);
+    let named = reg
+        .stores
+        .get(active)
+        .ok_or_else(|| anyhow::anyhow!("unknown store `{active}`"))?;
+
+    let quota = match &named.backend {
+        berth::vault_sync::StoreBackendConfig::Berth => {
+            let q = berth::vault_sync::berth_vault_delete(&paths, vault_id)?;
+            if let Ok(cache) = berth::vault_sync::store_cache_root(&paths, active) {
+                let _ = berth::vault_sync::local_dir_delete(&cache, vault_id);
+            }
+            Some(q)
+        }
+        berth::vault_sync::StoreBackendConfig::Local { path } => {
+            berth::vault_sync::local_dir_delete(path, vault_id)?;
+            if let Ok(cache) = berth::vault_sync::store_cache_root(&paths, active) {
+                let _ = berth::vault_sync::local_dir_delete(&cache, vault_id);
+            }
+            None
+        }
+        _ => {
+            let cache = berth::vault_sync::store_cache_root(&paths, active)?;
+            berth::vault_sync::local_dir_delete(&cache, vault_id)?;
+            let _ = berth::vault_sync::sync_store(
+                &paths,
+                Some(active),
+                berth::vault_sync::SyncDirection::PushOnly,
+                false,
+            )?;
+            None
+        }
+    };
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "deleted": vault_id,
+                "store": active,
+                "quota": quota,
+            }))?
+        );
+    } else {
+        println!("Tombstoned `{vault_id}` from store `{active}`");
+        if let Some(q) = quota {
+            println!(
+                "Vault quota: {}",
+                berth::vault_sync::render_quota_bar(q.used_bytes, q.quota_bytes, 24)
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_store_native(command: Option<StoreCommand>, json_mode: bool) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    let mut reg = berth::vault_sync::load_store_registry_checked(&paths)?;
+
+    match command.unwrap_or(StoreCommand::List) {
+        StoreCommand::List => {
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&reg)?);
+            } else {
+                for (name, s) in &reg.stores {
+                    let mark = if reg.active_store == *name { "*" } else { " " };
+                    let enc = if s.encrypt_by_default { " [encrypt]" } else { "" };
+                    println!(
+                        "{mark} {:<14} {}{enc}",
+                        name,
+                        berth::session_hub::format_store_backend(&s.backend)
+                    );
+                }
+            }
+        }
+        StoreCommand::Add {
+            name,
+            kind,
+            target,
+            branch,
+            identity_file,
+            known_hosts,
+            encrypt,
+        } => {
+            let clean_name = name.trim().to_string();
+            berth::vault_sync::validate_store_name(&clean_name)?;
+            if clean_name == "berth" {
+                anyhow::bail!("store name cannot overwrite built-in `berth`");
+            }
+            let backend = match kind.trim().to_ascii_lowercase().as_str() {
+                "local" => {
+                    let p = PathBuf::from(&target);
+                    if !p.is_absolute() {
+                        anyhow::bail!("local store path must be an absolute directory");
+                    }
+                    berth::vault_sync::StoreBackendConfig::Local { path: p }
+                }
+                "git" | "github" => {
+                    berth::vault_sync::validate_git_remote_args(&target, &branch)?;
+                    berth::vault_sync::StoreBackendConfig::Git {
+                        url: target,
+                        branch,
+                    }
+                }
+                "sftp" | "scp" => {
+                    let (host_target, port, remote_dir) = berth::vault_sync::parse_sftp_url(&target)?;
+                    berth::vault_sync::StoreBackendConfig::Sftp {
+                        target: host_target,
+                        port,
+                        remote_dir,
+                        identity_file,
+                        known_hosts_file: known_hosts,
+                    }
+                }
+                other => anyhow::bail!("unsupported store kind `{other}` (use local, git, sftp, or scp)"),
+            };
+            reg.stores.insert(
+                clean_name.clone(),
+                berth::vault_sync::NamedStore {
+                    name: clean_name.clone(),
+                    backend,
+                    encrypt_by_default: encrypt,
+                },
+            );
+            berth::vault_sync::save_store_registry(&paths, &reg)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&reg.stores[&clean_name])?);
+            } else {
+                println!(
+                    "Added store `{clean_name}` ({}). Activate with `bh store use {clean_name}`.",
+                    berth::session_hub::format_store_backend(&reg.stores[&clean_name].backend)
+                );
+            }
+        }
+        StoreCommand::Use { name } => {
+            if !reg.stores.contains_key(&name) {
+                anyhow::bail!("unknown store `{name}` (run `bh store` to list)");
+            }
+            reg.active_store = name.clone();
+            berth::vault_sync::save_store_registry(&paths, &reg)?;
+            if json_mode {
+                println!("{{\"active_store\":\"{name}\"}}");
+            } else {
+                println!("Active store set to `{name}`");
+            }
+        }
+        StoreCommand::Show { name } => {
+            let target = name.as_deref().unwrap_or(&reg.active_store);
+            let s = reg
+                .stores
+                .get(target)
+                .ok_or_else(|| anyhow::anyhow!("unknown store `{target}`"))?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(s)?);
+            } else {
+                println!("name:    {}", s.name);
+                println!("active:  {}", reg.active_store == s.name);
+                println!("backend: {}", berth::session_hub::format_store_backend(&s.backend));
+                println!("encrypt: {}", s.encrypt_by_default);
+            }
+        }
+        StoreCommand::Remove { name } => {
+            if name == "berth" {
+                anyhow::bail!("built-in `berth` cloud store cannot be removed");
+            }
+            if reg.stores.remove(&name).is_none() {
+                anyhow::bail!("unknown store `{name}`");
+            }
+            if reg.active_store == name {
+                reg.active_store = "berth".to_string();
+            }
+            berth::vault_sync::save_store_registry(&paths, &reg)?;
+            if json_mode {
+                println!("{{\"removed\":\"{name}\"}}");
+            } else {
+                println!("Removed store `{name}`");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_sync_native(
+    store: Option<&str>,
+    direction: berth::vault_sync::SyncDirection,
+    dry_run: bool,
+    json_mode: bool,
+) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    let report = berth::vault_sync::sync_store(&paths, store, direction, dry_run)?;
+    if json_mode {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Sync `{}`{}: pulled={}, pushed={}, tombstones={}",
+            report.store_name,
+            if report.dry_run { " (dry-run)" } else { "" },
+            report.pulled,
+            report.pushed,
+            report.tombstones_applied,
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_vault_native(command: VaultCommand, json_mode: bool) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    match command {
+        VaultCommand::Quota => {
+            let q = berth::vault_sync::berth_vault_quota(&paths)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&q)?);
+            } else {
+                println!(
+                    "Berth Cloud Vault: {}",
+                    berth::vault_sync::render_quota_bar(q.used_bytes, q.quota_bytes, 28)
+                );
+                println!("  items:      {}", q.item_count);
+                println!(
+                    "  remaining:  {}",
+                    berth::vault_sync::format_bytes_human(q.remaining_bytes)
+                );
+                println!(
+                    "  max_item:   {}",
+                    berth::vault_sync::format_bytes_human(q.max_item_bytes)
+                );
+                if q.has_custom_quota {
+                    println!("  custom_quota: yes ({})", q.notes);
+                }
+            }
+        }
+        VaultCommand::Ls { agent, query } => {
+            return cmd_ls_native(true, agent.as_deref(), query.as_deref(), true, None, json_mode);
+        }
+        VaultCommand::Rename { vault_id, title } => {
+            let updated =
+                berth::vault_sync::berth_vault_patch(&paths, &vault_id, Some(&title), None, None)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else {
+                println!("Renamed `{}` -> `{}`", updated.vault_id, updated.title);
+            }
+        }
+        VaultCommand::Pin { vault_id, unpin } => {
+            let updated = berth::vault_sync::berth_vault_patch(
+                &paths,
+                &vault_id,
+                None,
+                None,
+                Some(!unpin),
+            )?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&updated)?);
+            } else {
+                println!(
+                    "{} `{}`",
+                    if updated.pinned { "Pinned" } else { "Unpinned" },
+                    updated.vault_id
+                );
+            }
+        }
+        VaultCommand::Rm { vault_id } => {
+            return cmd_delete_native(&vault_id, Some("berth"), json_mode);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_berth_info_overview(json_mode: bool) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
+    let cfg = berth::berth::load_config(&paths).ok().flatten();
+    let reg = berth::vault_sync::load_store_registry(&paths);
+    let sb = berth::sandbox::probe_sandbox_backend();
+    let quota = berth::vault_sync::berth_vault_quota(&paths).ok();
+    let discovery = berth::session_hub::discover_unified_sessions(&paths, false, None);
+
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "configured": cfg.is_some(),
+                "central_url": cfg.as_ref().map(|c| &c.central_url),
+                "account_email": cfg.as_ref().and_then(|c| c.user_session.as_ref()).map(|u| &u.email),
+                "active_store": reg.active_store,
+                "stores_count": reg.stores.len(),
+                "vault_quota": quota,
+                "sandbox": sb,
+                "local_sessions_discovered": discovery.rows.len(),
+            }))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("berth (`bh`) {}", long_version());
+    if let Some(c) = cfg {
+        println!("  central       {}", c.central_url);
+        if let Some(u) = c.user_session {
+            println!("  account       {} (role={})", u.email, u.role);
+        } else {
+            println!("  account       static API key ({})", c.redacted_api_key());
+        }
+    } else {
+        println!("  central       not configured (run `bh login`)");
+    }
+    if let Some(q) = quota {
+        println!(
+            "  cloud vault   {} ({} snapshots)",
+            berth::vault_sync::render_quota_bar(q.used_bytes, q.quota_bytes, 24),
+            q.item_count
+        );
+    } else {
+        println!("  cloud vault   offline / not logged in");
+    }
+    println!(
+        "  active store  {} ({} configured)",
+        reg.active_store,
+        reg.stores.len()
+    );
+    println!(
+        "  sandbox       {} (available={}, kernel_egress_blocked={})",
+        sb.backend, sb.available, sb.kernel_egress_blocked
+    );
+    println!("  sessions      {} local/cage sessions discovered", discovery.rows.len());
+    Ok(ExitCode::SUCCESS)
 }
 
 fn read_lease_token_from_stdin_or_env() -> anyhow::Result<String> {
@@ -2490,15 +3741,21 @@ fn cmd_berth_launch(
 
     let mut next_rebind_ref: Option<String> = None;
     let mut next_cohort_hint: Option<String> = None;
+    let mut next_accounts = accounts.clone();
     let mut current_session_id = session_id.map(String::from);
+    let initial_agent_args = agent_args.to_vec();
     let mut current_args = agent_args.to_vec();
-    let max_rebinds = if auto_rebind { 3usize } else { 0usize };
+    let mut pending_handoff: Option<(
+        berth::sandbox::AccountCageHome,
+        berth::rebind_continue::DetectedCageSession,
+    )> = None;
+    let max_rebinds = if auto_rebind { 5usize } else { 0usize };
 
     for attempt in 0..=max_rebinds {
         let req = berth::berth::LeaseRequest {
             agent: canonical_agent.to_string(),
             work_session_id: current_session_id.clone(),
-            account_preference: accounts.clone(),
+            account_preference: next_accounts.clone(),
             zone_preference: config.zone_preference.clone(),
             isolation_mode,
             cohort_hint: next_cohort_hint.clone(),
@@ -2528,6 +3785,7 @@ fn cmd_berth_launch(
             rebind_file: Some(rebind_file.clone()),
             ready_file: None,
             upstream_timeout: std::time::Duration::from_secs(30),
+            abort_retries_on_rebind: auto_rebind,
         })?;
 
         let launch_env = berth::berth::build_cli_launch_env(
@@ -2680,12 +3938,58 @@ fn cmd_berth_launch(
             }
         };
 
+        // If we are entering a new Cage after a 409 cross-cohort rebind, cleanly migrate
+        // ONLY pure session transcript (+ single-thread goal state) into the new Cage
+        // and compute the state-aware continuation argv (never leaking old identity files).
+        if let Some((old_home, detected)) = pending_handoff.take() {
+            let migrated_sid = if isolation_mode == berth::berth::IsolationMode::Sandbox {
+                match berth::rebind_continue::migrate_session_for_rebind(
+                    canonical_agent,
+                    &old_home,
+                    &account_home,
+                    &detected,
+                ) {
+                    Ok(sid) => sid,
+                    Err(err) => {
+                        eprintln!("[berth] warning: session migration across cages failed: {err}");
+                        detected.session_id.clone()
+                    }
+                }
+            } else {
+                detected.session_id.clone()
+            };
+            let decision =
+                berth::rebind_continue::decide_continuation(canonical_agent, &detected);
+            eprintln!("[berth] rebind continuation: {}", decision.reason);
+            current_args = berth::rebind_continue::build_rebind_argv(
+                canonical_agent,
+                &initial_agent_args,
+                migrated_sid.as_deref(),
+                &decision,
+            );
+        }
+
+        let inspect_home_for_attempt = if isolation_mode == berth::berth::IsolationMode::Sandbox {
+            account_home.home_dir.clone()
+        } else {
+            real_home.clone()
+        };
+        let launch_started_at = std::time::SystemTime::now();
+        let pre_launch_codex_paused = if canonical_agent == "codex" {
+            berth::rebind_continue::snapshot_codex_paused_goals(
+                &inspect_home_for_attempt.join(".codex"),
+            )
+        } else {
+            std::collections::BTreeSet::new()
+        };
+
         let status = if isolation_mode == berth::berth::IsolationMode::Sandbox {
             let spec = berth::sandbox::SandboxLaunchSpec {
                 agent: canonical_agent.to_string(),
-                workspace_dir,
-                real_home,
-                account_home,
+                workspace_dir: workspace_dir.clone(),
+                real_home: real_home.clone(),
+                state_dir: paths.state_dir.clone(),
+                account_home: account_home.clone(),
                 cage: lease.cage.clone(),
                 stock_bin,
                 agent_args: current_args.clone(),
@@ -2701,7 +4005,9 @@ fn cmd_berth_launch(
                 overlay_fs_etc: overlay_plan
                     .as_ref()
                     .map(|p| p.overlay_root.join("fs").join("etc")),
-                allow_env_fallback: isolation_override.is_none(),
+                // Fail closed when sandbox isolation is selected; users can pass `--isolation tz-overlay` to opt out.
+                allow_env_fallback: false,
+                auto_rebind,
             };
             berth::sandbox::launch_in_sandbox(&spec, &mut shim)
                 .map_err(|e| std::io::Error::other(e.to_string()))
@@ -2731,7 +4037,8 @@ fn cmd_berth_launch(
             }
             // Authoritative Berth Cage env & loopback shim URLs override overlay defaults.
             launch_env.apply_to_command(&mut cmd);
-            cmd.status()
+            cmd.spawn()
+                .and_then(|child| berth::sandbox::wait_child_or_rebind(child, &shim, auto_rebind))
         };
         let rebind_signal: Option<berth::berth::RebindSignal> = if rebind_file.is_file() {
             std::fs::read_to_string(&rebind_file)
@@ -2749,21 +4056,31 @@ fn cmd_berth_launch(
         );
 
         if let Some(signal) = rebind_signal {
-            if attempt < max_rebinds {
+            let has_target = !signal.recommended_cohort_tz.trim().is_empty()
+                || signal.recommended_account_id.is_some();
+            if attempt < max_rebinds && has_target {
+                let detected = berth::rebind_continue::inspect_cage_session(
+                    canonical_agent,
+                    &inspect_home_for_attempt,
+                    &workspace_dir,
+                    Some(launch_started_at),
+                    &pre_launch_codex_paused,
+                );
                 eprintln!(
-                    "[berth] cage rebind required ({} -> {}, ref={}); rebinding and relaunching...",
-                    signal.current_cohort_tz, signal.recommended_cohort_tz, signal.rebind_ref
+                    "[berth] cage rebind required ({} -> {}, ref={}); state={:?}; rebinding and relaunching...",
+                    signal.current_cohort_tz,
+                    signal.recommended_cohort_tz,
+                    signal.rebind_ref,
+                    detected.state
                 );
                 next_rebind_ref = Some(signal.rebind_ref);
-                next_cohort_hint = Some(signal.recommended_cohort_tz);
-                // Preserve resume semantics on auto-rebind when not already passing resume.
-                if canonical_agent == "claude"
-                    && !current_args
-                        .iter()
-                        .any(|a| a == "--resume" || a == "-r" || a == "--continue" || a == "-c")
-                {
-                    current_args.push("--continue".to_string());
+                next_cohort_hint = (!signal.recommended_cohort_tz.trim().is_empty())
+                    .then_some(signal.recommended_cohort_tz);
+                if let Some(rec_acct) = signal.recommended_account_id {
+                    next_accounts = vec![rec_acct.to_string()];
                 }
+                pending_handoff = Some((account_home, detected));
+                std::thread::sleep(std::time::Duration::from_millis(250));
                 continue;
             }
             eprintln!(

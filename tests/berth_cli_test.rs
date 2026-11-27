@@ -554,7 +554,8 @@ print(resp.splitlines()[-1])
     );
 
     let report = fs::read_to_string(&report_file).unwrap();
-    assert!(report.contains("BACKEND=linux-bwrap"), "report:\n{report}");
+    // Antidetect hardening: BERTH_SANDBOX_* env vars must NOT leak into the child process.
+    assert!(report.contains("BACKEND=\n"), "report:\n{report}");
     assert!(report.contains("TZ=America/Chicago"), "report:\n{report}");
     assert!(report.contains("SSH_HIDDEN=yes"), "report:\n{report}");
     assert!(report.contains("WSL_CLEARED=yes"), "report:\n{report}");
@@ -1282,5 +1283,212 @@ fn cli_bh_login_auto_selects_platform_api_key_for_codex_and_claude_and_logout() 
             "Bearer sk-pinned-override".to_string(),
             "Bearer sk-oneshot-override".to_string(),
         ]
+    );
+}
+
+#[test]
+fn cli_strict_double_dash_argument_passing_and_rejection() {
+    let dir = TempDir::new().unwrap();
+    let xdg_config = dir.path().join("config");
+    let xdg_state = dir.path().join("state");
+
+    // 1. Unknown agent flag BEFORE `--` must exit 2 with actionable hint.
+    let bad_flag = Command::new(ags_bin())
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["claude", "-p", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_flag.status.code(), Some(2));
+    let bad_stderr = String::from_utf8_lossy(&bad_flag.stderr);
+    assert!(
+        bad_stderr.contains("bh claude -- <AGENT_ARGS...>"),
+        "expected `--` hint, got:\n{bad_stderr}"
+    );
+
+    // 2. Unexpected positional subcommand BEFORE `--` on `codex` must also exit 2 with hint.
+    let bad_pos = Command::new(ags_bin())
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["codex", "exec", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_pos.status.code(), Some(2));
+    let bad_pos_stderr = String::from_utf8_lossy(&bad_pos.stderr);
+    assert!(
+        bad_pos_stderr.contains("bh codex -- <AGENT_ARGS...>"),
+        "expected `--` hint, got:\n{bad_pos_stderr}"
+    );
+
+    // 3. Non-launching command with non-empty `--` suffix must exit 2.
+    let bad_non_launch = Command::new(ags_bin())
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["status", "--", "--unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_non_launch.status.code(), Some(2));
+    let non_launch_stderr = String::from_utf8_lossy(&bad_non_launch.stderr);
+    assert!(
+        non_launch_stderr.contains("does not accept arguments after `--`"),
+        "got:\n{non_launch_stderr}"
+    );
+}
+
+#[test]
+fn cli_pure_rust_session_ls_save_store_sync_and_resume_dry_run_e2e() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let xdg_config = dir.path().join("config");
+    let xdg_state = dir.path().join("state");
+    let workspace = dir.path().join("project");
+    let local_store_dir = dir.path().join("local-vault-mirror");
+    fs::create_dir_all(&workspace).unwrap();
+
+    // Plant a real Claude session inside a Berth Sandbox cage home (not host $HOME!)
+    // to verify multi-home discovery across `state_dir/cages/*/home/.claude/projects/...`.
+    let cage_claude_proj = xdg_state
+        .join("berth/cages/acct_demo/home/.claude/projects/-tmp-project");
+    fs::create_dir_all(&cage_claude_proj).unwrap();
+    let session_id = "11111111-2222-3333-4444-555555555555";
+    let jsonl_path = cage_claude_proj.join(format!("{session_id}.jsonl"));
+    let secret_token = "sk-ant-api03-SECRETTOKEN1234567890ABCDEF1234567890";
+    let session_body = format!(
+        concat!(
+            "{{\"type\":\"user\",\"uuid\":\"u1\",\"sessionId\":\"{sid}\",\"cwd\":\"{cwd}\",\"timestamp\":\"2026-11-26T10:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"Debug token {tok}\"}}}}\n",
+            "{{\"type\":\"assistant\",\"uuid\":\"a1\",\"parentUuid\":\"u1\",\"sessionId\":\"{sid}\",\"cwd\":\"{cwd}\",\"timestamp\":\"2026-11-26T10:00:05Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"I will rotate that secret right away.\"}}]}}}}\n",
+            "{{\"type\":\"system\",\"subtype\":\"away_summary\",\"content\":\"Rotate leaked key & harden cage\",\"timestamp\":\"2026-11-26T10:00:10Z\"}}\n"
+        ),
+        sid = session_id,
+        cwd = workspace.to_string_lossy().replace('\\', "\\\\"),
+        tok = secret_token
+    );
+    fs::write(&jsonl_path, &session_body).unwrap();
+
+    // 1. `bh ls -a --json` discovers the cage session and picks up the `away_summary` title!
+    let ls_out = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["ls", "-a", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        ls_out.status.success(),
+        "bh ls failed: {}",
+        String::from_utf8_lossy(&ls_out.stderr)
+    );
+    let ls_json: serde_json::Value = serde_json::from_slice(&ls_out.stdout).unwrap();
+    let sessions = ls_json["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "ls output: {ls_json}");
+    assert_eq!(sessions[0]["session_id"], session_id);
+    assert_eq!(sessions[0]["provider"], "claude-code");
+    assert_eq!(sessions[0]["title"], "Rotate leaked key & harden cage");
+
+    // 2. Register a local store (`bh store add backup local <dir>`) and verify `bh store ls`.
+    let add_store = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "store",
+            "add",
+            "backup",
+            "local",
+            local_store_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        add_store.status.success(),
+        "bh store add failed: {}",
+        String::from_utf8_lossy(&add_store.stderr)
+    );
+
+    // 3. `bh save <session_id> --store backup --json` saves redacted+zstd `.bhv1` snapshot.
+    let save_out = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["save", session_id, "--store", "backup", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        save_out.status.success(),
+        "bh save failed: {}",
+        String::from_utf8_lossy(&save_out.stderr)
+    );
+    let save_stdout = String::from_utf8_lossy(&save_out.stdout);
+    assert!(!save_stdout.contains(secret_token));
+    let save_json: serde_json::Value = serde_json::from_str(&save_stdout).unwrap();
+    let vault_id = save_json["saved"]["vault_id"].as_str().unwrap().to_string();
+    assert!(save_json["saved"]["redacted"].as_bool().unwrap());
+    assert!(save_json["saved"]["redacted_count"].as_i64().unwrap() >= 1);
+
+    // 4. `bh save <session_id> --store backup --encrypt --passphrase test-pass --json` encrypts E2EE.
+    let enc_save = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "save",
+            session_id,
+            "--store",
+            "backup",
+            "--encrypt",
+            "--passphrase",
+            "test-pass",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        enc_save.status.success(),
+        "bh save --encrypt failed: {}",
+        String::from_utf8_lossy(&enc_save.stderr)
+    );
+    let enc_json: serde_json::Value = serde_json::from_slice(&enc_save.stdout).unwrap();
+    assert_eq!(enc_json["saved"]["encrypted"], true);
+
+    // 5. `bh resume <vault_id> --to codex --workspace <ws> --dry-run --json` verifies cross-agent conversion!
+    let resume_dry = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "resume",
+            &vault_id,
+            "--to",
+            "codex",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        resume_dry.status.success(),
+        "bh resume --to codex --dry-run failed: {}",
+        String::from_utf8_lossy(&resume_dry.stderr)
+    );
+    let resume_json: serde_json::Value = serde_json::from_slice(&resume_dry.stdout).unwrap();
+    assert_eq!(resume_json["source_provider"], "claude-code");
+    assert_eq!(resume_json["target_agent"], "codex");
+    assert_eq!(resume_json["dry_run"], true);
+
+    // 6. `bh delete <vault_id> --store backup --json` tombstones cleanly.
+    let del_out = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args(["delete", &vault_id, "--store", "backup", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        del_out.status.success(),
+        "bh delete failed: {}",
+        String::from_utf8_lossy(&del_out.stderr)
     );
 }

@@ -150,6 +150,216 @@ impl Codex {
             .filter(|dir| dir.is_dir())
             .collect()
     }
+
+    /// Locate the newest Codex thread-index database inside an explicit `codex_home`.
+    pub fn latest_state_db_in_home(codex_home: &Path) -> Option<PathBuf> {
+        let mut best: Option<(i64, PathBuf)> = None;
+        for entry in std::fs::read_dir(codex_home).ok()?.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(version) = state_db_version(name) {
+                let replace = best.as_ref().is_none_or(|(v, _)| version > *v);
+                if replace {
+                    best = Some((version, path));
+                }
+            }
+        }
+        best.map(|(_, p)| p)
+    }
+
+    /// List live Codex rollout sessions inside an explicit `codex_home` (e.g. a Berth Sandbox
+    /// cage home) without mutating process environment variables.
+    pub fn list_sessions_in_home(codex_home: &Path) -> SessionListing {
+        let sessions_dir = codex_home.join(SESSIONS_DIR);
+        let archived_dir = codex_home.join(ARCHIVED_SESSIONS_DIR);
+        let roots = vec![sessions_dir.clone(), archived_dir];
+        let mut listing = SessionListing::default();
+        if !sessions_dir.is_dir() {
+            return listing;
+        }
+        for entry in WalkDir::new(&sessions_dir).max_depth(4) {
+            let Some(entry) = walk_entry_reporting(entry, &mut listing.unreadable) else {
+                continue;
+            };
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !is_rollout_file_name(name) || !is_rollout_layout(path, &roots) {
+                continue;
+            }
+            let meta = session_meta_payload(path);
+            if meta.as_ref().is_some_and(is_subagent_rollout) {
+                continue;
+            }
+            let session_id = meta
+                .as_ref()
+                .and_then(|payload| payload.get("id"))
+                .and_then(|id| id.as_str())
+                .map_or_else(|| rollout_stem(name).to_string(), ToString::to_string);
+            listing.sessions.push((session_id, path.to_path_buf()));
+        }
+        listing
+    }
+
+    /// Reads native thread title & preview metadata from `codex_home/state_*.sqlite` if present.
+    pub fn read_thread_titles_in_home(codex_home: &Path) -> HashMap<String, (String, String, bool)> {
+        let mut out = HashMap::new();
+        let Some(db_path) = Self::latest_state_db_in_home(codex_home) else {
+            return out;
+        };
+        let Ok(conn) = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return out;
+        };
+        let query = "SELECT id, COALESCE(NULLIF(name, ''), title, ''), COALESCE(cwd, ''), COALESCE(is_pinned, 0) FROM threads";
+        let fallback_query = "SELECT id, COALESCE(title, ''), COALESCE(cwd, ''), 0 FROM threads";
+        let stmt_res = conn.prepare(query).or_else(|_| conn.prepare(fallback_query));
+        if let Ok(mut stmt) = stmt_res {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3).unwrap_or(0) != 0,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    out.insert(row.0, (row.1, row.2, row.3));
+                }
+            }
+        }
+        out
+    }
+
+    /// Writes a canonical session directly into an explicit `codex_home` (e.g. a Berth Sandbox
+    /// cage home), refusing symlinks, and registers the rollout in THAT cage's `state_*.sqlite`
+    /// using `visible_codex_home` (so `rollout_path` matches what Codex sees inside `bwrap`).
+    pub fn write_session_to_home(
+        &self,
+        codex_home: &Path,
+        visible_codex_home: &Path,
+        session: &CanonicalSession,
+        opts: &WriteOptions,
+    ) -> anyhow::Result<WrittenSession> {
+        if let Ok(meta) = std::fs::symlink_metadata(codex_home) {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "refusing to write Codex session through symlinked home {}",
+                    codex_home.display()
+                );
+            }
+        }
+        let target_session_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+        let sessions_dir = codex_home.join(SESSIONS_DIR);
+        let target_path = rollout_path(&sessions_dir, &target_session_id, &now);
+        let visible_path = rollout_path(&visible_codex_home.join(SESSIONS_DIR), &target_session_id, &now);
+
+        let cwd = session
+            .workspace
+            .as_deref()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing target workspace path (pass `--workspace <DIR>` instead of defaulting to /tmp)"
+                )
+            })?
+            .to_string_lossy()
+            .to_string();
+
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let mut lines: Vec<String> = Vec::with_capacity(session.messages.len() + 1);
+        lines.push(serde_json::to_string(&serde_json::json!({
+            "type": "session_meta",
+            "timestamp": now_iso,
+            "payload": {
+                "id": target_session_id,
+                "session_id": target_session_id,
+                "cwd": cwd,
+                "timestamp": now_iso,
+                "originator": "codex_cli_rs",
+                "cli_version": env!("CARGO_PKG_VERSION"),
+                "source": "cli",
+                "thread_source": "user",
+                "model_provider": "openai",
+            }
+        }))?);
+
+        for msg in &session.messages {
+            let msg_iso = msg
+                .timestamp
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .unwrap_or(now)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            for event in codex_events_for_message(msg, &msg_iso) {
+                lines.push(serde_json::to_string(&event)?);
+            }
+        }
+        let mut content = lines.join("\n");
+        content.push('\n');
+
+        let outcome =
+            crate::pipeline::atomic_write(&target_path, content.as_bytes(), opts.force, self.slug())?;
+
+        let first_user = session
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let title = session
+            .title
+            .clone()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| {
+                let t = truncate_title(first_user, 100);
+                if t.is_empty() {
+                    "Resumed session".to_string()
+                } else {
+                    t
+                }
+            });
+        let preview = if first_user.trim().is_empty() {
+            title.clone()
+        } else {
+            first_user.to_string()
+        };
+
+        let mut warnings = Vec::new();
+        if let Some(db_path) = Self::latest_state_db_in_home(codex_home) {
+            if let Err(e) = register_thread_in_db(
+                &db_path,
+                &target_session_id,
+                &visible_path,
+                &cwd,
+                &title,
+                first_user,
+                &preview,
+                &now,
+                Some("openai"),
+            ) {
+                warnings.push(format!("could not register thread in cage Codex DB: {e}"));
+            }
+        }
+
+        Ok(WrittenSession {
+            paths: vec![outcome.target_path.clone()],
+            session_id: target_session_id.clone(),
+            resume_command: self.resume_command(&target_session_id),
+            backups: outcome.displaced().into_iter().collect(),
+            warnings,
+        })
+    }
 }
 
 impl Provider for Codex {
