@@ -58,6 +58,12 @@ pub struct CageShimConfig {
     /// fast-reject subsequent client SDK retry requests with non-retryable HTTP 400
     /// so `bh --auto-rebind` does not wait through 15-30s of SDK exponential backoff.
     pub abort_retries_on_rebind: bool,
+    /// Real execution client OS (`"MacOS"` | `"Linux"` | `"Windows"`), version, and arch
+    /// (`"arm64"` | `"x64"`). Sent as internal `X-Berth-Exec-*` headers to Landing Edge
+    /// (stripped before AI upstream) so Edge aligns User-Agent / headers to the true execution OS.
+    pub exec_os: String,
+    pub exec_os_version: String,
+    pub exec_arch: String,
 }
 
 impl fmt::Debug for CageShimConfig {
@@ -168,6 +174,9 @@ struct ShimSharedState {
     upstream_timeout: Duration,
     rebind_file: Option<PathBuf>,
     abort_retries_on_rebind: bool,
+    exec_os: String,
+    exec_os_version: String,
+    exec_arch: String,
     rebind_signaled: AtomicBool,
     secrets: RwLock<LeaseSecrets>,
     metrics: ShimMetrics,
@@ -239,6 +248,9 @@ impl CageShim {
             },
             rebind_file: config.rebind_file.clone(),
             abort_retries_on_rebind: config.abort_retries_on_rebind,
+            exec_os: config.exec_os,
+            exec_os_version: config.exec_os_version,
+            exec_arch: config.exec_arch,
             rebind_signaled: AtomicBool::new(false),
             secrets: RwLock::new(LeaseSecrets {
                 lease_id: config.lease_id,
@@ -953,9 +965,27 @@ fn forward_to_upstream(
          X-Berth-Cage-Country: {cage_country}\r\n\
          X-Berth-Cage-Strict: {}\r\n\
          X-Berth-AGS-Version: {AGS_VERSION_HEADER_VALUE}\r\n\
-         X-Berth-Operation-ID: {op_id}\r\n\r\n",
+         X-Berth-Operation-ID: {op_id}\r\n",
         if cage_strict { "true" } else { "false" }
     );
+    if !state.exec_os.trim().is_empty() {
+        let _ = write!(&mut wire_req, "X-Berth-Exec-OS: {}\r\n", state.exec_os.trim());
+    }
+    if !state.exec_os_version.trim().is_empty() {
+        let _ = write!(
+            &mut wire_req,
+            "X-Berth-Exec-OS-Version: {}\r\n",
+            state.exec_os_version.trim()
+        );
+    }
+    if !state.exec_arch.trim().is_empty() {
+        let _ = write!(
+            &mut wire_req,
+            "X-Berth-Exec-Arch: {}\r\n",
+            state.exec_arch.trim()
+        );
+    }
+    wire_req.extend_from_slice(b"\r\n");
     if !is_ws && !req_body.is_empty() {
         wire_req.extend_from_slice(&req_body);
     }
@@ -1984,6 +2014,9 @@ mod tests {
             ready_file: None,
             upstream_timeout: Duration::from_secs(5),
             abort_retries_on_rebind: false,
+            exec_os: String::new(),
+            exec_os_version: String::new(),
+            exec_arch: String::new(),
         }
     }
 

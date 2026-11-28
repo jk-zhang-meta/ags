@@ -21,6 +21,7 @@ pub mod error;
 pub mod ir;
 pub mod launch;
 pub mod listing_cache;
+pub mod macos_vm;
 pub mod model;
 pub mod pipeline;
 pub mod providers;

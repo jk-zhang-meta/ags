@@ -114,7 +114,7 @@ enum BerthCommand {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long, default_value = "auto")]
         zone: String,
-        /// Client isolation mode (sandbox|tz-overlay|strict).
+        /// Client isolation mode (sandbox|vm|tz-overlay|strict).
         #[arg(long, default_value = "sandbox")]
         isolation: String,
         /// Allow plaintext http:// central URL for local tests only.
@@ -198,9 +198,19 @@ enum BerthCommand {
 
 #[derive(clap::Subcommand, Debug)]
 enum SandboxCommand {
-    /// Probe native zero-VM sandbox capabilities (Linux/WSL2 bwrap, macOS Seatbelt, Windows AppContainer).
+    /// Probe native sandbox & Apple Silicon Micro-VM capabilities (Linux/WSL2 bwrap, macOS Seatbelt / VZ Micro-VM, Windows AppContainer).
     #[command(name = "check")]
     Check,
+    /// One-time setup on Apple Silicon macOS to initialize the hardware-isolated ARM64 Linux Micro-VM (`--isolation vm`).
+    #[command(name = "init-vm")]
+    InitVm {
+        /// Re-download and rebuild the ARM64 Linux Micro-VM image even if already initialized.
+        #[arg(long)]
+        force: bool,
+        /// Skip installing Linux ARM64 official CLIs (`claude`, `codex`, `agy`) during setup.
+        #[arg(long)]
+        skip_agents: bool,
+    },
     /// One-time Administrator setup on native Windows to enable AppContainer loopback bridge.
     #[command(name = "init-windows")]
     InitWindows,
@@ -276,7 +286,7 @@ struct AgentLaunchArgs {
     /// Override logical zone preference (auto|cn_mainland|overseas|home_direct).
     #[arg(long)]
     zone: Option<String>,
-    /// Override isolation mode (sandbox|tz-overlay|strict).
+    /// Override isolation mode (sandbox|vm|tz-overlay|strict).
     #[arg(long)]
     isolation: Option<String>,
     /// Optional Berth work session ID (renamed from --session-id to avoid confusion with Claude).
@@ -316,7 +326,7 @@ enum Command {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long)]
         zone: Option<String>,
-        /// Client isolation mode (sandbox|tz-overlay|strict).
+        /// Client isolation mode (sandbox|vm|tz-overlay|strict).
         #[arg(long)]
         isolation: Option<String>,
         /// Allow plaintext http:// central URL for local tests only.
@@ -347,7 +357,7 @@ enum Command {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long, default_value = "auto")]
         zone: String,
-        /// Client isolation mode (sandbox|tz-overlay|strict).
+        /// Client isolation mode (sandbox|vm|tz-overlay|strict).
         #[arg(long, default_value = "sandbox")]
         isolation: String,
         /// Allow plaintext http:// central URL for local tests only.
@@ -2781,6 +2791,8 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
             ready_file,
         } => {
             let lease_token = read_lease_token_from_stdin_or_env()?;
+            let (exec_os, exec_os_version, exec_arch) =
+                detect_exec_os_identity(berth::berth::IsolationMode::Sandbox, &paths.state_dir);
             let mut handle = berth::cage_shim::CageShim::start(berth::cage_shim::CageShimConfig {
                 bind_addr: bind,
                 ingress_url,
@@ -2794,6 +2806,9 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                 ready_file: ready_file.clone(),
                 upstream_timeout: std::time::Duration::from_secs(30),
                 abort_retries_on_rebind: false,
+                exec_os,
+                exec_os_version,
+                exec_arch,
             })?;
 
             if ready_file.is_none() {
@@ -3121,11 +3136,19 @@ fn cmd_session_resume_native(
             &lease.cage,
         )?;
         // Inside Linux bwrap, account_home.home_dir is bind-mounted over real_home;
-        // on macOS/Windows, HOME/USERPROFILE points directly to account_home.home_dir.
-        let visible_home = if cfg!(target_os = "linux") {
+        // inside Apple Silicon ARM64 Linux Micro-VM, guest HOME is `/home/dev` and workspace is `/workspace`;
+        // on macOS Seatbelt / Windows, HOME/USERPROFILE points directly to account_home.home_dir.
+        let visible_home = if isolation_mode == berth::berth::IsolationMode::Vm {
+            PathBuf::from("/home/dev")
+        } else if cfg!(target_os = "linux") {
             real_home.clone()
         } else {
             account_home.home_dir.clone()
+        };
+        let visible_ws = if isolation_mode == berth::berth::IsolationMode::Vm {
+            PathBuf::from("/workspace")
+        } else {
+            target_ws.clone()
         };
 
         if dry_run {
@@ -3166,7 +3189,7 @@ fn cmd_session_resume_native(
             &paths,
             &row,
             target_agent,
-            &target_ws,
+            &visible_ws,
             &account_home,
             &visible_home,
             &decryption,
@@ -3773,6 +3796,8 @@ fn cmd_berth_launch(
             .tempdir()?;
         let rebind_file = rebind_dir.path().join("rebind.json");
 
+        let (exec_os, exec_os_version, exec_arch) =
+            detect_exec_os_identity(isolation_mode, &paths.state_dir);
         let mut shim = berth::cage_shim::CageShim::start(berth::cage_shim::CageShimConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             ingress_url: selected.candidate.url.clone(),
@@ -3782,11 +3807,17 @@ fn cmd_berth_launch(
             cage_tz: lease.cage.timezone.clone(),
             cage_country: lease.cage.country_code.clone(),
             cage_strict: lease.cage.strict_mode
-                || isolation_mode == berth::berth::IsolationMode::Strict,
+                || matches!(
+                    isolation_mode,
+                    berth::berth::IsolationMode::Strict | berth::berth::IsolationMode::Vm
+                ),
             rebind_file: Some(rebind_file.clone()),
             ready_file: None,
             upstream_timeout: std::time::Duration::from_secs(30),
             abort_retries_on_rebind: auto_rebind,
+            exec_os,
+            exec_os_version,
+            exec_arch,
         })?;
 
         let launch_env = berth::berth::build_cli_launch_env(
@@ -3926,16 +3957,22 @@ fn cmd_berth_launch(
             return Ok(ExitCode::SUCCESS);
         }
 
-        let stock_bin = match berth::berth::resolve_stock_cli_binary(canonical_agent) {
-            Ok(bin) => bin,
-            Err(err) => {
-                shim.shutdown();
-                let _ = berth::berth::release_lease_with_token(
-                    &config,
-                    &resolved_auth.bearer_token,
-                    &lease.lease_id,
-                );
-                return Err(err.into());
+        let stock_bin = if isolation_mode == berth::berth::IsolationMode::Vm {
+            // Inside the Apple Silicon ARM64 Linux Micro-VM, the stock CLI binary is resolved
+            // from the guest Linux PATH (not the macOS host).
+            PathBuf::from(canonical_agent)
+        } else {
+            match berth::berth::resolve_stock_cli_binary(canonical_agent) {
+                Ok(bin) => bin,
+                Err(err) => {
+                    shim.shutdown();
+                    let _ = berth::berth::release_lease_with_token(
+                        &config,
+                        &resolved_auth.bearer_token,
+                        &lease.lease_id,
+                    );
+                    return Err(err.into());
+                }
             }
         };
 
@@ -3945,7 +3982,9 @@ fn cmd_berth_launch(
         if let Some((old_home, detected, expected_target_account)) = pending_handoff.take() {
             let uses_isolated_cage_home = matches!(
                 isolation_mode,
-                berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+                berth::berth::IsolationMode::Sandbox
+                    | berth::berth::IsolationMode::Vm
+                    | berth::berth::IsolationMode::Strict
             );
             if let (Some(expected_acct), Some(bound_acct)) = (expected_target_account, lease.account_id) {
                 if bound_acct != 0 && bound_acct != expected_acct {
@@ -4000,7 +4039,9 @@ fn cmd_berth_launch(
 
         let uses_isolated_cage_home = matches!(
             isolation_mode,
-            berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+            berth::berth::IsolationMode::Sandbox
+                | berth::berth::IsolationMode::Vm
+                | berth::berth::IsolationMode::Strict
         );
         let inspect_home_for_attempt = if uses_isolated_cage_home {
             account_home.home_dir.clone()
@@ -4016,9 +4057,9 @@ fn cmd_berth_launch(
             std::collections::BTreeSet::new()
         };
 
-        // Both `sandbox` and `strict` modes MUST execute inside the kernel-enforced
-        // network-isolated OS sandbox (`bwrap --unshare-net` on Linux, Seatbelt on macOS,
-        // AppContainer on Windows) with fail-closed `allow_env_fallback: false` (C-7).
+        // `sandbox`, `vm`, and `strict` modes MUST execute inside a kernel/hypervisor-enforced
+        // network-isolated boundary (`bwrap --unshare-net` on Linux, Seatbelt or Apple Silicon
+        // ARM64 Linux Micro-VM on macOS, AppContainer on Windows) with fail-closed `allow_env_fallback: false`.
         let status = if uses_isolated_cage_home {
             let spec = berth::sandbox::SandboxLaunchSpec {
                 agent: canonical_agent.to_string(),
@@ -4041,9 +4082,10 @@ fn cmd_berth_launch(
                 overlay_fs_etc: overlay_plan
                     .as_ref()
                     .map(|p| p.overlay_root.join("fs").join("etc")),
-                // Fail closed when sandbox/strict isolation is selected; users can pass `--isolation tz-overlay` to opt out.
+                // Fail closed when sandbox/vm/strict isolation is selected; users can pass `--isolation tz-overlay` to opt out.
                 allow_env_fallback: false,
                 auto_rebind,
+                use_vm: isolation_mode == berth::berth::IsolationMode::Vm,
             };
             berth::sandbox::launch_in_sandbox(&spec, &mut shim)
                 .map_err(|e| std::io::Error::other(e.to_string()))
@@ -4133,12 +4175,71 @@ fn cmd_berth_launch(
     Ok(ExitCode::from(75))
 }
 
+fn detect_exec_os_identity(
+    isolation_mode: berth::berth::IsolationMode,
+    state_dir: &Path,
+) -> (String, String, String) {
+    if isolation_mode == berth::berth::IsolationMode::Vm {
+        let meta = berth::macos_vm::read_vm_guest_meta(state_dir);
+        return (meta.os, meta.os_version, meta.arch);
+    }
+    let arch = match std::env::consts::ARCH {
+        "aarch64" | "arm64" => "arm64".to_string(),
+        _ => "x64".to_string(),
+    };
+    match std::env::consts::OS {
+        "macos" => {
+            let ver = std::process::Command::new("/usr/bin/sw_vers")
+                .arg("-productVersion")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "15.3.1".to_string());
+            ("MacOS".to_string(), ver, arch)
+        }
+        "windows" => ("Windows".to_string(), "11".to_string(), arch),
+        _ => {
+            let distro = std::fs::read_to_string("/etc/os-release")
+                .ok()
+                .and_then(|raw| {
+                    let mut name = None;
+                    let mut ver_id = None;
+                    for line in raw.lines() {
+                        if let Some(v) = line.strip_prefix("NAME=") {
+                            name = Some(v.trim_matches('"').trim().to_string());
+                        } else if let Some(v) = line.strip_prefix("VERSION_ID=") {
+                            ver_id = Some(v.trim_matches('"').trim().to_string());
+                        }
+                    }
+                    match (name, ver_id) {
+                        (Some(n), Some(v)) if !n.is_empty() && !v.is_empty() => {
+                            let short = n.split_whitespace().next().unwrap_or(&n);
+                            Some(format!("{short} {v}"))
+                        }
+                        (Some(n), _) if !n.is_empty() => Some(n),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| "Ubuntu 24.04".to_string());
+            ("Linux".to_string(), distro, arch)
+        }
+    }
+}
+
 fn cmd_sandbox(command: SandboxCommand, json_mode: bool) -> anyhow::Result<ExitCode> {
+    let paths = berth::berth::BerthPaths::from_env();
     match command {
         SandboxCommand::Check => {
             let probe = berth::sandbox::probe_sandbox_backend();
+            let vm_status = berth::macos_vm::probe_macos_vm(&paths.state_dir);
             if json_mode {
-                println!("{}", serde_json::to_string_pretty(&probe)?);
+                let mut val = serde_json::to_value(&probe)?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("macos_vm".into(), serde_json::to_value(&vm_status)?);
+                }
+                println!("{}", serde_json::to_string_pretty(&val)?);
             } else {
                 println!("berth sandbox check");
                 println!("  os                     {}", probe.os);
@@ -4153,12 +4254,30 @@ fn cmd_sandbox(command: SandboxCommand, json_mode: bool) -> anyhow::Result<ExitC
                 for note in &probe.notes {
                     println!("  note                   {note}");
                 }
+                if vm_status.supported {
+                    println!("  macos_vm_supported     {}", vm_status.supported);
+                    println!("  macos_vm_initialized   {}", vm_status.initialized);
+                    println!("  macos_vm_dir           {}", vm_status.vm_dir.display());
+                    for note in &vm_status.notes {
+                        println!("  macos_vm_note          {note}");
+                    }
+                }
             }
-            Ok(if probe.available {
+            Ok(if probe.available || vm_status.initialized {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             })
+        }
+        SandboxCommand::InitVm { force, skip_agents } => {
+            let status = berth::macos_vm::init_macos_vm(&paths.state_dir, force, !skip_agents)?;
+            if json_mode {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("Apple Silicon ARM64 Linux Micro-VM ready at {}", status.vm_dir.display());
+                println!("Launch any agent with: `bh claude --isolation vm` / `bh codex --isolation vm` / `bh agy --isolation vm`");
+            }
+            Ok(ExitCode::SUCCESS)
         }
         SandboxCommand::InitWindows => {
             berth::sandbox::run_windows_appcontainer_init()?;

@@ -129,6 +129,10 @@ pub enum IsolationMode {
     /// macOS sandbox-exec Seatbelt, Windows AppContainer) with all outbound traffic
     /// forced through the Berth Landing proxy and per-account isolated HOME.
     Sandbox,
+    /// Optional Apple Silicon (`aarch64-apple-darwin`) ARM64 Linux Micro-VM backend
+    /// powered by native `Virtualization.framework` with zero `virtio-net` NICs,
+    /// VirtioFS `/workspace`, and `virtio-vsock` transport to `CageShim` / `ForwardProxy`.
+    Vm,
     /// Requires Linux + zoneinfo + unprivileged `unshare -Ur -m` + no active
     /// Windows/WSL interop bypass. Fails closed otherwise.
     Strict,
@@ -139,6 +143,7 @@ impl IsolationMode {
         match self {
             Self::TzOverlay => "tz-overlay",
             Self::Sandbox => "sandbox",
+            Self::Vm => "vm",
             Self::Strict => "strict",
         }
     }
@@ -147,9 +152,10 @@ impl IsolationMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "tz-overlay" | "tz_overlay" | "env" => Ok(Self::TzOverlay),
             "sandbox" | "auto" => Ok(Self::Sandbox),
+            "vm" | "microvm" | "macos-vm" => Ok(Self::Vm),
             "strict" => Ok(Self::Strict),
             other => Err(BerthError::InvalidArgument(format!(
-                "isolation mode must be `sandbox`, `tz-overlay`, or `strict`; got `{other}`"
+                "isolation mode must be `sandbox`, `vm`, `tz-overlay`, or `strict`; got `{other}`"
             ))),
         }
     }
@@ -2343,6 +2349,25 @@ pub fn evaluate_isolation(
                 "sandbox mode routes all outbound network through the Berth Landing proxy with OS-native kernel egress confinement and per-account isolated HOME".into(),
             ],
         }),
+        IsolationMode::Vm => {
+            if caps.os != "macos" {
+                return Err(BerthError::StrictIsolationUnavailable(format!(
+                    "`vm` isolation mode is only supported on Apple Silicon macOS (host OS is `{}`); use `--isolation sandbox` on Linux/WSL/Windows",
+                    caps.os
+                )));
+            }
+            Ok(IsolationReport {
+                mode: "vm".to_string(),
+                os_egress_isolation: true,
+                mount_namespace_localtime: true,
+                windows_interop_path_scrubbed: true,
+                strict_eligible: true,
+                strict_blockers: Vec::new(),
+                host_visible_notes: vec![
+                    "vm mode runs Linux ARM64 CLIs inside an Apple Silicon Virtualization.framework Micro-VM with zero virtio-net NICs, /workspace VirtioFS, and virtio-vsock proxy transport".into(),
+                ],
+            })
+        }
         IsolationMode::TzOverlay => Ok(IsolationReport {
             mode: "tz-overlay".to_string(),
             os_egress_isolation: false,

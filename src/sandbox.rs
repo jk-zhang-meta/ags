@@ -249,6 +249,7 @@ pub struct SandboxLaunchSpec {
     pub overlay_fs_etc: Option<PathBuf>,
     pub allow_env_fallback: bool,
     pub auto_rebind: bool,
+    pub use_vm: bool,
 }
 
 /// Waits for a spawned CLI child process, or — when `auto_rebind` is enabled
@@ -893,6 +894,9 @@ pub fn launch_in_sandbox(
     spec: &SandboxLaunchSpec,
     shim: &mut CageShimHandle,
 ) -> Result<ExitStatus, BerthError> {
+    if spec.use_vm {
+        return crate::macos_vm::launch_macos_vm(spec, shim);
+    }
     validate_sandbox_workspace(&spec.workspace_dir, &spec.real_home, &spec.state_dir)?;
     if spec.agent == "claude" {
         let _ = write_claude_sandbox_config(&spec.account_home, &spec.workspace_dir);
