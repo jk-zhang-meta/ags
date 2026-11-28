@@ -18,6 +18,7 @@ pub mod environment;
 pub mod environment_launch;
 pub mod environment_runtime;
 pub mod error;
+pub mod host_mounts;
 pub mod ir;
 pub mod launch;
 pub mod listing_cache;

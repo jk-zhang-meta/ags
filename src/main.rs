@@ -114,8 +114,8 @@ enum BerthCommand {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long, default_value = "auto")]
         zone: String,
-        /// Client isolation mode (sandbox|vm|tz-overlay|strict).
-        #[arg(long, default_value = "sandbox")]
+        /// Client isolation mode (auto|vm|seatbelt|sandbox|tz-overlay|strict).
+        #[arg(long, default_value = "auto")]
         isolation: String,
         /// Allow plaintext http:// central URL for local tests only.
         #[arg(long)]
@@ -178,9 +178,15 @@ enum BerthCommand {
         /// Optional comma-separated account preference queue.
         #[arg(long)]
         account: Option<String>,
-        /// Override isolation mode (tz-overlay|strict).
+        /// Override isolation mode (auto|vm|seatbelt|sandbox|tz-overlay|strict).
         #[arg(long)]
         isolation: Option<String>,
+        /// Mount an additional host directory read-write at `/mnt/ext/<alias>` (VM & Linux bwrap). Repeatable.
+        #[arg(long = "mount", value_name = "DIR")]
+        mount: Vec<PathBuf>,
+        /// Mount an additional host directory read-only at `/mnt/ext/<alias>` (VM & Linux bwrap). Repeatable.
+        #[arg(long = "ro-mount", value_name = "DIR")]
+        ro_mount: Vec<PathBuf>,
         /// Optional work session ID.
         #[arg(long)]
         session_id: Option<String>,
@@ -286,9 +292,15 @@ struct AgentLaunchArgs {
     /// Override logical zone preference (auto|cn_mainland|overseas|home_direct).
     #[arg(long)]
     zone: Option<String>,
-    /// Override isolation mode (sandbox|vm|tz-overlay|strict).
+    /// Override isolation mode (auto|vm|seatbelt|sandbox|tz-overlay|strict).
     #[arg(long)]
     isolation: Option<String>,
+    /// Mount an additional host directory read-write at `/mnt/ext/<alias>` (VM & Linux bwrap). Repeatable.
+    #[arg(long = "mount", value_name = "DIR")]
+    mount: Vec<PathBuf>,
+    /// Mount an additional host directory read-only at `/mnt/ext/<alias>` (VM & Linux bwrap). Repeatable.
+    #[arg(long = "ro-mount", value_name = "DIR")]
+    ro_mount: Vec<PathBuf>,
     /// Optional Berth work session ID (renamed from --session-id to avoid confusion with Claude).
     #[arg(long = "work-session")]
     work_session: Option<String>,
@@ -357,8 +369,8 @@ enum Command {
         /// Logical zone preference (auto|cn_mainland|overseas|home_direct).
         #[arg(long, default_value = "auto")]
         zone: String,
-        /// Client isolation mode (sandbox|vm|tz-overlay|strict).
-        #[arg(long, default_value = "sandbox")]
+        /// Client isolation mode (auto|vm|seatbelt|sandbox|tz-overlay|strict).
+        #[arg(long, default_value = "auto")]
         isolation: String,
         /// Allow plaintext http:// central URL for local tests only.
         #[arg(long)]
@@ -2034,7 +2046,7 @@ fn cmd_berth_login(
         None => existing
             .as_ref()
             .map(|c| c.isolation_mode)
-            .unwrap_or(berth::berth::IsolationMode::Sandbox),
+            .unwrap_or(berth::berth::IsolationMode::Auto),
     };
     let zone_preference = zone
         .or_else(|| existing.as_ref().map(|c| c.zone_preference.clone()))
@@ -2455,7 +2467,7 @@ fn cmd_berth_key(command: KeyCommand, json_mode: bool) -> anyhow::Result<ExitCod
                     user_session: None,
                     mgmt_entries: Vec::new(),
                     zone_preference: "auto".to_string(),
-                    isolation_mode: berth::berth::IsolationMode::TzOverlay,
+                    isolation_mode: berth::berth::IsolationMode::Auto,
                     allow_insecure_http_for_tests: false,
                 });
             if canonical == "default" {
@@ -2579,11 +2591,21 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
         BerthCommand::Status => {
             let config = berth::berth::load_config(&paths)?;
             let caps = berth::berth::probe_host_isolation_capabilities(None);
-            let tz_report = berth::berth::evaluate_isolation(
-                berth::berth::IsolationMode::TzOverlay,
-                "UTC",
-                &caps,
-            )?;
+            let vm_status = berth::macos_vm::probe_macos_vm(&paths.state_dir);
+            let effective_iso = berth::berth::resolve_effective_isolation(
+                config.as_ref().map(|c| c.isolation_mode),
+                None,
+                &paths.state_dir,
+                true,
+            );
+            let effective_iso_label = match &effective_iso {
+                Ok(m) => m.to_string(),
+                Err(e) => format!("unavailable ({e})"),
+            };
+            let tz_report = match &effective_iso {
+                Ok(mode) => Some(berth::berth::evaluate_isolation(*mode, "UTC", &caps)?),
+                Err(_) => None,
+            };
             if json_mode {
                 let cfg_json = config.as_ref().map(|c| {
                     serde_json::json!({
@@ -2610,6 +2632,8 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                         "configured": config.is_some(),
                         "config_path": paths.config_file,
                         "config": cfg_json,
+                        "effective_isolation": effective_iso_label,
+                        "macos_vm": vm_status,
                         "host_capabilities": caps,
                         "isolation": tz_report,
                     }))?
@@ -2638,6 +2662,7 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                         }
                         println!("  zone_preference {}", c.zone_preference);
                         println!("  isolation_mode  {}", c.isolation_mode);
+                        println!("  effective_iso   {effective_iso_label}");
                         if !c.mgmt_entries.is_empty() {
                             println!("  mgmt_entries    {}", c.mgmt_entries.join(", "));
                         }
@@ -2653,14 +2678,21 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                 println!("  backend         {}", sb_probe.backend);
                 println!("  available       {}", sb_probe.available);
                 println!("  egress_blocked  {}", sb_probe.kernel_egress_blocked);
+                if vm_status.supported {
+                    println!("  macos_vm        initialized={}", vm_status.initialized);
+                }
                 println!("host isolation:");
                 println!("  os              {}", caps.os);
                 println!("  wsl             {}", caps.is_wsl);
                 println!("  wsl_interop     {}", caps.wsl_interop_active);
                 println!("  unshare_ur_m    {}", caps.unshare_user_mount_works);
-                println!("  strict_eligible {}", tz_report.strict_eligible);
-                if !tz_report.strict_blockers.is_empty() {
-                    println!("  strict_blockers {}", tz_report.strict_blockers.join("; "));
+                if let Some(ref rep) = tz_report {
+                    println!("  strict_eligible {}", rep.strict_eligible);
+                    if !rep.strict_blockers.is_empty() {
+                        println!("  strict_blockers {}", rep.strict_blockers.join("; "));
+                    }
+                } else {
+                    println!("  strict_eligible false");
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -2702,12 +2734,18 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
                         .collect()
                 })
                 .unwrap_or_default();
+            let effective_iso = berth::berth::resolve_effective_isolation(
+                Some(config.isolation_mode),
+                None,
+                &paths.state_dir,
+                true,
+            )?;
             let req = berth::berth::LeaseRequest {
                 agent: canonical_agent.to_string(),
                 work_session_id: session_id,
                 account_preference: accounts,
                 zone_preference: config.zone_preference.clone(),
-                isolation_mode: config.isolation_mode,
+                isolation_mode: effective_iso.wire_lease_mode(),
                 cohort_hint: None,
                 rebind_ref: None,
                 ags_version: berth::berth::AGS_VERSION_HEADER_VALUE.to_string(),
@@ -2843,6 +2881,8 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
             key,
             account,
             isolation,
+            mount,
+            ro_mount,
             session_id,
             dry_run,
             auto_rebind,
@@ -2854,6 +2894,8 @@ fn cmd_berth(command: BerthCommand, json_mode: bool) -> anyhow::Result<ExitCode>
             account.as_deref(),
             None,
             isolation.as_deref(),
+            &mount,
+            &ro_mount,
             session_id.as_deref(),
             dry_run,
             auto_rebind,
@@ -2877,6 +2919,8 @@ fn cmd_top_level_launch(
         args.account.as_deref(),
         args.zone.as_deref(),
         args.isolation.as_deref(),
+        &args.mount,
+        &args.ro_mount,
         args.work_session.as_deref(),
         args.dry_run,
         args.auto_rebind,
@@ -3104,9 +3148,39 @@ fn cmd_session_resume_native(
         }
         let resolved_auth =
             berth::berth::resolve_auth_for_agent(&paths, &mut config, target_agent, key)?;
-        let isolation_mode = match isolation {
-            Some(raw) => berth::berth::IsolationMode::parse(raw)?,
-            None => config.isolation_mode,
+        let cli_iso = isolation
+            .map(berth::berth::IsolationMode::parse)
+            .transpose()?;
+        let isolation_mode = berth::berth::resolve_effective_isolation(
+            Some(config.isolation_mode),
+            cli_iso,
+            &paths.state_dir,
+            true,
+        )?;
+        let real_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = paths
+            .config_file
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let uses_normalized_ws = isolation_mode == berth::berth::IsolationMode::Vm
+            || (cfg!(target_os = "linux")
+                && matches!(
+                    isolation_mode,
+                    berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+                ));
+        let ws_plan = if uses_normalized_ws {
+            let guard = berth::host_mounts::SensitivePathGuard::new(
+                &real_home,
+                &paths.state_dir,
+                &config_dir,
+                &[],
+            );
+            Some(berth::host_mounts::resolve_workspace_plan(
+                &target_ws, &guard,
+            )?)
+        } else {
+            None
         };
         let accounts: Vec<String> = account
             .map(|csv| {
@@ -3122,34 +3196,37 @@ fn cmd_session_resume_native(
             work_session_id: None,
             account_preference: accounts,
             zone_preference: config.zone_preference.clone(),
-            isolation_mode,
+            isolation_mode: isolation_mode.wire_lease_mode(),
             cohort_hint: None,
             rebind_ref: None,
             ags_version: berth::berth::AGS_VERSION_HEADER_VALUE.to_string(),
         };
         let lease =
             berth::berth::acquire_lease_with_token(&config, &resolved_auth.bearer_token, &req)?;
-        let real_home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let account_home = berth::sandbox::prepare_account_cage_home(
+        let account_home = berth::sandbox::prepare_account_cage_home_for_workspace(
             &paths.state_dir,
             lease.account_id,
             &lease.cage,
+            ws_plan.as_ref().map(|p| p.workspace_id.as_str()),
         )?;
-        // Inside Linux bwrap, account_home.home_dir is bind-mounted over real_home;
-        // inside Apple Silicon ARM64 Linux Micro-VM, guest HOME is `/home/dev` and workspace is `/workspace`;
-        // on macOS Seatbelt / Windows, HOME/USERPROFILE points directly to account_home.home_dir.
-        let visible_home = if isolation_mode == berth::berth::IsolationMode::Vm {
+        // Inside Linux bwrap and Apple Silicon ARM64 Linux Micro-VM, guest HOME is `/home/dev`
+        // and workspace is `/workspace`; on macOS Seatbelt / Windows, HOME/USERPROFILE points
+        // directly to account_home.home_dir.
+        let visible_home = if isolation_mode == berth::berth::IsolationMode::Vm
+            || (cfg!(target_os = "linux")
+                && matches!(
+                    isolation_mode,
+                    berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+                ))
+        {
             PathBuf::from("/home/dev")
-        } else if cfg!(target_os = "linux") {
-            real_home.clone()
         } else {
             account_home.home_dir.clone()
         };
-        let visible_ws = if isolation_mode == berth::berth::IsolationMode::Vm {
-            PathBuf::from("/workspace")
-        } else {
-            target_ws.clone()
-        };
+        let visible_ws = ws_plan
+            .as_ref()
+            .map(|p| p.guest_cwd.clone())
+            .unwrap_or_else(|| target_ws.clone());
 
         if dry_run {
             let canonical = berth::session_hub::load_canonical_session(&paths, &row, &decryption)?;
@@ -3228,6 +3305,8 @@ fn cmd_session_resume_native(
             pinned_acct.as_deref(),
             zone,
             isolation,
+            &[],
+            &[],
             Some(&lease.work_session_id),
             false,
             auto_rebind,
@@ -3726,6 +3805,8 @@ fn cmd_berth_launch(
     account: Option<&str>,
     zone_override: Option<&str>,
     isolation_override: Option<&str>,
+    mounts: &[PathBuf],
+    ro_mounts: &[PathBuf],
     session_id: Option<&str>,
     dry_run: bool,
     auto_rebind: bool,
@@ -3741,15 +3822,95 @@ fn cmd_berth_launch(
     let canonical_agent = berth::berth::validate_agent_name(agent)?;
     let resolved_auth =
         berth::berth::resolve_auth_for_agent(paths, &mut config, canonical_agent, key_override)?;
-    let isolation_mode = match isolation_override {
-        Some(raw) => berth::berth::IsolationMode::parse(raw)?,
-        None => config.isolation_mode,
-    };
 
-    // Fail closed immediately on strict isolation BEFORE leasing if host is ineligible.
-    if isolation_mode == berth::berth::IsolationMode::Strict {
-        let caps = berth::berth::probe_host_isolation_capabilities(None);
-        berth::berth::evaluate_isolation(isolation_mode, "UTC", &caps)?;
+    // Resolve effective isolation mode ONCE before leasing (fails closed on Apple Silicon
+    // if VM is uninitialized, on Rosetta 2, or on strict mode if host is ineligible).
+    let cli_iso = isolation_override
+        .map(berth::berth::IsolationMode::parse)
+        .transpose()?;
+    let isolation_mode = berth::berth::resolve_effective_isolation(
+        Some(config.isolation_mode),
+        cli_iso,
+        &paths.state_dir,
+        true,
+    )?;
+
+    let uses_isolated_cage_home = matches!(
+        isolation_mode,
+        berth::berth::IsolationMode::Sandbox
+            | berth::berth::IsolationMode::Seatbelt
+            | berth::berth::IsolationMode::Vm
+            | berth::berth::IsolationMode::Strict
+    );
+    let uses_normalized_workspace = isolation_mode == berth::berth::IsolationMode::Vm
+        || (cfg!(target_os = "linux")
+            && matches!(
+                isolation_mode,
+                berth::berth::IsolationMode::Sandbox | berth::berth::IsolationMode::Strict
+            ));
+
+    if (!mounts.is_empty() || !ro_mounts.is_empty()) && !uses_normalized_workspace {
+        anyhow::bail!(
+            "`--mount` and `--ro-mount` are supported only in isolated workspace modes (Apple Silicon Micro-VM and Linux/WSL bwrap); current isolation mode is `{}`",
+            isolation_mode
+        );
+    }
+
+    let workspace_dir = std::env::current_dir()?;
+    let real_home = dirs::home_dir().unwrap_or_else(|| workspace_dir.clone());
+    let config_dir = paths
+        .config_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+
+    // Prepare host-only MountSession & startup grants BEFORE leasing so invalid/protected
+    // host paths fail closed cleanly without consuming a Berth lease.
+    let _ext_staging_tmp: Option<tempfile::TempDir>;
+    let mount_session_arc: Option<std::sync::Arc<std::sync::Mutex<berth::host_mounts::MountSession>>>;
+    let ws_plan: Option<berth::host_mounts::WorkspacePlan>;
+    let initial_agent_args: Vec<String>;
+
+    if uses_normalized_workspace {
+        let staging_tmp = tempfile::Builder::new()
+            .prefix("berth-ext-files-")
+            .tempdir()?;
+        let mut ms = berth::host_mounts::MountSession::new(
+            &workspace_dir,
+            &real_home,
+            &paths.state_dir,
+            &config_dir,
+            staging_tmp.path().to_path_buf(),
+        )?;
+        if isolation_mode == berth::berth::IsolationMode::Vm
+            && (ms.workspace.host_root.to_str().is_none()
+                || ms.workspace.guest_cwd.to_str().is_none())
+        {
+            anyhow::bail!(
+                "non-UTF-8 workspace or guest cwd path is refused before leasing in Micro-VM mode"
+            );
+        }
+        for dir in mounts {
+            ms.grant_directory_os(dir, berth::host_mounts::MountAccess::Rw)?;
+        }
+        for dir in ro_mounts {
+            ms.grant_directory_os(dir, berth::host_mounts::MountAccess::Ro)?;
+        }
+        initial_agent_args = ms.rewrite_startup_add_dirs(canonical_agent, agent_args)?;
+        if ms.workspace.has_external_gitdir && !json_mode {
+            eprintln!(
+                "[berth] notice: `{}` uses an external gitdir pointer (.git file); only the workspace tree is mounted at /workspace",
+                ms.workspace.host_root.display()
+            );
+        }
+        ws_plan = Some(ms.workspace.clone());
+        mount_session_arc = Some(std::sync::Arc::new(std::sync::Mutex::new(ms)));
+        _ext_staging_tmp = Some(staging_tmp);
+    } else {
+        _ext_staging_tmp = None;
+        mount_session_arc = None;
+        ws_plan = None;
+        initial_agent_args = agent_args.to_vec();
     }
 
     let accounts: Vec<String> = account
@@ -3766,8 +3927,7 @@ fn cmd_berth_launch(
     let mut next_cohort_hint: Option<String> = None;
     let mut next_accounts = accounts.clone();
     let mut current_session_id = session_id.map(String::from);
-    let initial_agent_args = agent_args.to_vec();
-    let mut current_args = agent_args.to_vec();
+    let mut current_args = initial_agent_args.clone();
     let mut pending_handoff: Option<(
         berth::sandbox::AccountCageHome,
         berth::rebind_continue::DetectedCageSession,
@@ -3781,7 +3941,7 @@ fn cmd_berth_launch(
             work_session_id: current_session_id.clone(),
             account_preference: next_accounts.clone(),
             zone_preference: config.zone_preference.clone(),
-            isolation_mode,
+            isolation_mode: isolation_mode.wire_lease_mode(),
             cohort_hint: next_cohort_hint.clone(),
             rebind_ref: next_rebind_ref.clone(),
             ags_version: berth::berth::AGS_VERSION_HEADER_VALUE.to_string(),
@@ -3870,14 +4030,21 @@ fn cmd_berth_launch(
             }
         }
 
-        let workspace_dir = std::env::current_dir()?;
-        let real_home = dirs::home_dir().unwrap_or_else(|| workspace_dir.clone());
-        let account_home = berth::sandbox::prepare_account_cage_home(
+        let account_home = berth::sandbox::prepare_account_cage_home_for_workspace(
             &paths.state_dir,
             lease.account_id,
             &lease.cage,
+            ws_plan.as_ref().map(|p| p.workspace_id.as_str()),
         )?;
         let sandbox_probe = berth::sandbox::probe_sandbox_backend();
+        let (ext_staging_dir, ext_dirs) = if let Some(ms_arc) = &mount_session_arc {
+            let guard = ms_arc
+                .lock()
+                .map_err(|_| anyhow::anyhow!("mount session mutex poisoned"))?;
+            (Some(guard.staging_dir.clone()), guard.live_dirs().to_vec())
+        } else {
+            (None, Vec::new())
+        };
 
         if dry_run {
             let mut redacted_env = launch_env.set_env.clone();
@@ -3910,6 +4077,10 @@ fn cmd_berth_launch(
                 "proxy_addr": shim.proxy_addr().to_string(),
                 "cage": lease.cage,
                 "account_home": account_home.home_dir,
+                "workspace_root": ws_plan.as_ref().map(|p| &p.host_root).unwrap_or(&workspace_dir),
+                "guest_cwd": ws_plan.as_ref().map(|p| &p.guest_cwd).unwrap_or(&workspace_dir),
+                "workspace_id": ws_plan.as_ref().map(|p| p.workspace_id.as_str()),
+                "ext_mounts": ext_dirs,
                 "sandbox": sandbox_probe,
                 "isolation": launch_env.isolation,
                 "set_env": redacted_env,
@@ -3950,6 +4121,21 @@ fn cmd_berth_launch(
                     sandbox_probe.backend,
                     sandbox_probe.kernel_egress_blocked
                 );
+                if let Some(plan) = &ws_plan {
+                    println!(
+                        "  workspace   /workspace -> {} (cwd={})",
+                        plan.host_root.display(),
+                        plan.guest_cwd.display()
+                    );
+                }
+                for g in &ext_dirs {
+                    println!(
+                        "  ext_mount   /mnt/ext/{} ({}) -> {}",
+                        g.alias,
+                        g.access.as_str(),
+                        g.host_path.display()
+                    );
+                }
                 println!("  account_home {}", account_home.home_dir.display());
                 println!("  shim_url    {}", shim.listen_url());
                 println!("  proxy_addr  {}", shim.proxy_addr());
@@ -3980,12 +4166,22 @@ fn cmd_berth_launch(
         // ONLY pure session transcript (+ single-thread goal state) into the new Cage
         // and compute the state-aware continuation argv (never leaking old identity files).
         if let Some((old_home, detected, expected_target_account)) = pending_handoff.take() {
-            let uses_isolated_cage_home = matches!(
-                isolation_mode,
-                berth::berth::IsolationMode::Sandbox
-                    | berth::berth::IsolationMode::Vm
-                    | berth::berth::IsolationMode::Strict
-            );
+            if matches!(
+                detected.state,
+                berth::rebind_continue::SessionInterruptState::HumanBlockedOrPaused { .. }
+            ) && detected.session_id.is_none()
+            {
+                let decision =
+                    berth::rebind_continue::decide_continuation(canonical_agent, &detected);
+                eprintln!("[berth] rebind halted safely (no migration/relaunch): {}", decision.reason);
+                shim.shutdown();
+                let _ = berth::berth::release_lease_with_token(
+                    &config,
+                    &resolved_auth.bearer_token,
+                    &lease.lease_id,
+                );
+                return Ok(ExitCode::from(75));
+            }
             if let (Some(expected_acct), Some(bound_acct)) = (expected_target_account, lease.account_id) {
                 if bound_acct != 0 && bound_acct != expected_acct {
                     eprintln!(
@@ -4037,12 +4233,6 @@ fn cmd_berth_launch(
             );
         }
 
-        let uses_isolated_cage_home = matches!(
-            isolation_mode,
-            berth::berth::IsolationMode::Sandbox
-                | berth::berth::IsolationMode::Vm
-                | berth::berth::IsolationMode::Strict
-        );
         let inspect_home_for_attempt = if uses_isolated_cage_home {
             account_home.home_dir.clone()
         } else {
@@ -4057,13 +4247,34 @@ fn cmd_berth_launch(
             std::collections::BTreeSet::new()
         };
 
-        // `sandbox`, `vm`, and `strict` modes MUST execute inside a kernel/hypervisor-enforced
-        // network-isolated boundary (`bwrap --unshare-net` on Linux, Seatbelt or Apple Silicon
-        // ARM64 Linux Micro-VM on macOS, AppContainer on Windows) with fail-closed `allow_env_fallback: false`.
+        if isolation_mode == berth::berth::IsolationMode::Vm
+            && !json_mode
+            && std::io::stderr().is_terminal()
+        {
+            if let Some(plan) = &ws_plan {
+                eprintln!(
+                    "[berth-vm] ARM64 Linux Micro-VM active | /workspace -> {} (cwd: {}) | drag/paste host paths or press Ctrl+] to attach",
+                    plan.host_root.display(),
+                    plan.guest_cwd.display()
+                );
+            }
+        }
+
+        // `sandbox`, `seatbelt`, `vm`, and `strict` modes MUST execute inside a kernel/hypervisor-enforced
+        // network-isolated boundary (`bwrap --unshare-net` on Linux, Apple Silicon ARM64 Linux Micro-VM or
+        // Seatbelt on macOS, AppContainer on Windows) with fail-closed `allow_env_fallback: false`.
         let status = if uses_isolated_cage_home {
             let spec = berth::sandbox::SandboxLaunchSpec {
                 agent: canonical_agent.to_string(),
                 workspace_dir: workspace_dir.clone(),
+                workspace_root: ws_plan
+                    .as_ref()
+                    .map(|p| p.host_root.clone())
+                    .unwrap_or_else(|| workspace_dir.clone()),
+                guest_cwd: ws_plan
+                    .as_ref()
+                    .map(|p| p.guest_cwd.clone())
+                    .unwrap_or_else(|| workspace_dir.clone()),
                 real_home: real_home.clone(),
                 state_dir: paths.state_dir.clone(),
                 account_home: account_home.clone(),
@@ -4082,10 +4293,13 @@ fn cmd_berth_launch(
                 overlay_fs_etc: overlay_plan
                     .as_ref()
                     .map(|p| p.overlay_root.join("fs").join("etc")),
-                // Fail closed when sandbox/vm/strict isolation is selected; users can pass `--isolation tz-overlay` to opt out.
+                // Fail closed when sandbox/seatbelt/vm/strict isolation is selected; users can pass `--isolation tz-overlay` to opt out.
                 allow_env_fallback: false,
                 auto_rebind,
                 use_vm: isolation_mode == berth::berth::IsolationMode::Vm,
+                mount_session: mount_session_arc.clone(),
+                ext_staging_dir,
+                ext_dirs,
             };
             berth::sandbox::launch_in_sandbox(&spec, &mut shim)
                 .map_err(|e| std::io::Error::other(e.to_string()))
@@ -4126,10 +4340,14 @@ fn cmd_berth_launch(
             let has_target = !signal.recommended_cohort_tz.trim().is_empty()
                 || signal.recommended_account_id.is_some();
             if attempt < max_rebinds && has_target {
+                let rebind_visible_ws = ws_plan
+                    .as_ref()
+                    .map(|p| p.guest_cwd.as_path())
+                    .unwrap_or(&workspace_dir);
                 let detected = berth::rebind_continue::inspect_cage_session(
                     canonical_agent,
                     &inspect_home_for_attempt,
-                    &workspace_dir,
+                    rebind_visible_ws,
                     Some(launch_started_at),
                     &pre_launch_codex_paused,
                 );
@@ -4275,7 +4493,7 @@ fn cmd_sandbox(command: SandboxCommand, json_mode: bool) -> anyhow::Result<ExitC
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
                 println!("Apple Silicon ARM64 Linux Micro-VM ready at {}", status.vm_dir.display());
-                println!("Launch any agent with: `bh claude --isolation vm` / `bh codex --isolation vm` / `bh agy --isolation vm`");
+                println!("Apple Silicon defaults to this Micro-VM automatically: run `bh claude`, `bh codex`, or `bh agy` (pass `--isolation seatbelt` only to opt out).");
             }
             Ok(ExitCode::SUCCESS)
         }

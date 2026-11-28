@@ -232,11 +232,19 @@ pub struct AccountCageHome {
     pub machine_id: String,
 }
 
+use std::sync::{Arc, Mutex};
+use crate::host_mounts::{GUEST_EXT_ROOT, GUEST_FILES_SUBDIR, GUEST_WORKSPACE_ROOT, LiveDirGrant, MountSession};
+
 /// Parameters for launching an agent binary inside the cross-platform Berth sandbox.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SandboxLaunchSpec {
     pub agent: String,
+    /// Host `cwd` (or workspace root when `workspace_root` is empty).
     pub workspace_dir: PathBuf,
+    /// Authoritative Git-aware host workspace root mounted at `/workspace` (VM & Linux bwrap).
+    pub workspace_root: PathBuf,
+    /// Exact guest working directory (`/workspace` or `/workspace/<relpath>`).
+    pub guest_cwd: PathBuf,
     pub real_home: PathBuf,
     pub state_dir: PathBuf,
     pub account_home: AccountCageHome,
@@ -250,6 +258,26 @@ pub struct SandboxLaunchSpec {
     pub allow_env_fallback: bool,
     pub auto_rebind: bool,
     pub use_vm: bool,
+    /// Host-only per-launch mount grant registry (used by Apple Silicon VM live host attach
+    /// and startup `--mount`/`--ro-mount`/`--add-dir` grants; NEVER passed to CageShim!).
+    pub mount_session: Option<Arc<Mutex<MountSession>>>,
+    /// Optional read-only single-file snapshot staging directory mounted at `/mnt/ext/_files`.
+    pub ext_staging_dir: Option<PathBuf>,
+    /// Explicitly granted external directories mounted at `/mnt/ext/<alias>`.
+    pub ext_dirs: Vec<LiveDirGrant>,
+}
+
+impl std::fmt::Debug for SandboxLaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxLaunchSpec")
+            .field("agent", &self.agent)
+            .field("workspace_dir", &self.workspace_dir)
+            .field("workspace_root", &self.workspace_root)
+            .field("guest_cwd", &self.guest_cwd)
+            .field("use_vm", &self.use_vm)
+            .field("ext_dirs", &self.ext_dirs)
+            .finish()
+    }
 }
 
 /// Waits for a spawned CLI child process, or — when `auto_rebind` is enabled
@@ -488,6 +516,20 @@ pub fn prepare_account_cage_home(
     account_id: Option<i64>,
     cage: &LeaseCageProfile,
 ) -> Result<AccountCageHome, BerthError> {
+    prepare_account_cage_home_for_workspace(state_dir, account_id, cage, None)
+}
+
+/// Workspace-scoped variant of `prepare_account_cage_home`:
+/// - Account-level `hostname` and `machine_id` remain deterministic per `account_id`.
+/// - When `workspace_id` is `Some(ws_id)`, the isolated CLI home lives at
+///   `cages/<account_key>/ws-<ws_id>/home`, preventing concurrent projects mapped to
+///   `/workspace` from colliding on `.claude.json` trust or `--auto-rebind` transcripts.
+pub fn prepare_account_cage_home_for_workspace(
+    state_dir: &Path,
+    account_id: Option<i64>,
+    cage: &LeaseCageProfile,
+    workspace_id: Option<&str>,
+) -> Result<AccountCageHome, BerthError> {
     let raw_key = match account_id {
         Some(id) if id > 0 => format!("acct-{id}"),
         _ => format!(
@@ -500,7 +542,16 @@ pub fn prepare_account_cage_home(
     let cages_root = state_dir.join("cages");
     ensure_dir_no_symlink(&cages_root)?;
     let root_dir = cages_root.join(&account_key);
-    let home_dir = root_dir.join("home");
+    let home_dir = match workspace_id.filter(|s| !s.trim().is_empty()) {
+        Some(ws) => {
+            let ws_clean = sanitize_account_key(ws);
+            let ws_root = root_dir.join(format!("ws-{ws_clean}"));
+            ensure_dir_no_symlink(&root_dir)?;
+            ensure_dir_no_symlink(&ws_root)?;
+            ws_root.join("home")
+        }
+        None => root_dir.join("home"),
+    };
     let etc_dir = root_dir.join("etc");
 
     for sub in [
@@ -607,45 +658,26 @@ fn build_minimal_synthetic_passwd() -> String {
     } else {
         "/bin/sh"
     };
-    let cur_home = dirs::home_dir()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/root".to_string());
-    let cur_user = std::env::var("USER").unwrap_or_default();
-    let mut lines: Vec<String> = Vec::new();
-    if let Ok(raw) = fs::read_to_string("/etc/passwd") {
-        for line in raw.lines() {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 7 {
-                continue;
-            }
-            let uname = parts[0];
-            let uid = parts[2];
-            let gid = parts[3];
-            let home = parts[5];
-            let keep = uid == "0"
-                || uid == "65534"
-                || uname == "nobody"
-                || (!cur_user.is_empty() && uname == cur_user)
-                || home == cur_home;
-            if !keep {
-                continue;
-            }
-            let shell = if uid == "65534" || uname == "nobody" {
-                parts[6]
-            } else {
-                default_shell
-            };
-            // Strip GECOS real-name field (index 4).
-            let entry = format!("{uname}:x:{uid}:{gid}::{home}:{shell}");
-            if !lines.contains(&entry) {
-                lines.push(entry);
+    let mut uid_str = "0".to_string();
+    let mut gid_str = "0".to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(home) = dirs::home_dir() {
+            if let Ok(meta) = fs::metadata(&home) {
+                uid_str = meta.uid().to_string();
+                gid_str = meta.gid().to_string();
             }
         }
     }
-    if lines.is_empty() {
+    let mut lines = Vec::new();
+    if uid_str == "0" {
+        lines.push(format!("root:x:0:0::/home/dev:{default_shell}"));
+    } else {
         lines.push(format!("root:x:0:0::/root:{default_shell}"));
-        lines.push("nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin".to_string());
+        lines.push(format!("dev:x:{uid_str}:{gid_str}::/home/dev:{default_shell}"));
     }
+    lines.push("nobody:x:65534:65534::/nonexistent:/usr/sbin/nologin".to_string());
     lines.join("\n") + "\n"
 }
 
@@ -670,14 +702,24 @@ fn apply_clean_sandbox_env(
         "FORCE_COLOR",
         "COLUMNS",
         "LINES",
-        "EDITOR",
-        "VISUAL",
-        "PAGER",
     ];
     for key in SAFE_HOST_TERM_VARS {
         if let Ok(val) = std::env::var(key) {
             if !val.trim().is_empty() {
                 cmd.env(key, val);
+            }
+        }
+    }
+    // Forward EDITOR/VISUAL/PAGER ONLY if they are strictly bare safe guest command names
+    // (zero path separators or host-path substrings can ever leak into guest env).
+    const SAFE_GUEST_EDITORS: &[&str] = &[
+        "vi", "vim", "nvim", "nano", "less", "more", "cat", "emacs", "pico", "ed",
+    ];
+    for key in ["EDITOR", "VISUAL", "PAGER"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if SAFE_GUEST_EDITORS.contains(&trimmed) {
+                cmd.env(key, trimmed);
             }
         }
     }
@@ -731,6 +773,27 @@ pub fn write_codex_sandbox_config(
     socks5_proxy_url: &str,
     workspace_dir: Option<&Path>,
 ) -> Result<PathBuf, BerthError> {
+    let dirs: Vec<&Path> = workspace_dir.into_iter().collect();
+    write_codex_sandbox_config_dirs(
+        account_home,
+        cage,
+        shim_url,
+        http_proxy_url,
+        socks5_proxy_url,
+        &dirs,
+    )
+}
+
+/// Same as `write_codex_sandbox_config`, trusting multiple deduplicated project/subdir paths
+/// (e.g. both `/workspace` and `/workspace/<relpath>` when launched from a nested subdirectory).
+pub fn write_codex_sandbox_config_dirs(
+    account_home: &AccountCageHome,
+    cage: &LeaseCageProfile,
+    shim_url: &str,
+    http_proxy_url: &str,
+    socks5_proxy_url: &str,
+    trusted_dirs: &[&Path],
+) -> Result<PathBuf, BerthError> {
     let quote = |raw: &str| -> String {
         let esc = raw
             .replace('\\', "\\\\")
@@ -739,14 +802,19 @@ pub fn write_codex_sandbox_config(
         format!("\"{esc}\"")
     };
     let base_v1 = format!("{}/v1", shim_url.trim_end_matches('/'));
-    let trust_block = workspace_dir
-        .map(|ws| {
-            format!(
-                "\n[projects.{}]\ntrust_level = \"trusted\"\n",
-                quote(&ws.to_string_lossy())
-            )
-        })
-        .unwrap_or_default();
+    let mut seen_dirs: Vec<String> = Vec::new();
+    let mut trust_block = String::new();
+    for ws in trusted_dirs {
+        let s = ws.to_string_lossy().into_owned();
+        if s.trim().is_empty() || seen_dirs.contains(&s) {
+            continue;
+        }
+        seen_dirs.push(s.clone());
+        trust_block.push_str(&format!(
+            "\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            quote(&s)
+        ));
+    }
     let snippet = format!(
         "model_provider = \"berth\"\n\n\
          [features]\n\
@@ -783,31 +851,158 @@ pub fn write_codex_sandbox_config(
 /// interactive `bh claude` (including seamless cross-cage `--auto-rebind`)
 /// never stalls on theme/trust wizards in a brand-new account Cage.
 ///
+/// For normalized isolated cages (`/workspace` in Linux `bwrap` and Apple Silicon
+/// Micro-VM), also ensures `$CLAUDE_CONFIG_DIR/settings.json` includes `"/workspace"`
+/// and `"/mnt/ext"` in `permissions.additionalDirectories` so Claude Code can read
+/// the project root (when launched from a subdir) AND any host-mounted `/mnt/ext/...`
+/// directory or pasted file snapshot without refusing as "outside working directory"
+/// (kernel/VirtioFS still enforces exact mount existence and RO vs RW).
+///
 /// Security guarantee: NEVER copies `machineID`, `userID`, `anonymousId`, or
 /// credentials from the host or another account Cage; Claude generates fresh
 /// per-account identity fields inside each isolated Cage.
-pub fn write_claude_sandbox_config(
-    account_home: &AccountCageHome,
-    workspace_dir: &Path,
-) -> Result<PathBuf, BerthError> {
-    let claude_dir = account_home.home_dir.join(".claude");
-    fs::create_dir_all(&claude_dir)?;
-    let cfg_path = claude_dir.join(".claude.json");
-    if cfg_path
+fn read_file_nofollow_string(path: &Path) -> Result<Option<String>, BerthError> {
+    use std::io::Read;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    match opts.open(path) {
+        Ok(mut f) => {
+            let meta = f.metadata()?;
+            if !meta.is_file() {
+                return Err(BerthError::InvalidArgument(format!(
+                    "refusing non-regular Claude config file {}",
+                    path.display()
+                )));
+            }
+            let mut buf = String::new();
+            f.read_to_string(&mut buf)?;
+            Ok(Some(buf))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(BerthError::InvalidArgument(format!(
+            "refusing to read unsafe or symlinked Claude config {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_claude_file_nofollow_atomic(
+    claude_dir: &Path,
+    target_path: &Path,
+    tmp_prefix: &str,
+    body: &[u8],
+) -> Result<(), BerthError> {
+    use std::io::Write;
+    if claude_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink() || !m.is_dir())
+        .unwrap_or(true)
+    {
+        return Err(BerthError::InvalidArgument(format!(
+            "refusing to write inside symlinked or invalid Claude directory {}",
+            claude_dir.display()
+        )));
+    }
+    if target_path
         .symlink_metadata()
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
     {
         return Err(BerthError::InvalidArgument(format!(
-            "refusing to write symlinked Claude config {}",
-            cfg_path.display()
+            "refusing to replace symlinked Claude config {}",
+            target_path.display()
         )));
     }
-    let mut root: serde_json::Map<String, serde_json::Value> = fs::read_to_string(&cfg_path)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| v.as_object().cloned())
-        .unwrap_or_default();
+    let tmp_path = claude_dir.join(format!("{tmp_prefix}.tmp-{}", uuid::Uuid::new_v4().simple()));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(&tmp_path)?;
+    f.write_all(body)?;
+    f.sync_all()?;
+    drop(f);
+    // Re-verify parent dir & target leaf right before rename; clean up temp on failure.
+    if claude_dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(true)
+    {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(BerthError::InvalidArgument(format!(
+            "Claude directory became symlink during write: {}",
+            claude_dir.display()
+        )));
+    }
+    if let Err(e) = fs::rename(&tmp_path, target_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+struct CageConfigLockGuard {
+    _file: fs::File,
+}
+
+fn acquire_cage_config_lock(root_dir: &Path) -> Result<CageConfigLockGuard, BerthError> {
+    let lock_path = root_dir.join(".claude-config.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| BerthError::Io(format!("open cage config lock: {e}")))?;
+    // Process-held OS file lock (`std::fs::File::lock`, zero unsafe): automatically released
+    // by the kernel on process exit/crash and never unlinked while held by a live writer!
+    file.lock()
+        .map_err(|e| BerthError::Io(format!("acquire cage config lock: {e}")))?;
+    Ok(CageConfigLockGuard { _file: file })
+}
+
+pub fn write_claude_sandbox_config(
+    account_home: &AccountCageHome,
+    workspace_dir: &Path,
+) -> Result<PathBuf, BerthError> {
+    // Serialize host-side config updates via a host-only lockfile outside `home_dir`
+    // (never mounted inside guest!) so concurrent launches cannot race `.claude` writes.
+    let _lock_guard = acquire_cage_config_lock(&account_home.root_dir)?;
+
+    let claude_dir = account_home.home_dir.join(".claude");
+    if let Ok(meta) = fs::symlink_metadata(&claude_dir) {
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(BerthError::InvalidArgument(format!(
+                "refusing symlinked or non-directory Claude config dir {}",
+                claude_dir.display()
+            )));
+        }
+    } else {
+        fs::create_dir_all(&claude_dir)?;
+    }
+    let cfg_path = claude_dir.join(".claude.json");
+    let mut root: serde_json::Map<String, serde_json::Value> =
+        match read_file_nofollow_string(&cfg_path)? {
+            None => serde_json::Map::new(),
+            Some(raw) if raw.is_empty() => serde_json::Map::new(),
+            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .ok_or_else(|| {
+                    BerthError::InvalidArgument(format!(
+                        "refusing to overwrite malformed Claude config {}",
+                        cfg_path.display()
+                    ))
+                })?,
+        };
     root.entry("hasCompletedOnboarding".to_string())
         .or_insert(serde_json::Value::Bool(true));
     root.entry("theme".to_string())
@@ -844,9 +1039,61 @@ pub fn write_claude_sandbox_config(
     }
     let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
         .map_err(|e| BerthError::Io(e.to_string()))?;
-    let tmp_path = claude_dir.join(format!(".claude.json.tmp-{}", uuid::Uuid::new_v4().simple()));
-    fs::write(&tmp_path, body)?;
-    fs::rename(&tmp_path, &cfg_path)?;
+    write_claude_file_nofollow_atomic(&claude_dir, &cfg_path, ".claude.json", body.as_bytes())?;
+
+    if workspace_dir.starts_with(GUEST_WORKSPACE_ROOT) {
+        let settings_path = claude_dir.join("settings.json");
+        let mut settings: serde_json::Map<String, serde_json::Value> =
+            match read_file_nofollow_string(&settings_path)? {
+                None => serde_json::Map::new(),
+                Some(raw) if raw.is_empty() => serde_json::Map::new(),
+                Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .ok_or_else(|| {
+                        BerthError::InvalidArgument(format!(
+                            "refusing to overwrite malformed Claude settings {}",
+                            settings_path.display()
+                        ))
+                    })?,
+            };
+        let perms = settings
+            .entry("permissions".to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if !perms.is_object() {
+            return Err(BerthError::InvalidArgument(format!(
+                "refusing to overwrite non-object `permissions` in {}",
+                settings_path.display()
+            )));
+        }
+        if let Some(perms_obj) = perms.as_object_mut() {
+            let add_dirs = perms_obj
+                .entry("additionalDirectories".to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if !add_dirs.is_array() {
+                return Err(BerthError::InvalidArgument(format!(
+                    "refusing to overwrite non-array `permissions.additionalDirectories` in {}",
+                    settings_path.display()
+                )));
+            }
+            if let Some(arr) = add_dirs.as_array_mut() {
+                for allowed in [GUEST_WORKSPACE_ROOT, GUEST_EXT_ROOT] {
+                    if !arr.iter().any(|v| v.as_str() == Some(allowed)) {
+                        arr.push(serde_json::Value::String(allowed.to_string()));
+                    }
+                }
+            }
+        }
+        let settings_body = serde_json::to_string_pretty(&serde_json::Value::Object(settings))
+            .map_err(|e| BerthError::Io(e.to_string()))?;
+        write_claude_file_nofollow_atomic(
+            &claude_dir,
+            &settings_path,
+            "settings.json",
+            settings_body.as_bytes(),
+        )?;
+    }
+
     Ok(cfg_path)
 }
 
@@ -870,6 +1117,7 @@ pub fn apply_proxy_and_home_env(
     );
     cmd.env("CODEX_HOME", account_home.home_dir.join(".codex"));
     cmd.env("CLAUDE_CONFIG_DIR", account_home.home_dir.join(".claude"));
+    cmd.env("GEMINI_HOME", account_home.home_dir.join(".gemini"));
     #[cfg(windows)]
     {
         cmd.env("USERPROFILE", &account_home.home_dir);
@@ -899,7 +1147,16 @@ pub fn launch_in_sandbox(
     }
     validate_sandbox_workspace(&spec.workspace_dir, &spec.real_home, &spec.state_dir)?;
     if spec.agent == "claude" {
-        let _ = write_claude_sandbox_config(&spec.account_home, &spec.workspace_dir);
+        if cfg!(target_os = "linux") {
+            write_claude_sandbox_config(&spec.account_home, Path::new(GUEST_WORKSPACE_ROOT))?;
+            if spec.guest_cwd.starts_with(GUEST_WORKSPACE_ROOT)
+                && spec.guest_cwd != Path::new(GUEST_WORKSPACE_ROOT)
+            {
+                write_claude_sandbox_config(&spec.account_home, &spec.guest_cwd)?;
+            }
+        } else {
+            write_claude_sandbox_config(&spec.account_home, &spec.workspace_dir)?;
+        }
     }
     let probe = probe_sandbox_backend();
 
@@ -961,14 +1218,14 @@ fn launch_env_with_proxy(
     shim: &CageShimHandle,
 ) -> Result<ExitStatus, BerthError> {
     if spec.agent == "codex" {
-        let _ = write_codex_sandbox_config(
+        write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
             &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
             Some(&spec.workspace_dir),
-        );
+        )?;
     }
     let mut cmd = Command::new(&spec.stock_bin);
     cmd.args(&spec.agent_args);
@@ -999,9 +1256,12 @@ fn launch_env_with_proxy(
 // ---------------------------------------------------------------------------
 
 /// Builds the complete `bwrap` argv for a zero-leak Linux/WSL2 sandbox.
-/// Exposed publicly for deterministic unit testing across Linux/macOS/Windows.
+/// Preserves exact `OsString` host paths (zero lossy UTF-8 conversion!) so non-UTF-8
+/// host directories can NEVER bind a replacement-character sibling directory.
+#[allow(clippy::too_many_arguments)]
 pub fn build_bwrap_args(
-    workspace_dir: &Path,
+    workspace_root: &Path,
+    guest_cwd: &Path,
     real_home: &Path,
     account_home: &AccountCageHome,
     cage_tz: &str,
@@ -1012,14 +1272,56 @@ pub fn build_bwrap_args(
     agent: &str,
     stock_bin: &Path,
     agent_args: &[String],
-) -> Vec<String> {
-    let mut args: Vec<String> = vec![
+    ext_staging_dir: Option<&Path>,
+    ext_dirs: &[LiveDirGrant],
+) -> Vec<std::ffi::OsString> {
+    build_bwrap_args_with_pinned_sources(
+        workspace_root,
+        workspace_root,
+        guest_cwd,
+        real_home,
+        account_home,
+        cage_tz,
+        bridge_dir,
+        bh_exe,
+        shim_port,
+        proxy_port,
+        agent,
+        stock_bin,
+        agent_args,
+        ext_staging_dir,
+        ext_dirs,
+        &std::collections::HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_bwrap_args_with_pinned_sources(
+    workspace_root: &Path,
+    workspace_bind_source: &Path,
+    guest_cwd: &Path,
+    real_home: &Path,
+    account_home: &AccountCageHome,
+    cage_tz: &str,
+    bridge_dir: &Path,
+    bh_exe: &Path,
+    shim_port: u16,
+    proxy_port: u16,
+    agent: &str,
+    stock_bin: &Path,
+    agent_args: &[String],
+    ext_staging_dir: Option<&Path>,
+    ext_dirs: &[LiveDirGrant],
+    pinned_ext_sources: &std::collections::HashMap<String, PathBuf>,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut args: Vec<OsString> = vec![
         "--unshare-net".into(),
         "--unshare-uts".into(),
         "--unshare-pid".into(),
         "--die-with-parent".into(),
         "--hostname".into(),
-        account_home.hostname.clone(),
+        OsString::from(&account_home.hostname),
         "--proc".into(),
         "/proc".into(),
         "--dev".into(),
@@ -1029,15 +1331,13 @@ pub fn build_bwrap_args(
     ];
 
     // Mount standard Linux root directories read-only, respecting Arch/modern merged-usr symlinks.
-    // `/etc` is built separately on a tmpfs so symlinked /etc/localtime & /etc/resolv.conf
-    // (standard on Ubuntu, Arch, and WSL2) can be replaced cleanly with zero symlink leakage!
     for top in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/var"] {
         let p = Path::new(top);
         match fs::symlink_metadata(p) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 if let Ok(target) = fs::read_link(p) {
                     args.push("--symlink".into());
-                    args.push(target.to_string_lossy().into_owned());
+                    args.push(target.into_os_string());
                     args.push(top.into());
                 }
             }
@@ -1093,18 +1393,18 @@ pub fn build_bwrap_args(
         names.sort();
         for name in names {
             let host_entry = Path::new("/etc").join(&name);
-            let dst = format!("/etc/{name}");
+            let dst = OsString::from(format!("/etc/{name}"));
             match fs::symlink_metadata(&host_entry) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     if let Ok(target) = fs::read_link(&host_entry) {
                         args.push("--symlink".into());
-                        args.push(target.to_string_lossy().into_owned());
+                        args.push(target.into_os_string());
                         args.push(dst);
                     }
                 }
                 Ok(_) => {
                     args.push("--ro-bind".into());
-                    args.push(host_entry.to_string_lossy().into_owned());
+                    args.push(host_entry.into_os_string());
                     args.push(dst);
                 }
                 Err(_) => {}
@@ -1116,34 +1416,34 @@ pub fn build_bwrap_args(
     let zoneinfo = Path::new("/usr/share/zoneinfo").join(cage_tz);
     if zoneinfo.is_file() {
         args.push("--symlink".into());
-        args.push(zoneinfo.to_string_lossy().into_owned());
+        args.push(zoneinfo.into_os_string());
         args.push("/etc/localtime".into());
     }
     args.push("--ro-bind".into());
-    args.push(account_home.timezone_file.to_string_lossy().into_owned());
+    args.push(account_home.timezone_file.as_os_str().to_os_string());
     args.push("/etc/timezone".into());
     args.push("--ro-bind".into());
-    args.push(account_home.locale_file.to_string_lossy().into_owned());
+    args.push(account_home.locale_file.as_os_str().to_os_string());
     args.push("/etc/locale.conf".into());
     args.push("--dir".into());
     args.push("/etc/default".into());
     args.push("--ro-bind".into());
-    args.push(account_home.locale_file.to_string_lossy().into_owned());
+    args.push(account_home.locale_file.as_os_str().to_os_string());
     args.push("/etc/default/locale".into());
     args.push("--ro-bind".into());
-    args.push(account_home.passwd_file.to_string_lossy().into_owned());
+    args.push(account_home.passwd_file.as_os_str().to_os_string());
     args.push("/etc/passwd".into());
     args.push("--ro-bind".into());
-    args.push(account_home.machine_id_file.to_string_lossy().into_owned());
+    args.push(account_home.machine_id_file.as_os_str().to_os_string());
     args.push("/etc/machine-id".into());
     args.push("--ro-bind".into());
-    args.push(account_home.resolv_conf_file.to_string_lossy().into_owned());
+    args.push(account_home.resolv_conf_file.as_os_str().to_os_string());
     args.push("/etc/resolv.conf".into());
     args.push("--ro-bind".into());
-    args.push(account_home.hostname_file.to_string_lossy().into_owned());
+    args.push(account_home.hostname_file.as_os_str().to_os_string());
     args.push("/etc/hostname".into());
     args.push("--ro-bind".into());
-    args.push(account_home.hosts_file.to_string_lossy().into_owned());
+    args.push(account_home.hosts_file.as_os_str().to_os_string());
     args.push("/etc/hosts".into());
 
     if fs::symlink_metadata("/var/lib/dbus/machine-id")
@@ -1151,21 +1451,18 @@ pub fn build_bwrap_args(
         .unwrap_or(false)
     {
         args.push("--ro-bind".into());
-        args.push(account_home.machine_id_file.to_string_lossy().into_owned());
+        args.push(account_home.machine_id_file.as_os_str().to_os_string());
         args.push("/var/lib/dbus/machine-id".into());
     }
 
-    // Replace real $HOME with persistent isolated per-account cage home (hides ~/.ssh, ~/.berth, etc.).
-    let real_home_str = real_home.to_string_lossy().into_owned();
-    let cage_home_str = account_home.home_dir.to_string_lossy().into_owned();
+    // Mount isolated per-account/per-workspace cage home at neutral `/home/dev`
+    // (eliminating host username / `$HOME` path leakage in env, prompts, and transcripts!).
     args.push("--bind".into());
-    args.push(cage_home_str);
-    args.push(real_home_str.clone());
+    args.push(account_home.home_dir.as_os_str().to_os_string());
+    args.push("/home/dev".into());
 
-    // Read-only mount safe user developer toolchains (NEVER ~/.ssh, ~/.berth, ~/.claude, ~/.codex, ~/.aws, ~/.gnupg).
-    // Include `~/.local/share/claude/versions` and `~/.local/lib/node_modules` so official native
-    // Claude Code (`~/.local/bin/claude -> ~/.local/share/claude/versions/<ver>`) and user-prefix
-    // npm CLIs resolve cleanly inside the isolated home bind mount without exposing credentials.
+    // Read-only mount safe user developer toolchains under `/home/dev/...` (and preserve
+    // symlink targets only for versioned runtime trees like `.local/share/claude/versions`).
     for safe_tool_rel in [
         ".cargo/bin",
         ".rustup",
@@ -1183,15 +1480,18 @@ pub fn build_bwrap_args(
     ] {
         let host_tool = real_home.join(safe_tool_rel);
         if host_tool.exists() {
-            let s = host_tool.to_string_lossy().into_owned();
-            args.push("--ro-bind".into());
-            args.push(s.clone());
-            args.push(s);
+            if matches!(safe_tool_rel, ".local/bin" | ".cargo/bin" | "go/bin") {
+                args.push("--ro-bind".into());
+                args.push(host_tool.as_os_str().to_os_string());
+                args.push(OsString::from(format!("/home/dev/{safe_tool_rel}")));
+            } else if real_home != Path::new("/home/dev") {
+                args.push("--ro-bind".into());
+                args.push(host_tool.as_os_str().to_os_string());
+                args.push(host_tool.into_os_string());
+            }
         }
     }
 
-    // If stock_bin (or its symlink target) lives in an uncommon non-system path (e.g. custom prefix),
-    // expose its parent dir or resolved file read-only unless it sits inside sensitive home dirs.
     let is_sensitive_home_path = |p: &Path| -> bool {
         if let Ok(rel) = p.strip_prefix(real_home) {
             if let Some(first) = rel.components().next().and_then(|c| c.as_os_str().to_str()) {
@@ -1203,51 +1503,110 @@ pub fn build_bwrap_args(
         }
         false
     };
-    if let Some(bin_parent) = stock_bin.parent() {
-        let bp_str = bin_parent.to_string_lossy();
-        let covered_by_sys = ["/usr", "/bin", "/sbin", "/opt", "/var"]
+    let stock_bin_in_ws = stock_bin
+        .strip_prefix(workspace_root)
+        .ok()
+        .map(|rel| Path::new(GUEST_WORKSPACE_ROOT).join(rel))
+        .or_else(|| {
+            let canon_bin = fs::canonicalize(stock_bin).ok()?;
+            let canon_ws = fs::canonicalize(workspace_root).ok()?;
+            let rel = canon_bin.strip_prefix(&canon_ws).ok()?;
+            Some(Path::new(GUEST_WORKSPACE_ROOT).join(rel))
+        });
+
+    // If `stock_bin` lives inside one of the safe user bin dirs mounted under `/home/dev`,
+    // launch it by its neutral `/home/dev/...` guest path so guest `argv[0]` never leaks `$HOME`!
+    let stock_bin_in_home = if stock_bin_in_ws.is_none() {
+        [".local/bin", ".cargo/bin", "go/bin"]
             .iter()
-            .any(|p| bp_str.starts_with(p));
-        if !covered_by_sys && bin_parent.is_dir() && !bin_parent.starts_with(real_home) {
-            args.push("--ro-bind".into());
-            args.push(bp_str.clone().into_owned());
-            args.push(bp_str.into_owned());
+            .find_map(|rel_dir| {
+                let host_dir = real_home.join(rel_dir);
+                stock_bin
+                    .strip_prefix(&host_dir)
+                    .ok()
+                    .map(|sub| Path::new("/home/dev").join(rel_dir).join(sub))
+            })
+    } else {
+        None
+    };
+
+    if stock_bin_in_ws.is_none() {
+        if stock_bin_in_home.is_none() {
+            if let Some(bin_parent) = stock_bin.parent() {
+                let bp_str = bin_parent.to_string_lossy();
+                let covered_by_sys = ["/usr", "/bin", "/sbin", "/opt", "/var"]
+                    .iter()
+                    .any(|p| bp_str.starts_with(p));
+                if !covered_by_sys && bin_parent.is_dir() && !bin_parent.starts_with(real_home) {
+                    args.push("--ro-bind".into());
+                    args.push(bin_parent.as_os_str().to_os_string());
+                    args.push(bin_parent.as_os_str().to_os_string());
+                }
+            }
         }
-    }
-    if let Ok(resolved_bin) = fs::canonicalize(stock_bin) {
-        let rb_str = resolved_bin.to_string_lossy();
-        let covered_by_sys = ["/usr", "/bin", "/sbin", "/opt", "/var"]
-            .iter()
-            .any(|p| rb_str.starts_with(p));
-        if resolved_bin != stock_bin
-            && !covered_by_sys
-            && resolved_bin.is_file()
-            && !is_sensitive_home_path(&resolved_bin)
-        {
-            args.push("--ro-bind".into());
-            args.push(rb_str.clone().into_owned());
-            args.push(rb_str.into_owned());
+        if let Ok(resolved_bin) = fs::canonicalize(stock_bin) {
+            let rb_str = resolved_bin.to_string_lossy();
+            let covered_by_sys = ["/usr", "/bin", "/sbin", "/opt", "/var"]
+                .iter()
+                .any(|p| rb_str.starts_with(p));
+            if resolved_bin != stock_bin
+                && !covered_by_sys
+                && resolved_bin.is_file()
+                && !is_sensitive_home_path(&resolved_bin)
+            {
+                args.push("--ro-bind".into());
+                args.push(resolved_bin.as_os_str().to_os_string());
+                args.push(resolved_bin.into_os_string());
+            }
         }
     }
 
-    // Bind-mount ONLY the current project workspace read-write at its exact original path!
-    // (Works identically for ext4 paths AND WSL /mnt/c/... projects without mounting unrelated /mnt/*.)
-    let ws_str = workspace_dir.to_string_lossy().into_owned();
+    // Bind-mount ONLY the approved workspace root read-write at neutral `/workspace`
+    // (using the kernel-FD-pinned `/proc/<pid>/fd/<fd>` source when provided to defeat TOCTOU!).
     args.push("--bind".into());
-    args.push(ws_str.clone());
-    args.push(ws_str.clone());
+    args.push(workspace_bind_source.as_os_str().to_os_string());
+    args.push(GUEST_WORKSPACE_ROOT.into());
+
+    // Mount explicitly authorized external directories & RO file-snapshot staging under `/mnt/ext`.
+    if ext_staging_dir.is_some() || !ext_dirs.is_empty() {
+        args.push("--tmpfs".into());
+        args.push(GUEST_EXT_ROOT.into());
+        if let Some(stage) = ext_staging_dir {
+            args.push("--ro-bind".into());
+            args.push(stage.as_os_str().to_os_string());
+            args.push(OsString::from(format!("{GUEST_EXT_ROOT}/{GUEST_FILES_SUBDIR}")));
+        }
+        for grant in ext_dirs {
+            args.push(if grant.access.is_read_only() {
+                "--ro-bind".into()
+            } else {
+                "--bind".into()
+            });
+            let src = pinned_ext_sources
+                .get(&grant.alias)
+                .map(PathBuf::as_path)
+                .unwrap_or(grant.host_path.as_path());
+            args.push(src.as_os_str().to_os_string());
+            args.push(OsString::from(format!("{GUEST_EXT_ROOT}/{}", grant.alias)));
+        }
+    }
 
     // Mount private host Unix socket bridge dir + bh binary into /run/berth.
     args.push("--bind".into());
-    args.push(bridge_dir.to_string_lossy().into_owned());
+    args.push(bridge_dir.as_os_str().to_os_string());
     args.push("/run/berth".into());
 
     args.push("--ro-bind".into());
-    args.push(bh_exe.to_string_lossy().into_owned());
+    args.push(bh_exe.as_os_str().to_os_string());
     args.push("/run/berth/bh".into());
 
     args.push("--chdir".into());
-    args.push(ws_str);
+    let effective_guest_cwd = if guest_cwd.starts_with(GUEST_WORKSPACE_ROOT) {
+        guest_cwd.as_os_str().to_os_string()
+    } else {
+        OsString::from(GUEST_WORKSPACE_ROOT)
+    };
+    args.push(effective_guest_cwd);
 
     // Explicitly clear WSL Windows interop env vars inside sandbox.
     for wsl_var in [
@@ -1269,14 +1628,18 @@ pub fn build_bwrap_args(
     args.push("--proxy-sock".into());
     args.push("/run/berth/proxy.sock".into());
     args.push("--shim-port".into());
-    args.push(shim_port.to_string());
+    args.push(OsString::from(shim_port.to_string()));
     args.push("--proxy-port".into());
-    args.push(proxy_port.to_string());
+    args.push(OsString::from(proxy_port.to_string()));
     args.push("--agent".into());
-    args.push(agent.into());
+    args.push(OsString::from(agent));
     args.push("--".into());
-    args.push(stock_bin.to_string_lossy().into_owned());
-    args.extend(agent_args.iter().cloned());
+    let guest_stock_bin = stock_bin_in_ws
+        .as_deref()
+        .or(stock_bin_in_home.as_deref())
+        .unwrap_or(stock_bin);
+    args.push(guest_stock_bin.as_os_str().to_os_string());
+    args.extend(agent_args.iter().map(OsString::from));
     args
 }
 
@@ -1294,8 +1657,41 @@ fn launch_linux_bwrap(
         .tempdir()?;
     let (_shim_sock, _proxy_sock) = shim.start_unix_bridges(bridge_tmp.path())?;
 
-    let bwrap_args = build_bwrap_args(
-        &spec.workspace_dir,
+    let effective_root = if spec.workspace_root.as_os_str().is_empty() {
+        spec.workspace_dir.as_path()
+    } else {
+        spec.workspace_root.as_path()
+    };
+    let effective_guest_cwd = if spec.guest_cwd.as_os_str().is_empty() {
+        Path::new(GUEST_WORKSPACE_ROOT)
+    } else {
+        spec.guest_cwd.as_path()
+    };
+    // Require kernel-FD-pinned `/proc/<pid>/fd/<fd>` mount sources whenever `MountSession`
+    // is active (fail closed instead of silently falling back to a TOCTOU pathname!).
+    let mut ws_bind_source = effective_root.to_path_buf();
+    let mut pinned_ext_sources = std::collections::HashMap::new();
+    if let Some(ms_arc) = &spec.mount_session {
+        let ms = ms_arc
+            .lock()
+            .map_err(|_| BerthError::Io("mount session mutex poisoned".into()))?;
+        ws_bind_source = ms.pinned_workspace_fd_path().ok_or_else(|| {
+            BerthError::Io("missing kernel-FD-pinned workspace descriptor for bwrap".into())
+        })?;
+        for grant in &spec.ext_dirs {
+            let dir_fd = ms.pinned_dir_fd_path(&grant.alias).ok_or_else(|| {
+                BerthError::Io(format!(
+                    "missing kernel-FD-pinned external mount descriptor for `{}`",
+                    grant.alias
+                ))
+            })?;
+            pinned_ext_sources.insert(grant.alias.clone(), dir_fd);
+        }
+    }
+    let bwrap_args = build_bwrap_args_with_pinned_sources(
+        effective_root,
+        &ws_bind_source,
+        effective_guest_cwd,
         &spec.real_home,
         &spec.account_home,
         &spec.cage.timezone,
@@ -1306,31 +1702,49 @@ fn launch_linux_bwrap(
         &spec.agent,
         &spec.stock_bin,
         &spec.agent_args,
+        spec.ext_staging_dir.as_deref(),
+        &spec.ext_dirs,
+        &pinned_ext_sources,
     );
 
-    // Write Codex shell policy with the exact matching sandbox proxy URLs.
+    // Write Codex shell policy with the exact matching sandbox proxy URLs and `/workspace` + guest_cwd trust.
     if spec.agent == "codex" {
-        let _ = write_codex_sandbox_config(
+        let mut trusted: Vec<&Path> = vec![Path::new(GUEST_WORKSPACE_ROOT)];
+        if effective_guest_cwd.starts_with(GUEST_WORKSPACE_ROOT)
+            && effective_guest_cwd != Path::new(GUEST_WORKSPACE_ROOT)
+        {
+            trusted.push(effective_guest_cwd);
+        }
+        write_codex_sandbox_config_dirs(
             &spec.account_home,
             &spec.cage,
             &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
-            Some(&spec.workspace_dir),
-        );
+            &trusted,
+        )?;
     }
 
     let mut cmd = Command::new(&bwrap_bin);
     cmd.args(&bwrap_args);
     apply_clean_sandbox_env(&mut cmd, spec, Path::new("/tmp"), Path::new("/tmp/runtime"));
-    // Inside bwrap, real_home path IS bind-mounted to account_home.home_dir!
-    cmd.env("HOME", &spec.real_home);
-    cmd.env("XDG_CONFIG_HOME", spec.real_home.join(".config"));
-    cmd.env("XDG_CACHE_HOME", spec.real_home.join(".cache"));
-    cmd.env("XDG_DATA_HOME", spec.real_home.join(".local").join("share"));
-    cmd.env("XDG_STATE_HOME", spec.real_home.join(".local").join("state"));
-    cmd.env("CODEX_HOME", spec.real_home.join(".codex"));
-    cmd.env("CLAUDE_CONFIG_DIR", spec.real_home.join(".claude"));
+    // Inside bwrap, isolated per-workspace cage home is bind-mounted at neutral `/home/dev`!
+    // Pin ALL agent homes and scrubbed neutral PATH AFTER apply_clean_sandbox_env so ZERO host
+    // home / OneDrive / Windows profile path ever leaks into guest environment variables.
+    cmd.env("HOME", "/home/dev");
+    cmd.env("USER", "dev");
+    cmd.env("LOGNAME", "dev");
+    cmd.env("XDG_CONFIG_HOME", "/home/dev/.config");
+    cmd.env("XDG_CACHE_HOME", "/home/dev/.cache");
+    cmd.env("XDG_DATA_HOME", "/home/dev/.local/share");
+    cmd.env("XDG_STATE_HOME", "/home/dev/.local/state");
+    cmd.env("CODEX_HOME", "/home/dev/.codex");
+    cmd.env("CLAUDE_CONFIG_DIR", "/home/dev/.claude");
+    cmd.env("GEMINI_HOME", "/home/dev/.gemini");
+    cmd.env(
+        "PATH",
+        "/home/dev/.local/bin:/home/dev/.cargo/bin:/home/dev/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    );
     cmd.env(TRAMPOLINE_SHIM_TOKEN_ENV, shim.shim_token());
 
     let status = cmd
@@ -1836,14 +2250,14 @@ fn launch_macos_seatbelt(
     shim: &CageShimHandle,
 ) -> Result<ExitStatus, BerthError> {
     if spec.agent == "codex" {
-        let _ = write_codex_sandbox_config(
+        write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
             &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
             Some(&spec.workspace_dir),
-        );
+        )?;
     }
 
     let profile = generate_macos_seatbelt_profile_with_bin(
@@ -2103,14 +2517,14 @@ fn launch_windows_appcontainer(
     shim: &CageShimHandle,
 ) -> Result<ExitStatus, BerthError> {
     if spec.agent == "codex" {
-        let _ = write_codex_sandbox_config(
+        write_codex_sandbox_config(
             &spec.account_home,
             &spec.cage,
             &shim.listen_url(),
             &shim.proxy_http_url(),
             &shim.proxy_socks5_url(),
             Some(&spec.workspace_dir),
-        );
+        )?;
     }
     let script = generate_windows_appcontainer_script(
         &spec.account_home.account_key,
@@ -2192,8 +2606,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cage = sample_cage();
         let acct = prepare_account_cage_home(tmp.path(), Some(42), &cage).unwrap();
-        let args = build_bwrap_args(
+        let ext_grants = vec![LiveDirGrant {
+            alias: "d0001-shared".into(),
+            host_path: PathBuf::from("/work/shared"),
+            access: crate::host_mounts::MountAccess::Ro,
+            generation: 1,
+            identity: crate::host_mounts::FileIdentity::default(),
+        }];
+        let args: Vec<String> = build_bwrap_args(
             Path::new("/work/myproj"),
+            Path::new("/workspace/sub"),
             Path::new("/home/alice"),
             &acct,
             "America/Chicago",
@@ -2202,9 +2624,14 @@ mod tests {
             41001,
             41002,
             "claude",
-            Path::new("/usr/bin/claude"),
+            Path::new("/home/alice/.local/bin/claude"),
             &["--version".into()],
-        );
+            Some(Path::new("/tmp/stage")),
+            &ext_grants,
+        )
+        .into_iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
 
         assert!(args.contains(&"--unshare-net".to_string()));
         assert!(args.contains(&"--unshare-uts".to_string()));
@@ -2212,7 +2639,13 @@ mod tests {
         assert!(args.contains(&"/etc/machine-id".to_string()));
         assert!(args.contains(&"/etc/resolv.conf".to_string()));
         assert!(args.contains(&"WSL_INTEROP".to_string()));
-        assert!(args.contains(&"/work/myproj".to_string()));
+        assert!(args.windows(3).any(|w| w == ["--bind", acct.home_dir.to_str().unwrap(), "/home/dev"]));
+        assert!(args.windows(3).any(|w| w == ["--bind", "/work/myproj", "/workspace"]));
+        assert!(args.windows(2).any(|w| w == ["--chdir", "/workspace/sub"]));
+        assert!(args.windows(3).any(|w| w == ["--ro-bind", "/tmp/stage", "/mnt/ext/_files"]));
+        assert!(args.windows(3).any(|w| w == ["--ro-bind", "/work/shared", "/mnt/ext/d0001-shared"]));
+        assert!(args.contains(&"/home/dev/.local/bin/claude".to_string()));
+        assert!(!args.iter().any(|a| a.contains("/home/alice/.local/bin/claude")));
         assert!(!args.iter().any(|a| a.contains("/run/WSL")));
         assert!(!args.iter().any(|a| a.contains(".ssh")));
     }
@@ -2363,5 +2796,82 @@ mod tests {
         let st = Command::new(bwrap).args(&args).status().unwrap();
         assert!(st.success(), "bwrap isolation verification failed: {st}");
         assert_eq!(fs::read_to_string(ws.join("written.txt")).unwrap().trim(), "ok");
+    }
+
+    #[test]
+    fn claude_and_codex_sandbox_configs_seed_normalized_workspace_and_ext_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let cage = sample_cage();
+        let acct = prepare_account_cage_home(tmp.path(), Some(88), &cage).unwrap();
+
+        // Preserve existing user settings keys when seeding permissions.additionalDirectories.
+        let claude_dir = acct.home_dir.join(".claude");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"customKey":"keep","permissions":{"additionalDirectories":["/custom/pre"]}}"#,
+        )
+        .unwrap();
+
+        write_claude_sandbox_config(&acct, Path::new("/workspace")).unwrap();
+        write_claude_sandbox_config(&acct, Path::new("/workspace/sub")).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(claude_dir.join("settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(settings["customKey"], "keep");
+        let add_dirs: Vec<&str> = settings["permissions"]["additionalDirectories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(add_dirs, vec!["/custom/pre", "/workspace", "/mnt/ext"]);
+
+        // Non-normalized Seatbelt host path must NOT create /workspace or /mnt/ext grants.
+        let acct_sb = prepare_account_cage_home(tmp.path(), Some(89), &cage).unwrap();
+        write_claude_sandbox_config(&acct_sb, Path::new("/Users/alice/repo")).unwrap();
+        assert!(!acct_sb.home_dir.join(".claude/settings.json").exists());
+
+        // Symlinked settings.json must be refused fail-closed.
+        #[cfg(unix)]
+        {
+            let acct_sym = prepare_account_cage_home(tmp.path(), Some(90), &cage).unwrap();
+            let cd = acct_sym.home_dir.join(".claude");
+            fs::create_dir_all(&cd).unwrap();
+            let victim = tmp.path().join("victim.json");
+            fs::write(&victim, "{}").unwrap();
+            std::os::unix::fs::symlink(&victim, cd.join("settings.json")).unwrap();
+            assert!(write_claude_sandbox_config(&acct_sym, Path::new("/workspace")).is_err());
+        }
+
+        // Malformed existing settings.json must NOT be clobbered (fail closed)!
+        let acct_bad = prepare_account_cage_home(tmp.path(), Some(91), &cage).unwrap();
+        let bad_cd = acct_bad.home_dir.join(".claude");
+        fs::create_dir_all(&bad_cd).unwrap();
+        fs::write(bad_cd.join("settings.json"), "{not-valid-json").unwrap();
+        assert!(write_claude_sandbox_config(&acct_bad, Path::new("/workspace")).is_err());
+        assert_eq!(
+            fs::read_to_string(bad_cd.join("settings.json")).unwrap(),
+            "{not-valid-json"
+        );
+
+        // Codex subdir trust writes deduplicated trust entries for both /workspace and /workspace/sub.
+        let cfg_path = write_codex_sandbox_config_dirs(
+            &acct,
+            &cage,
+            "http://127.0.0.1:41001",
+            "http://bh:tok@127.0.0.1:41002",
+            "socks5h://bh:tok@127.0.0.1:41002",
+            &[
+                Path::new("/workspace"),
+                Path::new("/workspace/sub"),
+                Path::new("/workspace"),
+            ],
+        )
+        .unwrap();
+        let toml = fs::read_to_string(cfg_path).unwrap();
+        assert_eq!(toml.matches("[projects.\"/workspace\"]").count(), 1);
+        assert_eq!(toml.matches("[projects.\"/workspace/sub\"]").count(), 1);
     }
 }

@@ -108,7 +108,7 @@ pub fn inspect_cage_session(
     let min_mtime = launch_started_at.map(|t| t.checked_sub(Duration::from_secs(2)).unwrap_or(t));
     match agent {
         "claude" => inspect_claude_cage(old_home, workspace, min_mtime),
-        "codex" => inspect_codex_cage(old_home, min_mtime, pre_launch_codex_paused_goals),
+        "codex" => inspect_codex_cage(old_home, workspace, min_mtime, pre_launch_codex_paused_goals),
         "grok" => inspect_grok_cage(old_home, min_mtime),
         "agy" => inspect_agy_cage(old_home, min_mtime),
         other => DetectedCageSession {
@@ -369,6 +369,11 @@ pub fn build_rebind_argv(
         return original_args.to_vec();
     }
     let Some(sid) = migrated_session_id.filter(|s| !s.trim().is_empty()) else {
+        // When continuation is withheld and no session ID was established (e.g., ambiguous
+        // concurrent ownership), NEVER replay the original prompt!
+        if !decision.should_auto_continue {
+            return Vec::new();
+        }
         return original_args.to_vec();
     };
     let prompt = if decision.should_auto_continue {
@@ -397,15 +402,26 @@ fn inspect_claude_cage(
 ) -> DetectedCageSession {
     let projects = old_home.join(".claude").join("projects");
     let ws_dir = projects.join(project_dir_key(workspace));
-    let mut candidate = newest_file_matching(&ws_dir, min_mtime, |p| {
+    // Strictly scope transcript lookup to direct `*.jsonl` files inside the launch
+    // workspace directory (depth 1, never recursive subdirs or account-wide fallback)
+    // so concurrent projects sharing an account can NEVER hijack each other on rebind!
+    let candidates = matching_direct_files(&ws_dir, min_mtime, |p| {
         p.extension().and_then(|e| e.to_str()) == Some("jsonl")
     });
-    if candidate.is_none() {
-        candidate = newest_file_matching(&projects, min_mtime, |p| {
-            p.extension().and_then(|e| e.to_str()) == Some("jsonl")
-        });
+    if candidates.len() > 1 {
+        return DetectedCageSession {
+            agent: "claude".into(),
+            session_id: None,
+            session_path: None,
+            state: SessionInterruptState::HumanBlockedOrPaused {
+                reason: format!(
+                    "{} concurrent Claude sessions modified in this workspace cage; refusing ambiguous automatic migration (resume manually)",
+                    candidates.len()
+                ),
+            },
+        };
     }
-    let Some(path) = candidate else {
+    let Some(path) = candidates.into_iter().next() else {
         return DetectedCageSession {
             agent: "claude".into(),
             session_id: None,
@@ -600,16 +616,43 @@ fn inspect_claude_cage(
 
 fn inspect_codex_cage(
     old_home: &Path,
+    workspace: &Path,
     min_mtime: Option<SystemTime>,
     pre_launch_paused_goals: &BTreeSet<String>,
 ) -> DetectedCageSession {
     let codex_home = old_home.join(".codex");
     let sessions_dir = codex_home.join("sessions");
-    let Some(path) = newest_file_matching(&sessions_dir, min_mtime, |p| {
-        p.file_name()
+    let ws_norm = workspace.to_string_lossy().trim_end_matches('/').to_string();
+    let candidates = matching_files(&sessions_dir, min_mtime, |p| {
+        if !p
+            .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
-    }) else {
+        {
+            return false;
+        }
+        // Fail closed when `session_meta.payload.cwd` is missing/unreadable, and require
+        // exact workspace cwd match so concurrent sessions under one Git root never cross-migrate.
+        let Some(rollout_cwd) = extract_codex_rollout_cwd(p) else {
+            return false;
+        };
+        let norm = rollout_cwd.trim_end_matches('/');
+        norm == ws_norm
+    });
+    if candidates.len() > 1 {
+        return DetectedCageSession {
+            agent: "codex".into(),
+            session_id: None,
+            session_path: None,
+            state: SessionInterruptState::HumanBlockedOrPaused {
+                reason: format!(
+                    "{} concurrent Codex sessions modified in this workspace cage; refusing ambiguous automatic migration (resume manually)",
+                    candidates.len()
+                ),
+            },
+        };
+    }
+    let Some(path) = candidates.into_iter().next() else {
         return DetectedCageSession {
             agent: "codex".into(),
             session_id: None,
@@ -1022,12 +1065,43 @@ fn inspect_agy_cage(old_home: &Path, min_mtime: Option<SystemTime>) -> DetectedC
     let conv_dir = agy_root.join("conversations");
     let brain_dir = agy_root.join("brain");
 
-    let db_cand = newest_file_matching(&conv_dir, min_mtime, |p| {
+    let db_cands = matching_files(&conv_dir, min_mtime, |p| {
         p.extension().and_then(|e| e.to_str()) == Some("db")
     });
-    let transcript_cand = newest_file_matching(&brain_dir, min_mtime, |p| {
+    let transcript_cands = matching_files(&brain_dir, min_mtime, |p| {
         p.file_name().and_then(|n| n.to_str()) == Some("transcript.jsonl")
     });
+    let mut distinct_ids = BTreeSet::new();
+    for db in &db_cands {
+        if let Some(id) = db.file_stem().and_then(|s| s.to_str()) {
+            distinct_ids.insert(id.to_string());
+        }
+    }
+    for tr in &transcript_cands {
+        if let Some(id) = tr
+            .strip_prefix(&brain_dir)
+            .ok()
+            .and_then(|r| r.components().next())
+            .and_then(|c| c.as_os_str().to_str())
+        {
+            distinct_ids.insert(id.to_string());
+        }
+    }
+    if distinct_ids.len() > 1 {
+        return DetectedCageSession {
+            agent: "agy".into(),
+            session_id: None,
+            session_path: None,
+            state: SessionInterruptState::HumanBlockedOrPaused {
+                reason: format!(
+                    "{} concurrent Antigravity sessions modified in this workspace cage; refusing ambiguous automatic migration (resume manually)",
+                    distinct_ids.len()
+                ),
+            },
+        };
+    }
+    let db_cand = db_cands.into_iter().next();
+    let transcript_cand = transcript_cands.into_iter().next();
 
     let (sid, primary_path, transcript_path) = match (&db_cand, &transcript_cand) {
         (Some(db), _) => {
@@ -1712,14 +1786,14 @@ fn is_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn newest_file_matching<F>(root: &Path, min_mtime: Option<SystemTime>, pred: F) -> Option<PathBuf>
+fn matching_files<F>(root: &Path, min_mtime: Option<SystemTime>, mut pred: F) -> Vec<PathBuf>
 where
-    F: Fn(&Path) -> bool,
+    F: FnMut(&Path) -> bool,
 {
     if !root.is_dir() {
-        return None;
+        return Vec::new();
     }
-    let mut best: Option<(SystemTime, PathBuf)> = None;
+    let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .follow_links(false)
         .max_depth(6)
@@ -1740,15 +1814,74 @@ where
         {
             continue;
         }
-        let replace = match &best {
-            None => true,
-            Some((best_t, _)) => mtime >= *best_t,
+        matches.push((mtime, p.to_path_buf()));
+    }
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.into_iter().map(|(_, p)| p).collect()
+}
+
+fn matching_direct_files<F>(dir: &Path, min_mtime: Option<SystemTime>, mut pred: F) -> Vec<PathBuf>
+where
+    F: FnMut(&Path) -> bool,
+{
+    if !dir.is_dir() {
+        return Vec::new();
+    }
+    let threshold = min_mtime.map(|t| t.checked_sub(Duration::from_secs(2)).unwrap_or(t));
+    let mut matches: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for ent in entries.flatten() {
+        let p = ent.path();
+        if !p.is_file() || is_symlink(&p) || !pred(&p) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&p) else {
+            continue;
         };
-        if replace {
-            best = Some((mtime, p.to_path_buf()));
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if let Some(th) = threshold
+            && mtime < th
+        {
+            continue;
+        }
+        matches.push((mtime, p));
+    }
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+    matches.into_iter().map(|(_, p)| p).collect()
+}
+
+fn newest_file_matching<F>(root: &Path, min_mtime: Option<SystemTime>, pred: F) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    matching_files(root, min_mtime, pred).into_iter().next()
+}
+
+fn extract_codex_rollout_cwd(path: &Path) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    let f = fs::File::open(path).ok()?;
+    let reader = BufReader::new(f);
+    for line in reader.lines().take(16).flatten() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
+            if let Some(cwd) = v
+                .get("payload")
+                .and_then(|p| p.get("cwd"))
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(cwd.to_string());
+            }
         }
     }
-    best.map(|(_, p)| p)
+    None
 }
 
 fn ensure_no_symlink_in_path(root_boundary: Option<&Path>, target: &Path) -> Result<()> {
@@ -1764,6 +1897,14 @@ fn ensure_no_symlink_in_path(root_boundary: Option<&Path>, target: &Path) -> Res
         cur.push(comp);
         if let Ok(meta) = fs::symlink_metadata(&cur) {
             if meta.file_type().is_symlink() {
+                // On macOS, `/var` (-> `private/var`) and `/tmp` (-> `private/tmp`) are immutable
+                // OS root symlinks; allow them when no tighter `root_boundary` was provided.
+                #[cfg(target_os = "macos")]
+                if root_boundary.is_none()
+                    && (cur == Path::new("/var") || cur == Path::new("/tmp"))
+                {
+                    continue;
+                }
                 anyhow::bail!(
                     "refusing to traverse symlink component {} while writing {}",
                     cur.display(),
@@ -2043,10 +2184,11 @@ mod tests {
         let tid = "01a21abb-0000-7000-8000-000000000001";
         let rdir = old_cage.home_dir.join(".codex/sessions/2026/11/27");
         fs::create_dir_all(&rdir).unwrap();
+        let ws_json = serde_json::to_string(&ws.to_string_lossy()).unwrap();
         fs::write(
             rdir.join(format!("rollout-2026-11-27T10-00-00-{tid}.jsonl")),
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\"}}}}\n\
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\",\"cwd\":{ws_json}}}}}\n\
                  {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"ship feature\"}}]}}}}\n"
             ),
         )
@@ -2132,9 +2274,10 @@ mod tests {
         let tid = "01a21abb-0000-7000-8000-000000000099";
         let rdir = tmp.path().join(".codex/sessions/2026/11/27");
         fs::create_dir_all(&rdir).unwrap();
+        let ws_json = serde_json::to_string(&ws.to_string_lossy()).unwrap();
         fs::write(
             rdir.join(format!("rollout-2026-11-27T10-00-00-{tid}.jsonl")),
-            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\"}}}}\n"),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\",\"cwd\":{ws_json}}}}}\n"),
         )
         .unwrap();
         let gdb = tmp.path().join(".codex/goals_1.sqlite");
@@ -2187,10 +2330,11 @@ mod tests {
         drop(conn);
 
         // Case 1: Codex itself stalled the active goal because of `cage_rebind_in_progress`.
+        let ws_json = serde_json::to_string(&ws.to_string_lossy()).unwrap();
         fs::write(
             &rpath,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\"}}}}\n\
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\",\"cwd\":{ws_json}}}}}\n\
                  {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"error\":{{\"message\":\"{{\\\"error\\\":{{\\\"code\\\":\\\"cage_rebind_in_progress\\\"}}}}\"}}}}}}\n"
             ),
         )
@@ -2218,7 +2362,7 @@ mod tests {
         fs::write(
             &rpath,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\"}}}}\n\
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{tid}\",\"cwd\":{ws_json}}}}}\n\
                  {{\"type\":\"response_item\",\"payload\":{{\"type\":\"function_call\",\"call_id\":\"c9\",\"name\":\"update_goal\",\"arguments\":\"{{\\\"status\\\":\\\"blocked\\\"}}\"}}}}\n\
                  {{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"error\":{{\"message\":\"cage_rebind_in_progress\"}}}}}}\n"
             ),
@@ -2308,5 +2452,56 @@ mod tests {
         assert_eq!(argv_tui[2], "--resume");
         assert_eq!(argv_tui[3], "conv-1");
         assert_eq!(argv_tui[4], "-i");
+    }
+
+    #[test]
+    fn concurrent_sessions_in_same_workspace_refuse_ambiguous_rebind_migration() {
+        let tmp = TempDir::new().unwrap();
+        let ws = PathBuf::from("/workspace");
+        let now = SystemTime::now();
+
+        // 1) Claude: two concurrent transcripts under `/workspace` -> refuse ambiguous migration!
+        let claude_ws = tmp.path().join(".claude/projects/-workspace");
+        fs::create_dir_all(&claude_ws).unwrap();
+        fs::write(claude_ws.join("sess-1.jsonl"), r#"{"type":"user","message":{"content":"a"}}"#).unwrap();
+        fs::write(claude_ws.join("sess-2.jsonl"), r#"{"type":"user","message":{"content":"b"}}"#).unwrap();
+        let det_c = inspect_cage_session("claude", tmp.path(), &ws, Some(now), &BTreeSet::new());
+        assert!(det_c.session_id.is_none());
+        assert!(matches!(det_c.state, SessionInterruptState::HumanBlockedOrPaused { .. }));
+
+        // 2) Codex: rollout missing `session_meta.payload.cwd` is rejected; two matching rollouts refused!
+        let codex_dir = tmp.path().join(".codex/sessions/2026/11/28");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("rollout-no-cwd.jsonl"),
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
+        )
+        .unwrap();
+        let det_nocwd = inspect_cage_session("codex", tmp.path(), &ws, Some(now), &BTreeSet::new());
+        assert!(det_nocwd.session_id.is_none());
+        assert!(matches!(det_nocwd.state, SessionInterruptState::Turn1Unpersisted));
+
+        fs::write(
+            codex_dir.join("rollout-a.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"t1","cwd":"/workspace"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            codex_dir.join("rollout-b.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"t2","cwd":"/workspace"}}"#,
+        )
+        .unwrap();
+        let det_ambig = inspect_cage_session("codex", tmp.path(), &ws, Some(now), &BTreeSet::new());
+        assert!(det_ambig.session_id.is_none());
+        assert!(matches!(det_ambig.state, SessionInterruptState::HumanBlockedOrPaused { .. }));
+
+        // 3) AGY: two concurrent conversations -> refuse ambiguous migration!
+        let conv_dir = tmp.path().join(".gemini/antigravity-cli/conversations");
+        fs::create_dir_all(&conv_dir).unwrap();
+        fs::write(conv_dir.join("c1.db"), b"1").unwrap();
+        fs::write(conv_dir.join("c2.db"), b"2").unwrap();
+        let det_agy = inspect_cage_session("agy", tmp.path(), &ws, Some(now), &BTreeSet::new());
+        assert!(det_agy.session_id.is_none());
+        assert!(matches!(det_agy.state, SessionInterruptState::HumanBlockedOrPaused { .. }));
     }
 }

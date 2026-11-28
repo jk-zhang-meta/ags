@@ -117,21 +117,29 @@ impl From<serde_json::Error> for BerthError {
     }
 }
 
-/// Client-side cage isolation boundary.
+/// Client-side cage isolation preference / resolved backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum IsolationMode {
+    /// Automatic host-best isolation:
+    /// - Apple Silicon macOS -> ARM64 Linux Micro-VM (`vm`, fail-closed)
+    /// - Linux / WSL2 -> `bwrap --unshare-net` (`sandbox`)
+    /// - Intel macOS -> `sandbox-exec` (`seatbelt`)
+    /// - Windows -> AppContainer (`sandbox`)
+    #[default]
+    Auto,
     /// Aligns TZ/LANG/LC_ALL, overlay hooks, and scrubs Windows interop PATH.
     /// Does NOT claim OS-level network egress isolation.
-    #[default]
     TzOverlay,
     /// Cross-platform native zero-VM kernel sandbox (Linux/WSL2 bwrap --unshare-net,
-    /// macOS sandbox-exec Seatbelt, Windows AppContainer) with all outbound traffic
-    /// forced through the Berth Landing proxy and per-account isolated HOME.
+    /// Windows AppContainer; on Apple Silicon macOS legacy persisted `"sandbox"` auto-promotes
+    /// to `vm` unless `--isolation seatbelt` is passed explicitly).
     Sandbox,
-    /// Optional Apple Silicon (`aarch64-apple-darwin`) ARM64 Linux Micro-VM backend
+    /// Explicit macOS `sandbox-exec` Seatbelt escape hatch (opt-in on Apple Silicon; default on Intel macOS).
+    Seatbelt,
+    /// Apple Silicon (`aarch64-apple-darwin`) ARM64 Linux Micro-VM backend
     /// powered by native `Virtualization.framework` with zero `virtio-net` NICs,
-    /// VirtioFS `/workspace`, and `virtio-vsock` transport to `CageShim` / `ForwardProxy`.
+    /// VirtioFS `/workspace` & `/mnt/ext`, and `virtio-vsock` transport.
     Vm,
     /// Requires Linux + zoneinfo + unprivileged `unshare -Ur -m` + no active
     /// Windows/WSL interop bypass. Fails closed otherwise.
@@ -141,8 +149,10 @@ pub enum IsolationMode {
 impl IsolationMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::TzOverlay => "tz-overlay",
             Self::Sandbox => "sandbox",
+            Self::Seatbelt => "seatbelt",
             Self::Vm => "vm",
             Self::Strict => "strict",
         }
@@ -150,15 +160,164 @@ impl IsolationMode {
 
     pub fn parse(raw: &str) -> Result<Self, BerthError> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
             "tz-overlay" | "tz_overlay" | "env" => Ok(Self::TzOverlay),
-            "sandbox" | "auto" => Ok(Self::Sandbox),
+            "sandbox" => Ok(Self::Sandbox),
+            "seatbelt" | "macos-seatbelt" => Ok(Self::Seatbelt),
             "vm" | "microvm" | "macos-vm" => Ok(Self::Vm),
             "strict" => Ok(Self::Strict),
             other => Err(BerthError::InvalidArgument(format!(
-                "isolation mode must be `sandbox`, `vm`, `tz-overlay`, or `strict`; got `{other}`"
+                "isolation mode must be `auto`, `vm`, `sandbox`, `seatbelt`, `tz-overlay`, or `strict`; got `{other}`"
             ))),
         }
     }
+
+    /// Maps resolved backend to the wire value expected by Berth Central's lease API.
+    pub fn wire_lease_mode(self) -> Self {
+        match self {
+            Self::Seatbelt | Self::Auto => Self::Sandbox,
+            other => other,
+        }
+    }
+}
+
+/// Returns true when the current host is Apple Silicon macOS — including when running an
+/// x86_64 binary under Rosetta 2 (`sysctl.proc_translated == 1`) so translated binaries
+/// never silently choose the Intel macOS default.
+pub fn is_apple_silicon_host() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        true
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+    {
+        std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-in", "sysctl.proc_translated"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Authoritative single resolver from persisted preference + optional CLI override to the
+/// concrete runtime backend, invoked ONCE before lease acquisition across launch, resume,
+/// dry-run, env planning, and execution-OS reporting.
+pub fn resolve_effective_isolation(
+    config_pref: Option<IsolationMode>,
+    cli_override: Option<IsolationMode>,
+    state_dir: &Path,
+    preflight_ready: bool,
+) -> Result<IsolationMode, BerthError> {
+    let chosen = cli_override
+        .or(config_pref)
+        .unwrap_or(IsolationMode::Auto);
+    let apple_silicon = is_apple_silicon_host();
+
+    let resolved = if cfg!(target_os = "macos") {
+        if apple_silicon {
+            match chosen {
+                // On Apple Silicon macOS, Auto and legacy persisted `sandbox` resolve to Micro-VM!
+                // Users must pass `--isolation seatbelt` explicitly to opt into host Seatbelt.
+                IsolationMode::Auto | IsolationMode::Sandbox | IsolationMode::Vm => {
+                    if !cfg!(target_arch = "aarch64") {
+                        return Err(BerthError::StrictIsolationUnavailable(
+                            "running an x86_64 `bh` binary under Rosetta 2 on Apple Silicon; install the native `aarch64-apple-darwin` build for Micro-VM isolation".into(),
+                        ));
+                    }
+                    IsolationMode::Vm
+                }
+                IsolationMode::Seatbelt => IsolationMode::Seatbelt,
+                IsolationMode::Strict => {
+                    return Err(BerthError::StrictIsolationUnavailable(
+                        "`strict` isolation requires Linux unprivileged mount namespaces; use `--isolation vm` on Apple Silicon macOS".into(),
+                    ));
+                }
+                IsolationMode::TzOverlay => IsolationMode::TzOverlay,
+            }
+        } else {
+            // Intel macOS: Seatbelt is the kernel sandbox; Micro-VM is Apple Silicon only.
+            match chosen {
+                IsolationMode::Auto | IsolationMode::Sandbox | IsolationMode::Seatbelt => {
+                    IsolationMode::Seatbelt
+                }
+                IsolationMode::Vm => {
+                    return Err(BerthError::StrictIsolationUnavailable(
+                        "`vm` isolation mode is supported exclusively on Apple Silicon macOS (aarch64-apple-darwin)".into(),
+                    ));
+                }
+                IsolationMode::Strict => {
+                    return Err(BerthError::StrictIsolationUnavailable(
+                        "`strict` isolation requires Linux unprivileged mount namespaces".into(),
+                    ));
+                }
+                IsolationMode::TzOverlay => IsolationMode::TzOverlay,
+            }
+        }
+    } else if cfg!(target_os = "linux") {
+        match chosen {
+            IsolationMode::Auto | IsolationMode::Sandbox => IsolationMode::Sandbox,
+            IsolationMode::Strict => IsolationMode::Strict,
+            IsolationMode::TzOverlay => IsolationMode::TzOverlay,
+            IsolationMode::Vm => {
+                return Err(BerthError::StrictIsolationUnavailable(
+                    "`vm` isolation mode is only supported on Apple Silicon macOS; use `--isolation sandbox` (bwrap) on Linux/WSL".into(),
+                ));
+            }
+            IsolationMode::Seatbelt => {
+                return Err(BerthError::StrictIsolationUnavailable(
+                    "`seatbelt` isolation mode is macOS-only; use `--isolation sandbox` (bwrap) on Linux/WSL".into(),
+                ));
+            }
+        }
+    } else {
+        // Windows / other targets.
+        match chosen {
+            IsolationMode::Auto | IsolationMode::Sandbox => IsolationMode::Sandbox,
+            IsolationMode::TzOverlay => IsolationMode::TzOverlay,
+            IsolationMode::Vm => {
+                return Err(BerthError::StrictIsolationUnavailable(
+                    "`vm` isolation mode is only supported on Apple Silicon macOS".into(),
+                ));
+            }
+            IsolationMode::Seatbelt => {
+                return Err(BerthError::StrictIsolationUnavailable(
+                    "`seatbelt` isolation mode is macOS-only".into(),
+                ));
+            }
+            IsolationMode::Strict => {
+                return Err(BerthError::StrictIsolationUnavailable(
+                    "`strict` isolation requires Linux unprivileged mount namespaces".into(),
+                ));
+            }
+        }
+    };
+
+    if preflight_ready {
+        match resolved {
+            IsolationMode::Vm => {
+                let vm_status = crate::macos_vm::probe_macos_vm(state_dir);
+                if !vm_status.initialized {
+                    return Err(BerthError::StrictIsolationUnavailable(format!(
+                        "Apple Silicon ARM64 Linux Micro-VM is not initialized at {}; run once: `bh sandbox init-vm` (or pass `--isolation seatbelt` explicitly to opt out)",
+                        vm_status.vm_dir.display()
+                    )));
+                }
+            }
+            IsolationMode::Strict => {
+                let caps = probe_host_isolation_capabilities(None);
+                evaluate_isolation(IsolationMode::Strict, "UTC", &caps)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(resolved)
 }
 
 impl fmt::Display for IsolationMode {
@@ -214,6 +373,10 @@ fn default_schema() -> String {
 
 fn default_zone_preference() -> String {
     "auto".to_string()
+}
+
+fn default_isolation_mode() -> IsolationMode {
+    IsolationMode::Auto
 }
 
 fn default_ags_version() -> String {
@@ -308,7 +471,7 @@ pub struct BerthConfig {
     pub mgmt_entries: Vec<String>,
     #[serde(default = "default_zone_preference")]
     pub zone_preference: String,
-    #[serde(default)]
+    #[serde(default = "default_isolation_mode")]
     pub isolation_mode: IsolationMode,
     #[serde(default)]
     pub allow_insecure_http_for_tests: bool,
@@ -620,7 +783,7 @@ pub struct LeaseRequest {
     pub account_preference: Vec<String>,
     #[serde(default = "default_zone_preference")]
     pub zone_preference: String,
-    #[serde(default)]
+    #[serde(default = "default_isolation_mode")]
     pub isolation_mode: IsolationMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohort_hint: Option<String>,
@@ -2338,8 +2501,12 @@ pub fn evaluate_isolation(
                 host_visible_notes: Vec::new(),
             })
         }
-        IsolationMode::Sandbox => Ok(IsolationReport {
-            mode: "sandbox".to_string(),
+        IsolationMode::Auto | IsolationMode::Sandbox | IsolationMode::Seatbelt => Ok(IsolationReport {
+            mode: if mode == IsolationMode::Seatbelt {
+                "seatbelt".to_string()
+            } else {
+                "sandbox".to_string()
+            },
             os_egress_isolation: true,
             mount_namespace_localtime: caps.os == "linux" && caps.zoneinfo_exists,
             windows_interop_path_scrubbed: true,
@@ -2350,7 +2517,7 @@ pub fn evaluate_isolation(
             ],
         }),
         IsolationMode::Vm => {
-            if caps.os != "macos" {
+            if caps.os != "macos" || !is_apple_silicon_host() {
                 return Err(BerthError::StrictIsolationUnavailable(format!(
                     "`vm` isolation mode is only supported on Apple Silicon macOS (host OS is `{}`); use `--isolation sandbox` on Linux/WSL/Windows",
                     caps.os
@@ -2808,7 +2975,21 @@ pub fn write_codex_overlay_config_toml(
         }
         if let Some(projects_tbl) = projects_entry.as_table_mut() {
             for (k, v) in snip_projects {
-                projects_tbl.entry(k.clone()).or_insert_with(|| v.clone());
+                if let Some(snip_proj_tbl) = v.as_table() {
+                    let entry = projects_tbl
+                        .entry(k.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                    if !entry.is_table() {
+                        *entry = toml::Value::Table(toml::Table::new());
+                    }
+                    if let Some(existing_tbl) = entry.as_table_mut() {
+                        for (pk, pv) in snip_proj_tbl {
+                            existing_tbl.insert(pk.clone(), pv.clone());
+                        }
+                    }
+                } else {
+                    projects_tbl.insert(k.clone(), v.clone());
+                }
             }
         }
     }

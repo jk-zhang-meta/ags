@@ -1492,3 +1492,248 @@ fn cli_pure_rust_session_ls_save_store_sync_and_resume_dry_run_e2e() {
         String::from_utf8_lossy(&del_out.stderr)
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_berth_bwrap_workspace_normalization_ext_mounts_ro_erofs_conflict_and_ws_discovery_e2e() {
+    if !berth::sandbox::probe_sandbox_backend().available {
+        return;
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("canary_host_home_user");
+    let xdg_config = tmp.path().join("cfg");
+    let xdg_state = tmp.path().join("state");
+    let repo_a = tmp.path().join("repoA");
+    let repo_a_sub = repo_a.join("packages").join("api");
+    let repo_b = tmp.path().join("repoB");
+    let ext_rw = tmp.path().join("ext_rw");
+    let ext_ro = tmp.path().join("ext_ro");
+    let ext_add = tmp.path().join("ext_add");
+    for d in [&home, &xdg_config, &xdg_state, &repo_a_sub, &repo_b, &ext_rw, &ext_ro, &ext_add] {
+        fs::create_dir_all(d).unwrap();
+    }
+    fs::create_dir_all(repo_a.join(".git")).unwrap();
+    fs::create_dir_all(repo_b.join(".git")).unwrap();
+    fs::create_dir_all(home.join(".ssh")).unwrap();
+    fs::write(home.join(".ssh").join("id_ed25519"), "HOST_SSH_SECRET").unwrap();
+    fs::write(repo_a.join("root-marker.txt"), "ROOT_A_OK").unwrap();
+    fs::write(ext_ro.join("ro-file.txt"), "RO_MARKER").unwrap();
+    fs::write(ext_add.join("add-file.txt"), "ADD_MARKER").unwrap();
+
+    // Stub Berth Central that counts lease acquisitions so we prove pre-lease fail-closed checks!
+    let central = TcpListener::bind("127.0.0.1:0").unwrap();
+    let central_addr = central.local_addr().unwrap();
+    let lease_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let lease_count_bg = Arc::clone(&lease_count);
+    let _central_srv = thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        for stream in central.incoming() {
+            let Ok(mut s) = stream else { break };
+            let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+            if head.starts_with("POST /api/v1/ags/leases") {
+                lease_count_bg.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{
+                    "lease_id":"lease_norm_01",
+                    "lease_token":"tok_norm_01",
+                    "work_session_id":"ws_norm_01",
+                    "account_id":902,
+                    "expires_at":"2099-01-01T00:00:00Z",
+                    "cage":{"cage_id":"cage_chi","gate_epoch":1,"timezone":"America/Chicago","country_code":"US","locale":"en_US.UTF-8","strict_mode":true},
+                    "zone":{"zone_slug":"overseas","ingress_candidates":[{"node_id":"la-1","url":"http://127.0.0.1:9","weight":100}]}
+                }"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            } else if head.starts_with("DELETE /api/v1/ags/leases/") {
+                let body = r#"{"released":true}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        }
+    });
+
+    // Init with default `--isolation auto` (resolves to `bwrap` on Linux!).
+    let init = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .args([
+            "init",
+            "--url",
+            &format!("http://{central_addr}"),
+            "--key",
+            "sk-norm-e2e",
+            "--allow-insecure-http-for-tests",
+        ])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "init stderr: {}", String::from_utf8_lossy(&init.stderr));
+
+    // 1) Pre-lease fail-closed checks: conflicting `--mount` + `--ro-mount`, sensitive `~/.ssh`,
+    //    and trailing `--add-dir` without value MUST fail with ZERO lease acquisitions!
+    for bad_args in [
+        vec!["codex", "--mount", ext_rw.to_str().unwrap(), "--ro-mount", ext_rw.to_str().unwrap()],
+        vec!["codex", "--ro-mount", home.join(".ssh").to_str().unwrap()],
+        vec!["codex", "--ro-mount", repo_a.to_str().unwrap()],
+        vec!["claude", "--", "--add-dir"],
+    ] {
+        let out = Command::new(ags_bin())
+            .current_dir(&repo_a_sub)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .args(&bad_args)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "expected failure for args {bad_args:?}");
+    }
+    assert_eq!(
+        lease_count.load(Ordering::SeqCst),
+        0,
+        "fail-closed mount validation must reject BEFORE acquiring any lease"
+    );
+
+    // 2) Real bwrap launch from repoA/packages/api with --mount, --ro-mount, --add-dir, and host env canaries!
+    let fake_cli = repo_a.join("fake-agent.sh");
+    fs::write(
+        &fake_cli,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+{
+  echo "PWD=$(pwd)"
+  echo "HOME=$HOME"
+  echo "GEMINI_HOME=${GEMINI_HOME:-}"
+  echo "EDITOR=${EDITOR:-}"
+  echo "ARGS=$*"
+  echo "ROOT_MARKER=$(cat /workspace/root-marker.txt)"
+  echo "ENV_HAS_CANARY=$(env | grep -c 'canary_host_home_user' || true)"
+  echo "RO_READ=$(cat /mnt/ext/d0002-ext_ro/ro-file.txt)"
+  echo "ADD_READ=$(cat /mnt/ext/d0003-ext_add/add-file.txt)"
+  echo "RW_WRITE=$(echo persisted > /mnt/ext/d0001-ext_rw/out.txt && echo ok)"
+  echo "RO_WRITE_ERR=$( (echo bad > /mnt/ext/d0002-ext_ro/hack.txt) 2>&1 || true )"
+  echo "ADD_WRITE_ERR=$( (echo bad > /mnt/ext/d0003-ext_add/hack.txt) 2>&1 || true )"
+} > /workspace/norm-report.txt
+# Also plant a Claude session transcript inside isolated cage home to verify `bh ls` discovery!
+mkdir -p "$HOME/.claude/projects/-workspace"
+cat > "$HOME/.claude/projects/-workspace/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl" <<'JSONL'
+{"type":"user","cwd":"/workspace","message":{"role":"user","content":"ws-scoped discovery probe"},"timestamp":"2026-11-28T00:00:00Z"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"discovered"}]},"timestamp":"2026-11-28T00:00:01Z"}
+JSONL
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_cli, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let run_a = Command::new(ags_bin())
+        .current_dir(&repo_a_sub)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("AGENT_SESSION_STATE_DIR", &xdg_state)
+        .env("AGENT_SESSION_CLAUDE_BINARY", &fake_cli)
+        .env("EDITOR", home.join("my-editor").to_str().unwrap())
+        .env("GEMINI_HOME", home.join(".gemini-host-canary").to_str().unwrap())
+        .args([
+            "claude",
+            "--mount",
+            ext_rw.to_str().unwrap(),
+            "--ro-mount",
+            ext_ro.to_str().unwrap(),
+            "--",
+            "--add-dir",
+            ext_add.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run_a.status.success(),
+        "bwrap run A failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&run_a.stdout),
+        String::from_utf8_lossy(&run_a.stderr)
+    );
+
+    let report = fs::read_to_string(repo_a.join("norm-report.txt")).unwrap();
+    assert!(report.contains("PWD=/workspace/packages/api\n"), "report:\n{report}");
+    assert!(report.contains("HOME=/home/dev\n"), "report:\n{report}");
+    assert!(report.contains("GEMINI_HOME=/home/dev/.gemini\n"), "report:\n{report}");
+    assert!(report.contains("EDITOR=\n"), "host-path EDITOR must be scrubbed:\n{report}");
+    assert!(report.contains("ARGS=--add-dir /mnt/ext/d0003-ext_add\n"), "report:\n{report}");
+    assert!(report.contains("ROOT_MARKER=ROOT_A_OK\n"), "report:\n{report}");
+    assert!(report.contains("ENV_HAS_CANARY=0\n"), "zero host path allowed in guest env:\n{report}");
+    assert!(report.contains("RO_READ=RO_MARKER\n"), "report:\n{report}");
+    assert!(report.contains("ADD_READ=ADD_MARKER\n"), "report:\n{report}");
+    assert!(report.contains("RW_WRITE=ok\n"), "report:\n{report}");
+    assert!(
+        report
+            .lines()
+            .any(|l| l.starts_with("RO_WRITE_ERR=") && l.contains("Read-only file system")),
+        "expected kernel EROFS on --ro-mount:\n{report}"
+    );
+    assert!(
+        report
+            .lines()
+            .any(|l| l.starts_with("ADD_WRITE_ERR=") && l.contains("Read-only file system")),
+        "expected kernel EROFS on --add-dir:\n{report}"
+    );
+    assert_eq!(fs::read_to_string(ext_rw.join("out.txt")).unwrap().trim(), "persisted");
+    assert!(!ext_ro.join("hack.txt").exists());
+    assert!(!ext_add.join("hack.txt").exists());
+
+    // 3) Launch repoB under the EXACT same account 902 -> verify distinct `ws-<id>` cage homes!
+    let fake_cli_b = repo_b.join("fake-b.sh");
+    fs::write(&fake_cli_b, "#!/usr/bin/env bash\necho ok > /workspace/b.txt\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_cli_b, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run_b = Command::new(ags_bin())
+        .current_dir(&repo_b)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("AGENT_SESSION_STATE_DIR", &xdg_state)
+        .env("AGENT_SESSION_CLAUDE_BINARY", &fake_cli_b)
+        .args(["claude"])
+        .output()
+        .unwrap();
+    assert!(run_b.status.success(), "run B stderr: {}", String::from_utf8_lossy(&run_b.stderr));
+
+    let ws_dirs: Vec<_> = fs::read_dir(xdg_state.join("cages").join("acct-902"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("ws-"))
+        .collect();
+    assert_eq!(ws_dirs.len(), 2, "repoA and repoB must get 2 distinct ws-<id> cage homes");
+
+    // 4) Verify `bh ls --all --json` discovers sessions inside the new `cages/acct-902/ws-<id>/home` layout (H11)!
+    let ls_out = Command::new(ags_bin())
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("AGENT_SESSION_STATE_DIR", &xdg_state)
+        .args(["ls", "--all", "--json"])
+        .output()
+        .unwrap();
+    assert!(ls_out.status.success(), "bh ls stderr: {}", String::from_utf8_lossy(&ls_out.stderr));
+    let ls_str = String::from_utf8_lossy(&ls_out.stdout);
+    assert!(
+        ls_str.contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+        "bh ls must discover sessions inside cages/<acct>/ws-<id>/home; got:\n{ls_str}"
+    );
+}

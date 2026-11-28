@@ -237,7 +237,8 @@ pub fn discover_unified_sessions(
         );
     }
 
-    // 3. Scan ALL Berth Sandbox Cage homes (`<state_dir>/cages/*/home`).
+    // 3. Scan ALL Berth Sandbox Cage homes (`<state_dir>/cages/<acct>/home` AND
+    // workspace-scoped `<state_dir>/cages/<acct>/ws-<id>/home`).
     let cages_root = paths.state_dir.join("cages");
     if let Ok(entries) = fs::read_dir(&cages_root) {
         for entry in entries.flatten() {
@@ -248,16 +249,38 @@ pub fn discover_unified_sessions(
             let Some(acct_key) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
-            let cage_home = cage_dir.join("home");
-            if cage_home.is_dir() {
+            let legacy_home = cage_dir.join("home");
+            if legacy_home.is_dir() {
                 collect_provider_homes(
-                    &cage_home,
-                    &SessionOrigin::Cage(acct_key),
+                    &legacy_home,
+                    &SessionOrigin::Cage(acct_key.clone()),
                     provider_filter,
                     &cloud_ids,
                     &labels,
                     &mut rows,
                 );
+            }
+            if let Ok(sub_entries) = fs::read_dir(&cage_dir) {
+                for sub in sub_entries.flatten() {
+                    let name = sub.file_name();
+                    let Some(name_str) = name.to_str() else {
+                        continue;
+                    };
+                    if !name_str.starts_with("ws-") {
+                        continue;
+                    }
+                    let ws_home = sub.path().join("home");
+                    if ws_home.is_dir() {
+                        collect_provider_homes(
+                            &ws_home,
+                            &SessionOrigin::Cage(acct_key.clone()),
+                            provider_filter,
+                            &cloud_ids,
+                            &labels,
+                            &mut rows,
+                        );
+                    }
+                }
             }
         }
     }
